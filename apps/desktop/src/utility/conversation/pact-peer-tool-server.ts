@@ -5,7 +5,7 @@ import type { AgentCollaborationSourceReader } from '@pact/agent-runtime'
 
 import {
   collaborationSourceWireReadSchema,
-  collaborationSourceReadSchema,
+  collaborationSourceAnyReadSchema,
   codexCollaborationSourceWireReadSchema,
   collaborationSourceNativeReadSchema,
   collaborationSourceNativeRootSchema,
@@ -24,6 +24,7 @@ import {
   type CollaborationInputObservation,
   type CollaborationSourceReadResult,
   type CollaborationReviewObservation,
+  type RuntimeAgentId,
   sessionTitleInputSchema,
   type CollaborationTask,
   type CollaborationTurnAuthorization,
@@ -38,6 +39,7 @@ import {
   collaborationInputResultDescription,
   collaborationInputResultReceiptText,
   collaborationPlanRetentionReceiptText,
+  collaborationReviewMode,
   collaborationSourceToolDescription,
 } from './collaboration-prompt'
 import {
@@ -58,6 +60,23 @@ const REQUEST_BYTES = 64 * 1024
 const REQUESTS = 4
 const REQUEST_TIMEOUT_MS = 10_000
 
+const AGY_PROGRESS_TOKEN_PATTERN = /^([A-Za-z0-9_.:-]{1,256}):(\d{1,9})$/u
+
+type AgyToolCategory =
+  | 'title'
+  | 'peer'
+  | 'review'
+  | 'input_result'
+  | 'plan_retention'
+  | 'publish_plan'
+
+export interface AgyNativeMcpRootReceipt {
+  executorId: string
+  bindingGeneration: number
+  nativeSessionId: string
+  trajectoryId?: string | undefined
+}
+
 interface JsonRpcRequest {
   jsonrpc: '2.0'
   id?: string | number | undefined
@@ -72,7 +91,17 @@ export class PactPeerToolServer {
   private activeRequests = 0
   private activeSourceRequests = 0
   private origin: string | undefined
+  private expectedTarget: RuntimeAgentId = 'claude'
   private turn: PeerAssistanceTurn | undefined
+  private agyRoot:
+    | {
+        owner: { runId: string; grant?: string | undefined }
+        receipt: Readonly<AgyNativeMcpRootReceipt>
+        current: () => boolean
+        stagedTokens: Map<AgyToolCategory, Set<string>>
+        confirmedTokens: Set<string>
+      }
+    | undefined
 
   private collaboration: CollaborationTask | undefined
   private collaborationAuthorization: CollaborationTurnAuthorization | undefined
@@ -101,14 +130,25 @@ export class PactPeerToolServer {
     | { chunks: Buffer[]; byteLength: number; completedMarkdown?: string }
     | undefined
 
+  setExpectedTarget(target: RuntimeAgentId): void {
+    this.expectedTarget = target
+  }
+
   acceptPublishedPlan(receipt: string): string | undefined {
-    if (this.turn?.receipt !== receipt) return undefined
+    if (this.turn?.receipt !== receipt || !this.isAgyCategoryConfirmed('publish_plan'))
+      return undefined
     const markdown = this.planPublishState?.completedMarkdown
     return markdown && markdown.trim() ? markdown : undefined
   }
 
   acceptSessionTitle(input: unknown, receipt: string): string | undefined {
-    if (!this.titleAllowed || this.titleAccepted || this.turn?.receipt !== receipt) return undefined
+    if (
+      !this.titleAllowed ||
+      this.titleAccepted ||
+      this.turn?.receipt !== receipt ||
+      !this.isAgyCategoryConfirmed('title')
+    )
+      return undefined
     const result = sessionTitleInputSchema.safeParse(input)
     if (!result.success) return undefined
     this.titleAccepted = true
@@ -116,7 +156,7 @@ export class PactPeerToolServer {
   }
 
   beginTurn(
-    expectedTarget: 'claude' | 'codex',
+    expectedTarget: RuntimeAgentId,
     allowed: boolean,
     collaboration?: CollaborationTask,
     requestSessionTitle = false,
@@ -129,6 +169,8 @@ export class PactPeerToolServer {
     if (this.sourceGrant) throw new Error('A previous native root still owns its source grant.')
     if ((sourceReader || frozenReader) && !sourceGrant)
       throw new Error('The source reader requires its exact owner.')
+    this.expectedTarget = expectedTarget
+    this.agyRoot = undefined
     this.sourceGrant =
       (sourceReader || frozenReader) && sourceGrant
         ? { ...sourceGrant, reader: sourceReader, sourceReader: frozenReader }
@@ -155,6 +197,66 @@ export class PactPeerToolServer {
 
   hasSourceGrant(): boolean {
     return this.sourceGrant !== undefined
+  }
+
+  /** Bind Antigravity ACP 4-way root authentication for the active Turn. */
+  bindAgyNativeRoot(
+    owner: { runId: string; grant?: string | undefined },
+    receipt: AgyNativeMcpRootReceipt,
+    current: () => boolean,
+  ): void {
+    if (
+      !this.turn ||
+      this.agyRoot ||
+      !owner.runId ||
+      !receipt.executorId ||
+      receipt.executorId.length > 1024 ||
+      !Number.isSafeInteger(receipt.bindingGeneration) ||
+      receipt.bindingGeneration < 0 ||
+      !receipt.nativeSessionId ||
+      receipt.nativeSessionId.length > 256 ||
+      !current() ||
+      (this.sourceGrant &&
+        (this.sourceGrant.runId !== owner.runId || this.sourceGrant.grant !== owner.grant))
+    ) {
+      throw new Error('The Antigravity native MCP root cannot be bound to this owner.')
+    }
+    this.agyRoot = {
+      owner: { ...owner },
+      receipt: Object.freeze({ ...receipt }),
+      current,
+      stagedTokens: new Map(),
+      confirmedTokens: new Set(),
+    }
+    if (this.sourceGrant && !this.sourceGrant.nativeRoot) {
+      this.sourceGrant.nativeRoot = Object.freeze({
+        executorId: receipt.executorId,
+        threadId: receipt.nativeSessionId,
+        turnId: owner.runId,
+        current,
+      })
+    }
+  }
+
+  /** Confirm live ACP `tool_call` completion by exact `progressToken` (never falling back on mismatch). */
+  confirmAgyToolCallCompleted(progressToken: string | number, turnReceipt: string): boolean {
+    if (this.turn?.receipt !== turnReceipt || !this.agyRoot || !this.agyRoot.current()) {
+      return false
+    }
+    const normalized =
+      typeof progressToken === 'number' && Number.isSafeInteger(progressToken)
+        ? String(progressToken)
+        : typeof progressToken === 'string' && progressToken.length > 0
+          ? progressToken
+          : undefined
+    if (!normalized) return false
+    for (const tokens of this.agyRoot.stagedTokens.values()) {
+      if (tokens.has(normalized)) {
+        this.agyRoot.confirmedTokens.add(normalized)
+        return true
+      }
+    }
+    return false
   }
 
   /** Bind only the original Adapter's confirmed turn/start ACK, never an incoming Tool request. */
@@ -190,7 +292,9 @@ export class PactPeerToolServer {
 
   endTurn(receipt: string): void {
     if (this.turn?.receipt !== receipt) return
+    const wasAgyRoot = this.agyRoot !== undefined
     this.turn = undefined
+    this.agyRoot = undefined
     this.collaboration = undefined
     this.collaborationAuthorization = undefined
     this.planRetentionAllowed = false
@@ -199,15 +303,45 @@ export class PactPeerToolServer {
     this.peerAllowed = false
     this.titleAllowed = false
     this.titleAccepted = false
+    if (wasAgyRoot && this.sourceGrant) {
+      this.sourceGrant.sourceReader?.retire()
+      this.sourceGrant = undefined
+    }
   }
 
   /** Called only after the Adapter proves the root native Thread/Turn ownership. */
   acceptCompleted(input: unknown, turnReceipt: string): boolean {
-    return this.turn?.receipt === turnReceipt && this.turn.accept(input).ok
+    return (
+      this.turn?.receipt === turnReceipt &&
+      this.isAgyCategoryConfirmed('peer') &&
+      this.turn.accept(input).ok
+    )
   }
 
   /** Native root ownership is proved by the Adapter before admitting this metadata. */
   acceptReview(input: unknown, turnReceipt: string): CollaborationReviewObservation | undefined {
+    if (!this.isAgyCategoryConfirmed('review')) return undefined
+    return this.validateReview(input, turnReceipt)
+  }
+
+  acceptInputResult(
+    input: unknown,
+    turnReceipt: string,
+  ): CollaborationInputObservation | undefined {
+    if (!this.isAgyCategoryConfirmed('input_result')) return undefined
+    return this.validateInputResult(input, turnReceipt)
+  }
+
+  /** Validation only: the Adapter must prove this call completed in its native root. */
+  acceptPlanRetention(input: unknown, turnReceipt: string): boolean {
+    if (!this.isAgyCategoryConfirmed('plan_retention')) return false
+    return this.validatePlanRetention(input, turnReceipt)
+  }
+
+  private validateReview(
+    input: unknown,
+    turnReceipt: string,
+  ): CollaborationReviewObservation | undefined {
     if (
       this.turn?.receipt !== turnReceipt ||
       !this.collaboration ||
@@ -220,7 +354,7 @@ export class PactPeerToolServer {
     return parsed.success ? parsed.data : undefined
   }
 
-  acceptInputResult(
+  private validateInputResult(
     input: unknown,
     turnReceipt: string,
   ): CollaborationInputObservation | undefined {
@@ -234,14 +368,98 @@ export class PactPeerToolServer {
       : undefined
   }
 
-  /** Validation only: the Adapter must prove this call completed in its native root. */
-  acceptPlanRetention(input: unknown, turnReceipt: string): boolean {
+  private validatePlanRetention(input: unknown, turnReceipt: string): boolean {
     return (
       this.turn?.receipt === turnReceipt &&
       this.planRetentionAllowed &&
       (this.planRetentionCurrent?.() ?? true) &&
       collaborationPlanRetentionInputSchema.safeParse(input).success
     )
+  }
+
+  private stageAgyToken(category: AgyToolCategory, progressToken: string | undefined): void {
+    if (!this.agyRoot || !progressToken) return
+    let bucket = this.agyRoot.stagedTokens.get(category)
+    if (!bucket) {
+      bucket = new Set()
+      this.agyRoot.stagedTokens.set(category, bucket)
+    }
+    bucket.add(progressToken)
+  }
+
+  private isAgyCategoryConfirmed(category: AgyToolCategory): boolean {
+    if (!this.agyRoot) return true
+    if (!this.agyRoot.current()) return false
+    const staged = this.agyRoot.stagedTokens.get(category)
+    if (!staged || staged.size === 0) return false
+    for (const token of staged) {
+      if (this.agyRoot.confirmedTokens.has(token)) return true
+    }
+    return false
+  }
+
+  private verifyAgyRequestMeta(
+    request: JsonRpcRequest,
+    turn: PeerAssistanceTurn | undefined,
+    sourceGrant: typeof this.sourceGrant,
+    isSourceCall: boolean,
+  ): { ok: true; progressToken: string } | { ok: false; error: string } {
+    const agyRoot = this.agyRoot
+    if (!agyRoot) return { ok: true, progressToken: '' }
+    if (!agyRoot.current() || turn !== this.turn) {
+      return { ok: false, error: 'This Tool request belongs to an expired Antigravity Turn.' }
+    }
+    if (
+      isSourceCall &&
+      (!sourceGrant ||
+        sourceGrant !== this.sourceGrant ||
+        sourceGrant.runId !== agyRoot.owner.runId ||
+        sourceGrant.grant !== agyRoot.owner.grant)
+    ) {
+      return {
+        ok: false,
+        error: 'This source read has no active matching Antigravity root grant.',
+      }
+    }
+    const meta =
+      request.params && typeof request.params === 'object'
+        ? Reflect.get(request.params, '_meta')
+        : undefined
+    if (!meta || typeof meta !== 'object') {
+      return { ok: false, error: 'Antigravity root _meta authentication is required.' }
+    }
+    const expectedSessionId = agyRoot.receipt.nativeSessionId
+    const rootConvId = Reflect.get(meta, 'antigravity.google/root_conversation_id')
+    const googleConvId = Reflect.get(meta, 'antigravity.google/conversation_id')
+    const plainConvId = Reflect.get(meta, 'conversation_id')
+    if (
+      rootConvId !== expectedSessionId ||
+      googleConvId !== expectedSessionId ||
+      (plainConvId !== undefined && plainConvId !== expectedSessionId)
+    ) {
+      return {
+        ok: false,
+        error: 'Subagent or foreign conversation Tool calls are denied by Pact root policy.',
+      }
+    }
+    const rawProgressToken = Reflect.get(meta, 'progressToken')
+    if (typeof rawProgressToken !== 'string') {
+      return {
+        ok: false,
+        error: 'Valid Antigravity <trajectoryId>:<stepIdx> progressToken required.',
+      }
+    }
+    const tokenMatch = AGY_PROGRESS_TOKEN_PATTERN.exec(rawProgressToken)
+    if (
+      !tokenMatch ||
+      (agyRoot.receipt.trajectoryId !== undefined && tokenMatch[1] !== agyRoot.receipt.trajectoryId)
+    ) {
+      return {
+        ok: false,
+        error: 'Antigravity progressToken does not match the active root trajectory.',
+      }
+    }
+    return { ok: true, progressToken: rawProgressToken }
   }
 
   async start(): Promise<string> {
@@ -494,98 +712,116 @@ export class PactPeerToolServer {
                 : PEER_ASSISTANCE_INSTRUCTIONS,
           },
         }
-      case 'tools/list':
+      case 'tools/list': {
+        const allTools = [
+          {
+            name: 'publish_plan',
+            agyEnabled: Boolean(this.planPublishState),
+            description:
+              'Publish a revised Plan Markdown version during an open post-approval collaboration turn. Pass text (<= 48 KiB UTF-8 per call), optional byte offset, and complete=true on the final chunk (or omit complete/offset to send a small plan in one call). Only available during open collaboration mode; do not call this tool during initial /plan or structured plan-revision turns that use native <proposed_plan>, and do not use for ordinary Q&A.',
+            inputSchema: collaborationPublishPlanInputSchema.toJSONSchema(),
+            annotations: {
+              readOnlyHint: false,
+              destructiveHint: false,
+              idempotentHint: false,
+              openWorldHint: false,
+            },
+          },
+          {
+            name: 'retain_current_plan',
+            agyEnabled: this.planRetentionAllowed,
+            description:
+              'Explicitly retain the frozen official plan after handling the current input without changing the plan. Pass an empty object. Only the current planning owner with an existing plan can use this; finish the root normally afterward. This does not approve implementation or replace independent review.',
+            inputSchema: collaborationPlanRetentionInputSchema.toJSONSchema(),
+            annotations: {
+              readOnlyHint: true,
+              destructiveHint: false,
+              idempotentHint: true,
+              openWorldHint: false,
+            },
+          },
+          {
+            name: 'submit_input_result',
+            agyEnabled: Boolean(
+              this.collaboration &&
+              collaborationInputResultAllowed(this.collaboration, this.collaborationAuthorization),
+            ),
+            description: collaborationInputResultDescription,
+            inputSchema: collaborationInputResultSchema.toJSONSchema(),
+            annotations: {
+              readOnlyHint: true,
+              destructiveHint: false,
+              idempotentHint: true,
+              openWorldHint: false,
+            },
+          },
+          {
+            name: 'read_collaboration_source',
+            agyEnabled: Boolean(sourceGrant),
+            description: collaborationSourceToolDescription,
+            inputSchema: codexCollaborationSourceWireReadSchema.toJSONSchema(),
+            annotations: {
+              readOnlyHint: true,
+              destructiveHint: false,
+              openWorldHint: false,
+            },
+          },
+          {
+            name: 'submit_review',
+            agyEnabled: collaborationReviewMode(
+              this.collaboration,
+              this.collaborationAuthorization,
+            ),
+            description:
+              'Submit the current independent review conclusion after writing its natural-language report. needs_user requires up to three explicit questions with optional choices; other verdicts must omit questions. Only the current root reviewer can submit; this never starts another turn or permits project edits.',
+            inputSchema: collaborationReviewInputSchema.toJSONSchema(),
+            annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+          },
+          {
+            name: 'publish_session_title',
+            agyEnabled: this.titleAllowed,
+            description:
+              'Supply a concise Session title during the current authorized root Turn. No model or project operation is started.',
+            inputSchema: sessionTitleInputSchema.toJSONSchema(),
+            annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+          },
+          {
+            name: 'request_peer_assistance',
+            agyEnabled: this.peerAllowed,
+            description: PEER_ASSISTANCE_TOOL_DESCRIPTION,
+            inputSchema: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                target: { type: 'string', enum: [this.expectedTarget] },
+                kind: {
+                  type: 'string',
+                  enum: ['supplement', 'fact_check', 'challenge', 'review'],
+                },
+                reason: { type: 'string', minLength: 1, maxLength: 240 },
+              },
+              required: ['target', 'kind'],
+            },
+            annotations: {
+              readOnlyHint: true,
+              destructiveHint: false,
+              idempotentHint: true,
+              openWorldHint: false,
+            },
+          },
+        ]
+        const visibleTools = (this.agyRoot ? allTools.filter((t) => t.agyEnabled) : allTools).map(
+          ({ agyEnabled: _agyEnabled, ...tool }) => tool,
+        )
         return {
           jsonrpc: '2.0',
           id: request.id,
           result: {
-            // Loaded native Threads cache this catalog. The current Turn validates every capability.
-            tools: [
-              {
-                name: 'publish_plan',
-                description:
-                  'Publish a revised Plan Markdown version during an open post-approval collaboration turn. Pass text (<= 48 KiB UTF-8 per call), optional byte offset, and complete=true on the final chunk (or omit complete/offset to send a small plan in one call). Only available during open collaboration mode; do not call this tool during initial /plan or structured plan-revision turns that use native <proposed_plan>, and do not use for ordinary Q&A.',
-                inputSchema: collaborationPublishPlanInputSchema.toJSONSchema(),
-                annotations: {
-                  readOnlyHint: false,
-                  destructiveHint: false,
-                  idempotentHint: false,
-                  openWorldHint: false,
-                },
-              },
-              {
-                name: 'retain_current_plan',
-                description:
-                  'Explicitly retain the frozen official plan after handling the current input without changing the plan. Pass an empty object. Only the current planning owner with an existing plan can use this; finish the root normally afterward. This does not approve implementation or replace independent review.',
-                inputSchema: collaborationPlanRetentionInputSchema.toJSONSchema(),
-                annotations: {
-                  readOnlyHint: true,
-                  destructiveHint: false,
-                  idempotentHint: true,
-                  openWorldHint: false,
-                },
-              },
-              {
-                name: 'submit_input_result',
-                description: collaborationInputResultDescription,
-                inputSchema: collaborationInputResultSchema.toJSONSchema(),
-                annotations: {
-                  readOnlyHint: true,
-                  destructiveHint: false,
-                  idempotentHint: true,
-                  openWorldHint: false,
-                },
-              },
-              {
-                name: 'read_collaboration_source',
-                description: collaborationSourceToolDescription,
-                inputSchema: codexCollaborationSourceWireReadSchema.toJSONSchema(),
-                annotations: {
-                  readOnlyHint: true,
-                  destructiveHint: false,
-                  openWorldHint: false,
-                },
-              },
-              {
-                name: 'submit_review',
-                description:
-                  'Submit the current independent review conclusion after writing its natural-language report. needs_user requires up to three explicit questions with optional choices; other verdicts must omit questions. Only the current root reviewer can submit; this never starts another turn or permits project edits.',
-                inputSchema: collaborationReviewInputSchema.toJSONSchema(),
-                annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
-              },
-              {
-                name: 'publish_session_title',
-                description:
-                  'Supply a concise Session title during the current authorized root Turn. No model or project operation is started.',
-                inputSchema: sessionTitleInputSchema.toJSONSchema(),
-                annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
-              },
-              {
-                name: 'request_peer_assistance',
-                description: PEER_ASSISTANCE_TOOL_DESCRIPTION,
-                inputSchema: {
-                  type: 'object',
-                  additionalProperties: false,
-                  properties: {
-                    target: { type: 'string', enum: ['claude'] },
-                    kind: {
-                      type: 'string',
-                      enum: ['supplement', 'fact_check', 'challenge', 'review'],
-                    },
-                    reason: { type: 'string', minLength: 1, maxLength: 240 },
-                  },
-                  required: ['target', 'kind'],
-                },
-                annotations: {
-                  readOnlyHint: true,
-                  destructiveHint: false,
-                  idempotentHint: true,
-                  openWorldHint: false,
-                },
-              },
-            ],
+            // Loaded native Threads cache this catalog; Antigravity roots filter strictly per active stage.
+            tools: visibleTools,
           },
         }
+      }
       case 'tools/call': {
         const name =
           request.params && typeof request.params === 'object'
@@ -595,6 +831,28 @@ export class PactPeerToolServer {
           request.params && typeof request.params === 'object'
             ? Reflect.get(request.params, 'arguments')
             : undefined
+        const agyAuth = this.verifyAgyRequestMeta(
+          request,
+          turn,
+          sourceGrant,
+          name === 'read_collaboration_source',
+        )
+        if (!agyAuth.ok) {
+          if (sourceFailure) {
+            sourceFailure.entryOwner =
+              sourceGrant && sourceGrant === this.sourceGrant ? 'passed' : 'rejected'
+            sourceFailure.rootBinding = 'rejected'
+            sourceFailure.stage = 'native_root'
+          }
+          return {
+            jsonrpc: '2.0',
+            id: request.id,
+            result: {
+              content: [{ type: 'text', text: agyAuth.error }],
+              isError: true,
+            },
+          }
+        }
         if (name === 'read_collaboration_source') {
           if (this.activeSourceRequests >= 1) {
             return {
@@ -624,7 +882,7 @@ export class PactPeerToolServer {
               ? nativeForm
                 ? collaborationSourceNativeReadSchema.safeParse(args)
                 : collaborationSourceWireReadSchema.safeParse(args)
-              : collaborationSourceReadSchema.safeParse(args)
+              : collaborationSourceAnyReadSchema.safeParse(args)
             const root = sourceGrant?.nativeRoot
             const meta =
               request.params && typeof request.params === 'object'
@@ -634,7 +892,7 @@ export class PactPeerToolServer {
               meta && typeof meta === 'object'
                 ? Reflect.get(meta, 'x-codex-turn-metadata')
                 : undefined
-            const rootMatches = Boolean(
+            const codexRootMatches = Boolean(
               root &&
               sourceGrant?.sourceReader?.readNativeRoot &&
               meta &&
@@ -645,6 +903,14 @@ export class PactPeerToolServer {
               Reflect.get(inner, 'thread_id') === root.threadId &&
               Reflect.get(inner, 'turn_id') === root.turnId,
             )
+            const agyRootMatches = Boolean(
+              this.agyRoot &&
+              root &&
+              sourceGrant?.sourceReader?.readNativeRoot &&
+              root.threadId === this.agyRoot.receipt.nativeSessionId &&
+              root.turnId === this.agyRoot.owner.runId,
+            )
+            const rootMatches = codexRootMatches || agyRootMatches
             if (sourceFailure && nativeForm)
               sourceFailure.rootBinding = rootMatches ? 'passed' : 'rejected'
             const nativeAuthenticated = Boolean(
@@ -760,6 +1026,7 @@ export class PactPeerToolServer {
           const accepted = Boolean(
             turn && this.titleAllowed && !this.titleAccepted && parsed.success,
           )
+          if (accepted) this.stageAgyToken('title', agyAuth.progressToken)
           return {
             jsonrpc: '2.0',
             id: request.id,
@@ -780,7 +1047,8 @@ export class PactPeerToolServer {
           }
         }
         if (name === 'retain_current_plan') {
-          const accepted = Boolean(turn && this.acceptPlanRetention(args, turn.receipt))
+          const accepted = Boolean(turn && this.validatePlanRetention(args, turn.receipt))
+          if (accepted) this.stageAgyToken('plan_retention', agyAuth.progressToken)
           return {
             jsonrpc: '2.0',
             id: request.id,
@@ -805,7 +1073,8 @@ export class PactPeerToolServer {
           }
         }
         if (name === 'submit_input_result') {
-          const outcome = turn ? this.acceptInputResult(args, turn.receipt) : undefined
+          const outcome = turn ? this.validateInputResult(args, turn.receipt) : undefined
+          if (outcome) this.stageAgyToken('input_result', agyAuth.progressToken)
           return {
             jsonrpc: '2.0',
             id: request.id,
@@ -830,7 +1099,8 @@ export class PactPeerToolServer {
           }
         }
         if (name === 'submit_review') {
-          const verdict = turn ? this.acceptReview(args, turn.receipt) : undefined
+          const verdict = turn ? this.validateReview(args, turn.receipt) : undefined
+          if (verdict) this.stageAgyToken('review', agyAuth.progressToken)
           return {
             jsonrpc: '2.0',
             id: request.id,
@@ -896,6 +1166,7 @@ export class PactPeerToolServer {
                     }
                   }
                   if (!error) {
+                    if (final) this.stageAgyToken('publish_plan', agyAuth.progressToken)
                     published = {
                       receipt: this.capabilityReceipt,
                       final,
@@ -930,6 +1201,7 @@ export class PactPeerToolServer {
           name === 'request_peer_assistance'
             ? turn?.validate(args)
             : { ok: false as const, error: 'Unsupported Pact Tool.' }
+        if (admission?.ok) this.stageAgyToken('peer', agyAuth.progressToken)
         const error = admission?.ok ? undefined : (admission?.error ?? 'No active Agent Turn.')
         return {
           jsonrpc: '2.0',

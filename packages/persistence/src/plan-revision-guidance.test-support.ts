@@ -32,7 +32,12 @@ import {
 
 const settings = {
   primaryAgentId: 'codex',
-  agents: { codex: { model: null, effort: null }, claude: { model: null, effort: null } },
+  secondaryAgentId: 'claude',
+  agents: {
+    codex: { model: null, effort: null },
+    claude: { model: null, effort: null },
+    agy: { model: null, effort: null },
+  },
   maxDiscussionRounds: 6,
   maxReviewCycles: 3,
   maxRepairAttempts: 3,
@@ -61,11 +66,12 @@ export async function planRevisionFixture(
   const selectedSettings = {
     ...settings,
     primaryAgentId: planOwner,
+    secondaryAgentId: planOwner === 'codex' ? ('claude' as const) : ('codex' as const),
     ...(options.maxDiscussionRounds !== undefined
       ? { maxDiscussionRounds: options.maxDiscussionRounds }
       : {}),
   }
-  const nativeSessionId = (agent: 'codex' | 'claude') =>
+  const nativeSessionId = (agent: 'codex' | 'claude' | 'agy') =>
     agent === planOwner && options.nativeSessionId ? options.nativeSessionId : `fixture-${agent}`
   const db = await PactDatabase.open({
     filePath: options.filePath ?? ':memory:',

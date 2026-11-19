@@ -162,7 +162,9 @@ test(
       const templateOne: DefaultSessionSettings = {
         ...originalDefault,
         primaryAgentId: 'codex',
+        secondaryAgentId: 'claude',
         agents: {
+          ...originalDefault.agents,
           codex: selection(choices.codex, 'first'),
           claude: selection(choices.claude, 'first'),
         },
@@ -182,7 +184,9 @@ test(
       const templateTwo: DefaultSessionSettings = {
         ...templateOne,
         primaryAgentId: 'claude',
+        secondaryAgentId: 'codex',
         agents: {
+          ...templateOne.agents,
           codex: selection(choices.codex, 'next'),
           claude: selection(choices.claude, 'next'),
         },
@@ -494,6 +498,9 @@ async function changeSettingsFields(
 ): Promise<void> {
   const primary = settings.primaryAgentId === 'codex' ? /^Codex /u : /^Claude Code /u
   await scope.getByRole('radio', { name: primary }).check()
+  await scope
+    .getByRole('combobox', { name: 'Secondary agent', exact: true })
+    .selectOption(settings.secondaryAgentId)
   for (const agentId of ['codex', 'claude'] as const) {
     const region = scope.getByRole('region', {
       name: agentId === 'codex' ? 'Codex' : 'Claude Code',

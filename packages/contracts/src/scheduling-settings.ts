@@ -122,6 +122,7 @@ export const schedulingActivityActionSchema = z.enum([
   'reply',
   'route_codex',
   'route_claude',
+  'route_agy',
   'clarify_prepared_input',
   'supplement_plan',
   'supplement_code_response',
@@ -150,7 +151,7 @@ export const schedulingActivityRowSchema = z.strictObject({
   createdAt: z.string().datetime(),
   project: z.string().max(512),
   session: z.string().max(512),
-  provider: z.enum(['codex', 'claude', 'openai']).nullable(),
+  provider: z.enum(['codex', 'claude', 'agy', 'openai']).nullable(),
   model: z.string().max(256).nullable(),
   reason: z.enum([
     'workflow',

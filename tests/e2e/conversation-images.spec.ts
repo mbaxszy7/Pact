@@ -45,7 +45,12 @@ async function createImageSession(
         { id, projectId, title, createdAt },
         {
           primaryAgentId: 'claude',
-          agents: { claude: { model: null, effort: null }, codex: { model: null, effort: null } },
+          secondaryAgentId: 'codex',
+          agents: {
+            claude: { model: null, effort: null },
+            codex: { model: null, effort: null },
+            agy: { model: null, effort: null },
+          },
           maxDiscussionRounds: 3,
           maxReviewCycles: 3,
           maxRepairAttempts: 3,

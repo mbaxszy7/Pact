@@ -695,4 +695,87 @@ describe('SessionNotificationProjector', () => {
       ),
     ).toEqual([])
   })
+
+  it('projects Antigravity (agy) approval/question needs_user and completion transitions while suppressing initial historical subscription state', () => {
+    const projector = new SessionNotificationProjector()
+    const sessionId = randomUUID()
+    const historicalRunId = randomUUID()
+
+    // Initial subscription snapshot with historical completed agy run MUST NOT emit notification!
+    expect(
+      projector.observe(
+        makePatch({
+          sessionId,
+          status: 'completed',
+          activity: { state: 'completed', agentId: 'agy' },
+          latestRunId: historicalRunId,
+          runs: [makeRun(sessionId, { id: historicalRunId, agentId: 'agy', status: 'completed' })],
+        }),
+        false,
+      ),
+    ).toEqual([])
+
+    const liveRunId = randomUUID()
+    expect(
+      projector.observe(
+        makePatch({
+          sessionId,
+          status: 'building',
+          activity: { state: 'agent_working', agentId: 'agy' },
+          latestRunId: liveRunId,
+          runs: [makeRun(sessionId, { id: liveRunId, agentId: 'agy', status: 'running' })],
+        }),
+        false,
+      ),
+    ).toEqual([])
+
+    // Waiting for Antigravity permission/elicitation emits needs_input with agentId: 'agy'
+    const waitingEvents = projector.observe(
+      makePatch({
+        sessionId,
+        status: 'waiting_for_user',
+        updatedAt: '2026-11-19T12:00:00.000Z',
+        activity: { state: 'waiting_for_user', agentId: 'agy' },
+        latestRunId: liveRunId,
+      }),
+      false,
+    )
+    expect(waitingEvents).toMatchObject([
+      {
+        kind: 'raise',
+        category: 'needs_input',
+        agentId: 'agy',
+      },
+    ])
+
+    // Completion revokes needs_user and raises completed for agy
+    const doneEvents = projector.observe(
+      makePatch({
+        sessionId,
+        status: 'completed',
+        updatedAt: '2026-11-19T12:01:00.000Z',
+        activity: { state: 'completed', agentId: 'agy' },
+        latestRunId: liveRunId,
+        runs: [
+          makeRun(sessionId, {
+            id: liveRunId,
+            agentId: 'agy',
+            status: 'completed',
+            nativeEffectsState: 'settled',
+          }),
+        ],
+      }),
+      false,
+    )
+    expect(doneEvents).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ kind: 'revoke', sessionId }),
+        expect.objectContaining({
+          kind: 'raise',
+          category: 'completed',
+          agentId: 'agy',
+        }),
+      ]),
+    )
+  })
 })

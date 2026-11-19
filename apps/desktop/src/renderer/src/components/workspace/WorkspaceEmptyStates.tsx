@@ -97,7 +97,7 @@ export function ProjectReadyState({
           </span>
         </h2>
         <p className="mx-auto mt-group max-w-[48ch] text-body leading-relaxed text-secondary">
-          Create a shared workspace for Claude Code, Codex, and you.
+          Create a shared workspace for Claude Code, Codex, Antigravity, and you.
         </p>
         {error ? <ErrorNotice message={error} onRetry={onRetry} /> : null}
         <button className="primary-action-button mt-section" type="button" onClick={onCreate}>

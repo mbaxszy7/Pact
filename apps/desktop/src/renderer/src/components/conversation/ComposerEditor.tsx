@@ -11,7 +11,7 @@ import {
 } from 'react'
 import { createPortal } from 'react-dom'
 
-import { skillSelectionsSchema, type SkillSelection } from '@pact/contracts'
+import { agentDisplayName, skillSelectionsSchema, type SkillSelection } from '@pact/contracts'
 
 import {
   assertComposerEditCapacity,
@@ -1246,8 +1246,8 @@ export function ComposerEditor({
               type="button"
               contentEditable={false}
               className="mx-0.5 inline-flex max-w-full items-baseline gap-1.5 rounded-control border border-border/60 bg-surface-muted px-2 py-0.5 align-baseline text-caption font-medium leading-normal text-primary hover:border-border-strong focus-visible:outline-2 focus-visible:outline-focus"
-              aria-label={`Open ${atom.token.agentId === 'codex' ? 'Codex' : 'Claude Code'} Skill ${atom.token.name}`}
-              title={`${atom.token.agentId === 'codex' ? 'Codex' : 'Claude Code'} · ${atom.token.name} · Open Skill document`}
+              aria-label={`Open ${agentDisplayName(atom.token.agentId)} Skill ${atom.token.name}`}
+              title={`${agentDisplayName(atom.token.agentId)} · ${atom.token.name} · Open Skill document`}
               onMouseDown={(event) => event.preventDefault()}
               onClick={() => {
                 if ('agentId' in atom.token) callbacks.current.onSkillOpen(atom.token)

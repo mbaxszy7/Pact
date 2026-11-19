@@ -27,6 +27,7 @@ import {
   frozenExecutionInputSchema,
   runEffectiveExecutionSettingsSchema,
   relaySchedulingDecisionProofSchema,
+  unsentBoundaryMatchesProvider,
 } from '@pact/contracts'
 
 import type { PactDrizzleDatabase } from './drizzle-database.js'
@@ -260,7 +261,7 @@ export function reserveRecoveryCheck(
       handoffJson: JSON.stringify(node),
       utilityPid: input.utilityPid,
       physicalOwnerJson: JSON.stringify({
-        kind: fault.agentId === 'claude' ? 'utility_io' : 'inspection_pending',
+        kind: fault.agentId === 'codex' ? 'inspection_pending' : 'utility_io',
       }),
       createdAt: now,
       deadline,
@@ -1595,8 +1596,7 @@ export function reacquireUnsentExtraTurnBudget(
     proof.inputSha256 !== input.inputSha256 ||
     proof.effectiveSettingsSha256 !== fingerprint(effective) ||
     effective.provider !== grant.actor ||
-    (grant.actor === 'codex' && proof.boundary.kind === 'claude_root_not_yielded') ||
-    (grant.actor === 'claude' && proof.boundary.kind === 'codex_root_frame_not_written')
+    !unsentBoundaryMatchesProvider(grant.actor, proof.boundary.kind)
   )
     throw unsentExtraTurnConflict()
   const root = db

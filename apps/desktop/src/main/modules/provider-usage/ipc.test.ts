@@ -27,7 +27,7 @@ vi.mock('electron', () => ({
   },
 }))
 
-function makeSnapshot(provider: 'codex' | 'claude'): ProviderUsageSnapshot {
+function makeSnapshot(provider: 'codex' | 'claude' | 'agy'): ProviderUsageSnapshot {
   return {
     provider,
     revision: 1,

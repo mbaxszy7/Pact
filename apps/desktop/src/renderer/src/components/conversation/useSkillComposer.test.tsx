@@ -24,7 +24,12 @@ const session: CollaborationSession = {
   updatedAt: '2026-10-07T00:00:00.000Z',
   settings: {
     primaryAgentId: 'codex',
-    agents: { codex: { model: null, effort: null }, claude: { model: null, effort: null } },
+    secondaryAgentId: 'claude',
+    agents: {
+      codex: { model: null, effort: null },
+      claude: { model: null, effort: null },
+      agy: { model: null, effort: null },
+    },
     maxDiscussionRounds: 3,
 
     maxReviewCycles: 3,
@@ -224,4 +229,37 @@ it('keeps main-chat /btw handoff unblocked and routes side-chat @Main validation
   expect(mainHook.result.current.warning).toBe(
     '/lint belongs to Codex. It does not match the main chat target (Claude Code).',
   )
+})
+
+it('orders skill catalog groups by the active 2-of-3 pair and warns when mentioning the inactive 3rd agent', () => {
+  vi.stubGlobal('pact', composerBridgeFixture())
+  const claudeAgySession: CollaborationSession = {
+    ...session,
+    settings: {
+      ...session.settings,
+      primaryAgentId: 'claude',
+      secondaryAgentId: 'agy',
+    },
+  }
+
+  const activeHook = renderHook(() =>
+    useSkillComposer({
+      session: claudeAgySession,
+      text: '@agy /',
+      selections: [],
+      disabled: false,
+    }),
+  )
+  expect(activeHook.result.current.agents).toEqual(['agy', 'claude'])
+  expect(activeHook.result.current.warning).toBeUndefined()
+
+  const inactiveHook = renderHook(() =>
+    useSkillComposer({
+      session: claudeAgySession,
+      text: '@codex check status',
+      selections: [],
+      disabled: false,
+    }),
+  )
+  expect(inactiveHook.result.current.warning).toBe('@codex (Codex) is not active in this session.')
 })

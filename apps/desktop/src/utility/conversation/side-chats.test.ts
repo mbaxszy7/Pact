@@ -38,7 +38,11 @@ interface HeldRun {
 }
 
 const mockState = vi.hoisted(() => ({
-  skills: { codex: [] as SkillRecord[], claude: [] as SkillRecord[] },
+  skills: {
+    codex: [] as SkillRecord[],
+    claude: [] as SkillRecord[],
+    agy: [] as SkillRecord[],
+  },
   runs: [] as AgentRunInput[],
   holdSessions: new Set<string>(),
   heldRuns: new Map<string, HeldRun>(),
@@ -196,11 +200,17 @@ function createMockAdapter(agentId: RuntimeAgentId) {
 
 vi.mock('./codex-agent-adapter.js', () => ({ CodexAgentAdapter: createMockAdapter('codex') }))
 vi.mock('./claude-agent-adapter.js', () => ({ ClaudeAgentAdapter: createMockAdapter('claude') }))
+vi.mock('./agy-agent-adapter.js', () => ({ AgyAgentAdapter: createMockAdapter('agy') }))
 
 const migrationsFolder = resolve(import.meta.dirname, '../../../../../packages/persistence/drizzle')
 const defaultSettings: DefaultSessionSettings = {
   primaryAgentId: 'codex',
-  agents: { claude: { model: null, effort: null }, codex: { model: null, effort: null } },
+  secondaryAgentId: 'claude',
+  agents: {
+    claude: { model: null, effort: null },
+    codex: { model: null, effort: null },
+    agy: { model: null, effort: null },
+  },
   maxDiscussionRounds: 4,
   maxReviewCycles: 2,
   maxRepairAttempts: 2,
@@ -209,7 +219,7 @@ const defaultSettings: DefaultSessionSettings = {
 const cleanups: Array<() => Promise<void>> = []
 
 beforeEach(() => {
-  mockState.skills = { codex: [], claude: [] }
+  mockState.skills = { codex: [], claude: [], agy: [] }
   mockState.runs = []
   mockState.holdSessions.clear()
   mockState.heldRuns.clear()

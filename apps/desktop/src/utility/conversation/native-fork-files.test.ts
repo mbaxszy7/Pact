@@ -1,6 +1,17 @@
+import Database from 'better-sqlite3'
 import { build } from 'electron-vite'
 import { createHash, randomUUID } from 'node:crypto'
-import { appendFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
+import {
+  appendFile,
+  copyFile,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  symlink,
+  writeFile,
+} from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -11,6 +22,20 @@ import type { ClaudePlanCheckpointSource } from '@pact/agent-runtime'
 import type { AgentNativeForkWitness } from '@pact/contracts'
 
 import { LogicalIpcWorkerTraffic } from '../../shared/logical-ipc-traffic'
+import {
+  CORTEX_STEP_STATUS_DONE,
+  CORTEX_STEP_TYPE_PLANNER_RESPONSE,
+  CORTEX_STEP_TYPE_USER_INPUT,
+  EXECUTOR_TERMINATION_REASON_NO_TOOL_CALL,
+  encodeAgyPlannerResponseStep,
+  encodeAgyUserInputStep,
+  encodeBytesField,
+  encodeCortexStepMetadata,
+  encodeExecutorMetadata,
+  encodeProtobufFields,
+  encodeStringField,
+  encodeVarintField,
+} from './agy-native-storage'
 import { claudePlanInputFingerprint, claudePlanSubmissionFingerprint } from './claude-native-plan'
 import {
   NativeForkFiles,
@@ -62,11 +87,19 @@ beforeAll(async () => {
   const desktopRoot = resolve(import.meta.dirname, '../../..')
   const require = createRequire(join(desktopRoot, 'package.json'))
   const configFile = join(directory, 'worker.config.mjs')
+  const betterSqliteEntry = pathToFileURL(require.resolve('better-sqlite3')).href
+  await copyFile(join(desktopRoot, 'package.json'), join(directory, 'package.json'))
+  await symlink(
+    join(desktopRoot, 'node_modules'),
+    join(directory, 'node_modules'),
+    process.platform === 'win32' ? 'junction' : 'dir',
+  )
   await writeFile(
     configFile,
-    `import {externalizeDepsPlugin} from ${JSON.stringify(pathToFileURL(require.resolve('electron-vite')).href)}; export default {main:{plugins:[externalizeDepsPlugin({exclude:['@pact/contracts']})],build:{outDir:${JSON.stringify(join(directory, 'bundle'))},rollupOptions:{input:{'native-fork-worker':${JSON.stringify(join(import.meta.dirname, 'native-fork-worker.ts'))}}}}}};`,
+    `import {externalizeDepsPlugin} from ${JSON.stringify(pathToFileURL(require.resolve('electron-vite')).href)}; export default {main:{plugins:[externalizeDepsPlugin({exclude:['@pact/contracts']})],resolve:{alias:{'better-sqlite3':${JSON.stringify(betterSqliteEntry)}}},build:{outDir:${JSON.stringify(join(directory, 'bundle'))},rollupOptions:{external:[${JSON.stringify(betterSqliteEntry)}],input:{'native-fork-worker':${JSON.stringify(join(import.meta.dirname, 'native-fork-worker.ts'))}}}}}};`,
   )
-  await build({ root: desktopRoot, configFile, ignoreConfigWarning: true, logLevel: 'silent' })
+  await build({ root: directory, configFile, ignoreConfigWarning: true, logLevel: 'silent' })
+  await writeFile(join(directory, 'bundle', 'package.json'), '{"type":"module"}\n')
   workerLocation.path = join(directory, 'bundle', 'native-fork-worker.js')
 }, 20_000)
 afterAll(async () => {
@@ -2103,3 +2136,431 @@ it.each([false, true])(
     }
   },
 )
+
+async function createAgyWorkerShellFixture(storageRoot: string, sessionId: string) {
+  await mkdir(join(storageRoot, 'conversations'), { recursive: true })
+  await mkdir(join(storageRoot, 'brain'), { recursive: true })
+  const summariesPath = join(storageRoot, 'conversation_summaries.db')
+  const trajectoryId = randomUUID()
+  const rawSummary = encodeProtobufFields([
+    encodeStringField(4, trajectoryId),
+    encodeBytesField(15, Buffer.alloc(0)),
+    encodeBytesField(
+      17,
+      encodeProtobufFields([
+        encodeStringField(6, sessionId),
+        encodeBytesField(90, Buffer.alloc(560, 0x2a)),
+      ]),
+    ),
+    encodeVarintField(22, 1),
+  ])
+  const sumDb = new Database(summariesPath)
+  try {
+    sumDb.pragma('journal_mode = WAL')
+    sumDb.exec(`
+      CREATE TABLE IF NOT EXISTS "conversation_summaries" (
+        "conversation_id" TEXT PRIMARY KEY,
+        "title" TEXT,
+        "step_count" INTEGER NOT NULL DEFAULT 0,
+        "last_user_input_step_index" INTEGER NOT NULL DEFAULT 0,
+        "raw_summary" BLOB,
+        "parent_conversation_id" TEXT
+      );
+    `)
+    sumDb
+      .prepare(
+        'INSERT INTO "conversation_summaries" ("conversation_id", "title", "step_count", "last_user_input_step_index", "raw_summary") VALUES (?, ?, 0, 0, ?)',
+      )
+      .run(sessionId, '', rawSummary)
+  } finally {
+    sumDb.close()
+  }
+
+  const dbPath = join(storageRoot, 'conversations', `${sessionId}.db`)
+  const db = new Database(dbPath)
+  try {
+    db.pragma('page_size = 32768')
+    db.pragma('journal_mode = WAL')
+    db.exec(`
+      CREATE TABLE "trajectory_meta" (
+        "trajectory_id" TEXT PRIMARY KEY,
+        "cascade_id" TEXT NOT NULL,
+        "step_format" INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE TABLE "steps" (
+        "idx" INTEGER PRIMARY KEY,
+        "step_type" INTEGER NOT NULL,
+        "status" INTEGER NOT NULL,
+        "has_subtrajectory" INTEGER NOT NULL DEFAULT 0,
+        "metadata" BLOB,
+        "error_details" BLOB,
+        "permissions" BLOB,
+        "task_details" BLOB,
+        "render_info" BLOB,
+        "step_payload" BLOB,
+        "step_format" INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE TABLE "gen_metadata" (
+        "idx" INTEGER PRIMARY KEY,
+        "data" BLOB NOT NULL,
+        "size" INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE TABLE "executor_metadata" (
+        "idx" INTEGER PRIMARY KEY,
+        "data" BLOB NOT NULL,
+        "size" INTEGER NOT NULL DEFAULT 0
+      );
+    `)
+    db.prepare(
+      'INSERT INTO "trajectory_meta" ("trajectory_id", "cascade_id", "step_format") VALUES (?, ?, 0)',
+    ).run(trajectoryId, sessionId)
+  } finally {
+    db.close()
+  }
+  return { dbPath, trajectoryId }
+}
+
+it('executes Antigravity rebuildAgySeed, verifyAgySeed, exists, and inspectAgyRun through the real Worker', async () => {
+  const storageRoot = join(directory, randomUUID())
+  const cwd = await realpath(directory)
+  const candidateSid = randomUUID()
+  const rebuildId = randomUUID()
+  const msgId = randomUUID()
+  const imgId = randomUUID()
+  await createAgyWorkerShellFixture(storageRoot, candidateSid)
+
+  const imgBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 4, 3, 2, 1])
+  const imgPath = join(storageRoot, `${imgId}.png`)
+  await writeFile(imgPath, imgBytes, { mode: 0o600 })
+  const imgSha = createHash('sha256').update(imgBytes).digest('hex')
+
+  const chunks = [
+    {
+      kind: 'image' as const,
+      messageId: msgId,
+      sequence: 1,
+      image: {
+        id: imgId,
+        name: 'worker-seed.png',
+        mediaType: 'image/png' as const,
+        bytes: imgBytes.byteLength,
+        width: 16,
+        height: 16,
+        sha256: imgSha,
+      },
+    },
+    {
+      kind: 'message' as const,
+      messageId: msgId,
+      sequence: 1,
+      speaker: 'agy' as const,
+      state: 'complete' as const,
+      part: 0,
+      final: true,
+      content: 'Worker rebuild seed payload.',
+    },
+  ]
+
+  expect(
+    await files.exists(
+      { cwd, nativeSessionId: randomUUID(), provider: 'agy', storageRoot },
+      new AbortController().signal,
+    ),
+  ).toBe(false)
+  expect(
+    await files.exists(
+      { cwd, nativeSessionId: candidateSid, provider: 'agy', storageRoot },
+      new AbortController().signal,
+    ),
+  ).toBe(true)
+
+  const sourceHash = hash('worker-rebuild-source-v1')
+  const seeded = await files.rebuildAgySeed(
+    {
+      cwd,
+      storageRoot,
+      nativeSessionId: candidateSid,
+      rebuildId,
+      sourceHash,
+      chunks,
+      images: [
+        {
+          id: imgId,
+          name: 'worker-seed.png',
+          path: imgPath,
+          mediaType: 'image/png',
+          bytes: imgBytes.byteLength,
+          width: 16,
+          height: 16,
+          sha256: imgSha,
+        },
+      ],
+    },
+    new AbortController().signal,
+  )
+  expect(seeded.stepCount).toBe(2)
+  expect(seeded.chunkCount).toBe(2)
+  expect(seeded.initializationWitness).toBeUndefined()
+  expect(workerLocation.live).toBe(0)
+
+  // Before cold-load verification receipt is sealed, read-only `rejectAdditionalWork: true` check MUST reject!
+  await expect(
+    files.verifyAgySeed(
+      {
+        cwd,
+        storageRoot,
+        nativeSessionId: candidateSid,
+        rebuildId,
+        sourceHash,
+        chunks,
+        rejectAdditionalWork: true,
+      },
+      new AbortController().signal,
+    ),
+  ).rejects.toThrow(/cold-load verification receipt/iu)
+
+  const confirmedWitness = await files.confirmAgyRebuildColdLoad(
+    {
+      cwd,
+      appDataDir: storageRoot,
+      nativeSessionId: candidateSid,
+      sourceHash,
+      pbSha256: seeded.pbSha256,
+      pbBytes: seeded.pbBytes,
+      stepCount: 2,
+    },
+    new AbortController().signal,
+  )
+  expect(confirmedWitness).toMatchObject({
+    kind: 'agy_rebuild_v1',
+    nativeSessionId: candidateSid,
+    sourceHash,
+    pbSha256: seeded.pbSha256,
+    pbBytes: seeded.pbBytes,
+    stepCount: 2,
+  })
+  expect(confirmedWitness.coldLoadVerifiedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/u)
+
+  const verified = await files.verifyAgySeed(
+    {
+      cwd,
+      storageRoot,
+      nativeSessionId: candidateSid,
+      rebuildId,
+      sourceHash,
+      chunks,
+      rejectAdditionalWork: true,
+      expectedSeedHash: seeded.seedHash,
+      expectedTrajectoryId: seeded.trajectoryId,
+      expectedPbSha256: seeded.pbSha256,
+      expectedPbBytes: seeded.pbBytes,
+      expectedVerifiedPrefixSha256: seeded.verifiedPrefixSha256,
+      expectedVerifiedPrefixBytes: seeded.verifiedPrefixBytes,
+      expectedRecordCount: seeded.recordCount,
+    },
+    new AbortController().signal,
+  )
+  expect(verified).toEqual({
+    ...seeded,
+    initializationWitness: confirmedWitness,
+  })
+  expect(workerLocation.live).toBe(0)
+})
+
+it('executes Antigravity prepare, two-phase forkAgy, and inspect through the real Worker', async () => {
+  const storageRoot = join(directory, randomUUID())
+  const cwd = await realpath(directory)
+  const sourceSid = randomUUID()
+  const candidateSid = randomUUID()
+  const { dbPath: sourceDbPath, trajectoryId: sourceTrajId } = await createAgyWorkerShellFixture(
+    storageRoot,
+    sourceSid,
+  )
+  await createAgyWorkerShellFixture(storageRoot, candidateSid)
+
+  const pactRunId = randomUUID()
+  const pactMsgId = randomUUID()
+  const db = new Database(sourceDbPath)
+  try {
+    const u0Meta = encodeCortexStepMetadata({
+      createdAtSeconds: 1_710_000_500n,
+      source: 1,
+      executionId: 'exec-worker-1',
+      trajectoryId: sourceTrajId,
+      stepIndex: 0,
+      cascadeId: sourceSid,
+      stepId: 'step-w0',
+    })
+    const u0Data = encodeAgyUserInputStep({
+      metadata: u0Meta,
+      text: `Worker prompt mentioning ${sourceSid} and ${sourceTrajId}\n${JSON.stringify({
+        version: 'pact-agent-prompt-v1',
+        messageId: pactMsgId,
+        pactRunId,
+      })}`,
+    })
+    const p1Meta = encodeCortexStepMetadata({
+      createdAtSeconds: 1_710_000_501n,
+      source: 2,
+      executionId: 'exec-worker-1',
+      trajectoryId: sourceTrajId,
+      stepIndex: 1,
+      cascadeId: sourceSid,
+      stepId: 'step-w1',
+    })
+    const p1Data = encodeAgyPlannerResponseStep({
+      metadata: p1Meta,
+      response: 'Worker Fork canonical answer.',
+    })
+    const insertStep = db.prepare(
+      'INSERT INTO "steps" ("idx", "step_type", "status", "has_subtrajectory", "metadata", "step_payload", "step_format") VALUES (?, ?, ?, 0, ?, ?, 0)',
+    )
+    insertStep.run(0, CORTEX_STEP_TYPE_USER_INPUT, CORTEX_STEP_STATUS_DONE, u0Meta, u0Data)
+    insertStep.run(1, CORTEX_STEP_TYPE_PLANNER_RESPONSE, CORTEX_STEP_STATUS_DONE, p1Meta, p1Data)
+
+    const genData = encodeProtobufFields([
+      encodeBytesField(
+        1,
+        encodeProtobufFields([
+          encodeBytesField(
+            20,
+            encodeProtobufFields([
+              encodeStringField(1, 'trajectory_id'),
+              encodeStringField(2, sourceTrajId),
+            ]),
+          ),
+          encodeBytesField(
+            20,
+            encodeProtobufFields([
+              encodeStringField(1, 'cascade_id'),
+              encodeStringField(2, sourceSid),
+            ]),
+          ),
+        ]),
+      ),
+      encodeVarintField(2, 1),
+      encodeStringField(4, 'exec-worker-1'),
+    ])
+    db.prepare('INSERT INTO "gen_metadata" ("idx", "data", "size") VALUES (0, ?, ?)').run(
+      genData,
+      genData.byteLength,
+    )
+    const execData = encodeExecutorMetadata({
+      terminationReason: EXECUTOR_TERMINATION_REASON_NO_TOOL_CALL,
+      numGeneratorInvocations: 1,
+      lastStepIdx: 1,
+      executionId: 'exec-worker-1',
+    })
+    db.prepare('INSERT INTO "executor_metadata" ("idx", "data", "size") VALUES (0, ?, ?)').run(
+      execData,
+      execData.byteLength,
+    )
+  } finally {
+    db.close()
+  }
+
+  const coldRun = await files.inspectAgyRun(
+    {
+      cwd,
+      storageRoot,
+      nativeSessionId: sourceSid,
+      nativeTurnId: pactRunId,
+    },
+    new AbortController().signal,
+  )
+  expect(coldRun.terminalState?.status).toBe('completed')
+  expect(coldRun.terminalState?.executionId).toBe('exec-worker-1')
+  expect(coldRun.terminalState?.consumedInputs[0]?.pactRunId).toBe(pactRunId)
+  expect(coldRun.terminalState?.answer).toBe('Worker Fork canonical answer.')
+
+  const responseHash = hash('Worker Fork canonical answer.')
+  const boundary = await files.prepareAgyBoundary(
+    {
+      cwd,
+      storageRoot,
+      nativeSessionId: sourceSid,
+      nativeTurnId: pactRunId,
+      nativeInputIds: [pactRunId],
+      bindingGeneration: 1,
+      throughSequence: 2,
+      deliveryCursor: 2,
+      responseHash,
+    },
+    new AbortController().signal,
+  )
+  expect(boundary.provider).toBe('agy')
+  expect(boundary.nativeCutId).toBe('exec-worker-1')
+  expect(boundary.agyCut?.version).toBe('pact-agy-fork-cut-v1')
+  expect(boundary.agyCut?.executionId).toBe('exec-worker-1')
+  expect(boundary.agyCut?.cutStepIdx).toBe(1)
+
+  const candidateCallbacks: string[] = []
+  const forked = await files.forkAgy(
+    {
+      cwd,
+      storageRoot,
+      candidateNativeSessionId: candidateSid,
+      source: boundary,
+      responseHash,
+      model: 'gemini-3-flash',
+      effort: 'high',
+      permissionMode: 'auto',
+      markInitialized: true,
+      onCandidate: async (sid, candidateWitness) => {
+        candidateCallbacks.push(sid)
+        expect(candidateWitness.sourceNativeSessionId).toBe(sourceSid)
+        expect(candidateWitness.provider).toBe('agy')
+        expect(candidateWitness.initializedAt).toBeUndefined()
+      },
+    },
+    new AbortController().signal,
+  )
+  expect(candidateCallbacks).toEqual([candidateSid])
+  expect(forked.witness.initializedAt).toBeDefined()
+  expect(forked.witness.provider).toBe('agy')
+  expect(forked.witness.sourceTrajectoryId).toBe(sourceTrajId)
+  expect(forked.witness.candidateTrajectoryId).toBeTruthy()
+  expect(forked.witness.cutStepIdx).toBe(1)
+  expect(forked.witness.agyCut).toMatchObject({
+    version: 'pact-agy-fork-cut-v1',
+    trajectoryId: forked.witness.candidateTrajectoryId,
+    executionId: 'exec-worker-1',
+    cutStepIdx: 1,
+  })
+  expect(workerLocation.live).toBe(0)
+
+  const inspected = await files.execute(
+    {
+      provider: 'agy',
+      action: 'inspect',
+      cwd,
+      storageRoot,
+      nativeSessionId: candidateSid,
+      source: boundary,
+      witness: forked.witness,
+    },
+    new AbortController().signal,
+  )
+  expect(inspected.initializedVerified).toBe(true)
+  expect(workerLocation.live).toBe(0)
+
+  await expect(
+    files.forkAgy(
+      {
+        cwd,
+        storageRoot,
+        candidateNativeSessionId: randomUUID(),
+        source: {
+          ...boundary,
+          agyCut: { ...boundary.agyCut!, trajectoryId: 'traj-mismatch-worker' },
+        },
+        responseHash,
+        model: 'gemini-3-flash',
+        effort: 'high',
+        permissionMode: 'auto',
+      },
+      new AbortController().signal,
+    ),
+  ).rejects.toThrow(/changed before Fork|disagrees/iu)
+  expect(workerLocation.live).toBe(0)
+})

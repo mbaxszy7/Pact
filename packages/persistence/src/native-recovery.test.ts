@@ -24,9 +24,11 @@ import {
 const migrationsFolder = resolve(import.meta.dirname, '../drizzle')
 const settings: DefaultSessionSettings = {
   primaryAgentId: 'codex',
+  secondaryAgentId: 'claude',
   agents: {
     claude: { model: null, effort: null },
     codex: { model: 'frozen-model', effort: 'high' },
+    agy: { model: null, effort: null },
   },
   maxDiscussionRounds: 6,
 
@@ -799,6 +801,7 @@ describe('Session-scoped permission revisions', () => {
       expect(f.db.sessionRepository.find(f.sessionId)?.settings.permissionModes).toEqual({
         claude: 'ask',
         codex: 'ask',
+        agy: 'ask',
       })
     } finally {
       f.db.close()
@@ -875,6 +878,7 @@ describe('Session-scoped permission revisions', () => {
       expect(db.sessionRepository.find(f.sessionId)?.settings.permissionModes).toEqual({
         claude: 'full',
         codex: 'auto',
+        agy: 'ask',
       })
       const id = randomUUID()
       db.sessionRepository.create(
@@ -889,6 +893,7 @@ describe('Session-scoped permission revisions', () => {
       expect(db.sessionRepository.find(id)?.settings.permissionModes).toEqual({
         claude: 'ask',
         codex: 'native',
+        agy: 'ask',
       })
       expect(db.defaultSessionSettingsRepository.read()).toEqual(global)
     } finally {

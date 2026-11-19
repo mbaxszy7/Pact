@@ -1,7 +1,12 @@
 import { Clock, LoaderCircle, RotateCcw, TriangleAlert } from 'lucide-react'
 import { useRef, useState } from 'react'
 
-import type { RuntimeAgentId, SessionIssue, SessionIssues } from '@pact/contracts'
+import {
+  agentDisplayName,
+  type RuntimeAgentId,
+  type SessionIssue,
+  type SessionIssues,
+} from '@pact/contracts'
 
 function focusCancel(button: HTMLButtonElement | null): void {
   button?.focus()
@@ -92,7 +97,7 @@ export function SessionWarningCard({
         <>
           <h3 className="flex items-center gap-2 font-medium">
             <TriangleAlert className="size-4 shrink-0" aria-hidden="true" />
-            Rebuild {confirming.agentId === 'codex' ? 'Codex' : 'Claude Code'} session?
+            Rebuild {agentDisplayName(confirming.agentId)} session?
           </h3>
           <p className="mt-2 leading-relaxed">
             Starts a new agent session. Chat history and drafts stay saved; the earlier task won’t
@@ -159,9 +164,7 @@ export function SessionWarningCard({
                           : undefined
                       }
                     >
-                      {value.agents.length > 1
-                        ? `${issue.agentId === 'codex' ? 'Codex' : 'Claude Code'} · `
-                        : null}
+                      {value.agents.length > 1 ? `${agentDisplayName(issue.agentId)} · ` : null}
                       {stopping ? 'Stopping…' : checking ? 'Checking…' : issue.title}
                       {!inProgress && issue.phase === 'background_check' && issue.reason ? (
                         <span className="font-normal text-tertiary"> — {issue.reason}</span>

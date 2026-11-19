@@ -13,6 +13,7 @@ export * from './execution-settings.js'
 export * from './execution-envelope.js'
 export * from './app-updates.js'
 import {
+  AGENTS,
   collaborationViewSchema,
   collaborationDocumentSchema,
   collaborationMarkdownNodeSchema,
@@ -846,12 +847,13 @@ export const runtimeHealthSchema = z.object({
 
 export type RuntimeHealth = z.infer<typeof runtimeHealthSchema>
 
-export const runtimeAgentIdSchema = z.enum(['claude', 'codex'])
+export const runtimeAgentIdSchema = z.enum(AGENTS)
 export type RuntimeAgentId = z.infer<typeof runtimeAgentIdSchema>
 
 export const RUNTIME_MINIMUM_VERSIONS = {
   claude: '2.1.272',
   codex: '0.159.2',
+  agy: '1.5.9',
 } as const satisfies Record<RuntimeAgentId, string>
 
 export const runtimeReadinessStateSchema = z.enum([
@@ -869,15 +871,22 @@ export const runtimeAgentReadinessSchema = z.strictObject({
   state: runtimeReadinessStateSchema,
   executablePath: z.string().optional(),
   version: z.string().optional(),
+  agentInfoVersion: z.string().optional(),
+  acpVersion: z.string().optional(),
   detail: z.string().optional(),
   checkedAt: z.string().datetime(),
 })
 export type RuntimeAgentReadiness = z.infer<typeof runtimeAgentReadinessSchema>
 
-export const runtimePreparationSchema = z.strictObject({
-  firstUse: z.boolean(),
-  agents: z.tuple([runtimeAgentReadinessSchema, runtimeAgentReadinessSchema]),
-})
+export const runtimePreparationSchema = z
+  .strictObject({
+    firstUse: z.boolean(),
+    agents: z.array(runtimeAgentReadinessSchema).min(2).max(3),
+  })
+  .refine(
+    (prep) => new Set(prep.agents.map((entry) => entry.agentId)).size === prep.agents.length,
+    'Runtime preparation entries must have unique Agent identities.',
+  )
 export type RuntimePreparation = z.infer<typeof runtimePreparationSchema>
 
 export const runtimeExecutablePathUpdateSchema = z.strictObject({
@@ -899,26 +908,42 @@ export const agentModelSelectionSchema = z
   })
 export type AgentModelSelection = z.infer<typeof agentModelSelectionSchema>
 
-export const defaultSessionSettingsSchema = z.strictObject({
+const defaultSessionSettingsBaseSchema = z.strictObject({
   primaryAgentId: runtimeAgentIdSchema,
+  secondaryAgentId: runtimeAgentIdSchema,
   agents: z.strictObject({
     claude: agentModelSelectionSchema,
     codex: agentModelSelectionSchema,
+    agy: agentModelSelectionSchema,
   }),
   maxDiscussionRounds: z.number().int().min(1).max(20),
   maxReviewCycles: z.number().int().min(1).max(10),
   maxRepairAttempts: z.number().int().min(1).max(10),
 })
+
+export const defaultSessionSettingsSchema = defaultSessionSettingsBaseSchema.refine(
+  (settings) => settings.primaryAgentId !== settings.secondaryAgentId,
+  {
+    message: 'Primary and Secondary Agents must be distinct.',
+    path: ['secondaryAgentId'],
+  },
+)
 export type DefaultSessionSettings = z.infer<typeof defaultSessionSettingsSchema>
 
-export const sessionSettingsSchema = defaultSessionSettingsSchema.extend({
-  permissionModes: z
-    .strictObject({
-      claude: sessionPermissionModeSchema,
-      codex: sessionPermissionModeSchema,
-    })
-    .optional(),
-})
+export const sessionSettingsSchema = defaultSessionSettingsBaseSchema
+  .extend({
+    permissionModes: z
+      .strictObject({
+        claude: sessionPermissionModeSchema,
+        codex: sessionPermissionModeSchema,
+        agy: sessionPermissionModeSchema,
+      })
+      .optional(),
+  })
+  .refine((settings) => settings.primaryAgentId !== settings.secondaryAgentId, {
+    message: 'Primary and Secondary Agents must be distinct.',
+    path: ['secondaryAgentId'],
+  })
 export type SessionSettings = z.infer<typeof sessionSettingsSchema>
 
 export const defaultSessionSettingsStateSchema = z.strictObject({
@@ -948,11 +973,29 @@ export const agentModelCatalogSchema = z.strictObject({
 })
 export type AgentModelCatalog = z.infer<typeof agentModelCatalogSchema>
 
+export const activeAgentPairInputSchema = z
+  .strictObject({
+    primaryAgentId: runtimeAgentIdSchema,
+    secondaryAgentId: runtimeAgentIdSchema,
+  })
+  .refine((pair) => pair.primaryAgentId !== pair.secondaryAgentId, {
+    message: 'Primary and Secondary Agents must be distinct.',
+    path: ['secondaryAgentId'],
+  })
+export type ActiveAgentPairInput = z.infer<typeof activeAgentPairInputSchema>
+
+export const defaultSessionSettingsGetInputSchema = z.strictObject({
+  activePair: activeAgentPairInputSchema.optional(),
+})
+export type DefaultSessionSettingsGetInput = z.infer<typeof defaultSessionSettingsGetInputSchema>
+
 export const defaultSessionSettingsEditorStateSchema = z.strictObject({
   modelCatalogs: z.strictObject({
     claude: agentModelCatalogSchema,
     codex: agentModelCatalogSchema,
+    agy: agentModelCatalogSchema,
   }),
+  recommendedPair: activeAgentPairInputSchema.optional(),
   current: defaultSessionSettingsStateSchema.optional(),
 })
 export type DefaultSessionSettingsEditorState = z.infer<
@@ -1395,6 +1438,7 @@ export type SessionGroupMutation = z.infer<typeof sessionGroupMutationSchema>
 
 export const sessionCreationPrepareInputSchema = z.strictObject({
   projectId: z.string().uuid(),
+  activePair: activeAgentPairInputSchema.optional(),
 })
 export type SessionCreationPrepareInput = z.infer<typeof sessionCreationPrepareInputSchema>
 
@@ -1414,6 +1458,7 @@ export type SessionCreateInput = z.infer<typeof sessionCreateInputSchema>
 
 export const sessionSettingsInputSchema = z.strictObject({
   sessionId: z.string().uuid(),
+  activePair: activeAgentPairInputSchema.optional(),
 })
 export type SessionSettingsInput = z.infer<typeof sessionSettingsInputSchema>
 
@@ -1441,15 +1486,21 @@ export const sessionMarkReadInputSchema = z.strictObject({
 })
 export type SessionMarkReadInput = z.infer<typeof sessionMarkReadInputSchema>
 
+export const sessionEditorModelCatalogsSchema = z.strictObject({
+  claude: agentModelCatalogSchema,
+  codex: agentModelCatalogSchema,
+  agy: agentModelCatalogSchema.optional(),
+})
+
 export const sessionSettingsEditorStateSchema = z.strictObject({
   session: collaborationSessionSchema,
-  modelCatalogs: defaultSessionSettingsEditorStateSchema.shape.modelCatalogs,
+  modelCatalogs: sessionEditorModelCatalogsSchema,
 })
 export type SessionSettingsEditorState = z.infer<typeof sessionSettingsEditorStateSchema>
 
 export const sessionSettingsSaveResultSchema = z.strictObject({
   catalogChange: sessionCatalogChangeSchema,
-  modelCatalogs: defaultSessionSettingsEditorStateSchema.shape.modelCatalogs,
+  modelCatalogs: sessionEditorModelCatalogsSchema,
 })
 export type SessionSettingsSaveResult = z.infer<typeof sessionSettingsSaveResultSchema>
 
@@ -1718,8 +1769,7 @@ export const nativeEvidenceIdentitySchema = z.strictObject({
 })
 export type NativeEvidenceIdentity = z.infer<typeof nativeEvidenceIdentitySchema>
 
-/** Small private initialization receipt; never a copy of native history. */
-export const nativeInitializationWitnessSchema = z.strictObject({
+export const codexInitializationWitnessSchema = z.strictObject({
   kind: z.literal('codex_rollout_v1'),
   nativeSessionId: nativeEvidenceIdentitySchema.shape.nativeSessionId,
   verifiedPrefixBytes: z
@@ -1730,6 +1780,28 @@ export const nativeInitializationWitnessSchema = z.strictObject({
   verifiedPrefixSha256: z.string().regex(/^[a-f0-9]{64}$/u),
   recordCount: z.number().int().positive().max(10_000),
 })
+export type CodexInitializationWitness = z.infer<typeof codexInitializationWitnessSchema>
+
+export const agyRebuildInitializationWitnessSchema = z.strictObject({
+  kind: z.literal('agy_rebuild_v1'),
+  nativeSessionId: nativeEvidenceIdentitySchema.shape.nativeSessionId,
+  pbSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+  pbBytes: z
+    .number()
+    .int()
+    .positive()
+    .max(64 * 1024 * 1024),
+  stepCount: z.literal(2),
+  sourceHash: z.string().regex(/^[a-f0-9]{64}$/u),
+  coldLoadVerifiedAt: z.string().datetime(),
+})
+export type AgyRebuildInitializationWitness = z.infer<typeof agyRebuildInitializationWitnessSchema>
+
+/** Small private initialization receipt; never a copy of native history. */
+export const nativeInitializationWitnessSchema = z.discriminatedUnion('kind', [
+  codexInitializationWitnessSchema,
+  agyRebuildInitializationWitnessSchema,
+])
 export type NativeInitializationWitness = z.infer<typeof nativeInitializationWitnessSchema>
 
 const nativeRecoveredOutputSchema = z
@@ -1881,6 +1953,7 @@ export const agentRunSchema = z.strictObject({
   failureKind: runFailureKindSchema.optional(),
   failureMessage: z.string().optional(),
   handoffMessageCount: z.number().int().positive().optional(),
+  handoffSourceAgents: z.array(runtimeAgentIdSchema).min(1).max(3).optional(),
   peerProposal: peerRequestProposalSchema.optional(),
   workspaceChanges: workspaceChangeSetSchema.optional(),
   createdAt: z.string().datetime(),
@@ -1960,7 +2033,7 @@ export type SessionIssue = z.infer<typeof sessionIssueSchema>
 export const sessionIssuesSchema = z.strictObject({
   sessionId: z.string().uuid(),
   inputGate: z.enum(['open', 'send_blocked', 'read_only']),
-  agents: z.array(sessionIssueSchema).max(2),
+  agents: z.array(sessionIssueSchema).max(3),
 })
 export type SessionIssues = z.infer<typeof sessionIssuesSchema>
 
@@ -2021,7 +2094,7 @@ export type RebuildReturnedInputRecord = z.infer<typeof rebuildReturnedInputReco
 export const conversationQueuedInputSchema = z.strictObject({
   id: z.string().uuid(),
   revision: z.number().int().nonnegative(),
-  recipient: z.enum(['claude', 'codex', 'all']),
+  recipient: z.enum(['claude', 'codex', 'agy', 'all']),
   preview: z.string().max(512),
   workflowCommand: z.boolean(),
   state: z.enum(['queued', 'paused', 'dispatching', 'unknown']),
@@ -2100,7 +2173,7 @@ export const conversationSnapshotSchema = z.strictObject({
   activities: z.array(agentActivitySchema),
   runs: z.array(agentRunSchema),
   nativeContexts: z.array(nativeAgentContextSchema),
-  rebuildOperations: z.array(pendingNativeRebuildSchema).max(2).optional(),
+  rebuildOperations: z.array(pendingNativeRebuildSchema).max(3).optional(),
   rebuildInputRecovery: rebuildInputRecoverySchema.nullable().optional(),
   forkOperation: sessionForkOperationSchema.optional(),
   forkBlocked: z.boolean().optional(),
@@ -2353,8 +2426,8 @@ const conversationPageHeaderSchema = z.strictObject({
   commentsRevision: z.number().int().nonnegative(),
   latestRun: agentRunSchema.optional(),
   latestCompleteAssistantSequence: z.number().int().nonnegative().optional(),
-  nativeContexts: z.array(nativeAgentContextSchema).max(2).optional(),
-  rebuildOperations: z.array(pendingNativeRebuildSchema).max(2).optional(),
+  nativeContexts: z.array(nativeAgentContextSchema).max(3).optional(),
+  rebuildOperations: z.array(pendingNativeRebuildSchema).max(3).optional(),
   rebuildInputRecovery: rebuildInputRecoverySchema.nullable().optional(),
   forkOperation: sessionForkOperationSchema.optional(),
   forkBlocked: z.boolean().optional(),
@@ -2688,8 +2761,8 @@ export const conversationPatchSchema = z
         }),
       )
       .max(4),
-    nativeContexts: z.array(nativeAgentContextSchema).max(2).optional(),
-    rebuildOperations: z.array(pendingNativeRebuildSchema).max(2).optional(),
+    nativeContexts: z.array(nativeAgentContextSchema).max(3).optional(),
+    rebuildOperations: z.array(pendingNativeRebuildSchema).max(3).optional(),
     rebuildInputRecovery: rebuildInputRecoverySchema.nullable().optional(),
     forkOperation: sessionForkOperationSchema.optional(),
     forkBlocked: z.boolean().optional(),
@@ -2871,6 +2944,15 @@ export const conversationSendInputSchema = z
     }
   })
 export type ConversationSendInput = z.infer<typeof conversationSendInputSchema>
+const queuedCollaborationRouteSchema = z.union([
+  z.discriminatedUnion('type', [
+    z.strictObject({ type: z.literal('primary') }),
+    z.strictObject({ type: z.literal('agent'), agentId: runtimeAgentIdSchema }),
+    z.strictObject({ type: z.literal('all') }),
+  ]),
+  conversationMessageRouteSchema,
+])
+
 export const collaborationReceivedMetadataSchema = z.strictObject({
   steerSkillInvocation: collaborationDocumentSchema.optional(),
   replyIntentBasis: collaborationReplyIntentBasisSchema.optional(),
@@ -2881,7 +2963,7 @@ export const collaborationReceivedMetadataSchema = z.strictObject({
   skills: skillSelectionsSchema.default([]),
   imageIds: conversationSendInputSchema.shape.imageIds.default([]),
   commentIds: conversationSendInputSchema.shape.commentIds,
-  route: conversationSendInputSchema.shape.route,
+  route: queuedCollaborationRouteSchema.optional(),
   replyToDecision: conversationSendInputSchema.shape.replyToDecision,
   replaceTask: conversationSendInputSchema.shape.replaceTask,
   batchId: conversationSendInputSchema.shape.batchId,
@@ -2941,7 +3023,7 @@ export const nativeContextRebuildChunkSchema = z.discriminatedUnion('kind', [
     kind: z.literal('message'),
     messageId: z.string().uuid(),
     sequence: z.number().int().nonnegative(),
-    speaker: z.enum(['user', 'claude', 'codex']),
+    speaker: z.enum(['user', 'claude', 'codex', 'agy']),
     state: z.enum(['complete', 'incomplete']),
     part: z.number().int().nonnegative(),
     final: z.boolean(),
@@ -3276,6 +3358,7 @@ export const utilityRequestSchema = z.discriminatedUnion('type', [
   z.object({
     type: z.literal('default-session-settings.get.request'),
     requestId: z.string().uuid(),
+    input: defaultSessionSettingsGetInputSchema.optional(),
   }),
   z.object({
     type: z.literal('default-session-settings.save.request'),
@@ -4074,7 +4157,9 @@ export interface DesktopBridge {
   getRuntimeHealth(): Promise<RpcResult<RuntimeHealth>>
   getRuntimePreparation(): Promise<RpcResult<RuntimePreparation>>
   chooseRuntimeExecutable(agentId: RuntimeAgentId): Promise<RpcResult<RuntimePreparation>>
-  getDefaultSessionSettingsEditorState(): Promise<RpcResult<DefaultSessionSettingsEditorState>>
+  getDefaultSessionSettingsEditorState(
+    activePair?: ActiveAgentPairInput,
+  ): Promise<RpcResult<DefaultSessionSettingsEditorState>>
   saveDefaultSessionSettings(
     input: DefaultSessionSettingsSaveInput,
   ): Promise<RpcResult<DefaultSessionSettingsState>>
@@ -4110,7 +4195,10 @@ export interface DesktopBridge {
   moveSessionGroup(input: MoveSessionGroupInput): Promise<RpcResult<SessionGroupMutation>>
   dissolveSessionGroup(input: DissolveSessionGroupInput): Promise<RpcResult<SessionGroupMutation>>
   setSessionGroup(input: SetSessionGroupInput): Promise<RpcResult<SessionGroupMutation>>
-  prepareSessionCreation(projectId: string): Promise<RpcResult<DefaultSessionSettingsEditorState>>
+  prepareSessionCreation(
+    projectId: string,
+    activePair?: ActiveAgentPairInput,
+  ): Promise<RpcResult<DefaultSessionSettingsEditorState>>
   createSession(input: SessionCreateInput): Promise<RpcResult<SessionCatalogChange>>
   renameSession(input: SessionRenameInput): Promise<RpcResult<SessionCatalogChange>>
   markSessionRead(input: SessionMarkReadInput): Promise<RpcResult<SessionCatalogChange>>
@@ -4119,7 +4207,10 @@ export interface DesktopBridge {
   setSessionSidebarHidden(
     input: SessionSidebarHiddenInput,
   ): Promise<RpcResult<SessionCatalogChange>>
-  getSessionSettings(sessionId: string): Promise<RpcResult<SessionSettingsEditorState>>
+  getSessionSettings(
+    sessionId: string,
+    activePair?: ActiveAgentPairInput,
+  ): Promise<RpcResult<SessionSettingsEditorState>>
   saveSessionSettings(
     input: SessionSettingsSaveInput,
   ): Promise<RpcResult<SessionSettingsSaveResult>>

@@ -174,7 +174,7 @@ export function collaborationInstructions(
     COLLABORATION_DISPLAY_TEXT_RULES,
     'This root turn has one responsibility. Do not call the other agent, request peer assistance, delegate native subagents, start another stage or manufacture user approval. Pact arranges the next turn and binds any result to its sources.',
     !openMode && task.kind === 'plan'
-      ? 'In initial planning phase: /plan @codex or /plan @claude chooses the planner; accepted plans offer Swap implementer before implementation.'
+      ? `In initial planning phase: /plan @${task.owner} or /plan @${task.reviewer} chooses the planner; accepted plans offer Swap implementer before implementation.`
       : undefined,
     collaborationReadOnly(task, authorization)
       ? collaborationPlanMode(task, authorization)
@@ -192,6 +192,9 @@ export function collaborationInstructions(
       : undefined,
     collaborationPlanMode(task, authorization) && (authorization?.actor ?? task.actor) === 'claude'
       ? 'When a first or changed plan is decision complete and no necessary user choice remains, submit the complete official plan once through ExitPlanMode, then end this turn immediately without calling ExitPlanMode again, calling AskUserQuestion, or implementing the plan. If the frozen official plan needs no change, use the explicit retention operation described below instead.'
+      : undefined,
+    collaborationPlanMode(task, authorization) && (authorization?.actor ?? task.actor) === 'agy'
+      ? 'When a first or changed plan is decision complete and no necessary user choice remains, write the complete official Markdown plan once to your native artifact directory (<appDataDir>/brain/<sessionId>/implementation_plan.md) using write_file or edit_file with ArtifactMetadata, then end this turn immediately without modifying workspace files or implementing the plan. If the frozen official plan needs no change, use the explicit retention operation described below instead.'
       : undefined,
     collaborationPlanRetentionAllowed(task, authorization)
       ? 'If the existing official plan remains correct after handling the supplied input, call retain_current_plan with an empty object in this root. This explicitly retains the frozen plan and its original version/source; ordinary prose saying that the plan is unchanged is not a submission. Do not call it after changing or starting to change the plan, while a plan operation is unresolved, or while a required user choice remains. If the plan needs changes, submit the complete updated plan through the native mechanism instead. This operation does not approve implementation or replace the independent reviewer.'

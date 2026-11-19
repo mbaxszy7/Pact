@@ -122,4 +122,24 @@ describe('adversarial review instructions', () => {
     expect(prompt).toContain('challenge it as an adversarial reviewer would')
     expect(prompt).toContain('Do not silently drop a finding')
   })
+
+  it('gives Antigravity (agy) native brain Markdown plan instructions and binds active-pair /plan mentions in open mode', () => {
+    const input = planRunInput('codex')
+    const agyTask = {
+      ...input.promptEnvelope.collaboration!,
+      owner: 'agy' as const,
+      reviewer: 'claude' as const,
+      actor: 'agy' as const,
+      planAuthor: 'agy' as const,
+    }
+    const agyAuth = {
+      ...input.promptEnvelope.collaborationAuthorization!,
+      actor: 'agy' as const,
+    }
+    const phase1Prompt = collaborationInstructions(agyTask, agyAuth)
+    expect(phase1Prompt).toContain('<appDataDir>/brain/<sessionId>/implementation_plan.md')
+    expect(phase1Prompt).toContain('ArtifactMetadata')
+    expect(phase1Prompt).not.toContain('<proposed_plan>')
+    expect(phase1Prompt).toContain('/plan @agy or /plan @claude')
+  })
 })

@@ -25,7 +25,7 @@ export const workspaceChangeSetSchema = z.strictObject({
   runId: z.string().uuid(),
   sessionId: z.string().uuid(),
   projectId: z.string().uuid(),
-  agentId: z.enum(['claude', 'codex']),
+  agentId: z.enum(['claude', 'codex', 'agy']),
   state: z.enum(['recording', 'ready', 'mixed', 'undone', 'recovery_required']),
   revision: z.number().int().positive().optional(),
   fileCount: z.number().int().nonnegative().max(WORKSPACE_CHANGE_FILES),

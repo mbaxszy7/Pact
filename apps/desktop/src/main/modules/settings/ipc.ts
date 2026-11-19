@@ -3,6 +3,7 @@ import { ipcMain } from 'electron'
 import type { DefaultSessionSettingsState, RpcResult } from '@pact/contracts'
 
 import {
+  activeAgentPairInputSchema,
   defaultSessionSettingsSaveInputSchema,
   IPC_CHANNELS,
   relayCredentialSaveSchema,
@@ -89,8 +90,18 @@ export function registerSettingsIpcHandlers(
       }
     return utilityClient.readRelayCredentialReceipt(input.data.nonce)
   })
-  ipcMain.handle(IPC_CHANNELS.defaultSessionSettingsGet, (event) => {
+  ipcMain.handle(IPC_CHANNELS.defaultSessionSettingsGet, (event, rawActivePair?: unknown) => {
     trust.assertTrustedMainFrame(event)
+    if (rawActivePair !== undefined) {
+      const parsed = activeAgentPairInputSchema.safeParse(rawActivePair)
+      if (!parsed.success) {
+        return Promise.resolve({
+          ok: false as const,
+          error: { code: 'VALIDATION' as const, message: 'Active Agent pair is invalid.' },
+        })
+      }
+      return utilityClient.getDefaultSessionSettingsEditorState(parsed.data)
+    }
     return utilityClient.getDefaultSessionSettingsEditorState()
   })
 

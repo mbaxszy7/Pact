@@ -1,5 +1,6 @@
 import type {
   AnchoredComment,
+  CollaborationTask,
   ConversationObservation,
   ConversationPage,
   ConversationPageActivity,
@@ -18,6 +19,7 @@ import type {
 } from '@pact/contracts'
 
 import {
+  AGENTS,
   compareConversationMessages,
   compareConversationDisplayOrder,
   conversationMessageOrder,
@@ -64,6 +66,7 @@ export interface ConversationViewProjection {
   rebuildInputRecovery?: ConversationSnapshot['rebuildInputRecovery']
   sessionIssues?: SessionIssues | undefined
   queue?: ConversationQueueState | undefined
+  collaborationTask?: CollaborationTask | null | undefined
 }
 
 export interface ConversationWindow {
@@ -191,7 +194,7 @@ export function nativeRecoveryTargets(view: ConversationViewProjection | undefin
         ?.operation,
     }))
   }
-  for (const agentId of ['codex', 'claude'] as const) {
+  for (const agentId of AGENTS) {
     const context = view?.nativeContexts.find((item) => item.agentId === agentId)
     const rebuildOperation =
       view?.rebuildOperations?.find((item) => item.agentId === agentId)?.operation ??

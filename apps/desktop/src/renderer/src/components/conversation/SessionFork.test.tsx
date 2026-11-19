@@ -83,11 +83,13 @@ function fixture() {
     preview: 'Selected completed reply',
     settings: {
       primaryAgentId: 'claude',
+      secondaryAgentId: 'codex',
       agents: {
         claude: { model: 'claude-opus', effort: 'high' },
         codex: { model: 'gpt-6.1-sol', effort: 'medium' },
+        agy: { model: null, effort: null },
       },
-      permissionModes: { claude: 'full', codex: 'ask' },
+      permissionModes: { claude: 'full', codex: 'ask', agy: 'ask' },
       maxDiscussionRounds: 3,
 
       maxReviewCycles: 3,

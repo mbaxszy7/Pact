@@ -34,7 +34,7 @@ export default defineConfig({
   projects: [
     { name: 'ui', grep: /@ui\b/u, use: { trace: 'retain-on-failure' } },
     // Secrets stay in private configuration files; do not export raw provider traces.
-    { name: 'real', grep: /@real\b/u, use: { trace: 'off', screenshot: 'off' } },
+    { name: 'real', grep: /@real\b/u, use: { trace: 'off', screenshot: 'off', video: 'off' } },
     { name: 'deterministic', grep: /@deterministic\b/u, use: { trace: 'retain-on-failure' } },
   ],
 })

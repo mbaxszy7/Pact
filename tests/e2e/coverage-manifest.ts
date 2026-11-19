@@ -471,6 +471,14 @@ function journey(
       ? {
           contractUpdates: [
             {
+              originalLine: 12,
+              reason:
+                'Runtime preparation now evaluates 3 coding agents (Claude Code, Codex, Antigravity) with a minimum-2-ready threshold; retain the exact 2-ready first-use gate while Antigravity fixture defaults to Sign-in required.',
+              replacementAssertions: [
+                "expect(window.getByText('2 of 3 ready · Minimum 2 required', { exact: true })).toBeVisible()",
+              ],
+            },
+            {
               originalLine: 16,
               reason:
                 'The accepted CLI compatibility page labels the detected version explicitly; retain the exact Claude Code version and its visible identity.',

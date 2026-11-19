@@ -21,7 +21,7 @@ async function fixture() {
   vi.stubEnv('LOCALAPPDATA', root)
   vi.stubEnv('PATH', dirname(inherited))
   const selected: Record<string, string | undefined> = {}
-  const save = vi.fn<(agentId: 'claude' | 'codex', executablePath: string) => void>()
+  const save = vi.fn<(agentId: 'claude' | 'codex' | 'agy', executablePath: string) => void>()
   const runtime = new RuntimePreparation({
     hasCompletedFirstUseSetup: () => true,
     readSelectedExecutablePath: (id) => selected[id],

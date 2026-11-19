@@ -1,5 +1,7 @@
 import { and, desc, eq, isNull, ne, sql } from 'drizzle-orm'
 
+import type { RuntimeAgentId } from '@pact/contracts'
+
 import type { PactDrizzleDatabase } from './drizzle-database.js'
 
 import {
@@ -7,6 +9,7 @@ import {
   nativeAgentContexts,
   nativeRebuildOperations,
   sessionForkOperations,
+  sessionSettingsRevisions,
   nativePresenceMetadata,
   projects,
   sessions,
@@ -57,12 +60,13 @@ export function nativeSessionIssueMetadata(database: PactDrizzleDatabase, sessio
       state: nativeAgentContexts.state,
       recoveryFailureKind: nativeAgentContexts.recoveryFailureKind,
       recoveryAction: nativeAgentContexts.recoveryAction,
+      permissionRequestsJson: nativeAgentContexts.permissionRequestsJson,
       lastRunId: nativeAgentContexts.lastRunId,
       executorId: nativeAgentContexts.executorId,
     })
     .from(nativeAgentContexts)
     .where(eq(nativeAgentContexts.sessionId, sessionId))
-    .limit(2)
+    .limit(3)
     .all()
     .map((row) => ({
       agentId: row.agentId,
@@ -72,10 +76,30 @@ export function nativeSessionIssueMetadata(database: PactDrizzleDatabase, sessio
       state: row.state,
       recoveryFailureKind: row.recoveryFailureKind ?? undefined,
       recoveryAction: row.recoveryAction ?? undefined,
+      hasPendingPermission:
+        row.permissionRequestsJson !== null && row.permissionRequestsJson !== '[]',
       lastRunId: row.lastRunId ?? undefined,
       executorId: row.executorId ?? undefined,
     }))
-  const readRun = (agentId: 'claude' | 'codex', generation?: number, unacknowledged = false) =>
+  const activeSettings = database
+    .select({
+      primaryAgentId: sessionSettingsRevisions.primaryAgentId,
+      secondaryAgentId: sessionSettingsRevisions.secondaryAgentId,
+    })
+    .from(sessions)
+    .innerJoin(
+      sessionSettingsRevisions,
+      and(
+        eq(sessionSettingsRevisions.sessionId, sessions.id),
+        eq(sessionSettingsRevisions.revision, sessions.settingsRevision),
+      ),
+    )
+    .where(eq(sessions.id, sessionId))
+    .get()
+  const activeAgents: readonly [RuntimeAgentId, RuntimeAgentId] | undefined = activeSettings
+    ? [activeSettings.primaryAgentId, activeSettings.secondaryAgentId]
+    : undefined
+  const readRun = (agentId: RuntimeAgentId, generation?: number, unacknowledged = false) =>
     database
       .select(issueRunColumns)
       .from(agentRuns)
@@ -98,7 +122,7 @@ export function nativeSessionIssueMetadata(database: PactDrizzleDatabase, sessio
       .orderBy(desc(agentRuns.createdAt), desc(sql`${agentRuns}.rowid`))
       .limit(1)
       .get()
-  const runs = (['codex', 'claude'] as const).map((agentId) => {
+  const runs = (['codex', 'claude', 'agy'] as const).map((agentId) => {
     const context = contexts.find((row) => row.agentId === agentId)
     return projectNativeIssueRun(
       (!context ? readRun(agentId, undefined, true) : undefined) ??
@@ -133,7 +157,7 @@ export function nativeSessionIssueMetadata(database: PactDrizzleDatabase, sessio
         .get(),
     )
   })
-  const operations = (['codex', 'claude'] as const).flatMap((agentId) => {
+  const operations = (['codex', 'claude', 'agy'] as const).flatMap((agentId) => {
     const row = database
       .select({
         id: nativeRebuildOperations.id,
@@ -173,7 +197,9 @@ export function nativeSessionIssueMetadata(database: PactDrizzleDatabase, sessio
       : [],
   )
   return {
-    issues: projectSessionIssues(sessionId, contexts, runs, cursors, incomplete, operations),
+    issues: projectSessionIssues(sessionId, contexts, runs, cursors, incomplete, operations, {
+      activeAgents,
+    }),
     bindings: contexts.length,
   }
 }
@@ -191,7 +217,7 @@ export function refreshNativeSessionMetadata(
   updateSessionNativeMetadata(
     database,
     sessionId,
-    Boolean(fork && (!fork.ready || facts.bindings !== 2)) ||
+    Boolean(fork && (!fork.ready || facts.bindings < 2)) ||
       facts.issues.agents.some((issue) => issue.phase !== 'resolved'),
   )
 }

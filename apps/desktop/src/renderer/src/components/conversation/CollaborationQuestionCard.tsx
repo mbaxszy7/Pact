@@ -1,7 +1,7 @@
 import { MessageSquareText } from 'lucide-react'
 import { useEffect, useState } from 'react'
 
-import type { CollaborationDocument } from '@pact/contracts'
+import { agentDisplayName, type CollaborationDocument, type RuntimeAgentId } from '@pact/contracts'
 
 import type { ProjectFileTarget } from './MessageMarkdown'
 
@@ -17,7 +17,7 @@ type QuestionCardProps = {
   sessionId: string
   runId: string
   messageId?: string | undefined
-  actor?: 'claude' | 'codex' | undefined
+  actor?: RuntimeAgentId | undefined
   disabled: boolean
   onOpenProjectFile: (target: ProjectFileTarget) => void
   decision: DecisionReplyContext
@@ -50,7 +50,7 @@ function DecisionQuestions({
   const [error, setError] = useState<string>()
   const stale = hasDecisionAnswers(draft) && !sameDecision(draft?.reference, decision.reference)
   const answers = !stale ? (draft?.answers ?? {}) : {}
-  const speaker = actor === 'claude' ? 'Claude Code' : actor === 'codex' ? 'Codex' : 'Agent'
+  const speaker = actor ? agentDisplayName(actor) : 'Agent'
   const change = (id: string, value: { optionIds: string[]; text: string }): void => {
     if (!onDraftChange?.({ ...decision, answers: { ...answers, [id]: value } }))
       setError('Couldn’t save your edit. Earlier answers are kept.')
@@ -212,7 +212,7 @@ function LegacyQuestionCard({
   const [state, setState] = useState<{
     source?: CollaborationDocument
     taskId?: string
-    actor?: 'claude' | 'codex'
+    actor?: RuntimeAgentId
     error?: string
   }>({})
   useEffect(() => {
@@ -244,7 +244,7 @@ function LegacyQuestionCard({
     }
     // oxlint-disable-next-line react/exhaustive-effect-dependencies -- Retry explicitly reissues the failed immutable-source read.
   }, [sessionId, runId, retry, expanded])
-  const speaker = actor === 'claude' ? 'Claude Code' : actor === 'codex' ? 'Codex' : 'Agent'
+  const speaker = actor ? agentDisplayName(actor) : 'Agent'
   return (
     <section
       aria-label="Collaboration questions"

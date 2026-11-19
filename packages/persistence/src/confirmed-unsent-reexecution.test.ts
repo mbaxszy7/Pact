@@ -37,7 +37,12 @@ afterEach(async () => {
 })
 const settings = {
   primaryAgentId: 'codex' as const,
-  agents: { codex: { model: null, effort: null }, claude: { model: null, effort: null } },
+  secondaryAgentId: 'claude' as const,
+  agents: {
+    codex: { model: null, effort: null },
+    claude: { model: null, effort: null },
+    agy: { model: null, effort: null },
+  },
   maxDiscussionRounds: 6,
   maxReviewCycles: 3,
   maxRepairAttempts: 3,
@@ -367,7 +372,11 @@ async function stoppedWriteReplacement(
       ...effective,
       provider: original.agentId,
       provenance:
-        original.agentId === 'claude' ? 'claude_applied_settings' : 'codex_thread_configuration',
+        original.agentId === 'claude'
+          ? 'claude_applied_settings'
+          : original.agentId === 'codex'
+            ? 'codex_thread_configuration'
+            : 'agy_applied_settings',
       permissionMode: original.permissionMode ?? 'native',
     },
     { executorId, nativeSessionId },
@@ -376,7 +385,11 @@ async function stoppedWriteReplacement(
   f.repo.recordConfirmedUnsent(
     original.id,
     nativeGeneration,
-    { kind: 'codex_root_frame_not_written', requestId: 9 },
+    original.agentId === 'codex'
+      ? { kind: 'codex_root_frame_not_written', requestId: 9 }
+      : original.agentId === 'claude'
+        ? { kind: 'claude_root_not_yielded' }
+        : { kind: 'agy_root_frame_not_written', requestId: 9 },
     { executorId, nativeSessionId },
   )
   f.repo.failRun(original.id, 'transient_transport', 'Original root was positively not written.')
@@ -577,7 +590,11 @@ async function replaceUnsentPactTurn(
       ...effective,
       provider: original.agentId,
       provenance:
-        original.agentId === 'claude' ? 'claude_applied_settings' : 'codex_thread_configuration',
+        original.agentId === 'claude'
+          ? 'claude_applied_settings'
+          : original.agentId === 'codex'
+            ? 'codex_thread_configuration'
+            : 'agy_applied_settings',
       permissionMode: original.permissionMode ?? 'native',
     },
     { executorId, nativeSessionId },
@@ -586,7 +603,11 @@ async function replaceUnsentPactTurn(
   f.repo.recordConfirmedUnsent(
     original.id,
     nativeGeneration,
-    { kind: 'codex_root_frame_not_written', requestId: 9 },
+    original.agentId === 'codex'
+      ? { kind: 'codex_root_frame_not_written', requestId: 9 }
+      : original.agentId === 'claude'
+        ? { kind: 'claude_root_not_yielded' }
+        : { kind: 'agy_root_frame_not_written', requestId: 9 },
     { executorId, nativeSessionId },
   )
   f.repo.failRun(original.id, 'transient_transport', 'Physical root was not written.')

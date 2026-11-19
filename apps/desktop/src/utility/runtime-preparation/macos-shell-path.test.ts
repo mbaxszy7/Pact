@@ -29,8 +29,8 @@ async function fixture(startup?: string) {
   const bin = join(home, 'bin')
   await mkdir(bin)
   await symlink(process.execPath, join(bin, 'node'))
-  await Promise.all(
-    (
+  await Promise.all([
+    ...(
       [
         ['claude', '2.1.272 (Claude Code)'],
         ['codex', 'codex-cli 0.159.2'],
@@ -43,7 +43,12 @@ async function fixture(startup?: string) {
         { mode: 0o700 },
       ),
     ),
-  )
+    writeFile(
+      join(bin, 'agy'),
+      `#!/usr/bin/env node\nif(process.argv[2] === '--version'){console.log('1.5.9');process.exit(0);}if(process.argv[2] === 'acp'){const rl=require('node:readline').createInterface({input:process.stdin});rl.on('line',l=>{const m=JSON.parse(l);if(m.method==='initialize')process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result:{protocolVersion:1,agentInfo:{name:'Antigravity ACP Server',version:'1.5.11'}}})+'\\n');else if(m.method==='session/new')process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result:{sessionId:'11111111-1111-4111-8111-111111111111'}})+'\\n');else if(m.method==='session/close'){process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result:{}})+'\\n');process.exit(0);}});}\n`,
+      { mode: 0o700 },
+    ),
+  ])
   await writeFile(join(home, '.zprofile'), '')
   await writeFile(
     join(home, '.zshrc'),
@@ -53,6 +58,8 @@ async function fixture(startup?: string) {
         `export PATH='${bin}':"$PATH"\nexport PACT_SHELL_SECRET='synthetic-shell-only'\n`,
   )
   vi.stubEnv('HOME', home)
+  vi.stubEnv('USERPROFILE', home)
+  vi.stubEnv('ANTIGRAVITY_GEMINI_DIR', join(home, '.gemini'))
   vi.stubEnv('PATH', systemPath)
   const repository: RuntimePreparationRepository = {
     readSelectedExecutablePath: () => undefined,
@@ -78,6 +85,7 @@ describe.skipIf(process.platform !== 'darwin')('macOS GUI runtime PATH', () => {
         agents: [
           { agentId: 'claude', state: 'ready', executablePath: join(f.bin, 'claude') },
           { agentId: 'codex', state: 'ready', executablePath: join(f.bin, 'codex') },
+          { agentId: 'agy', state: 'ready', executablePath: join(f.bin, 'agy') },
         ],
       },
     })
@@ -116,7 +124,13 @@ describe.skipIf(process.platform !== 'darwin')('macOS GUI runtime PATH', () => {
     )
     expect(await f.preparation.inspectReadiness()).toMatchObject({
       ok: true,
-      value: { agents: [{ state: 'ready' }, { state: 'ready', executablePath: selected }] },
+      value: {
+        agents: [
+          { state: 'ready' },
+          { state: 'ready', executablePath: selected },
+          { state: 'ready' },
+        ],
+      },
     })
     expect(process.env.PATH?.split(':')[0]).toBe(inherited)
   })

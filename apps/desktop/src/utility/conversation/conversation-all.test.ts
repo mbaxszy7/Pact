@@ -108,7 +108,12 @@ async function fixture(primaryAgentId: RuntimeAgentId) {
     { id: sessionId, projectId, title: 'All', createdAt },
     {
       primaryAgentId,
-      agents: { codex: { model: null, effort: null }, claude: { model: null, effort: null } },
+      secondaryAgentId: primaryAgentId === 'claude' ? 'codex' : 'claude',
+      agents: {
+        codex: { model: null, effort: null },
+        claude: { model: null, effort: null },
+        agy: { model: null, effort: null },
+      },
       maxDiscussionRounds: 3,
 
       maxReviewCycles: 3,
@@ -293,6 +298,7 @@ it('resumes only an uncreated secondary after reopening the database and retains
   f.owner.db.sessionRepository.saveSettings(f.sessionId, {
     ...saved,
     primaryAgentId: 'codex',
+    secondaryAgentId: 'claude',
     agents: { ...saved.agents, codex: { model: 'changed-after-send', effort: 'high' } },
   })
   f.owner.db.close()

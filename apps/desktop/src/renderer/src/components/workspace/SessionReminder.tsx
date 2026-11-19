@@ -17,7 +17,13 @@ function statusLabel(category: SessionReminderModel['category']): string {
 }
 
 function agentLabel(agentId: SessionReminderModel['agentId']): string {
-  return agentId === 'codex' ? 'Codex' : agentId === 'claude' ? 'Claude Code' : 'Pact'
+  return agentId === 'codex'
+    ? 'Codex'
+    : agentId === 'claude'
+      ? 'Claude Code'
+      : agentId === 'agy'
+        ? 'Antigravity'
+        : 'Pact'
 }
 
 export function SessionReminder({

@@ -46,7 +46,12 @@ beforeEach(async () => {
     { id: sessionId, projectId, title: 'Reader fixture', createdAt },
     {
       primaryAgentId: 'codex',
-      agents: { claude: { model: null, effort: null }, codex: { model: null, effort: null } },
+      secondaryAgentId: 'claude',
+      agents: {
+        claude: { model: null, effort: null },
+        codex: { model: null, effort: null },
+        agy: { model: null, effort: null },
+      },
       maxDiscussionRounds: 6,
 
       maxReviewCycles: 3,

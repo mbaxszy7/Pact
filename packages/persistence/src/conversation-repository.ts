@@ -60,8 +60,14 @@ import type {
 } from '@pact/contracts'
 
 import {
+  agentDisplayName,
+  agentIdForRouteCandidate,
   COLLABORATION_PROTOCOL,
+  isAgentInPair,
   isConversationBackgroundReport,
+  resolveActiveAgentPair,
+  routeCandidateIdSchema,
+  unsentBoundaryMatchesProvider,
   collaborationInitialStage,
   defaultTaskStageRoles,
   initialTaskRoleCandidates,
@@ -296,11 +302,13 @@ import {
   workspaceChangeSets,
   workspaceFileChanges,
 } from './schema/index.js'
+import { isRetiredAgentRecoverySettled } from './session-issues.js'
 import {
   deriveSessionActivity,
   hasUnreadSessionMessage,
   projectSessionTitle,
 } from './session-projection.js'
+import { SessionRepository } from './session-repository.js'
 import {
   allocateSessionMessageSequence,
   buildCutoffInlineTail,
@@ -1376,6 +1384,7 @@ export class ConversationRepository {
     return changed
   }
   private readonly observations = new Map<string, ConversationObservation>()
+  private readonly handoffSourceAgentsCache = new Map<string, RuntimeAgentId[] | null>()
   private completeReadCount = 0
   private pageReadCount = 0
   private patchCount = 0
@@ -2621,7 +2630,7 @@ export class ConversationRepository {
   commitFork(
     operationId: string,
     selection: forkFacts.ForkSelection,
-    boundaries: Record<RuntimeAgentId, import('@pact/contracts').AgentNativeForkBoundary>,
+    boundaries: Partial<Record<RuntimeAgentId, import('@pact/contracts').AgentNativeForkBoundary>>,
     fullConsent: RuntimeAgentId[],
   ) {
     return forkFacts.commitFork(
@@ -2807,7 +2816,7 @@ export class ConversationRepository {
       .where(eq(agentRuns.sessionId, sessionId))
       .orderBy(asc(agentRuns.createdAt))
       .all()
-      .map((run) => ConversationRepository.toRun(run))
+      .map((run) => this.toRun(run))
     const messages = this.database
       .select()
       .from(conversationMessages)
@@ -2875,31 +2884,10 @@ export class ConversationRepository {
     sessionId: string,
     targetAgentId: RuntimeAgentId,
   ): { afterSequence: number; throughSequence: number } {
-    const lastAccepted = this.database
-      .select({ sequence: conversationMessages.sequence })
-      .from(agentRuns)
-      .innerJoin(conversationMessages, eq(conversationMessages.id, agentRuns.userMessageId))
-      .where(
-        and(
-          eq(agentRuns.sessionId, sessionId),
-          eq(agentRuns.agentId, targetAgentId),
-          isNotNull(agentRuns.nativeTurnId),
-          or(
-            sql`${agentRuns.failureKind} IS NULL`,
-            sql`${agentRuns.failureKind} NOT IN ('context_limit', 'unknown_delivery')`,
-          ),
-        ),
-      )
-      .orderBy(desc(agentRuns.createdAt), desc(conversationMessages.sequence))
-      .limit(1)
-      .get()
-    const latest = this.database
-      .select({ sequence: max(conversationMessages.sequence) })
-      .from(conversationMessages)
-      .where(eq(conversationMessages.sessionId, sessionId))
-      .get()
-    const rebuilt = this.database
+    const context = this.database
       .select({
+        nativeSessionId: nativeAgentContexts.nativeSessionId,
+        bindingGeneration: nativeAgentContexts.bindingGeneration,
         sequence: nativeAgentContexts.rebuiltThroughSequence,
         forkSequence: nativeAgentContexts.forkThroughSequence,
       })
@@ -2911,11 +2899,39 @@ export class ConversationRepository {
         ),
       )
       .get()
+    const lastAccepted = context
+      ? this.database
+          .select({ sequence: conversationMessages.sequence })
+          .from(agentRuns)
+          .innerJoin(conversationMessages, eq(conversationMessages.id, agentRuns.userMessageId))
+          .where(
+            and(
+              eq(agentRuns.sessionId, sessionId),
+              eq(agentRuns.agentId, targetAgentId),
+              isNull(agentRuns.forkSourceRunId),
+              eq(agentRuns.nativeSessionId, context.nativeSessionId),
+              eq(agentRuns.bindingGeneration, context.bindingGeneration),
+              isNotNull(agentRuns.nativeTurnId),
+              or(
+                sql`${agentRuns.failureKind} IS NULL`,
+                sql`${agentRuns.failureKind} NOT IN ('context_limit', 'unknown_delivery')`,
+              ),
+            ),
+          )
+          .orderBy(desc(agentRuns.createdAt), desc(conversationMessages.sequence))
+          .limit(1)
+          .get()
+      : undefined
+    const latest = this.database
+      .select({ sequence: max(conversationMessages.sequence) })
+      .from(conversationMessages)
+      .where(eq(conversationMessages.sessionId, sessionId))
+      .get()
     return {
       afterSequence: Math.max(
         lastAccepted?.sequence ?? -1,
-        rebuilt?.sequence ?? -1,
-        rebuilt?.forkSequence ?? -1,
+        context?.sequence ?? -1,
+        context?.forkSequence ?? -1,
       ),
       throughSequence: latest?.sequence ?? -1,
     }
@@ -2946,6 +2962,63 @@ export class ConversationRepository {
     excludeMessageId?: string,
     workflow = false,
   ): HandoffRow[] {
+    const targetContext = this.database
+      .select({
+        nativeSessionId: nativeAgentContexts.nativeSessionId,
+        bindingGeneration: nativeAgentContexts.bindingGeneration,
+        rebuiltThroughSequence: nativeAgentContexts.rebuiltThroughSequence,
+        forkThroughSequence: nativeAgentContexts.forkThroughSequence,
+      })
+      .from(nativeAgentContexts)
+      .where(
+        and(
+          eq(nativeAgentContexts.sessionId, sessionId),
+          eq(nativeAgentContexts.agentId, targetAgentId),
+        ),
+      )
+      .get()
+    const forkOperation = this.database
+      .select({
+        id: sessionForkOperations.id,
+        sourceSequence: sessionForkOperations.sourceSequence,
+      })
+      .from(sessionForkOperations)
+      .where(eq(sessionForkOperations.sessionId, sessionId))
+      .get()
+    const targetForkIntent = forkOperation
+      ? this.database
+          .select({
+            state: nativeForkIntents.state,
+            nativeSessionId: nativeForkIntents.nativeSessionId,
+          })
+          .from(nativeForkIntents)
+          .where(
+            and(
+              eq(nativeForkIntents.operationId, forkOperation.id),
+              eq(nativeForkIntents.agentId, targetAgentId),
+            ),
+          )
+          .get()
+      : undefined
+    const targetForkedNativeSessionId =
+      targetForkIntent?.state === 'ready' &&
+      targetForkIntent.nativeSessionId &&
+      targetContext?.nativeSessionId === targetForkIntent.nativeSessionId
+        ? targetForkIntent.nativeSessionId
+        : undefined
+    const rebuiltThrough = targetContext?.rebuiltThroughSequence ?? -1
+    const forkThrough = targetForkedNativeSessionId
+      ? (targetContext?.forkThroughSequence ?? -1)
+      : -1
+    const inheritedSameAgentRunUncovered = (runTable: SQLWrapper) =>
+      targetForkedNativeSessionId && targetContext
+        ? sql`(${runTable}.fork_source_run_id IS NOT NULL
+            AND NOT (${runTable}.native_session_id = ${targetForkedNativeSessionId}
+              AND ${runTable}.binding_generation = ${targetContext.bindingGeneration})
+            AND ${conversationMessages.sequence} > ${rebuiltThrough})`
+        : forkOperation
+          ? sql`(${runTable}.fork_source_run_id IS NOT NULL AND ${conversationMessages.sequence} > ${rebuiltThrough})`
+          : sql`0`
     const rows = this.database
       .select({
         id: conversationMessages.id,
@@ -2975,7 +3048,8 @@ export class ConversationRepository {
                 SELECT 1 FROM agent_runs AS accepted
                 WHERE (accepted.user_message_id = ${conversationMessages.id}
                   OR accepted.id = ${conversationMessages.runId})
-                  AND accepted.agent_id <> ${targetAgentId}
+                  AND (accepted.agent_id <> ${targetAgentId}
+                    OR ${inheritedSameAgentRunUncovered(sql`accepted`)})
                   AND accepted.native_turn_id IS NOT NULL
                   AND (accepted.failure_kind IS NULL OR accepted.failure_kind NOT IN ('context_limit', 'unknown_delivery'))
               )`,
@@ -2983,7 +3057,7 @@ export class ConversationRepository {
             and(
               eq(conversationMessages.role, 'assistant'),
               eq(conversationMessages.state, 'complete'),
-              ne(agentRuns.agentId, targetAgentId),
+              or(ne(agentRuns.agentId, targetAgentId), inheritedSameAgentRunUncovered(agentRuns)),
               isNotNull(agentRuns.nativeTurnId),
               or(
                 sql`${agentRuns.failureKind} IS NULL`,
@@ -2995,7 +3069,15 @@ export class ConversationRepository {
               eq(conversationMessages.state, 'complete'),
               isNull(conversationMessages.runId),
               isNotNull(conversationMessages.sourceMessageId),
-              ne(conversationMessages.agentId, targetAgentId),
+              or(
+                ne(conversationMessages.agentId, targetAgentId),
+                forkOperation
+                  ? and(
+                      lte(conversationMessages.sequence, forkOperation.sourceSequence),
+                      gt(conversationMessages.sequence, Math.max(rebuiltThrough, forkThrough)),
+                    )
+                  : sql`0`,
+              ),
             ),
           ),
         ),
@@ -3278,22 +3360,9 @@ export class ConversationRepository {
       input.queueReturnOperationId ||
       input.replyToDecision ||
       input.freezeDrafts === false ||
-      Buffer.byteLength(input.content) > DECISION_INPUT_BYTES ||
-      !(['codex', 'claude'] as const).every((actor) => allowedAgentIds.includes(actor))
+      Buffer.byteLength(input.content) > DECISION_INPUT_BYTES
     )
       return undefined
-    const task = this.collaboration(input.sessionId)
-    if (
-      (task && task.status !== 'complete') ||
-      this.receivedCollaborationInput(input.sessionId) ||
-      this.nativeRecoveryBlocksInput(input.sessionId)
-    )
-      return undefined
-    for (const actor of ['codex', 'claude'] as const) {
-      const binding = this.nativeContext(input.sessionId, actor)
-      if (binding && (binding.continuationState !== 'ready' || binding.permissionRequests?.length))
-        return undefined
-    }
     const session = this.database
       .select()
       .from(sessions)
@@ -3311,11 +3380,33 @@ export class ConversationRepository {
       )
       .get()
     if (!settings) return undefined
+    const activePair = resolveActiveAgentPair({
+      primaryAgentId: settings.primaryAgentId,
+      secondaryAgentId: settings.secondaryAgentId,
+    })
+    if (!activePair.every((actor) => allowedAgentIds.includes(actor))) return undefined
+    const task = this.collaboration(input.sessionId)
+    if (
+      (task && task.status !== 'complete') ||
+      this.receivedCollaborationInput(input.sessionId) ||
+      this.nativeRecoveryBlocksInput(input.sessionId)
+    )
+      return undefined
+    for (const actor of activePair) {
+      const binding = this.nativeContext(input.sessionId, actor)
+      if (binding && (binding.continuationState !== 'ready' || binding.permissionRequests?.length))
+        return undefined
+    }
     return {
       kind: prefix.pact,
       primaryAgentId: settings.primaryAgentId,
-      defaults: defaultTaskStageRoles(settings.primaryAgentId),
-      candidates: initialTaskRoleCandidates(prefix.pact, settings.primaryAgentId),
+      secondaryAgentId: settings.secondaryAgentId,
+      defaults: defaultTaskStageRoles(settings.primaryAgentId, settings.secondaryAgentId),
+      candidates: initialTaskRoleCandidates(
+        prefix.pact,
+        settings.primaryAgentId,
+        settings.secondaryAgentId,
+      ),
     }
   }
 
@@ -3801,8 +3892,7 @@ export class ConversationRepository {
             collaborationActor(
               {
                 owner: opportunity.primaryAgentId,
-                reviewer:
-                  opportunity.primaryAgentId === 'codex' ? ('claude' as const) : ('codex' as const),
+                reviewer: opportunity.secondaryAgentId ?? opportunity.defaults.planReviewer,
                 kind: opportunity.kind,
                 stageRoles: opportunity.defaults,
               },
@@ -4500,11 +4590,15 @@ export class ConversationRepository {
         model:
           metadata.defaultAgentId === 'codex'
             ? modelSettings.codexModel
-            : modelSettings.claudeModel,
+            : metadata.defaultAgentId === 'claude'
+              ? modelSettings.claudeModel
+              : modelSettings.agyModel,
         effort:
           metadata.defaultAgentId === 'codex'
             ? modelSettings.codexEffort
-            : modelSettings.claudeEffort,
+            : metadata.defaultAgentId === 'claude'
+              ? modelSettings.claudeEffort
+              : modelSettings.agyEffort,
         speed: settings.speed,
         permissionMode: settings.permissionMode,
       },
@@ -5149,15 +5243,16 @@ export class ConversationRepository {
   ): RuntimeAgentId {
     const accepted = this.admittedPreparedInputSelection(receipt, proposal)
     if (!accepted) return receipt.metadata.defaultAgentId
-    if (accepted.candidateId === 'route_codex') return 'codex'
-    if (accepted.candidateId === 'route_claude') return 'claude'
+    const routeCandidate = routeCandidateIdSchema.safeParse(accepted.candidateId)
+    if (routeCandidate.success) return agentIdForRouteCandidate(routeCandidate.data)
     const roles = receipt.metadata.taskRoles
     const choice = roles?.candidates.find((candidate) => candidate.id === accepted.candidateId)
     if (!roles || !choice) return receipt.metadata.defaultAgentId
+    const secondary = roles.secondaryAgentId ?? roles.defaults.planReviewer
     return collaborationActor(
       {
         owner: roles.primaryAgentId,
-        reviewer: roles.primaryAgentId === 'codex' ? 'claude' : 'codex',
+        reviewer: secondary,
         kind: roles.kind,
         stageRoles: choice.roles,
       },
@@ -5205,24 +5300,29 @@ export class ConversationRepository {
         .where(eq(schedulingEvaluations.id, parsed.evaluationId))
         .get()
       const roles = receipt.metadata.taskRoles
+      const routeCandidate = routeCandidateIdSchema.safeParse(parsed.candidateId)
       const roleCandidate =
-        roles && parsed.candidateId !== 'route_codex' && parsed.candidateId !== 'route_claude'
+        roles && !routeCandidate.success
           ? roles.candidates.find((candidate) => candidate.id === parsed.candidateId)
           : undefined
+      const roleSecondary = roles
+        ? (roles.secondaryAgentId ?? roles.defaults.planReviewer)
+        : undefined
       const actor = roles
         ? roleCandidate &&
+          roleSecondary &&
           collaborationActor(
             {
               owner: roles.primaryAgentId,
-              reviewer: roles.primaryAgentId === 'codex' ? 'claude' : 'codex',
+              reviewer: roleSecondary,
               kind: roles.kind,
               stageRoles: roleCandidate.roles,
             },
             collaborationInitialStage(roles.kind),
           )
-        : parsed.candidateId === 'route_codex'
-          ? 'codex'
-          : 'claude'
+        : routeCandidate.success
+          ? agentIdForRouteCandidate(routeCandidate.data)
+          : undefined
       const task = this.collaboration(receipt.sessionId)
       if (
         !settings.enabled ||
@@ -5249,8 +5349,9 @@ export class ConversationRepository {
           scheduling.decisionConfigurationFingerprint(this.database) ||
         Date.parse(evaluation.deadline) !== parsed.deadlineAt ||
         (roles &&
+          roleSecondary &&
           ((task && task.status !== 'complete') ||
-            !(['codex', 'claude'] as const).every((id) => {
+            !([roles.primaryAgentId, roleSecondary] as const).every((id) => {
               const binding = this.nativeContext(receipt.sessionId, id)
               return (
                 !binding ||
@@ -5322,10 +5423,19 @@ export class ConversationRepository {
         ),
       )
       .get()!
-    if (
-      input.model !== (input.agentId === 'claude' ? settings.claudeModel : settings.codexModel) ||
-      input.effort !== (input.agentId === 'claude' ? settings.claudeEffort : settings.codexEffort)
-    )
+    const expectedModel =
+      input.agentId === 'claude'
+        ? settings.claudeModel
+        : input.agentId === 'codex'
+          ? settings.codexModel
+          : settings.agyModel
+    const expectedEffort =
+      input.agentId === 'claude'
+        ? settings.claudeEffort
+        : input.agentId === 'codex'
+          ? settings.codexEffort
+          : settings.agyEffort
+    if (input.model !== expectedModel || input.effort !== expectedEffort)
       throw new RunOperationConflictError('The frozen recipient settings changed before admission.')
     const body = this.database
       .select()
@@ -7322,7 +7432,9 @@ export class ConversationRepository {
       throw new RunOperationConflictError('The current Agent is still working.')
     const peerBase =
       task.unreviewedCodeActor ?? task.lastCodeActor ?? collaborationActor(task, 'implement')
-    const reviewer = explicitReviewer ?? otherAgent(peerBase)
+    const taskPair =
+      task.owner !== task.reviewer ? ([task.owner, task.reviewer] as const) : undefined
+    const reviewer = explicitReviewer ?? otherAgent(peerBase, taskPair)
     return collaborationTaskSchema.parse({
       ...task,
       inputProcessing: collaborationInputProcessing(task),
@@ -7479,7 +7591,7 @@ export class ConversationRepository {
       candidates,
       sources,
       objective:
-        'Select one supplied recipient (route_claude or route_codex) for this open-mode task message when the evidence clearly favors switching or continuing with a specific agent. Return false to keep the current default implementer. ' +
+        `Select one supplied recipient (${candidates.map((c) => c.id).join(' or ')}) for this open-mode task message when the evidence clearly favors switching or continuing with a specific agent. Return false to keep the current default implementer. ` +
         JSON.stringify({
           defaultActor: fallbackActor,
           lastCodeActor: freshTask.lastCodeActor ?? null,
@@ -7650,7 +7762,15 @@ export class ConversationRepository {
       AND n.native_work_state='settled' AND n.source_hash IS NOT NULL AND n.source_chunks_json IS NOT NULL
       AND n.through_sequence=${context.rebuiltThroughSequence ?? -1} AND m.sequence<=n.through_sequence
       ${workflow ? sql`AND NOT ${this.askOnlySource({ runId: sql`m.run_id`, sourceMessageId: sql`m.source_message_id`, sessionId: sql`m.session_id`, role: sql`m.role` })}` : sql``}
-      AND ((n.agent_id='codex' AND n.initialization_witness_json IS NOT NULL)
+      AND ((n.agent_id='codex' AND n.initialization_witness_json IS NOT NULL
+          AND json_extract(n.initialization_witness_json,'$.kind')='codex_rollout_v1'
+          AND json_extract(n.initialization_witness_json,'$.nativeSessionId')=n.provisional_native_session_id)
+        OR (n.agent_id='agy' AND n.initialization_witness_json IS NOT NULL
+          AND json_extract(n.initialization_witness_json,'$.kind')='agy_rebuild_v1'
+          AND json_extract(n.initialization_witness_json,'$.nativeSessionId')=n.provisional_native_session_id
+          AND json_extract(n.initialization_witness_json,'$.sourceHash')=n.source_hash
+          AND json_extract(n.initialization_witness_json,'$.stepCount')=2
+          AND json_extract(n.initialization_witness_json,'$.coldLoadVerifiedAt') IS NOT NULL)
         OR (n.agent_id='claude' AND n.initialization_witness_json IS NULL))`)
   }
 
@@ -8123,7 +8243,7 @@ export class ConversationRepository {
         if (
           !row ||
           row.contentRevision !== ref.revision ||
-          !['codex', 'claude'].includes(row.handledBy)
+          !['codex', 'claude', 'agy'].includes(row.handledBy)
         )
           throw new HandoffSourceUnavailableError('A saved context source changed.')
         if (isConversationBackgroundReport(row))
@@ -8404,14 +8524,48 @@ export class ConversationRepository {
     )
   }
 
+  private activePairForSession(
+    sessionId: string,
+    revision?: number,
+  ): [RuntimeAgentId, RuntimeAgentId] | undefined {
+    const rev =
+      revision ??
+      this.database
+        .select({ settingsRevision: sessions.settingsRevision })
+        .from(sessions)
+        .where(eq(sessions.id, sessionId))
+        .get()?.settingsRevision
+    if (rev === undefined) return undefined
+    const row = this.database
+      .select({
+        primaryAgentId: sessionSettingsRevisions.primaryAgentId,
+        secondaryAgentId: sessionSettingsRevisions.secondaryAgentId,
+      })
+      .from(sessionSettingsRevisions)
+      .where(
+        and(
+          eq(sessionSettingsRevisions.sessionId, sessionId),
+          eq(sessionSettingsRevisions.revision, rev),
+        ),
+      )
+      .get()
+    return row ? resolveActiveAgentPair(row) : undefined
+  }
+
   private queueRoute(row: typeof collaborationInputs.$inferSelect): ConversationMessageRoute {
     const metadata = storedReceivedMetadata(row.metadataJson)
-    if (metadata.route?.type === 'all')
+    if (metadata.route?.type === 'all') {
+      if ('firstAgentId' in metadata.route) {
+        return metadata.route
+      }
+      const firstAgentId = row.actor === 'claude' ? 'claude' : 'codex'
+      const secondAgentId = firstAgentId === 'claude' ? 'codex' : 'claude'
       return {
         type: 'all',
-        firstAgentId: row.actor,
-        secondAgentId: row.actor === 'claude' ? 'codex' : 'claude',
+        firstAgentId,
+        secondAgentId,
       }
+    }
     return { type: metadata.route?.type === 'agent' ? 'agent' : 'primary', agentId: row.actor }
   }
 
@@ -9775,6 +9929,7 @@ export class ConversationRepository {
     clientMessageId: string,
     input?: import('@pact/contracts').ConversationSendInput,
     waitingForWork = false,
+    expectedActor?: RuntimeAgentId,
   ): ConversationPatch | undefined {
     const row = this.database
       .select()
@@ -9787,8 +9942,46 @@ export class ConversationRepository {
       )
       .get()
     if (!row) return undefined
+    if (expectedActor && expectedActor !== row.actor) {
+      throw new RunOperationConflictError('This received nonce belongs to different input.')
+    }
     if (input) {
       const meta = storedReceivedMetadata(row.metadataJson)
+      let effectivePrefixText = input.content
+      if (input.inputId && input.inputId === row.inputId && !input.content) {
+        const body = this.database
+          .select()
+          .from(conversationBodyInputs)
+          .where(
+            and(
+              eq(conversationBodyInputs.id, row.inputId),
+              eq(conversationBodyInputs.sessionId, sessionId),
+            ),
+          )
+          .get()
+        if (body?.sealed && body.bytes <= BODY_INTERNAL_READ_BYTES) {
+          const read = this.readBody(body, true)
+          if (read.hash === row.digest && read.hash === body.hash) {
+            effectivePrefixText = read.text
+          }
+        }
+      }
+      const prefix = parseComposerCommandPrefix(effectivePrefixText, input.skills)
+      const routeMatches = (() => {
+        if (meta.route?.type === 'all') {
+          const requested = input.route ?? prefix.route
+          if (requested?.type !== 'all') return false
+          if (input.route && input.route.type !== 'all') return false
+          if (input.route && 'firstAgentId' in input.route && 'firstAgentId' in meta.route) {
+            return (
+              Reflect.get(input.route, 'firstAgentId') === meta.route.firstAgentId &&
+              Reflect.get(input.route, 'secondAgentId') === meta.route.secondAgentId
+            )
+          }
+          return true
+        }
+        return JSON.stringify(input.route) === JSON.stringify(meta.route)
+      })()
       const askOnly =
         meta.replyIntentBasis?.kind === 'ask_only'
           ? { taskId: row.taskId, expectedRevision: meta.replyIntentBasis.taskRevision }
@@ -9802,7 +9995,7 @@ export class ConversationRepository {
         (input.freezeDrafts ?? true) !== (meta.freezeDrafts ?? true) ||
         JSON.stringify(input.imageIds ?? []) !== JSON.stringify(meta.imageIds) ||
         JSON.stringify(input.skills ?? []) !== JSON.stringify(meta.skills) ||
-        JSON.stringify(input.route) !== JSON.stringify(meta.route) ||
+        !routeMatches ||
         !isDeepStrictEqual(input.replyToDecision, meta.replyToDecision) ||
         !isDeepStrictEqual(input.replaceTask, meta.replaceTask) ||
         !isDeepStrictEqual(input.askOnly, askOnly)
@@ -10060,6 +10253,7 @@ export class ConversationRepository {
         input.clientMessageId,
         input,
         waitingForWork,
+        actor,
       )
       if (priorReceipt) return priorReceipt
       if (this.receivedCollaborationInput(input.sessionId))
@@ -10150,38 +10344,70 @@ export class ConversationRepository {
       const candidate = savedTask?.status === 'complete' ? undefined : savedTask
       const inTaskReview = this.isInTaskReviewCommand(candidate, prefix.pact)
       const workflowCommand = Boolean(prefix.pact) && !inTaskReview
-      if (rolePolicy) {
-        const settings = this.database
-          .select()
-          .from(sessionSettingsRevisions)
-          .where(
-            and(
-              eq(sessionSettingsRevisions.sessionId, input.sessionId),
-              eq(sessionSettingsRevisions.revision, session.settingsRevision),
-            ),
+      const settings = this.database
+        .select()
+        .from(sessionSettingsRevisions)
+        .where(
+          and(
+            eq(sessionSettingsRevisions.sessionId, input.sessionId),
+            eq(sessionSettingsRevisions.revision, session.settingsRevision),
+          ),
+        )
+        .get()
+      if (!settings) {
+        throw new RunOperationConflictError('Session settings are unavailable.')
+      }
+      const activePair = resolveActiveAgentPair({
+        primaryAgentId: settings.primaryAgentId,
+        secondaryAgentId: settings.secondaryAgentId,
+      })
+      const allowedMembers =
+        !workflowCommand && candidate && candidate.owner !== candidate.reviewer
+          ? ([candidate.owner, candidate.reviewer] as const)
+          : activePair
+      if (!isAgentInPair(actor, allowedMembers)) {
+        throw new RunOperationConflictError(
+          `${agentDisplayName(actor)} is not an active Agent in this Session.`,
+        )
+      }
+      if (prefix.route?.type === 'agent' && !isAgentInPair(prefix.route.agentId, allowedMembers)) {
+        throw new RunOperationConflictError(
+          `@${prefix.route.agentId} is not an active Agent in this Session.`,
+        )
+      }
+      if (input.route?.type === 'agent' && !isAgentInPair(input.route.agentId, allowedMembers)) {
+        throw new RunOperationConflictError(
+          `@${input.route.agentId} is not an active Agent in this Session.`,
+        )
+      }
+      for (const skill of input.skills ?? []) {
+        if (!isAgentInPair(skill.agentId, allowedMembers)) {
+          throw new RunOperationConflictError(
+            `Skill /${skill.name} belongs to ${agentDisplayName(skill.agentId)}, which is not an active Agent in this Session.`,
           )
-          .get()
+        }
+      }
+      if (rolePolicy) {
         const requestedRoute = input.route ?? prefix.route
-        const primary =
-          prefix.pact && settings
-            ? pactEntryPrimary(
-                prefix.pact,
-                settings.primaryAgentId,
-                requestedRoute?.type === 'agent' ? requestedRoute.agentId : undefined,
-              )
-            : undefined
+        const primary = prefix.pact
+          ? pactEntryPrimary(
+              prefix.pact,
+              settings.primaryAgentId,
+              requestedRoute?.type === 'agent' ? requestedRoute.agentId : undefined,
+              settings.secondaryAgentId,
+            )
+          : undefined
         if (
           requestedRoute?.type === 'all' ||
           (requestedRoute?.type === 'agent' && requestedRoute.agentId !== actor) ||
           !prefix.pact ||
-          !settings ||
           !primary ||
           actor !==
             collaborationActor(
               {
                 kind: prefix.pact,
                 owner: primary,
-                reviewer: otherAgent(primary),
+                reviewer: otherAgent(primary, activePair),
                 rolePolicy,
               },
               prefix.pact === 'plan'
@@ -10229,6 +10455,14 @@ export class ConversationRepository {
         throw new RunOperationConflictError(
           'Ask only needs an idle Agent at the current task checkpoint.',
         )
+      const frozenQueueRoute =
+        requestedRoute?.type === 'all'
+          ? {
+              type: 'all' as const,
+              firstAgentId: actor,
+              secondAgentId: otherAgent(actor, allowedMembers),
+            }
+          : input.route
       const metadata = JSON.stringify({
         workflowCommand,
         ...(inTaskReview ? { inTaskReview: true } : {}),
@@ -10240,7 +10474,7 @@ export class ConversationRepository {
         commentIds: [],
         batchId: input.batchId ?? input.clientMessageId,
         freezeDrafts,
-        route: input.route,
+        route: frozenQueueRoute,
         replyToDecision: input.replyToDecision,
         replaceTask: input.replaceTask,
         ...(originSideChat ? { originSideChat } : {}),
@@ -11305,7 +11539,7 @@ export class ConversationRepository {
         task.kind !== 'plan' ||
         task.status !== 'ready' ||
         task.owner !== settings.primaryAgentId ||
-        task.reviewer !== otherAgent(settings.primaryAgentId) ||
+        task.reviewer !== settings.secondaryAgentId ||
         !collaborationPlanAccepted(task) ||
         task.codeRunId ||
         task.pendingWork ||
@@ -11545,7 +11779,7 @@ export class ConversationRepository {
     task: CollaborationTask,
   ): NonNullable<import('@pact/contracts').CollaborationView['replacement']> {
     const agentName = (stage: Parameters<typeof collaborationActor>[1]) =>
-      collaborationActor(task, stage) === 'claude' ? 'Claude Code' : 'Codex'
+      agentDisplayName(collaborationActor(task, stage))
     const unreviewedChanges = this.collaborationUnreviewedWrite(task)
     const review = task.review
     const summary = task.planRevision
@@ -12069,7 +12303,7 @@ export class ConversationRepository {
                 nextStep:
                   collaborationStageLabel(stage, task!.kind) +
                   ' with ' +
-                  (collaborationActor(task!, stage) === 'claude' ? 'Claude Code' : 'Codex'),
+                  agentDisplayName(collaborationActor(task!, stage)),
               }
             : {}),
           ...(task?.planReference
@@ -12155,7 +12389,7 @@ export class ConversationRepository {
         ...(latest ? { latestRunId: latest.id } : {}),
       }
       for (const row of rows.slice(0, 3)) {
-        page.runs.push(ConversationRepository.toRun(row))
+        page.runs.push(this.toRun(row))
         if (!ConversationRepository.fitsPage(page)) {
           page.runs.pop()
           if (!page.runs.length) throw new OversizedConversationEntityError()
@@ -12387,7 +12621,7 @@ export class ConversationRepository {
         .orderBy(desc(agentRuns.createdAt), desc(sql`rowid`))
         .limit(1)
         .get()
-      const latestRun = latestRunRow ? ConversationRepository.toRun(latestRunRow) : undefined
+      const latestRun = latestRunRow ? this.toRun(latestRunRow) : undefined
       const latestCompleteAssistantSequence = this.database
         .select({ value: max(conversationMessages.sequence) })
         .from(conversationMessages)
@@ -12485,7 +12719,7 @@ export class ConversationRepository {
           const candidate = candidateRuns.get(item.id)
           const addRun = candidate && !runIds.has(item.id)
           page.runContexts!.push(context)
-          if (addRun) page.runs.push(ConversationRepository.toRun(candidate))
+          if (addRun) page.runs.push(this.toRun(candidate))
           if (
             page.runs.length > CONVERSATION_PAGE_ITEMS ||
             !ConversationRepository.fitsPage(page)
@@ -12551,7 +12785,7 @@ export class ConversationRepository {
           row.runId && !runIds.has(row.runId) ? candidateRuns.get(row.runId) : undefined
         page.messages.push(pageMessage)
         if (candidateRun) {
-          const runSummary = ConversationRepository.toRun(candidateRun)
+          const runSummary = this.toRun(candidateRun)
           delete runSummary.failureMessage
           page.runs.push(runSummary)
           runIds.add(candidateRun.id)
@@ -12565,7 +12799,7 @@ export class ConversationRepository {
           page.runArtifacts!.push(group)
           const latest = artifactRuns.get(group.latestRunId)
           if (latest && !runIds.has(latest.id)) {
-            const summary = ConversationRepository.toRun(latest)
+            const summary = this.toRun(latest)
             delete summary.failureMessage
             page.runs.push(summary)
             runIds.add(latest.id)
@@ -12986,7 +13220,7 @@ export class ConversationRepository {
     this.patchCount += 1
     const observation = this.nextObservation(sessionId)
     const latestRunRow = this.sourceQueries.latestEligibleRun().get({ sessionId })
-    const latestRun = latestRunRow ? ConversationRepository.toRun(latestRunRow) : undefined
+    const latestRun = latestRunRow ? this.toRun(latestRunRow) : undefined
     const latestRunId = latestRun?.id
     const received = this.database
       .select({ id: collaborationInputs.id })
@@ -13287,14 +13521,21 @@ export class ConversationRepository {
     handoff: SchedulingHandoff,
     kind: 'reassign_roles' | 'extend_plan_review',
   ): string {
-    if (kind === 'reassign_roles')
+    if (kind === 'reassign_roles') {
+      const taskMembers = (['codex', 'claude', 'agy'] as const).filter(
+        (actor) => actor === task.owner || actor === task.reviewer,
+      )
       return scheduling.fingerprint({
         kind,
-        stageRoles: task.stageRoles ?? defaultTaskStageRoles(task.owner),
-        bindings: (['codex', 'claude'] as const).map(
-          (actor) => this.workflowHandoff(task, actor).freshnessGuard,
-        ),
+        stageRoles:
+          task.stageRoles ??
+          defaultTaskStageRoles(
+            task.owner,
+            task.owner !== task.reviewer ? task.reviewer : undefined,
+          ),
+        bindings: taskMembers.map((actor) => this.workflowHandoff(task, actor).freshnessGuard),
       })
+    }
     return scheduling.fingerprint({
       action: this.actionReceiptBasis(task, this.relayWorkflowActionNext(task, kind), handoff),
       maximum: this.planReviewLimits(task.sessionId).maxDiscussionRounds,
@@ -13404,7 +13645,10 @@ export class ConversationRepository {
       !(allowUnusedSuggestion && this.isUnansweredRelaySuggestion(gate))
     )
       return false
-    for (const actor of ['codex', 'claude'] as const) {
+    const taskMembers = (['codex', 'claude', 'agy'] as const).filter(
+      (actor) => actor === task.owner || actor === task.reviewer,
+    )
+    for (const actor of taskMembers) {
       const binding = this.nativeContext(task.sessionId, actor)
       if (
         !binding ||
@@ -13494,7 +13738,9 @@ export class ConversationRepository {
       .limit(1)
       .get()
     if (prior && prior.id !== existingDecisionId) return undefined
-    const previousRoles = task.stageRoles ?? defaultTaskStageRoles(task.owner)
+    const previousRoles =
+      task.stageRoles ??
+      defaultTaskStageRoles(task.owner, task.owner !== task.reviewer ? task.reviewer : undefined)
     // An explicit role choice already made must not produce an automated swap-back proposal.
     if (previousRoles.revision > 0) return undefined
     return relayReassignRolesOperationSchema.parse({
@@ -13709,7 +13955,7 @@ export class ConversationRepository {
       .limit(1)
       .get()
     if (prior) return false
-    const name = agentId === 'codex' ? 'Codex' : 'Claude Code'
+    const name = agentDisplayName(agentId)
     const card: RelaySchedulingDecision = {
       version: 'relay-decision-v2',
       sessionId,
@@ -13876,11 +14122,11 @@ export class ConversationRepository {
         handoffId: input.handoff.id,
         title:
           operation.kind === 'extend_plan_review'
-            ? `Have ${operation.actor === 'codex' ? 'Codex' : 'Claude Code'} review plan v${operation.planReference.version} once more.`
+            ? `Have ${agentDisplayName(operation.actor)} review plan v${operation.planReference.version} once more.`
             : 'Change code roles?',
         reason:
           operation.kind === 'reassign_roles'
-            ? `Suggested: ${operation.proposedRoles.codeAuthor === 'codex' ? 'Codex' : 'Claude Code'} implements · ${operation.proposedRoles.codeReviewer === 'codex' ? 'Codex' : 'Claude Code'} reviews`
+            ? `Suggested: ${agentDisplayName(operation.proposedRoles.codeAuthor)} implements · ${agentDisplayName(operation.proposedRoles.codeReviewer)} reviews`
             : proposalReasons.extend_plan_review,
         consequence:
           operation.kind === 'extend_plan_review'
@@ -14095,7 +14341,10 @@ export class ConversationRepository {
   private workflowRoleBindings(task: CollaborationTask, requireIdle = true): string | undefined {
     const bindings = this.nativeContexts(task.sessionId)
     const identities = []
-    for (const agentId of ['claude', 'codex'] as const) {
+    const taskMembers = (['claude', 'codex', 'agy'] as const).filter(
+      (agentId) => agentId === task.owner || agentId === task.reviewer,
+    )
+    for (const agentId of taskMembers) {
       const binding = bindings.find((entry) => entry.agentId === agentId)
       if (!binding) {
         // A direct Review may be the first native Run. Only its untouched peer
@@ -14223,7 +14472,9 @@ export class ConversationRepository {
         throw new RunOperationConflictError(
           'Code roles can only change before implementation is authorized.',
         )
-      const previousRoles = task.stageRoles ?? defaultTaskStageRoles(task.owner)
+      const previousRoles =
+        task.stageRoles ??
+        defaultTaskStageRoles(task.owner, task.owner !== task.reviewer ? task.reviewer : undefined)
       const proposedRoles = {
         ...previousRoles,
         revision: previousRoles.revision + 1,
@@ -14748,7 +14999,11 @@ export class ConversationRepository {
           task.revision !== operation.expectedTaskRevision ||
           task.runId !== operation.afterRunId ||
           !isDeepStrictEqual(
-            task.stageRoles ?? defaultTaskStageRoles(task.owner),
+            task.stageRoles ??
+              defaultTaskStageRoles(
+                task.owner,
+                task.owner !== task.reviewer ? task.reviewer : undefined,
+              ),
             operation.previousRoles,
           )
         )
@@ -16992,7 +17247,14 @@ export class ConversationRepository {
           responses: snapshot.responses,
           ...(snapshot.node === 'plan_ready'
             ? {
-                stageRoles: snapshot.task.stageRoles ?? defaultTaskStageRoles(snapshot.task.owner),
+                stageRoles:
+                  snapshot.task.stageRoles ??
+                  defaultTaskStageRoles(
+                    snapshot.task.owner,
+                    snapshot.task.owner !== snapshot.task.reviewer
+                      ? snapshot.task.reviewer
+                      : undefined,
+                  ),
               }
             : {}),
           progress: {
@@ -17848,7 +18110,8 @@ export class ConversationRepository {
       saved.row.nativeGeneration !== nativeGeneration ||
       saved.row.utilityEpoch !== this.schedulingRecoveryEpoch ||
       saved.row.executorId !== identity.executorId ||
-      saved.row.nativeSessionId !== identity.nativeSessionId
+      saved.row.nativeSessionId !== identity.nativeSessionId ||
+      !unsentBoundaryMatchesProvider(run.agentId, boundary.kind)
     )
       return
     const proof = confirmedUnsentProofSchema.parse({
@@ -17956,6 +18219,7 @@ export class ConversationRepository {
       this.pendingNativeRebuild(run.sessionId, run.agentId) ||
       saved.proof.runId !== run.id ||
       saved.proof.inputSha256 !== saved.input.inputSha256 ||
+      !unsentBoundaryMatchesProvider(run.agentId, saved.proof.boundary.kind) ||
       saved.proof.effectiveSettingsSha256 !==
         createHash('sha256').update(JSON.stringify(saved.effective)).digest('hex') ||
       [
@@ -18416,8 +18680,9 @@ export class ConversationRepository {
         binding.bindingGeneration !== saved.proof.bindingGeneration ||
         binding.executorId !== saved.proof.executorId ||
         (run.executorId !== undefined && run.executorId !== saved.proof.executorId) ||
-        this.nativeContext(run.sessionId, run.agentId === 'codex' ? 'claude' : 'codex')
-          ?.continuationState === 'waiting_user'
+        this.nativeContexts(run.sessionId).some(
+          (other) => other.agentId !== run.agentId && other.continuationState === 'waiting_user',
+        )
       )
         return false
       const guard = reexecutionDispatchGuardSchema.parse(JSON.parse(operation.dispatchGuardJson))
@@ -18457,6 +18722,9 @@ export class ConversationRepository {
     const existing = this.submittedRunReceipt(input)
     if (existing) return existing
     const commandPrefix = parseComposerCommandPrefix(input.content, input.skills)
+    if (commandPrefix.error && !input.collaboration && !input.sourceMessageId) {
+      throw new RunOperationConflictError(commandPrefix.error)
+    }
     if (commandPrefix.pact && !pactCommandRouteAllowed(input.route, commandPrefix.route))
       throw new RunOperationConflictError(
         'The explicit Agent recipients conflict. Your draft was preserved.',
@@ -18493,20 +18761,12 @@ export class ConversationRepository {
     const runId = randomUUID()
     const userMessageId = input.clientMessageId
     const createdAt = new Date().toISOString()
-    const route: ConversationMessageRoute =
-      input.route?.type === 'all'
-        ? 'firstAgentId' in input.route
-          ? input.route
-          : {
-              type: 'all',
-              firstAgentId: input.agentId,
-              secondAgentId: input.agentId === 'claude' ? 'codex' : 'claude',
-            }
-        : input.route?.type === 'agent'
-          ? input.route
-          : { type: 'primary', agentId: input.agentId }
-    const routeAgents =
-      route.type === 'all' ? [route.firstAgentId, route.secondAgentId] : [route.agentId]
+    const isPeerProposal = Boolean(input.sourceProposalId)
+    const isRoutedSecondLeg = Boolean(input.sourceMessageId && !input.sourceProposalId)
+    const unfrozenRun =
+      (!input.sourceMessageId || isPeerProposal) &&
+      !input.receivedInputId &&
+      !input.collaborationActionReceiptId
     const supersededProposalRunIds: string[] = []
     let replacedTaskRunId: string | undefined
     const receivedMeta = input.receivedInputId
@@ -18549,10 +18809,101 @@ export class ConversationRepository {
           .where(eq(sessions.id, input.sessionId))
           .get()
         if (!session) throw new Error('Session does not exist.')
-        if (input.collaboration && session.settingsRevision !== input.settingsRevision)
+        if (unfrozenRun && session.settingsRevision !== input.settingsRevision)
           throw new RunOperationConflictError(
             'Session settings changed during workflow preparation.',
           )
+        const usesLiveSettings = unfrozenRun || Boolean(input.receivedInputId)
+        const effectiveSettingsRevision = usesLiveSettings
+          ? session.settingsRevision
+          : input.settingsRevision
+        const activePairForRun = usesLiveSettings
+          ? this.activePairForSession(input.sessionId, session.settingsRevision)
+          : (this.activePairForSession(input.sessionId, input.settingsRevision) ??
+            this.activePairForSession(input.sessionId))
+        const ongoingTask = this.collaboration(input.sessionId)
+        const effectiveAllowedPair: readonly [RuntimeAgentId, RuntimeAgentId] | undefined =
+          input.collaboration && input.collaboration.owner !== input.collaboration.reviewer
+            ? [input.collaboration.owner, input.collaboration.reviewer]
+            : !commandPrefix.pact &&
+                ongoingTask &&
+                ongoingTask.status !== 'complete' &&
+                !ongoingTask.ending &&
+                ongoingTask.owner !== ongoingTask.reviewer
+              ? [ongoingTask.owner, ongoingTask.reviewer]
+              : activePairForRun
+        if (effectiveAllowedPair && !isRoutedSecondLeg) {
+          if (!isAgentInPair(input.agentId, effectiveAllowedPair)) {
+            throw new RunOperationConflictError(
+              `${agentDisplayName(input.agentId)} is not an active Agent in this Session.`,
+            )
+          }
+          if (
+            commandPrefix.route?.type === 'agent' &&
+            !isAgentInPair(commandPrefix.route.agentId, effectiveAllowedPair)
+          ) {
+            throw new RunOperationConflictError(
+              `@${commandPrefix.route.agentId} is not an active Agent in this Session.`,
+            )
+          }
+          if (
+            input.route?.type === 'agent' &&
+            !isAgentInPair(input.route.agentId, effectiveAllowedPair)
+          ) {
+            throw new RunOperationConflictError(
+              `@${input.route.agentId} is not an active Agent in this Session.`,
+            )
+          }
+          if (
+            input.route?.type === 'all' &&
+            'firstAgentId' in input.route &&
+            (!isAgentInPair(input.route.firstAgentId, effectiveAllowedPair) ||
+              !isAgentInPair(input.route.secondAgentId, effectiveAllowedPair))
+          ) {
+            throw new RunOperationConflictError(
+              'The routed @all Agents do not match this Session’s active Agent pair.',
+            )
+          }
+          for (const skill of input.skills ?? []) {
+            if (!isAgentInPair(skill.agentId, effectiveAllowedPair)) {
+              throw new RunOperationConflictError(
+                `Skill /${skill.name} belongs to ${agentDisplayName(skill.agentId)}, which is not an active Agent in this Session.`,
+              )
+            }
+          }
+          for (const selection of input.skillInvocation?.selections ?? []) {
+            if (!isAgentInPair(selection.agentId, effectiveAllowedPair)) {
+              throw new RunOperationConflictError(
+                `Skill /${selection.name} belongs to ${agentDisplayName(selection.agentId)}, which is not an active Agent in this Session.`,
+              )
+            }
+          }
+          for (const binding of input.skillInvocation?.bindings ?? []) {
+            if (!isAgentInPair(binding.agentId, effectiveAllowedPair)) {
+              throw new RunOperationConflictError(
+                `Skill /${binding.name} belongs to ${agentDisplayName(binding.agentId)}, which is not an active Agent in this Session.`,
+              )
+            }
+          }
+        }
+        const route: ConversationMessageRoute =
+          input.route?.type === 'all'
+            ? 'firstAgentId' in input.route
+              ? input.route
+              : {
+                  type: 'all',
+                  firstAgentId: input.agentId,
+                  secondAgentId: effectiveAllowedPair
+                    ? otherAgent(input.agentId, effectiveAllowedPair)
+                    : input.agentId === 'claude'
+                      ? 'codex'
+                      : 'claude',
+                }
+            : input.route?.type === 'agent'
+              ? input.route
+              : { type: 'primary', agentId: input.agentId }
+        const routeAgents =
+          route.type === 'all' ? [route.firstAgentId, route.secondAgentId] : [route.agentId]
         if (handoff) this.assertSchedulingFreshness(handoff)
         const roleMetadata = input.preparedInput?.metadata.taskRoles
         const newTask = input.collaboration
@@ -18856,23 +19207,39 @@ export class ConversationRepository {
                 ),
               )
               .get()
+            const activePair = settings
+              ? resolveActiveAgentPair({
+                  primaryAgentId: settings.primaryAgentId,
+                  secondaryAgentId: settings.secondaryAgentId,
+                })
+              : undefined
+            const rolePair = roleMetadata
+              ? resolveActiveAgentPair({
+                  primaryAgentId: roleMetadata.primaryAgentId,
+                  secondaryAgentId:
+                    roleMetadata.secondaryAgentId ?? roleMetadata.defaults.planReviewer,
+                })
+              : activePair
             const primary =
               roleMetadata?.primaryAgentId ??
               (queued?.metadata.rolePolicy
                 ? task.kind === 'build'
-                  ? otherAgent(queued.actor)
+                  ? otherAgent(queued.actor, rolePair)
                   : queued.actor
                 : settings
                   ? pactEntryPrimary(
                       task.kind,
                       settings.primaryAgentId,
                       input.route?.type === 'agent' ? input.route.agentId : undefined,
+                      settings.secondaryAgentId,
                     )
                   : undefined)
             if (
               !primary ||
+              !rolePair ||
+              !isAgentInPair(primary, rolePair) ||
               task.owner !== primary ||
-              task.reviewer !== otherAgent(primary) ||
+              task.reviewer !== otherAgent(primary, rolePair) ||
               (queued &&
                 (queued.id !== input.receivedInputId ||
                   queued.metadata.rolePolicy !== task.rolePolicy ||
@@ -18885,7 +19252,9 @@ export class ConversationRepository {
               task.stageRoles &&
               !isDeepStrictEqual(
                 task.stageRoles,
-                roleMetadata ? initialTaskRoles : defaultTaskStageRoles(primary),
+                roleMetadata
+                  ? initialTaskRoles
+                  : defaultTaskStageRoles(primary, otherAgent(primary, rolePair)),
               )
             )
               throw new RunOperationConflictError(
@@ -19056,6 +19425,27 @@ export class ConversationRepository {
             .where(eq(conversationImageAssets.id, image.id))
             .run()
         }
+        const liveAgentModelSettings =
+          Boolean(input.receivedInputId) && input.settingsRevision !== session.settingsRevision
+            ? (() => {
+                const revRow = transaction
+                  .select()
+                  .from(sessionSettingsRevisions)
+                  .where(
+                    and(
+                      eq(sessionSettingsRevisions.sessionId, input.sessionId),
+                      eq(sessionSettingsRevisions.revision, session.settingsRevision),
+                    ),
+                  )
+                  .get()
+                if (!revRow) return undefined
+                return input.agentId === 'claude'
+                  ? { model: revRow.claudeModel, effort: revRow.claudeEffort }
+                  : input.agentId === 'codex'
+                    ? { model: revRow.codexModel, effort: revRow.codexEffort }
+                    : { model: revRow.agyModel, effort: revRow.agyEffort }
+              })()
+            : undefined
         transaction
           .insert(agentRuns)
           .values({
@@ -19071,10 +19461,10 @@ export class ConversationRepository {
               this.nativeContext(input.sessionId, input.agentId)?.bindingGeneration ?? 1,
             nativeEffectsState: 'not_dispatched',
             attemptCount: 1,
-            settingsRevision: input.settingsRevision,
-            ...this.runSettingsAt(input.sessionId, input.agentId, input.settingsRevision),
-            model: input.model,
-            effort: input.effort,
+            settingsRevision: effectiveSettingsRevision,
+            ...this.runSettingsAt(input.sessionId, input.agentId, effectiveSettingsRevision),
+            model: liveAgentModelSettings ? liveAgentModelSettings.model : input.model,
+            effort: liveAgentModelSettings ? liveAgentModelSettings.effort : input.effort,
             handoffSourceIds,
             handoffMessageCount: input.handoffSourceRefs?.length ?? 0,
             createdAt,
@@ -19340,13 +19730,13 @@ export class ConversationRepository {
             .from(agentRuns)
             .where(inArray(agentRuns.id, supersededProposalRunIds))
             .all()
-            .map((entry) => ConversationRepository.toRun(entry))
+            .map((entry) => this.toRun(entry))
         : []
     // The mounted footer of the replaced task re-reads its ended state from this related Run.
     const endedRun = replacedTaskRunId ? this.findRun(replacedTaskRunId) : undefined
     const relatedRuns = [
       ...(endedRun ? [endedRun] : []),
-      ...(sourceRun ? [ConversationRepository.toRun(sourceRun)] : []),
+      ...(sourceRun ? [this.toRun(sourceRun)] : []),
       ...supersededRuns,
     ]
     return {
@@ -19705,9 +20095,7 @@ export class ConversationRepository {
       .orderBy(desc(conversationMessages.sequence))
       .limit(1)
       .get()
-    return row
-      ? { run: ConversationRepository.toRun(row.run), sourceMessageId: row.sourceMessageId }
-      : undefined
+    return row ? { run: this.toRun(row.run), sourceMessageId: row.sourceMessageId } : undefined
   }
 
   runPatch(runId: string): ConversationPatch {
@@ -19857,7 +20245,9 @@ export class ConversationRepository {
       throw new RunOperationConflictError('The task permission settings are unavailable.')
     return agentId === 'claude'
       ? { permissionMode: settings.claudePermissionMode, speed: settings.claudeSpeed }
-      : { permissionMode: settings.codexPermissionMode, speed: settings.codexSpeed }
+      : agentId === 'codex'
+        ? { permissionMode: settings.codexPermissionMode, speed: settings.codexSpeed }
+        : { permissionMode: settings.agyPermissionMode, speed: settings.agySpeed }
   }
 
   recordExecutor(runId: string, executorId: string): ConversationPatch {
@@ -20333,7 +20723,7 @@ export class ConversationRepository {
       generation === undefined
         ? this.sourceQueries.latestRun().get({ sessionId, agentId })
         : this.sourceQueries.latestGenerationRun().get({ sessionId, agentId, generation })
-    return row ? ConversationRepository.toRun(row) : undefined
+    return row ? this.toRun(row) : undefined
   }
 
   hasCompleteResponse(runId: string): boolean {
@@ -21459,10 +21849,23 @@ export class ConversationRepository {
   ): ConversationPatch {
     nativeEvidenceIdentitySchema.shape.nativeSessionId.parse(nativeSessionId)
     nativeEvidenceIdentitySchema.shape.executorId.parse(executorId)
-    const witness =
+    const parsedWitness =
       initializationWitness === undefined
         ? undefined
-        : nativeInitializationWitnessSchema.parse(initializationWitness)
+        : nativeInitializationWitnessSchema.safeParse(initializationWitness)
+    if (parsedWitness && !parsedWitness.success) {
+      const candidateKind =
+        typeof initializationWitness === 'object' && initializationWitness !== null
+          ? Reflect.get(initializationWitness, 'kind')
+          : undefined
+      if (candidateKind === 'codex_rollout_v1' || candidateKind === 'agy_rebuild_v1') {
+        throw new RunOperationConflictError(
+          'The initialization witness is incomplete or does not match its required schema.',
+        )
+      }
+      throw new RunOperationConflictError('The initialization witness belongs to another Agent.')
+    }
+    const witness = parsedWitness?.data
     if (witness && witness.nativeSessionId !== nativeSessionId)
       throw new RunOperationConflictError(
         'The initialization witness belongs to another Native Session.',
@@ -21482,12 +21885,29 @@ export class ConversationRepository {
       row.provisionalNativeSessionId !== nativeSessionId
     )
       throw new RunOperationConflictError('The complete Native seed has not been confirmed.')
-    if (row.agentId === 'codex' && !witness)
+    if ((row.agentId === 'codex' || row.agentId === 'agy') && !witness)
       throw new RunOperationConflictError(
         'The complete native initialization has no durable readback witness.',
       )
-    if (witness && row.agentId !== 'codex')
+    if (
+      witness &&
+      (row.agentId === 'claude' ||
+        (row.agentId === 'codex' && witness.kind !== 'codex_rollout_v1') ||
+        (row.agentId === 'agy' && witness.kind !== 'agy_rebuild_v1'))
+    )
       throw new RunOperationConflictError('The initialization witness belongs to another Agent.')
+    if (
+      row.agentId === 'agy' &&
+      (witness?.kind !== 'agy_rebuild_v1' ||
+        witness.nativeSessionId !== row.provisionalNativeSessionId ||
+        !row.sourceHash ||
+        witness.sourceHash !== row.sourceHash ||
+        witness.stepCount !== 2 ||
+        !witness.coldLoadVerifiedAt)
+    )
+      throw new RunOperationConflictError(
+        'The initialization witness does not match the rebuilt Antigravity source.',
+      )
 
     const dividerId = randomUUID()
     let returnedMessageId: string | undefined
@@ -21613,7 +22033,7 @@ export class ConversationRepository {
           sessionId: row.sessionId,
           agentId: row.agentId,
           role: 'system',
-          content: `${row.agentId === 'claude' ? 'Claude Code' : 'Codex'} native session rebuilt`,
+          content: `${agentDisplayName(row.agentId)} native session rebuilt`,
           state: 'complete',
           sequence,
           createdAt: now,
@@ -21885,7 +22305,7 @@ export class ConversationRepository {
 
   findRun(runId: string): AgentRun | undefined {
     const run = this.sourceQueries.run().get({ runId })
-    return run ? ConversationRepository.toRun(run) : undefined
+    return run ? this.toRun(run) : undefined
   }
 
   recordWorkspaceChanges(summary: WorkspaceChangeSet): ConversationPatch {
@@ -23918,23 +24338,48 @@ export class ConversationRepository {
 
   nativeRecoveryBlocksInput(sessionId: string): boolean {
     if (forkFacts.forkBlocksInput(this.database, sessionId)) return true
-    const blockedContext =
-      this.database
-        .select({ agentId: nativeAgentContexts.agentId })
-        .from(nativeAgentContexts)
-        .where(
-          and(
-            eq(nativeAgentContexts.sessionId, sessionId),
-            inArray(nativeAgentContexts.continuationState, [
-              'recovery_required',
-              'checking',
-              'rebuilding',
-            ]),
-          ),
-        )
-        .limit(1)
-        .get() !== undefined
-    if (blockedContext) return true
+    const activePair = this.activePairForSession(sessionId)
+    const contexts = this.database
+      .select({
+        agentId: nativeAgentContexts.agentId,
+        continuationState: nativeAgentContexts.continuationState,
+        recoveryAction: nativeAgentContexts.recoveryAction,
+        recoveryFailureKind: nativeAgentContexts.recoveryFailureKind,
+        permissionRequestsJson: nativeAgentContexts.permissionRequestsJson,
+      })
+      .from(nativeAgentContexts)
+      .where(eq(nativeAgentContexts.sessionId, sessionId))
+      .limit(3)
+      .all()
+    for (const ctx of contexts) {
+      if (!activePair || isAgentInPair(ctx.agentId, activePair)) {
+        if (['recovery_required', 'checking', 'rebuilding'].includes(ctx.continuationState)) {
+          return true
+        }
+        continue
+      }
+      const retiredGate = SessionRepository.replacementGateQueries(sessionId, [ctx.agentId])
+        .retired[0]!
+      const hasPendingPermission =
+        ctx.permissionRequestsJson !== null && ctx.permissionRequestsJson !== '[]'
+      const hasPendingRebuild = Boolean(
+        this.database.get(retiredGate.pendingRebuildStage) ||
+        this.database.get(retiredGate.pendingRebuildWork),
+      )
+      const hasUnsettledRun = Boolean(this.database.get(retiredGate.unsettledRun))
+      if (
+        !isRetiredAgentRecoverySettled({
+          continuationState: ctx.continuationState,
+          recoveryAction: ctx.recoveryAction,
+          recoveryFailureKind: ctx.recoveryFailureKind,
+          hasPendingPermission,
+          hasPendingRebuild,
+          hasUnsettledRun,
+        })
+      ) {
+        return true
+      }
+    }
     return this.unacknowledgedNativeRun(sessionId) !== undefined
   }
 
@@ -23959,7 +24404,7 @@ export class ConversationRepository {
       .orderBy(desc(agentRuns.createdAt), desc(sql`${agentRuns}.rowid`))
       .limit(1)
       .get()
-    return row ? ConversationRepository.toRun(row) : undefined
+    return row ? this.toRun(row) : undefined
   }
 
   markNativeContextsMissing(
@@ -24382,7 +24827,147 @@ export class ConversationRepository {
     }
   }
 
-  private static toRun(
+  private getOrComputeHandoffSourceAgents(
+    runId: string,
+    sessionId: string,
+    runAgentId: RuntimeAgentId,
+    runNativeSessionId: string | null,
+  ): RuntimeAgentId[] | undefined {
+    if (this.handoffSourceAgentsCache.has(runId)) {
+      const cached = this.handoffSourceAgentsCache.get(runId)
+      this.handoffSourceAgentsCache.delete(runId)
+      this.handoffSourceAgentsCache.set(runId, cached ?? null)
+      return cached ?? undefined
+    }
+    const cacheResult = (value: RuntimeAgentId[] | null): RuntimeAgentId[] | undefined => {
+      if (this.handoffSourceAgentsCache.size >= MAX_OBSERVED_SESSIONS) {
+        const oldestKey = this.handoffSourceAgentsCache.keys().next().value
+        if (oldestKey !== undefined) {
+          this.handoffSourceAgentsCache.delete(oldestKey)
+        }
+      }
+      this.handoffSourceAgentsCache.set(runId, value)
+      return value ?? undefined
+    }
+    const raw = this.database
+      .select({ handoffSourceIds: agentRuns.handoffSourceIds })
+      .from(agentRuns)
+      .where(eq(agentRuns.id, runId))
+      .get()
+    if (
+      !raw?.handoffSourceIds ||
+      Buffer.byteLength(raw.handoffSourceIds, 'utf8') > HANDOFF_SOURCE_IDS_BYTES
+    ) {
+      return cacheResult(null)
+    }
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(raw.handoffSourceIds)
+    } catch {
+      return cacheResult(null)
+    }
+    if (!Array.isArray(parsed) || parsed.length === 0) {
+      return cacheResult(null)
+    }
+    const refIds: string[] = []
+    for (const item of parsed) {
+      const id = typeof item === 'object' && item !== null ? Reflect.get(item, 'id') : undefined
+      if (typeof id !== 'string' || id.length === 0) {
+        return cacheResult(null)
+      }
+      refIds.push(id)
+    }
+    const coveredSessionId =
+      runNativeSessionId ?? this.nativeContext(sessionId, runAgentId)?.nativeSessionId ?? null
+    const orderedUnique = new Set<RuntimeAgentId>()
+    for (let offset = 0; offset < refIds.length; offset += HANDOFF_PAGE_ITEMS) {
+      const pageIds = refIds.slice(offset, offset + HANDOFF_PAGE_ITEMS)
+      const messages = this.database
+        .select({
+          id: conversationMessages.id,
+          sessionId: conversationMessages.sessionId,
+          runId: conversationMessages.runId,
+          role: conversationMessages.role,
+          messageAgentId: conversationMessages.agentId,
+          runAgentId: agentRuns.agentId,
+        })
+        .from(conversationMessages)
+        .leftJoin(agentRuns, eq(agentRuns.id, conversationMessages.runId))
+        .where(inArray(conversationMessages.id, pageIds))
+        .all()
+      const msgById = new Map(messages.map((m) => [m.id, m]))
+      const userIds = messages.filter((m) => m.role === 'user').map((m) => m.id)
+      const userRunIds = messages
+        .filter((m) => m.role === 'user' && m.runId !== null)
+        .map((m) => m.runId!)
+      const acceptedForUsers =
+        userIds.length > 0
+          ? this.database
+              .select({
+                id: agentRuns.id,
+                userMessageId: agentRuns.userMessageId,
+                agentId: agentRuns.agentId,
+                forkSourceRunId: agentRuns.forkSourceRunId,
+                nativeSessionId: agentRuns.nativeSessionId,
+              })
+              .from(agentRuns)
+              .where(
+                and(
+                  eq(agentRuns.sessionId, sessionId),
+                  ne(agentRuns.id, runId),
+                  isNotNull(agentRuns.nativeTurnId),
+                  or(
+                    sql`${agentRuns.failureKind} IS NULL`,
+                    sql`${agentRuns.failureKind} NOT IN ('context_limit', 'unknown_delivery')`,
+                  ),
+                  userRunIds.length > 0
+                    ? or(
+                        inArray(agentRuns.userMessageId, userIds),
+                        inArray(agentRuns.id, userRunIds),
+                      )
+                    : inArray(agentRuns.userMessageId, userIds),
+                ),
+              )
+              .orderBy(asc(agentRuns.createdAt), asc(sql`${agentRuns}.rowid`))
+              .all()
+          : []
+
+      for (const refId of pageIds) {
+        const msg = msgById.get(refId)
+        if (!msg || msg.sessionId !== sessionId) {
+          return cacheResult(null)
+        }
+        if (msg.role === 'assistant') {
+          const actor = msg.runAgentId ?? msg.messageAgentId
+          if (actor !== 'claude' && actor !== 'codex' && actor !== 'agy') {
+            return cacheResult(null)
+          }
+          orderedUnique.add(actor)
+        } else if (msg.role === 'user') {
+          const peerRuns = acceptedForUsers.filter(
+            (r) =>
+              (r.userMessageId === msg.id || (msg.runId !== null && r.id === msg.runId)) &&
+              (r.agentId !== runAgentId ||
+                (r.forkSourceRunId !== null && r.nativeSessionId !== coveredSessionId)),
+          )
+          if (peerRuns.length === 0) {
+            return cacheResult(null)
+          }
+          for (const r of peerRuns) {
+            orderedUnique.add(r.agentId)
+          }
+        } else {
+          return cacheResult(null)
+        }
+      }
+    }
+    if (orderedUnique.size === 0) {
+      return cacheResult(null)
+    }
+    return cacheResult([...orderedUnique].slice(0, 3))
+  }
+
+  private toRun(
     row: Omit<
       typeof agentRuns.$inferSelect,
       'handoffSourceIds' | 'nativeInputIdsJson' | 'answerFormat' | 'automaticRecoveryRevoked'
@@ -24393,6 +24978,15 @@ export class ConversationRepository {
       outputSnapshotsJson?: string | null
     },
   ): AgentRun {
+    const handoffSourceAgents =
+      row.handoffMessageCount > 0
+        ? this.getOrComputeHandoffSourceAgents(
+            row.id,
+            row.sessionId,
+            row.agentId,
+            row.nativeSessionId,
+          )
+        : undefined
     return {
       outputSnapshots: parseOutputSnapshotSummary(row.outputSnapshotsJson),
       ...(row.workflowTaskId === row.collaborationTaskId &&
@@ -24443,6 +25037,7 @@ export class ConversationRepository {
       ...(row.failureKind ? { failureKind: row.failureKind } : {}),
       ...(row.failureMessage ? { failureMessage: row.failureMessage } : {}),
       ...(row.handoffMessageCount > 0 ? { handoffMessageCount: row.handoffMessageCount } : {}),
+      ...(handoffSourceAgents ? { handoffSourceAgents } : {}),
       ...(row.workspaceChangesJson
         ? { workspaceChanges: workspaceChangeSetSchema.parse(JSON.parse(row.workspaceChangesJson)) }
         : {}),
@@ -24471,7 +25066,10 @@ export class ConversationRepository {
   ): Pick<ConversationMessage, 'route'> | undefined {
     if (!row.routeKind || !row.routeAgentsJson) return undefined
     const agents: unknown = JSON.parse(row.routeAgentsJson)
-    if (!Array.isArray(agents) || agents.some((agent) => agent !== 'claude' && agent !== 'codex'))
+    if (
+      !Array.isArray(agents) ||
+      agents.some((agent) => agent !== 'claude' && agent !== 'codex' && agent !== 'agy')
+    )
       throw new Error('Conversation Message has an invalid persisted route.')
     if (row.routeKind === 'all') {
       const [firstAgentId, secondAgentId] = agents
@@ -24485,7 +25083,7 @@ export class ConversationRepository {
   }
 
   rebuildOperations(sessionId: string) {
-    return (['codex', 'claude'] as const).flatMap((agentId) => {
+    return (['codex', 'claude', 'agy'] as const).flatMap((agentId) => {
       const operation = this.lastNativeRebuild(sessionId, agentId)
       return operation &&
         ['preparing', 'creating', 'seeding', 'unconfirmed', 'failed'].includes(operation.stage)
@@ -24524,10 +25122,24 @@ export class ConversationRepository {
       .from(nativeRebuildOperations)
       .where(eq(nativeRebuildOperations.id, operation.id))
       .get()
-    const witness = witnessRow?.value
-      ? nativeInitializationWitnessSchema.parse(JSON.parse(witnessRow.value))
+    const parsedWitness = witnessRow?.value
+      ? nativeInitializationWitnessSchema.safeParse(JSON.parse(witnessRow.value))
       : undefined
-    if (agentId === 'codex' && !witness) return undefined
+    if (parsedWitness && !parsedWitness.success) return undefined
+    const witness = parsedWitness?.data
+    if (
+      ((agentId === 'codex' || agentId === 'agy') && !witness) ||
+      (witness &&
+        (agentId === 'claude' ||
+          witness.nativeSessionId !== context.nativeSessionId ||
+          (agentId === 'codex' && witness.kind !== 'codex_rollout_v1') ||
+          (agentId === 'agy' &&
+            (witness.kind !== 'agy_rebuild_v1' ||
+              witness.sourceHash !== operation.sourceHash ||
+              witness.stepCount !== 2 ||
+              !witness.coldLoadVerifiedAt))))
+    )
+      return undefined
     return laterRun
       ? undefined
       : {

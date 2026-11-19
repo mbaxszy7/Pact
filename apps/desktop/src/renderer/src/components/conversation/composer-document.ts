@@ -5,7 +5,7 @@ import type {
   SkillSelection,
 } from '@pact/contracts'
 
-import { parseComposerCommandPrefix } from '@pact/contracts'
+import { defaultSecondaryAgent, parseComposerCommandPrefix } from '@pact/contracts'
 
 import { assertComposerEditLengths, assertComposerReplacementCapacity } from './composer-capacity'
 
@@ -18,7 +18,7 @@ export type ComposerRoute =
 
 export interface ComposerMention {
   route: NonNullable<ConversationSendInput['route']> | { type: 'main' }
-  token: '@claude' | '@codex' | '@all' | '@Main'
+  token: '@claude' | '@codex' | '@agy' | '@all' | '@Main'
   start: number
   end: number
 }
@@ -204,7 +204,10 @@ export function resolveComposerRoute(
     'text' | 'skills' | 'mention' | 'route' | 'returnedInputOperationId'
   >,
   primaryAgentId: RuntimeAgentId,
-  options?: { allowMainRoute?: boolean | undefined },
+  options?: {
+    allowMainRoute?: boolean | undefined
+    secondaryAgentId?: RuntimeAgentId | undefined
+  },
 ): {
   route: ComposerRoute
   targets: RuntimeAgentId[]
@@ -231,12 +234,15 @@ export function resolveComposerRoute(
       sendRoute: undefined,
     }
   }
-  const secondaryAgentId = primaryAgentId === 'codex' ? 'claude' : 'codex'
+  const resolvedSecondary =
+    options?.secondaryAgentId && options.secondaryAgentId !== primaryAgentId
+      ? options.secondaryAgentId
+      : defaultSecondaryAgent(primaryAgentId)
   const targets: RuntimeAgentId[] =
     route.type === 'all'
       ? route.firstAgentId && route.secondAgentId
         ? [route.firstAgentId, route.secondAgentId]
-        : [primaryAgentId, secondaryAgentId]
+        : [primaryAgentId, resolvedSecondary]
       : [route.agentId ?? primaryAgentId]
   // Undefined restores the complete original route through the retained returned-input receipt.
   const sendRoute =

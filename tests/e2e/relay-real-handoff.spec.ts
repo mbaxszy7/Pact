@@ -69,9 +69,11 @@ async function seed(
     repo = db.conversationRepository
   const settings = {
     primaryAgentId: 'codex',
+    secondaryAgentId: 'claude',
     agents: {
       codex: { model: 'gpt-6-luna', effort: 'low' },
       claude: { model: claudeModel, effort: null },
+      agy: { model: null, effort: null },
     },
     maxDiscussionRounds: 2,
     maxReviewCycles: 3,
@@ -260,7 +262,9 @@ async function resume(page: Page, sessionId: string) {
   )
   const settings = {
     primaryAgentId: editor.session.settings.primaryAgentId,
+    secondaryAgentId: editor.session.settings.secondaryAgentId,
     agents: {
+      agy: editor.session.settings.agents.agy,
       codex: {
         ...editor.session.settings.agents.codex,
         model: resolveRealConfiguredModel(

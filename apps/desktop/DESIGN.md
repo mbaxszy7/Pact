@@ -106,7 +106,7 @@ components:
 
 **Creative North Star: "The Daylight Control Room"**
 
-Pact pairs an airy sky-tinted workspace with a midnight companion theme. The interface remains operational and precise, but soft lavender, peach, and mint message surfaces give User, Claude, and Codex an identity that is memorable without becoming noisy. Dense actions stay charcoal or pale inverse; Iris blue is rationed to focus, selection, and live state.
+Pact pairs an airy sky-tinted workspace with a midnight companion theme. The interface remains operational and precise, while soft lavender, peach, mint, and cool glacier-blue message surfaces give User, Claude Code, Codex, and Antigravity (`agy`) distinct identities within each Session's active two-Agent pair without becoming noisy. Dense actions stay charcoal or pale inverse; Iris blue is rationed to focus, selection, and live state.
 
 This is an Operate interface. Transcript, Diff, documents, permissions, and runtime activity must remain readable for hours. Translucency is optional material depth, not decoration: navigation may reveal more of the desktop environment, Chat reveals less, and code surfaces remain nearly opaque.
 
@@ -114,7 +114,7 @@ This is an Operate interface. Transcript, Diff, documents, permissions, and runt
 
 - Pale sky canvas and bone-white work surfaces in light mode.
 - Midnight-blue surfaces rather than generic black in dark mode.
-- Lavender User messages on the right; peach Claude and mint Codex messages on the left.
+- Lavender User messages on the right; peach Claude Code, mint Codex, and glacier-blue Antigravity messages on the left.
 - Compact, familiar desktop controls with deliberate color fields.
 - Solid and pure-translucent variants sharing one component system.
 - Fully opaque type, icons, code, Diff meaning, and focus states.
@@ -140,8 +140,9 @@ The palette uses daylight blue and midnight navy as environmental fields, with p
 ### Secondary
 
 - **User Lavender** (`#f1e6ff` / `#2b2941`): right-aligned User messages.
-- **Claude Peach** (`#fff2eb` / `#382923`): left-aligned Claude messages.
+- **Claude Peach** (`#fff2eb` / `#382923`): left-aligned Claude Code messages.
 - **Codex Mint** (`#d3f6e3` / `#19372f`): left-aligned Codex messages and its inline activity rows.
+- **Antigravity Glacier**: left-aligned Antigravity (`agy`) messages and inline activity rows using cool sky-slate provenance tinting paired with the `Antigravity` speaker label and mark.
 
 ### Tertiary
 
@@ -257,7 +258,9 @@ Messages and self-contained Artifacts earn a colored surface. Navigation groups,
 
 ### Inputs / Fields
 
-Agent settings align Model and Effort, stacking in compact panels. Speed belongs in Composer: each Agent groups independent Permission and Speed buttons with a divider and the Project folder/branch surface treatment. Speed always shows its label and Native, Standard or Fast value. All dropdown arrows stay neutral; Full access warning color applies only to its icon and label. Speed opens its own upward popover with checked choices, descriptions and a Next run / This Session footer. Selection saves immediately; keyboard navigation, Escape and visibility/focus recovery follow existing Composer menus. Requested speed and native fallback remain distinct. Run headers show Native speed when a requested override was not applied and no effective speed was reported. Put the explanation behind a neutral info icon with a hover and keyboard-focus tooltip; keep long diagnostic prose out of the header. App defaults, Session settings and creation customization contain no Speed field.
+Runtime Preparation presents three equal-hierarchy CLI cards (**Claude Code**, **Codex**, **Antigravity**) with readiness summary copy (`2 of 3 ready · Minimum 2 required`) unlocking **Continue** once any two CLIs are Ready. Default Session Settings and Session Creation (**Use App defaults** or **Customize this Session**) support all six `(Primary, Secondary)` permutations, pre-selecting the two Ready CLIs on first use when the third is unavailable and disabling an unready third option with its concise reason while loading model catalogs only for the active pair. Main-Session **Session settings** allow swapping `Primary <-> Secondary` anytime and allow replacing an active member with the third Agent at clean idle boundaries, disabling third-Agent replacement with a single inline explanation whenever active/recovering Runs, queued input, an unfinished collaboration task, or unsettled effects remain; leaving the active pair resets that Agent's `Full access` to `Ask`, while side chats keep settings, Permission, and Speed hidden.
+
+Agent settings align Model and Effort, stacking in compact panels. Speed belongs in Composer: each active Agent in the Session's two-Agent pair groups independent Permission and Speed buttons with a divider and the Project folder/branch surface treatment. Speed always shows its label and Native, Standard or Fast value (Antigravity remains `Native` with an explanatory tooltip while native speed overrides and readback are unsupported). All dropdown arrows stay neutral; Full access warning color applies only to its icon and label. Speed opens its own upward popover with checked choices, descriptions and a Next run / This Session footer. Selection saves immediately; keyboard navigation, Escape and visibility/focus recovery follow existing Composer menus. Requested speed and native fallback remain distinct. Run headers show Native speed when a requested override was not applied and no effective speed was reported. Put the explanation behind a neutral info icon with a hover and keyboard-focus tooltip; keep long diagnostic prose out of the header. App defaults, Session settings and creation customization contain no Speed field.
 
 Permission controls keep their existing layout and labels. Their tooltip and existing menu footer distinguish the next-task selection from the active Run's frozen choice and any project read-only duty. Full access does not display tool-approval cards; native-policy refusals do not become approvals, and questions/forms and plan implementation decisions retain their own interaction.
 
@@ -273,11 +276,11 @@ Session group headers mix the chosen color into the raised surface and show the 
 
 ### Transcript and Composer
 
-User messages are right-aligned on lavender. Claude and Codex messages are left-aligned on peach and mint. Speaker labels remain visible, and ordinary messages avoid avatars that could be mistaken for account UI. Flow steps and runtime states may appear inline inside the responsible Agent message; global workflow timelines and `Plan approved` banners are not persistent Chat chrome. Main-chat user messages synced from a side chat carry a clickable **From side chat** badge (`+8px → 0`, 180 ms `--ease-out-pact`) that opens that side chat in the right pane; ordinary text selections on main-chat User/Agent messages expose **Ask in side chat** beside **Add comment** (`@starting-style` 140 ms float-in / 90 ms float-out).
+User messages are right-aligned on lavender. Claude Code, Codex, and Antigravity messages are left-aligned on peach, mint, and glacier-blue surfaces. Speaker labels remain visible, and ordinary messages avoid avatars that could be mistaken for account UI. Flow steps and runtime states may appear inline inside the responsible Agent message; global workflow timelines and `Plan approved` banners are not persistent Chat chrome. Main-chat user messages synced from a side chat carry a clickable **From side chat** badge (`+8px → 0`, 180 ms `--ease-out-pact`) that opens that side chat in the right pane; ordinary text selections on main-chat User/Agent messages expose **Ask in side chat** beside **Add comment** (`@starting-style` 140 ms float-in / 90 ms float-out).
 
-The Composer is a stable dense surface at least two lines high. Native Skills and the selected route are atomic inline units; attached Comments are removable source chips above the input; native question answers stay in their live forms. Images show thumbnails, filename and state, with Add image below full-width text. Agent permissions, Speed, Project folder and branch stay on one row below the input. Project context shrinks first; labels truncate as space decreases while icons and dropdown controls remain visible. Full values remain available through accessible names, tooltips and menus. Send becomes Stop during a response. Enter queues one message, Shift+Enter inserts a newline; a disabled queue retains Enter as newline. Unsubmitted drafts never auto-send.
+The Composer is a stable dense surface at least two lines high. Native Skills and the selected route (`@claude`, `@codex`, `@agy`, `@all`, or side-chat `@Main`) are atomic inline units; attached Comments are removable source chips above the input; native question answers stay in their live forms. Images show thumbnails, filename and state, with Add image below full-width text. Active-pair Agent permissions, Speed, Project folder and branch stay on one row below the input. Project context shrinks first; labels truncate as space decreases while icons and dropdown controls remain visible. Full values remain available through accessible names, tooltips and menus. Send becomes Stop during a response. Enter queues one message, Shift+Enter inserts a newline; a disabled queue retains Enter as newline. Unsubmitted drafts never auto-send.
 
-Completed Pact command tokens use the same book icon and inline badge treatment as native Skills, labeled `pact:plan`, `pact:review`, `pact:build`, and main-chat `pact:btw`. Their original slash text remains authoritative for editing, copying and sending. In side chats, all Pact slash commands and **Fork** are disabled, and the locked Composer footer hides the Session settings gear, Permission, Speed, and Project controls. Side-chat `@` autocomplete inserts `@Main` directly below `@claude`, morphing Send (150 ms) to `CornerUpLeft` (**Send to main**) and displaying a compact **Sent to main chat · View** bar (160 ms entrance) upon sync-back. Seeding a `/btw` draft into a new side-chat Composer plays a 220 ms Iris border/surface arrive settle (`.pact-composer-handoff-arrive`) with cursor at end and zero auto-send. Skill and Agent recipient pickers sit 8px above the entire Composer and escape input-panel clipping. The Skill picker keeps command targets fixed as native catalogs load; both pickers fit their scrollable height to the available viewport. Escape and outside clicks dismiss the active picker until its query changes; incidental cursor events must not reopen it. Ordinary draft and validation resizing must preserve the complete Composer focus outline.
+Completed Pact command tokens use the same book icon and inline badge treatment as native Skills, labeled `pact:plan`, `pact:review`, `pact:build`, and main-chat `pact:btw`. Their original slash text remains authoritative for editing, copying and sending. Main-Session `@` autocomplete offers the Session's active two-Agent pair and `All` (supporting `/btw @agy /skill` handoffs without `@gemini` aliases); `/` Skills groups Pact commands separately from native catalogs of the active two-Agent pair. In side chats, all Pact slash commands and **Fork** are disabled, and the locked Composer footer hides the Session settings gear, Permission, Speed, and Project controls. Side-chat `@` autocomplete places `@Main` below the side chat's active member mentions and `@all`, morphing Send (150 ms) to `CornerUpLeft` (**Send to main**) and displaying a compact **Sent to main chat · View** bar (160 ms entrance) upon sync-back. Seeding a `/btw` draft into a new side-chat Composer plays a 220 ms Iris border/surface arrive settle (`.pact-composer-handoff-arrive`) with cursor at end and zero auto-send. Skill and Agent recipient pickers sit 8px above the entire Composer and escape input-panel clipping. The Skill picker keeps command targets fixed as native catalogs load; both pickers fit their scrollable height to the available viewport. Escape and outside clicks dismiss the active picker until its query changes; incidental cursor events must not reopen it. Ordinary draft and validation resizing must preserve the complete Composer focus outline.
 
 One compact raised message strip sits immediately above Composer, with a queue icon, recipient, readable preview and Steer, Remove and More actions. When the responding Agent differs from the queued recipient, an info icon beside disabled Steer explains both Agents on hover or keyboard focus. The menu contains Edit message and Disable queue; paused delivery offers Resume queue. State/reason and attachment counts wrap beneath the preview without displacing actions at narrow widths. A queued Pact command carrying a confirmed task replacement says it waits for the current response and will start instead of continuing the old task; it never claims the old task already ended. Unknown or active delivery locks destructive/duplicate actions and offers Check status for its original Run. After a confirmed Rebuild retires that Run, Remove becomes available with copy explaining that only the Pact queue is cleared and delivery remains unconfirmed; Edit, Steer and Resume remain locked. An empty disabled queue still exposes Enable queue. Use the existing Composer popover treatment, keyboard menu navigation, Escape/focus return and both themes. Edit removes the item and returns its full content to the normal Composer, overwriting its draft; no Save/Cancel edit mode is introduced. A return receipt needing recovery uses a quiet Restore returned message action outside the queue.
 
@@ -385,12 +388,12 @@ hierarchy, and status never relies on color alone.
 
 In the bottom-left Project Navigation footer above **Settings**, Pact shows a compact **Usage**
 icon trigger (`Gauge`) instead of permanently stacking metrics in the sidebar. Hovering or focusing
-the trigger opens a lightweight compact popover showing available **Codex** and **Claude Code** `5h` and `7d`
-remaining quota bars with `tabular-nums` `% left` labels (omitting absent windows), semantic
+the trigger opens a lightweight compact popover showing available **Codex**, **Claude Code**, and **Antigravity** `5h` and `7d`
+remaining quota bars with `tabular-nums` `% left` labels (omitting absent windows), concise pool-scope notes when multiple model pools exist (such as `Gemini Models quota`), semantic
 low-quota thresholds (`20%` left warning ochre, `5%` left danger), silent loading bar placeholders, and
 1–3 word status labels for non-window or unauthenticated logins without timestamps. Clicking pins a
 detailed popover that adds per-window reset times and per-provider manual refresh buttons (respecting
-the thirty-second cooldown), dismissible by clicking the trigger, clicking outside, or pressing
+the thirty-second cooldown and the two-probe App-wide concurrency ceiling), dismissible by clicking the trigger, clicking outside, or pressing
 `Escape`.
 
 Send keeps its **Send message** title; there is no separate question control beside it. A pure
@@ -400,11 +403,10 @@ restores the frozen checkpoint without changing the task.
 A valid `/plan`, `/build` or `/review` command carrying an explicit `@Agent` shows a quiet
 caption naming who plans, implements and reviews code before Send.
 
-Keep the current author's Repair action. Offer **Choose repairer** with the other Agent's name
+Keep the current author's Repair action. Offer **Choose repairer** with the other active Agent's name
 when they can repair the current findings. Both this choice and an eligible request from the
 reviewer's reply use **Switch repair agent** in the existing InputReplacement. Keep the neutral border and raised surface with a static edge.
-Name who repairs and who reviews for the rest of the task in one sentence. Use **Repair with Codex**
-or **Repair with Claude Code**, and **Keep current roles**. State Full access when applicable.
+Name who repairs and who reviews for the rest of the task in one sentence. Use **Repair with Codex**, **Repair with Claude Code**, or **Repair with Antigravity**, and **Keep current roles**. State Full access when applicable.
 Keep cancellation, focus, error and receipt behavior. The confirmation also appears with Relay off.
 
 A future code-role change uses the same card and **Use suggested roles** action. Name the

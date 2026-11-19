@@ -1,7 +1,7 @@
 import { FileText, Maximize2, Minimize2, RotateCcw, X } from 'lucide-react'
 import { useLayoutEffect, useRef, type ReactNode } from 'react'
 
-import type { CollaborationDocument } from '@pact/contracts'
+import { agentDisplayName, type CollaborationDocument, type RuntimeAgentId } from '@pact/contracts'
 
 import type { PlanTextSelection } from './CollaborationReview'
 
@@ -13,7 +13,7 @@ export interface CurrentPlanDocument {
   runId: string
   messageId: string
   version: number
-  author: 'codex' | 'claude'
+  author: RuntimeAgentId
   content: string
   document?: CollaborationDocument | undefined
   sessionId?: string | undefined
@@ -105,7 +105,7 @@ export function CurrentPlanPanel({
           </div>
           {plan ? (
             <p className="mt-2 text-caption text-secondary">
-              {plan.author === 'claude' ? 'Claude Code' : 'Codex'} · {plan.status}
+              {agentDisplayName(plan.author)} · {plan.status}
             </p>
           ) : null}
         </div>

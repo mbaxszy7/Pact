@@ -74,7 +74,7 @@ function createEvent(overrides: {
   id?: string
   sessionId?: string
   sessionTitle?: string
-  agentId?: 'codex' | 'claude'
+  agentId?: 'codex' | 'claude' | 'agy'
   category?: 'needs_input' | 'failure' | 'completed'
   createdAt?: string
 }): SessionNotificationEvent {
@@ -133,9 +133,11 @@ function createFixture() {
           hasUnread: false,
           settings: {
             primaryAgentId: 'codex',
+            secondaryAgentId: 'claude',
             agents: {
               claude: { model: null, effort: null },
               codex: { model: null, effort: null },
+              agy: { model: null, effort: null },
             },
             maxDiscussionRounds: 3,
             maxReviewCycles: 3,
@@ -516,9 +518,11 @@ describe('SessionNotificationController & IPC', () => {
             hasUnread: false,
             settings: {
               primaryAgentId: 'codex',
+              secondaryAgentId: 'claude',
               agents: {
                 claude: { model: null, effort: null },
                 codex: { model: null, effort: null },
+                agy: { model: null, effort: null },
               },
               maxDiscussionRounds: 3,
               maxReviewCycles: 3,
@@ -562,6 +566,29 @@ describe('SessionNotificationController & IPC', () => {
       f.dispose()
       expect(harness.handlers.size).toBe(0)
       expect(f.badgeCounts.at(-1)).toBe(0)
+    } finally {
+      f.dispose()
+    }
+  })
+
+  it('uses Antigravity label for agy background desktop notifications', () => {
+    const f = createFixture()
+    try {
+      f.setWindowState({ focused: false })
+      f.emit(createEvent({ id: 'agy-1', agentId: 'agy', category: 'needs_input' }))
+      expect(harness.instances).toHaveLength(1)
+      expect(harness.instances[0]?.options).toEqual({
+        title: 'Pact',
+        body: 'Antigravity needs your input',
+        silent: false,
+      })
+
+      f.emit(createEvent({ id: 'agy-2', agentId: 'agy', category: 'completed' }))
+      expect(harness.instances.at(-1)?.options).toEqual({
+        title: 'Pact',
+        body: 'Antigravity finished a reply',
+        silent: false,
+      })
     } finally {
       f.dispose()
     }

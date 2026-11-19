@@ -1,6 +1,11 @@
 import type { CollaborationDocument, RuntimeAgentId } from '@pact/contracts'
 
-import { DECISION_CANDIDATES, DECISION_INPUT_BYTES, DECISION_SOURCES } from '@pact/contracts'
+import {
+  DECISION_CANDIDATES,
+  DECISION_INPUT_BYTES,
+  DECISION_SOURCES,
+  isAgentInPair,
+} from '@pact/contracts'
 
 export type RelaySourceRole =
   | 'task'
@@ -57,6 +62,8 @@ type RelayNodeFacts = {
   ordinary: boolean | null
   openMode?: boolean
   primary: RuntimeAgentId
+  /** Optional active 2-member pair restricting legal routing candidates. */
+  activePair?: readonly [RuntimeAgentId, RuntimeAgentId] | undefined
   route: 'implicit' | 'agent' | 'command' | 'all'
   inputSourceId: string
   referencedSourceIds: readonly string[]
@@ -128,7 +135,8 @@ export type RelayPolicyResult =
 const idValid = (value: string): boolean =>
   typeof value === 'string' && value.length > 0 && value.length <= 160
 const digestValid = (value: string): boolean => /^[a-f0-9]{64}$/u.test(value)
-const agentValid = (value: RuntimeAgentId): boolean => value === 'codex' || value === 'claude'
+const agentValid = (value: RuntimeAgentId): boolean =>
+  value === 'codex' || value === 'claude' || value === 'agy'
 const countValid = (value: number): boolean => Number.isSafeInteger(value) && value >= 0
 export function evaluateRelayPolicy(facts: RelayPolicyFacts): RelayPolicyResult {
   const admission = facts.admission
@@ -216,6 +224,18 @@ export function evaluateRelayPolicy(facts: RelayPolicyFacts): RelayPolicyResult 
           requiredSources: material.sources.map(({ id, roles }) => ({ id, roles: [...roles] })),
         }
   const ineligible: RelayPolicyResult = { kind: 'skip', reason: 'ineligible' }
+  if (
+    facts.activePair !== undefined &&
+    (facts.activePair.length !== 2 ||
+      !agentValid(facts.activePair[0]) ||
+      !agentValid(facts.activePair[1]) ||
+      facts.activePair[0] === facts.activePair[1] ||
+      !isAgentInPair(facts.primary, facts.activePair))
+  )
+    return ineligible
+  const candidateOrder = (['codex', 'claude', 'agy'] as const).filter(
+    (actor) => !facts.activePair || isAgentInPair(actor, facts.activePair),
+  )
   if (facts.openMode) {
     if (
       facts.route !== 'implicit' ||
@@ -228,7 +248,7 @@ export function evaluateRelayPolicy(facts: RelayPolicyFacts): RelayPolicyResult 
       const source = sources.get(id)
       if (!source || source.actor === null) return ineligible
     }
-    for (const actor of ['codex', 'claude'] as const) add('route_send', actor)
+    for (const actor of candidateOrder) add('route_send', actor)
   } else {
     if (
       facts.ordinary !== true ||
@@ -246,7 +266,7 @@ export function evaluateRelayPolicy(facts: RelayPolicyFacts): RelayPolicyResult 
       referenced.add(source.actor)
     }
     if (referenced.size < 2 && referenced.has(facts.primary)) return ineligible
-    for (const actor of ['codex', 'claude'] as const)
+    for (const actor of candidateOrder)
       if (actor === facts.primary || referenced.has(actor)) add('route_send', actor)
   }
   const information = facts.informationOpportunity

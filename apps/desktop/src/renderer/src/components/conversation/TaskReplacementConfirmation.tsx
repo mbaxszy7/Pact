@@ -1,7 +1,7 @@
 import { X } from 'lucide-react'
 import { useEffect, useId, useRef } from 'react'
 
-import type { CollaborationTask, RuntimeAgentId } from '@pact/contracts'
+import { agentDisplayName, type CollaborationTask, type RuntimeAgentId } from '@pact/contracts'
 
 interface TaskReplacementConfirmationProps {
   task: CollaborationTask
@@ -92,7 +92,7 @@ export function TaskReplacementConfirmation({
         <div id={descriptionId} className="space-y-2 text-body text-secondary">
           {running ? (
             <p>
-              {actor === 'claude' ? 'Claude Code' : 'Codex'} finishes this response first.{' '}
+              {agentDisplayName(actor)} finishes this response first.{' '}
               {unreviewedChanges
                 ? 'Current changes won’t be reviewed.'
                 : 'The current task will end.'}

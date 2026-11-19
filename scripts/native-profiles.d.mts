@@ -3,6 +3,8 @@ export const codexExecutionNativeCases: readonly string[]
 export const windowsOwnerNativeFiles: readonly string[]
 export const windowsOwnerNativeCases: readonly string[]
 export const windowsOwnerHostCases: readonly string[]
+export const agyNativeFiles: readonly string[]
+export const agyNativeCases: readonly string[]
 export function nativeProfileSupports(
   profile: ReturnType<typeof nativeProfile>,
   platform?: string,
@@ -14,11 +16,15 @@ export function nativeProfileSetupSupports(
   arch?: string,
 ): boolean
 export function nativeProfile(name?: string): {
-  name: 'legacy' | 'execution-codex' | 'windows-owner'
-  command: 'test:native' | 'test:native:execution' | 'test:native:windows-owner'
+  name: 'legacy' | 'execution-codex' | 'windows-owner' | 'agy'
+  command: 'test:native' | 'test:native:execution' | 'test:native:windows-owner' | 'test:native:agy'
   codexVersion: '0.159.2' | '0.163.0' | null
   claudeVersion?: null
-  directory: 'pact-native-cli' | 'pact-codex-execution-cli' | 'pact-windows-owner-native'
+  directory:
+    | 'pact-native-cli'
+    | 'pact-codex-execution-cli'
+    | 'pact-windows-owner-native'
+    | 'pact-agy-native-cli'
   files: readonly string[] | null
   cases?: readonly string[]
 }

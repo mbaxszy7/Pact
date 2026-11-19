@@ -36,7 +36,7 @@ export {
   type RelayWorkflowTurnSource,
 } from './conversation-repository.js'
 export { ProjectCatalogRepository } from './project-catalog-repository.js'
-export { projectSessionIssues } from './session-issues.js'
+export { isRetiredAgentRecoverySettled, projectSessionIssues } from './session-issues.js'
 export {
   SideChatPersistenceError,
   type CapturedCutoffRecord,
@@ -63,6 +63,7 @@ export {
 export {
   OversizedCatalogSessionError,
   SessionRepository,
+  SessionSettingsConflictError,
   StaleCatalogCursorError,
   StaleSessionGroupError,
   type NewSessionRecord,

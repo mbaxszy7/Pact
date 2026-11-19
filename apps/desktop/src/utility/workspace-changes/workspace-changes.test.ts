@@ -65,7 +65,12 @@ import {
 const migrationsFolder = resolve(import.meta.dirname, '../../../../../packages/persistence/drizzle')
 const settings: DefaultSessionSettings = {
   primaryAgentId: 'codex',
-  agents: { claude: { model: null, effort: null }, codex: { model: null, effort: null } },
+  secondaryAgentId: 'claude',
+  agents: {
+    claude: { model: null, effort: null },
+    codex: { model: null, effort: null },
+    agy: { model: null, effort: null },
+  },
   maxDiscussionRounds: 6,
 
   maxReviewCycles: 3,

@@ -83,6 +83,7 @@ interface ConfigurationSource {
 export interface ProviderConfiguration {
   claudePath: string
   codexPath: string
+  agyPath?: string
   models: { claude: string | null; codex: string | null }
   configurationFingerprint: string
   sourceHashes: ReadonlyArray<{ file: ConfigurationSource['destination']; sha256: string }>
@@ -100,6 +101,7 @@ export interface ProviderEnvironment {
   sessionDataDirectory: string
   claudePath: string | null
   codexPath: string | null
+  agyPath?: string | null
 }
 
 // Weak ownership avoids a process-wide credential cache; contents live only with a run's config.
@@ -374,6 +376,34 @@ async function findExecutable(
   )
 }
 
+async function findOptionalAgyExecutable(
+  environment: NodeJS.ProcessEnv,
+): Promise<string | undefined> {
+  const explicit = environment['PACT_E2E_AGY_EXECUTABLE']
+  if (explicit === undefined) return undefined
+  const trimmed = explicit.trim()
+  if (
+    !trimmed ||
+    !isAbsolute(trimmed) ||
+    /[\r\n\0]/u.test(trimmed) ||
+    (process.platform === 'win32' && /\.cmd$/iu.test(trimmed) && /[&|<>^%!"\r\n\0]/u.test(trimmed))
+  ) {
+    fail('agy executable must be a safe absolute path')
+  }
+  try {
+    const path = await realpath(trimmed)
+    const info = await stat(path)
+    if (!info.isFile()) fail('agy executable must be a regular file')
+    await access(path, process.platform === 'win32' ? constants.F_OK : constants.X_OK)
+    return path
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('E2E provider configuration:')) {
+      throw error
+    }
+    return fail('agy CLI was not found at its explicit E2E executable path')
+  }
+}
+
 function referencedEnvironment(config: Record<string, unknown>): Set<string> {
   const keys = new Set<string>()
   const pending: unknown[] = [config]
@@ -463,9 +493,10 @@ export async function loadProviderConfiguration(
         : requireSetting(claudeEnvironment['ANTHROPIC_MODEL'], 'Claude model'),
     codex: codex['model'] === undefined ? null : requireSetting(codex['model'], 'Codex model'),
   }
-  const [claudePath, codexPath] = await Promise.all([
+  const [claudePath, codexPath, agyPath] = await Promise.all([
     findExecutable('claude', sourceEnvironment),
     findExecutable('codex', sourceEnvironment),
+    findOptionalAgyExecutable(sourceEnvironment),
   ])
   const secretValues = [...secrets]
     .filter((value) => value.length >= 4)
@@ -473,6 +504,7 @@ export async function loadProviderConfiguration(
   const configuration: ProviderConfiguration = {
     claudePath,
     codexPath,
+    ...(agyPath ? { agyPath } : {}),
     models,
     configurationFingerprint: hash(
       sources.map((source) => `${source.destination}:${source.sha256}`).join('\n') +
@@ -676,5 +708,6 @@ export async function prepareProviderEnvironment(
     sessionDataDirectory,
     claudePath: config?.claudePath ?? null,
     codexPath: config?.codexPath ?? null,
+    agyPath: config?.agyPath ?? null,
   }
 }

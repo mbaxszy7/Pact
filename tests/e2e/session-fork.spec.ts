@@ -32,7 +32,12 @@ async function seed(fixture: RuntimeFixture, both: boolean, commit: boolean) {
       { id: sourceId, projectId, title: 'Fork source', createdAt },
       {
         primaryAgentId: 'codex',
-        agents: { claude: { model: null, effort: null }, codex: { model: null, effort: null } },
+        secondaryAgentId: 'claude',
+        agents: {
+          claude: { model: null, effort: null },
+          codex: { model: null, effort: null },
+          agy: { model: null, effort: null },
+        },
         maxDiscussionRounds: 3,
         maxReviewCycles: 2,
         maxRepairAttempts: 2,
@@ -142,9 +147,11 @@ async function seedNativeSource(fixture: RuntimeFixture, resolvedModel: string) 
       { id: sourceId, projectId, title: 'Native fork source', createdAt },
       {
         primaryAgentId: 'codex',
+        secondaryAgentId: 'claude',
         agents: {
           claude: { model: 'opus', effort: 'high' },
           codex: { model: 'gpt-fixture', effort: 'medium' },
+          agy: { model: null, effort: null },
         },
         maxDiscussionRounds: 3,
         maxReviewCycles: 2,

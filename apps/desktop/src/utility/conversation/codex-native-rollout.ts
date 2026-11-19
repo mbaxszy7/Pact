@@ -3,7 +3,7 @@ import { constants } from 'node:fs'
 import { lstat, open, realpath } from 'node:fs/promises'
 import { isAbsolute, relative } from 'node:path'
 
-import type { NativeInitializationWitness } from '@pact/contracts'
+import type { CodexInitializationWitness, NativeInitializationWitness } from '@pact/contracts'
 
 import { nativeInitializationWitnessSchema } from '@pact/contracts'
 
@@ -37,7 +37,7 @@ export async function readCodexInitializationRollout(
   input: CodexInitializationRolloutInput,
   signal: AbortSignal,
   observePhysicalCompletion?: (completion: Promise<void>) => void,
-): Promise<NativeInitializationWitness> {
+): Promise<CodexInitializationWitness> {
   const reservation = new NativeWorkingMemory().reserve(NATIVE_OWNER_WORKING_BYTES)
   const physical = Promise.withResolvers<void>()
   observePhysicalCompletion?.(physical.promise)
@@ -62,9 +62,12 @@ export async function readCodexInitializationRollout(
       !isAbsolute(input.path)
     )
       throw invalid('The native initialization rollout identity is incomplete.')
-    const witness = input.witness
+    const rawWitness = input.witness
       ? nativeInitializationWitnessSchema.parse(input.witness)
       : undefined
+    if (rawWitness && rawWitness.kind !== 'codex_rollout_v1')
+      throw invalid('The stored initialization witness belongs to another runtime.')
+    const witness = rawWitness
 
     if (witness && witness.nativeSessionId !== input.nativeSessionId)
       throw invalid('The stored native initialization witness belongs to another Session.')

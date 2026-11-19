@@ -30,7 +30,12 @@ async function seed(fixture: RuntimeFixture, history = 1, largeDetail = false) {
       { id: sessionId, projectId, title: 'Visible Session', createdAt },
       {
         primaryAgentId: 'codex',
-        agents: { claude: { model: null, effort: null }, codex: { model: null, effort: null } },
+        secondaryAgentId: 'claude',
+        agents: {
+          claude: { model: null, effort: null },
+          codex: { model: null, effort: null },
+          agy: { model: null, effort: null },
+        },
         maxDiscussionRounds: 6,
         maxReviewCycles: 3,
         maxRepairAttempts: 3,

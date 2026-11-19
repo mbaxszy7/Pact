@@ -1,10 +1,11 @@
-import type {
-  AgentRun,
-  NativeAgentContext,
-  NativeRebuildOperation,
-  RuntimeAgentId,
-  SessionIssue,
-  SessionIssues,
+import {
+  agentDisplayName,
+  type AgentRun,
+  type NativeAgentContext,
+  type NativeRebuildOperation,
+  type RuntimeAgentId,
+  type SessionIssue,
+  type SessionIssues,
 } from '@pact/contracts'
 
 export type SessionIssueRun = Pick<
@@ -37,9 +38,31 @@ export type SessionIssueContext = Pick<
   | 'recoveryReason'
   | 'recoveryFailureMessage'
 > &
-  Partial<Pick<NativeAgentContext, 'lastRunId' | 'executorId'>> & {
+  Partial<Pick<NativeAgentContext, 'lastRunId' | 'executorId' | 'permissionRequests'>> & {
     rebuildOperation?: SessionIssueRebuild | undefined
+    hasPendingPermission?: boolean | undefined
   }
+
+export function isRetiredAgentRecoverySettled(input: {
+  continuationState: string | undefined
+  recoveryAction?: string | null | undefined
+  recoveryFailureKind?: string | null | undefined
+  hasPendingPermission?: boolean | undefined
+  hasPendingRebuild?: boolean | undefined
+  hasUnsettledRun?: boolean | undefined
+}): boolean {
+  if (input.hasPendingPermission || input.hasPendingRebuild || input.hasUnsettledRun) {
+    return false
+  }
+  if (input.continuationState === undefined || input.continuationState === 'ready') {
+    return true
+  }
+  return (
+    input.continuationState === 'recovery_required' &&
+    input.recoveryAction !== 'check' &&
+    input.recoveryFailureKind !== 'unknown_delivery'
+  )
+}
 
 /** Pure, bounded projection of durable facts; never dispatches or infers an ending. */
 export function projectSessionIssues(
@@ -50,15 +73,19 @@ export function projectSessionIssues(
   incompleteResults: string[] = [],
   operations: Array<{ agentId: RuntimeAgentId; operation: SessionIssueRebuild }> = [],
   presentation?: {
-    isArchivedRejection: (error: unknown, nativeSessionId: string) => boolean
-    sanitize: (value: string, maximum: number) => string
+    isArchivedRejection?: (error: unknown, nativeSessionId: string) => boolean
+    sanitize?: (value: string, maximum: number) => string
+    activeAgents?: readonly [RuntimeAgentId, RuntimeAgentId] | undefined
   },
 ): SessionIssues {
   const isCodexArchivedSessionRejection = presentation?.isArchivedRejection ?? (() => false)
   const safeNativePermissionText = presentation?.sanitize ?? (() => '')
+  const activeAgents = presentation?.activeAgents
   const agents: SessionIssue[] = []
   let inputGate: SessionIssues['inputGate'] = 'open'
-  for (const agentId of ['codex', 'claude'] as const) {
+  for (const agentId of ['codex', 'claude', 'agy'] as const) {
+    const isActiveMember =
+      !activeAgents || activeAgents[0] === agentId || activeAgents[1] === agentId
     const context = contexts.find((item) => item.agentId === agentId)
     const latest = runs.find((item) => item?.agentId === agentId)
     const cursor = cursors.find((item) => item?.agentId === agentId)
@@ -118,8 +145,25 @@ export function projectSessionIssues(
       (!run.nativeOutcome || incompleteResults.includes(run.id))
     const unsettledEffects =
       !processing && run && ['pending', 'unknown'].includes(run.nativeEffectsState ?? '')
+    const hasPendingPermission =
+      Boolean(context?.hasPendingPermission) || Boolean(context?.permissionRequests?.length)
+    if (
+      !isActiveMember &&
+      isRetiredAgentRecoverySettled({
+        continuationState: state,
+        recoveryAction: context?.recoveryAction,
+        recoveryFailureKind: context?.recoveryFailureKind,
+        hasPendingPermission,
+        hasPendingRebuild: Boolean(pending) || state === 'rebuilding',
+        hasUnsettledRun:
+          Boolean(processing || uncertainWork || unsettledEffects || lostForeground) || incomplete,
+      })
+    )
+      continue
+    if (!isActiveMember && !blocked && !lostForeground && !uncertainWork && !unsettledEffects)
+      continue
     if (!blocked && !lostForeground && !failed && !incomplete && !unsettledEffects) continue
-    const name = agentId === 'codex' ? 'Codex' : 'Claude Code'
+    const name = agentDisplayName(agentId)
     const inputDisposition: SessionIssue['inputDisposition'] =
       !run || run.dispatchPhase === 'not_sent' || run.dispatchPhase === 'rejected'
         ? 'not_submitted'

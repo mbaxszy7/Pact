@@ -4994,7 +4994,12 @@ it('roundtrips actual immutable current and historical Sources through SDK and n
       { id: sessionId, projectId, title: 'SDK source seam', createdAt },
       {
         primaryAgentId: 'claude',
-        agents: { codex: { model: null, effort: null }, claude: { model: null, effort: null } },
+        secondaryAgentId: 'codex',
+        agents: {
+          codex: { model: null, effort: null },
+          claude: { model: null, effort: null },
+          agy: { model: null, effort: null },
+        },
         maxDiscussionRounds: 6,
         maxReviewCycles: 3,
         maxRepairAttempts: 3,

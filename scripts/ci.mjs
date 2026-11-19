@@ -55,8 +55,10 @@ const systemKeys = [
   'PACT_E2E_POWERSHELL_EXECUTABLE',
   'PACT_E2E_CLAUDE_EXECUTABLE',
   'PACT_E2E_CODEX_EXECUTABLE',
+  'PACT_E2E_AGY_EXECUTABLE',
   'PACT_NATIVE_CLAUDE_EXECUTABLE',
   'PACT_NATIVE_CODEX_EXECUTABLE',
+  'PACT_NATIVE_AGY_EXECUTABLE',
   'PACT_NATIVE_CODEX_PACKAGE_ROOT',
   'PACT_NATIVE_EXECUTION_CODEX_EXECUTABLE',
   'PACT_NATIVE_EXECUTION_CODEX_VERSION',
@@ -424,6 +426,8 @@ export async function main(args = process.argv.slice(2), source = process.env) {
     }
     if (profile.name === 'windows-owner' && !nativeProfileSupports(profile))
       throw new Error('The Windows owner profile requires a native Windows x64 or arm64 runner')
+    if (profile.name === 'agy' && !nativeProfileSupports(profile))
+      throw new Error('The Antigravity native profile requires an x64 or arm64 runner')
     const temporaryReport = !source.PACT_CI_NATIVE_REPORT_DIR
     const directory =
       source.PACT_CI_NATIVE_REPORT_DIR ?? (await mkdtemp(join(tmpdir(), 'pact-native-report-')))

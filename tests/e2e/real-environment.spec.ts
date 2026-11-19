@@ -28,7 +28,9 @@ test(
       expect(versions.map((row) => row.exitCode)).toEqual([0, 0])
       const app = await fixture.launch(),
         page = await app.firstWindow()
-      await expect(page.getByText('2 of 2 ready', { exact: true })).toBeVisible({ timeout: 30_000 })
+      await expect(
+        page.getByText('2 of 3 ready · Minimum 2 required', { exact: true }),
+      ).toBeVisible({ timeout: 30_000 })
       await expect(
         page.getByText('Detected: ' + versions[0].stdout.trim(), { exact: true }),
       ).toBeVisible()
@@ -42,7 +44,12 @@ test(
         const bridge: DesktopBridge = Reflect.get(globalThis, 'pact')
         return bridge.getRuntimePreparation()
       })
-      expect(ready.ok && ready.value.agents.map((row) => row.state)).toEqual(['ready', 'ready'])
+      expect(
+        ready.ok &&
+          ready.value.agents
+            .filter((row) => row.agentId === 'claude' || row.agentId === 'codex')
+            .map((row) => row.state),
+      ).toEqual(['ready', 'ready'])
     } finally {
       await fixture.dispose()
     }
@@ -72,7 +79,9 @@ test(
       await expect(row.getByRole('button', { name: 'Locate manually…' })).toHaveCount(0)
       await expect(page.getByRole('button', { name: 'Continue', exact: true })).toHaveCount(0)
       await expect(page.getByRole('button', { name: 'Check again', exact: true })).toBeEnabled()
-      await expect(page.getByText('1 of 2 ready', { exact: true })).toBeVisible()
+      await expect(
+        page.getByText('1 of 3 ready · Minimum 2 required', { exact: true }),
+      ).toBeVisible()
     } finally {
       await fixture.dispose()
     }

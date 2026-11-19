@@ -1801,7 +1801,13 @@ function SessionActivityIndicator({
     )
   }
   const agentName =
-    activity.agentId === 'claude' ? 'Claude Code' : activity.agentId === 'codex' ? 'Codex' : 'Agent'
+    activity.agentId === 'claude'
+      ? 'Claude Code'
+      : activity.agentId === 'codex'
+        ? 'Codex'
+        : activity.agentId === 'agy'
+          ? 'Antigravity'
+          : 'Agent'
   const details = {
     agent_working: {
       label: `${agentName} is working`,

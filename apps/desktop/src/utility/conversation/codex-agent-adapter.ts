@@ -15,6 +15,7 @@ import type {
   SessionPermissionMode,
   NormalizedAgentEvent,
   RunEffectiveExecutionSettings,
+  RuntimeAgentId,
 } from '@pact/contracts'
 
 import {
@@ -135,6 +136,7 @@ function codexCapabilityError(message: string): AgentExecutionError {
 export interface CodexRunConfiguration {
   model: string
   effort: string | null
+  peerTargetAgentId?: RuntimeAgentId | undefined
 }
 
 type OwnedCodexProcess = {
@@ -610,10 +612,9 @@ export class CodexAgentAdapter implements AgentAdapter {
   private disposed = false
   private disposal: Promise<void> | undefined
   private readonly loadedThreadIds = new Set<string>()
-  private readonly loadedThreadConfigurations = new Map<
-    string,
-    { model: string; effort: string | null }
-  >()
+  private readonly loadedThreadConfigurations = new Map<string, CodexRunConfiguration>()
+  private connectionPeerTarget: RuntimeAgentId | undefined
+  private currentPeerTarget: RuntimeAgentId = 'claude'
   private skillCatalogChanged: (() => void) | undefined
   setSkillCatalogListener(listener: (() => void) | undefined): void {
     this.skillCatalogChanged = listener
@@ -641,6 +642,7 @@ export class CodexAgentAdapter implements AgentAdapter {
     private readonly processFactory?: CodexProcessFactory,
     private readonly nativeReadOptions: { storageRoot?: string } = {},
     private readonly ipcTraffic?: LogicalIpcWorkerTraffic,
+    private readonly resolvePeerTarget?: (sessionId: string) => RuntimeAgentId | undefined,
   ) {
     this.nativeForkFiles = new NativeForkFiles(ipcTraffic, (signal, physicalCompletion) =>
       this.nativeCheck.observeRequest(signal, physicalCompletion),
@@ -4087,8 +4089,17 @@ export class CodexAgentAdapter implements AgentAdapter {
     }
 
     try {
-      connection = await this.ensureConnection(input.cwd)
+      const resolvedPeerCandidate = this.resolvePeerTarget?.(input.sessionId)
+      const expectedPeerTarget: RuntimeAgentId =
+        resolvedPeerCandidate && resolvedPeerCandidate !== 'codex'
+          ? resolvedPeerCandidate
+          : 'claude'
       const expectedRecovery = input.recovery?.expected
+      connection = await this.ensureConnection(
+        input.cwd,
+        expectedRecovery ? undefined : expectedPeerTarget,
+        input.nativeSessionId,
+      )
       if (
         expectedRecovery &&
         (expectedRecovery.executorId !== connection.executorId ||
@@ -4100,13 +4111,15 @@ export class CodexAgentAdapter implements AgentAdapter {
       input.recordExecutor?.(connection.executorId)
       background.connection = connection
       this.nativeBackground.add(background)
+      this.currentPeerTarget = expectedPeerTarget
+      this.peerToolServer.setExpectedTarget(expectedPeerTarget)
       await this.initializeConnection(connection, signal)
       background.sourceReadForm =
         this.nativeSourceContextSupported && input.collaborationSourceReader?.readNativeRoot
           ? 'nativeRoot'
           : 'legacy'
       peerReceipt = this.peerToolServer.beginTurn(
-        'claude',
+        expectedPeerTarget,
         !workflow && input.peerAssistanceAllowed !== false,
         workflow,
         input.promptEnvelope.requestSessionTitle === true,
@@ -4351,7 +4364,11 @@ export class CodexAgentAdapter implements AgentAdapter {
           input.recordDispatch?.('rejected', resolvedThreadId, connection.executorId)
           throw error
         }
-        this.rememberThread(resolvedThreadId)
+        const priorConfig = this.loadedThreadConfigurations.get(resolvedThreadId)
+        this.rememberThread(
+          resolvedThreadId,
+          priorConfig ? { ...priorConfig, peerTargetAgentId: expectedPeerTarget } : undefined,
+        )
         // Absent reasoningEffort is unknown. It must not become a known-null
         // default merely because the display configuration accepts null.
         const effectiveEffort = input.effort ?? resolvedEffort
@@ -4376,7 +4393,10 @@ export class CodexAgentAdapter implements AgentAdapter {
             model: resolvedModel,
             ...(typeof resolvedEffort === 'string' ? { reasoningEffort: resolvedEffort } : {}),
           })
-          this.rememberThread(resolvedThreadId, configuration)
+          this.rememberThread(resolvedThreadId, {
+            ...configuration,
+            peerTargetAgentId: expectedPeerTarget,
+          })
           yield* resolvedModelEvent(configuration)
         }
         yield { agentId: 'codex', type: 'session.started', nativeSessionId: threadId }
@@ -4901,6 +4921,7 @@ export class CodexAgentAdapter implements AgentAdapter {
               turnId,
               this.peerToolServer.capabilityReceipt,
               this.peerServerName,
+              expectedPeerTarget,
             )
             if (
               proposal &&
@@ -5965,7 +5986,11 @@ export class CodexAgentAdapter implements AgentAdapter {
     await connection.respond(id, response)
   }
 
-  private async ensureConnection(cwd: string): Promise<CodexAppServerConnection> {
+  private async ensureConnection(
+    cwd: string,
+    peerTargetAgentId?: RuntimeAgentId,
+    nativeSessionId?: string,
+  ): Promise<CodexAppServerConnection> {
     if (this.disposed || this.disposal)
       throw new AgentExecutionError('agent_process_crash', 'Codex is shutting down.', false)
     const storageRoot = resolvePath(
@@ -5979,20 +6004,41 @@ export class CodexAgentAdapter implements AgentAdapter {
     const key = createHash('sha256')
       .update(JSON.stringify({ executable: this.executablePath, cwd, env }))
       .digest('hex')
-    if (this.connection?.isOpen && this.processCwd === cwd && this.processEnvironmentKey === key)
+    const loadedThreadPeer =
+      nativeSessionId !== undefined
+        ? this.loadedThreadConfigurations.get(nativeSessionId)?.peerTargetAgentId
+        : undefined
+    const loadedPeerMismatch =
+      peerTargetAgentId !== undefined &&
+      ((this.connectionPeerTarget !== undefined &&
+        this.connectionPeerTarget !== peerTargetAgentId) ||
+        (loadedThreadPeer !== undefined && loadedThreadPeer !== peerTargetAgentId))
+    if (
+      this.connection?.isOpen &&
+      this.processCwd === cwd &&
+      this.processEnvironmentKey === key &&
+      !loadedPeerMismatch
+    ) {
+      if (peerTargetAgentId !== undefined && this.connectionPeerTarget === undefined) {
+        this.connectionPeerTarget = peerTargetAgentId
+      }
       return this.connection
+    }
+    const startingKey = peerTargetAgentId !== undefined ? `${key}:${peerTargetAgentId}` : key
     if (this.connectionStarting) {
-      if (this.connectionStarting.key === key) return this.connectionStarting.task
+      if (this.connectionStarting.key === startingKey || this.connectionStarting.key === key) {
+        return this.connectionStarting.task
+      }
       throw new AgentExecutionError(
         'runtime_incompatible',
         'Codex is already starting with another native configuration. No new process was started.',
         false,
       )
     }
-    const task = this.openConnection(cwd, storageRoot, env, key).finally(() => {
+    const task = this.openConnection(cwd, storageRoot, env, key, peerTargetAgentId).finally(() => {
       if (this.connectionStarting?.task === task) this.connectionStarting = undefined
     })
-    this.connectionStarting = { key, task }
+    this.connectionStarting = { key: startingKey, task }
     return task
   }
 
@@ -6001,6 +6047,7 @@ export class CodexAgentAdapter implements AgentAdapter {
     storageRoot: string,
     env: NodeJS.ProcessEnv,
     environmentKey: string,
+    peerTargetAgentId?: RuntimeAgentId,
   ): Promise<CodexAppServerConnection> {
     if (this.connection?.isOpen && this.hasActiveBackgroundWork())
       throw new AgentExecutionError(
@@ -6009,7 +6056,10 @@ export class CodexAgentAdapter implements AgentAdapter {
         false,
       )
     const previous = this.connection
-    if (previous) this.detachConnection(previous)
+    if (previous) {
+      this.detachConnection(previous)
+      this.peerServerName = `pact_peer_${randomUUID().replaceAll('-', '')}`
+    }
     if (previous) await this.closeConnection(previous, new Error('Codex connection replaced.'))
     await this.closingConnection
     if (this.disposed)
@@ -6063,6 +6113,7 @@ export class CodexAgentAdapter implements AgentAdapter {
     this.retiredNativeChildren.clear()
     this.loadedThreadIds.clear()
     this.loadedThreadConfigurations.clear()
+    this.connectionPeerTarget = peerTargetAgentId
     return connection
   }
 
@@ -6232,6 +6283,7 @@ export class CodexAgentAdapter implements AgentAdapter {
     this.nativeSourceContextSupported = false
     this.loadedThreadIds.clear()
     this.loadedThreadConfigurations.clear()
+    this.connectionPeerTarget = undefined
     for (const receipt of this.nativeRebuildReceipts.values()) {
       if (receipt.executorId !== connection.executorId) continue
       // Actual transport release is not initialization completion evidence.
@@ -6684,6 +6736,7 @@ export class CodexAgentAdapter implements AgentAdapter {
     const servers = Reflect.get(config, 'mcp_servers') ?? {}
     if (servers && typeof servers === 'object' && Object.hasOwn(servers, this.peerServerName))
       this.peerServerName = `pact_peer_${randomUUID().replaceAll('-', '')}`
+    this.connectionPeerTarget = this.currentPeerTarget
     const approvalPolicy = Reflect.get(config, 'approval_policy')
     const sandbox = Reflect.get(config, 'sandbox_mode')
     const reviewer = Reflect.get(config, 'approvals_reviewer') ?? 'user'
@@ -6992,6 +7045,7 @@ export class CodexAgentAdapter implements AgentAdapter {
     turnId: string,
     expectedReceipt: string,
     serverName: string,
+    expectedTarget: RuntimeAgentId = 'claude',
   ): Extract<NormalizedAgentEvent, { type: 'peer.assistance.requested' }> | undefined {
     if (
       Reflect.get(item, 'status') !== 'completed' ||
@@ -7001,7 +7055,7 @@ export class CodexAgentAdapter implements AgentAdapter {
       return undefined
     const input = Reflect.get(item, 'arguments')
     const parsed = peerRequestToolInputSchema.safeParse(input)
-    if (!parsed.success || parsed.data.target !== 'claude') return undefined
+    if (!parsed.success || parsed.data.target !== expectedTarget) return undefined
     const result = Reflect.get(item, 'result')
     const structured =
       result && typeof result === 'object' ? Reflect.get(result, 'structuredContent') : undefined
@@ -7021,7 +7075,7 @@ export class CodexAgentAdapter implements AgentAdapter {
       type: 'peer.assistance.requested',
       turnId,
       proposalId: randomUUID(),
-      targetAgentId: 'claude',
+      targetAgentId: parsed.data.target,
       kind: parsed.data.kind,
       ...(parsed.data.reason ? { reason: parsed.data.reason } : {}),
     }

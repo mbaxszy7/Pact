@@ -31,7 +31,12 @@ afterEach(async () => {
 describe('Peer proposal persistence', () => {
   const settings: DefaultSessionSettings = {
     primaryAgentId: 'codex',
-    agents: { claude: { model: null, effort: null }, codex: { model: null, effort: null } },
+    secondaryAgentId: 'claude',
+    agents: {
+      claude: { model: null, effort: null },
+      codex: { model: null, effort: null },
+      agy: { model: null, effort: null },
+    },
     maxDiscussionRounds: 6,
 
     maxReviewCycles: 3,

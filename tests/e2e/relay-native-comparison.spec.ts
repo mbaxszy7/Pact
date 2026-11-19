@@ -37,6 +37,7 @@ test(
           sessionId,
           settings: {
             primaryAgentId: 'codex',
+            secondaryAgentId: 'claude',
             agents: { ...prior.agents, codex: { model: 'gpt-6-luna', effort: 'low' } },
             maxDiscussionRounds: prior.maxDiscussionRounds,
             maxReviewCycles: prior.maxReviewCycles,

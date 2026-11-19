@@ -1,8 +1,9 @@
 import { z } from 'zod'
 
 export const PROVIDER_USAGE_SNAPSHOT_BYTES = 8 * 1024
+export const MAX_PROVIDER_USAGE_POOLS = 4
 
-export const providerUsageProviderSchema = z.enum(['claude', 'codex'])
+export const providerUsageProviderSchema = z.enum(['claude', 'codex', 'agy'])
 export type ProviderUsageProvider = z.infer<typeof providerUsageProviderSchema>
 
 export const providerUsageStatusSchema = z.enum([
@@ -27,6 +28,14 @@ export const providerUsageWindowSchema = z.strictObject({
 })
 export type ProviderUsageWindow = z.infer<typeof providerUsageWindowSchema>
 
+export const providerUsagePoolSchema = z.strictObject({
+  id: z.string().min(1).max(64),
+  label: z.string().min(1).max(64),
+  fiveHour: providerUsageWindowSchema.nullable(),
+  sevenDay: providerUsageWindowSchema.nullable(),
+})
+export type ProviderUsagePool = z.infer<typeof providerUsagePoolSchema>
+
 export const providerUsageSnapshotSchema = z
   .strictObject({
     provider: providerUsageProviderSchema,
@@ -34,6 +43,7 @@ export const providerUsageSnapshotSchema = z
     status: providerUsageStatusSchema,
     fiveHour: providerUsageWindowSchema.nullable(),
     sevenDay: providerUsageWindowSchema.nullable(),
+    pools: z.array(providerUsagePoolSchema).min(1).max(MAX_PROVIDER_USAGE_POOLS).optional(),
     checkedAt: z.iso.datetime().nullable(),
     cooldownUntil: z.iso.datetime().nullable(),
     identityConfirmed: z.boolean(),

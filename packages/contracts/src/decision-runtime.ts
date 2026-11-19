@@ -50,7 +50,7 @@ export type DecisionCapabilityReason = z.infer<typeof decisionCapabilityReasonSc
 /** A completed zero-inference inspection of native compatibility, never future dispatch authority. */
 export const decisionCapabilitySchema = z
   .strictObject({
-    provider: z.enum(['codex', 'claude']),
+    provider: z.enum(['codex', 'claude', 'agy']),
     modelId: z.string().min(1).max(256),
     status: z.enum(['supported', 'unavailable']),
     supported: z.boolean(),

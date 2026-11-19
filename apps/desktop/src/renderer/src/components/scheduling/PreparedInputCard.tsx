@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from 'react'
 
-import type {
-  ConversationPage,
-  PreparedInputContinuation,
-  PreparedInputContinue,
+import {
+  agentDisplayName,
+  type ConversationPage,
+  type PreparedInputContinuation,
+  type PreparedInputContinue,
 } from '@pact/contracts'
 
 type SourcePage = Extract<ConversationPage, { scope: 'prepared-input' }>
@@ -187,7 +188,7 @@ export function PreparedInputCard({
           ) : null}
           {input.preview ? <p className="relay-action-explanation">{input.preview}</p> : null}
           <p className="relay-action-target">
-            {input.agentId === 'codex' ? 'Codex' : 'Claude Code'} · {executionLabel}
+            {agentDisplayName(input.agentId)} · {executionLabel}
             {input.commentCount > 0
               ? ` · ${input.commentCount} ${input.commentCount === 1 ? 'Comment' : 'Comments'}`
               : ''}

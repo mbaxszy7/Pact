@@ -108,9 +108,11 @@ export function seedRoutingScenario(
     { id: sessionId, projectId, title: `Routing ${label}`, createdAt },
     {
       primaryAgentId: 'claude',
+      secondaryAgentId: 'codex',
       agents: {
         codex: { model: 'gpt-6-luna', effort: 'low' },
         claude: { model: claudeModel, effort: null },
+        agy: { model: null, effort: null },
       },
       maxDiscussionRounds: 6,
       maxReviewCycles: 3,

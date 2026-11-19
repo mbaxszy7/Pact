@@ -9,16 +9,18 @@ import type {
   CollaborationSession,
   ConversationPage,
   MessageCommentAnchor,
+  RuntimeAgentId,
 } from '@pact/contracts'
 
 import {
+  agentDisplayName,
   collaborationContinuationLimit,
   collaborationActor,
   collaborationInputGate,
   collaborationInputProcessing,
-  defaultTaskStageRoles,
   isCollaborationOpenMode,
   otherAgent,
+  resolveLegacyCompatibleTaskStageRoles,
 } from '@pact/contracts'
 
 import type { ProjectFileTarget } from './MessageMarkdown'
@@ -39,7 +41,7 @@ export type ReportTextSelection = MessageTextSelection & {
   textBasis?: 'markdown-visible-v2' | 'plain-visible-v1' | undefined
   contentHash?: string | undefined
 }
-const agentName = (id: 'claude' | 'codex'): string => (id === 'claude' ? 'Claude Code' : 'Codex')
+const agentName = (id: RuntimeAgentId): string => agentDisplayName(id)
 const verdictLabel = {
   accepted: 'Accepted',
   changes_requested: 'Changes requested',
@@ -340,30 +342,36 @@ export const CollaborationReview = memo(function CollaborationReview({
       )
     : []
   const draftBlocksActions = feedbackDraft && actions.some((action) => action !== 'recover_plan')
-  const codeRoles = task.stageRoles ?? defaultTaskStageRoles(task.owner)
+  const codeRoles = resolveLegacyCompatibleTaskStageRoles(task)
+  const taskPair: readonly [RuntimeAgentId, RuntimeAgentId] =
+    task.owner !== task.reviewer
+      ? [task.owner, task.reviewer]
+      : [codeRoles.planAuthor, codeRoles.planReviewer]
   const canOpenLimitSettings = Boolean(continuationLimit && onOpenSessionSettings)
   const actionLabel = (action: CollaborationAction): string =>
     ({
       execute: `Implement plan · ${agentName(
         isCollaborationOpenMode(task) && task.review
-          ? otherAgent(task.review.actor)
+          ? otherAgent(task.review.actor, taskPair)
           : collaborationActor(task, 'implement'),
       )}`,
       review_plan: `Review plan · ${agentName(
         isCollaborationOpenMode(task) && task.unreviewedPlanActor
-          ? otherAgent(task.unreviewedPlanActor)
+          ? otherAgent(task.unreviewedPlanActor, taskPair)
           : collaborationActor(task, 'plan_review'),
       )}`,
       review_code: `Review code · ${agentName(
         task.unreviewedCodeActor
-          ? otherAgent(task.unreviewedCodeActor)
+          ? otherAgent(task.unreviewedCodeActor, taskPair)
           : collaborationActor(task, 'code_review'),
       )}`,
       fix:
         task.review?.runId === task.runId && task.review.stage === 'plan_review'
-          ? `Update plan · ${agentName(otherAgent(task.review.actor))}`
+          ? `Update plan · ${agentName(otherAgent(task.review.actor, taskPair))}`
           : `Fix issues · ${agentName(
-              task.review ? otherAgent(task.review.actor) : collaborationActor(task, 'repair'),
+              task.review
+                ? otherAgent(task.review.actor, taskPair)
+                : collaborationActor(task, 'repair'),
             )}`,
       swap_code_roles: 'Swap implementer',
       resume: `Update plan · ${agentName(collaborationActor(task, 'plan'))}`,

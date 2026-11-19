@@ -104,7 +104,7 @@ export const preparedInputContinuationSchema = z.strictObject({
   commentCount: z.number().int().nonnegative().max(12),
   hasAnswer: z.boolean(),
   phase: z.enum(['paused', 'preparing']),
-  agentId: z.enum(['codex', 'claude']),
+  agentId: z.enum(['codex', 'claude', 'agy']),
   settingsRevision: z.number().int().positive(),
   queueRevision: z.number().int().nonnegative(),
   continuationFingerprint: digest,

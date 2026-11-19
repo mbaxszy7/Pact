@@ -58,7 +58,12 @@ afterEach(async () => {
 })
 const settings = {
   primaryAgentId: 'codex',
-  agents: { codex: { model: null, effort: null }, claude: { model: null, effort: null } },
+  secondaryAgentId: 'claude',
+  agents: {
+    codex: { model: null, effort: null },
+    claude: { model: null, effort: null },
+    agy: { model: null, effort: null },
+  },
   maxDiscussionRounds: 6,
 
   maxReviewCycles: 3,
@@ -131,6 +136,7 @@ async function fixture(
     {
       ...settings,
       primaryAgentId: roles.primary,
+      secondaryAgentId: roles.primary === 'codex' ? 'claude' : 'codex',
       ...(roles.maxDiscussionRounds !== undefined
         ? { maxDiscussionRounds: roles.maxDiscussionRounds }
         : {}),
@@ -2422,6 +2428,7 @@ describe('Explicit adoption of split roles for a ready plan', () => {
         f.db.sessionRepository.saveSettings(f.sessionId, {
           ...saved,
           primaryAgentId: change === 'primary' ? 'claude' : 'codex',
+          secondaryAgentId: change === 'primary' ? 'codex' : 'claude',
         })
       } else if (change === 'input') f.receive()
       else if (change === 'effects') f.repo.recordNativeEffects(review.id, 'unknown')
@@ -3547,9 +3554,11 @@ it.each([
       .from(workflowTurns)
       .where(eq(workflowTurns.runId, write.id))
       .get()!
+    const currentSettings = f.db.sessionRepository.find(f.sessionId)!.settings
     f.db.sessionRepository.saveSettings(f.sessionId, {
-      ...f.db.sessionRepository.find(f.sessionId)!.settings,
+      ...currentSettings,
       primaryAgentId: secondary,
+      secondaryAgentId: currentSettings.primaryAgentId,
     })
     f.db.close()
     databases.splice(databases.indexOf(f.db), 1)

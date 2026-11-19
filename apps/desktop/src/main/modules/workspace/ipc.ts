@@ -336,16 +336,22 @@ export function registerWorkspaceIpcHandlers(
         })
   })
 
-  ipcMain.handle(IPC_CHANNELS.sessionCreationPrepare, (event, projectIdInput: unknown) => {
-    trust.assertTrustedMainFrame(event)
-    const input = sessionCreationPrepareInputSchema.safeParse({ projectId: projectIdInput })
-    return input.success
-      ? utilityClient.prepareSessionCreation(input.data)
-      : Promise.resolve({
-          ok: false as const,
-          error: { code: 'VALIDATION' as const, message: 'Choose a valid Project.' },
-        })
-  })
+  ipcMain.handle(
+    IPC_CHANNELS.sessionCreationPrepare,
+    (event, projectIdInput: unknown, activePairInput?: unknown) => {
+      trust.assertTrustedMainFrame(event)
+      const input = sessionCreationPrepareInputSchema.safeParse({
+        projectId: projectIdInput,
+        ...(activePairInput !== undefined ? { activePair: activePairInput } : {}),
+      })
+      return input.success
+        ? utilityClient.prepareSessionCreation(input.data)
+        : Promise.resolve({
+            ok: false as const,
+            error: { code: 'VALIDATION' as const, message: 'Choose a valid Project.' },
+          })
+    },
+  )
 
   ipcMain.handle(IPC_CHANNELS.sessionCreate, (event, rawInput: unknown) => {
     trust.assertTrustedMainFrame(event)
@@ -413,16 +419,22 @@ export function registerWorkspaceIpcHandlers(
       : { ok: false, error: { code: 'VALIDATION', message: 'Choose a valid Session.' } }
   })
 
-  ipcMain.handle(IPC_CHANNELS.sessionSettingsGet, (event, sessionIdInput: unknown) => {
-    trust.assertTrustedMainFrame(event)
-    const input = sessionSettingsInputSchema.safeParse({ sessionId: sessionIdInput })
-    return input.success
-      ? utilityClient.getSessionSettings(input.data)
-      : Promise.resolve({
-          ok: false as const,
-          error: { code: 'VALIDATION' as const, message: 'Choose a valid Session.' },
-        })
-  })
+  ipcMain.handle(
+    IPC_CHANNELS.sessionSettingsGet,
+    (event, sessionIdInput: unknown, activePairInput?: unknown) => {
+      trust.assertTrustedMainFrame(event)
+      const input = sessionSettingsInputSchema.safeParse({
+        sessionId: sessionIdInput,
+        ...(activePairInput !== undefined ? { activePair: activePairInput } : {}),
+      })
+      return input.success
+        ? utilityClient.getSessionSettings(input.data)
+        : Promise.resolve({
+            ok: false as const,
+            error: { code: 'VALIDATION' as const, message: 'Choose a valid Session.' },
+          })
+    },
+  )
 
   ipcMain.handle(IPC_CHANNELS.sessionSettingsSave, (event, rawInput: unknown) => {
     trust.assertTrustedMainFrame(event)

@@ -1,9 +1,15 @@
 import { describe, expect, it } from 'vitest'
 
-import { createUnavailableAgentAdapter, serializeAgentPromptEnvelope } from './index.js'
+import {
+  createUnavailableAgentAdapter,
+  serializeAgentPromptEnvelope,
+  type AgentNativeContextRebuildResult,
+  type AgentNativeForkBoundary,
+  type AgentNativeForkWitness,
+} from './index.js'
 
 describe('agent adapter seam', () => {
-  it.each(['claude', 'codex'] as const)('supports a fake %s adapter', async (id) => {
+  it.each(['claude', 'codex', 'agy'] as const)('supports a fake %s adapter', async (id) => {
     const adapter = createUnavailableAgentAdapter(id, 'Foundation-only adapter')
 
     await expect(adapter.probe()).resolves.toEqual({
@@ -12,6 +18,66 @@ describe('agent adapter seam', () => {
       reason: 'Foundation-only adapter',
     })
     await expect(adapter.dispose()).resolves.toBeUndefined()
+  })
+
+  it('supports agy fork boundaries, B2 separate nativeInputIds, and rebuild initialization witnesses', () => {
+    const boundary: AgentNativeForkBoundary = {
+      provider: 'agy',
+      nativeSessionId: 'agy-parent-uuid',
+      nativeCutId: 'turn-2:step-7',
+      nativeTurnId: 'turn-2',
+      nativeInputIds: ['input-2a', 'input-2b'],
+      agyCut: {
+        version: 'pact-agy-fork-cut-v1',
+        trajectoryId: 'agy-parent-uuid',
+        executionId: 'exec-1',
+        cutStepIdx: 7,
+        genMetadataCount: 2,
+        executorMetadataCount: 1,
+        mediaCount: 0,
+      },
+      bindingGeneration: 1,
+      throughSequence: 4,
+      deliveryCursor: 2,
+      prefixHash: 'b'.repeat(64),
+      prefixRecords: 8,
+      prefixBytes: 512,
+    }
+    const witness: AgentNativeForkWitness = {
+      version: 'pact-native-fork-v1',
+      provider: 'agy',
+      sourceNativeSessionId: boundary.nativeSessionId,
+      nativeSessionId: 'agy-child-uuid',
+      sourceCutId: boundary.nativeCutId,
+      sourcePrefixHash: boundary.prefixHash,
+      candidatePrefixHash: boundary.prefixHash,
+      idMap: [['turn-2', 'turn-2']],
+      agyCut: boundary.agyCut,
+      model: 'gemini-3.1-pro',
+      effort: 'high',
+      permissionMode: 'ask',
+      initializedAt: '2026-11-19T00:00:00.000Z',
+      initializedPrefixHash: 'c'.repeat(64),
+      initializedPrefixBytes: 512,
+      initializedPrefixRecords: 8,
+    }
+    const rebuild: AgentNativeContextRebuildResult = {
+      nativeSessionId: 'agy-rebuilt-uuid',
+      initializationWitness: {
+        kind: 'agy_rebuild_v1',
+        nativeSessionId: 'agy-rebuilt-uuid',
+        pbSha256: 'd'.repeat(64),
+        pbBytes: 1024,
+        stepCount: 2,
+        sourceHash: 'e'.repeat(64),
+        coldLoadVerifiedAt: '2026-11-19T00:00:00.000Z',
+      },
+    }
+
+    expect(boundary.nativeTurnId).toBe('turn-2')
+    expect(boundary.nativeInputIds).toEqual(['input-2a', 'input-2b'])
+    expect(witness.provider).toBe('agy')
+    expect(rebuild.initializationWitness?.kind).toBe('agy_rebuild_v1')
   })
 })
 

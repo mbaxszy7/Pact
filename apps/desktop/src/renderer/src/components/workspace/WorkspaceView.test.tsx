@@ -129,7 +129,12 @@ function fixture(): Props {
         hasUnread: false,
         settings: {
           primaryAgentId: 'codex',
-          agents: { claude: { model: null, effort: null }, codex: { model: null, effort: null } },
+          secondaryAgentId: 'claude',
+          agents: {
+            claude: { model: null, effort: null },
+            codex: { model: null, effort: null },
+            agy: { model: null, effort: null },
+          },
           maxDiscussionRounds: 3,
           maxReviewCycles: 3,
           maxRepairAttempts: 3,
@@ -422,7 +427,12 @@ it('rebases loadPage after CONFLICT on explicit older page to load five unseen s
   }
   const baseSettings: CollaborationSession['settings'] = {
     primaryAgentId: 'codex',
-    agents: { claude: { model: null, effort: null }, codex: { model: null, effort: null } },
+    secondaryAgentId: 'claude',
+    agents: {
+      claude: { model: null, effort: null },
+      codex: { model: null, effort: null },
+      agy: { model: null, effort: null },
+    },
     maxDiscussionRounds: 6,
     maxReviewCycles: 3,
     maxRepairAttempts: 3,

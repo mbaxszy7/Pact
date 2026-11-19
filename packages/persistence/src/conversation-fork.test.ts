@@ -46,9 +46,11 @@ const migrationsFolder = resolve(import.meta.dirname, '../drizzle')
 const agents = ['claude', 'codex'] as const
 const settings: DefaultSessionSettings = {
   primaryAgentId: 'claude',
+  secondaryAgentId: 'codex',
   agents: {
     claude: { model: 'fixture-claude', effort: 'high' },
     codex: { model: 'fixture-codex', effort: 'high' },
+    agy: { model: 'fixture-agy', effort: 'high' },
   },
   maxDiscussionRounds: 3,
 
@@ -76,7 +78,7 @@ async function fixture(filePath = ':memory:', withCollaboration = false, withSta
   )
   db.sessionRepository.saveSettings(sourceId, {
     ...settings,
-    permissionModes: { claude: 'full', codex: 'ask' },
+    permissionModes: { claude: 'full', codex: 'ask', agy: 'ask' },
   })
   if (!withCollaboration) {
     for (const [index, agentId] of agents.entries()) {
@@ -359,7 +361,7 @@ async function fixture(filePath = ':memory:', withCollaboration = false, withSta
 }
 function witness(
   f: Awaited<ReturnType<typeof fixture>>,
-  agentId: RuntimeAgentId,
+  agentId: 'claude' | 'codex',
   nativeSessionId = `child-${agentId}`,
 ): AgentNativeForkWitness {
   return {
@@ -730,7 +732,7 @@ describe('Frozen Fork through ConversationRepository', () => {
     expect(f.db.drizzle.select().from(sessions).all()).toHaveLength(1)
     f.db.sessionRepository.saveSettings(f.sourceId, {
       ...settings,
-      permissionModes: { claude: 'full', codex: 'ask' },
+      permissionModes: { claude: 'full', codex: 'ask', agy: 'ask' },
       maxDiscussionRounds: 4,
     })
     expect(() => f.repo.commitFork(randomUUID(), selection, f.boundaries, ['claude'])).toThrow(

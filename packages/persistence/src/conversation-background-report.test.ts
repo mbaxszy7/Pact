@@ -61,7 +61,12 @@ async function fixture(persistent = false, measurePerformance = false) {
     { id: sessionId, projectId, title: 'Reports', createdAt: now },
     {
       primaryAgentId: 'claude',
-      agents: { claude: { model: null, effort: null }, codex: { model: null, effort: null } },
+      secondaryAgentId: 'codex',
+      agents: {
+        claude: { model: null, effort: null },
+        codex: { model: null, effort: null },
+        agy: { model: null, effort: null },
+      },
       maxDiscussionRounds: 3,
       maxReviewCycles: 3,
       maxRepairAttempts: 3,
@@ -1089,7 +1094,7 @@ it('keeps immutable report bytes and Comment sources through two successive Fork
       session.settingsRevision,
     )
     const boundary = (agentId: 'claude' | 'codex'): AgentNativeForkBoundary => {
-      const run = selection.runs[agentId],
+      const run = selection.runs[agentId]!,
         response = f.repo.forkResponse(run.id, selection.prepared.sequence)
       return {
         nativeSessionId: run.nativeSessionId!,

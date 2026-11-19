@@ -405,3 +405,50 @@ it('ties the draft hint to the disabled advancing actions with aria-describedby'
     expect(button).toHaveProperty('disabled', true)
   }
 })
+
+it('renders historical legacy tasks without stageRoles where owner === reviewer without throwing', async () => {
+  Object.defineProperty(HTMLDialogElement.prototype, 'showModal', {
+    configurable: true,
+    value(this: HTMLDialogElement) {
+      this.open = true
+    },
+  })
+  Object.defineProperty(HTMLDialogElement.prototype, 'close', {
+    configurable: true,
+    value(this: HTMLDialogElement) {
+      this.open = false
+    },
+  })
+  const { props, task, planReference } = collaborationFixture()
+  Object.assign(task, {
+    owner: 'claude',
+    reviewer: 'claude',
+    stageRoles: undefined,
+    stage: 'plan_review',
+    actor: 'claude',
+    status: 'ready',
+    automation: 'active',
+    planInputSequence: 0,
+    review: {
+      runId: props.run.id,
+      actor: 'claude',
+      stage: 'plan_review',
+      verdict: 'accepted',
+      inputSequence: 0,
+      planReference,
+      document: planReference.document,
+    },
+  })
+  const bridge = installRead(task)
+  bridge.getConversation.mockResolvedValue({
+    ok: true,
+    value: reportPage(task, { availableActions: ['execute', 'swap_code_roles'] }),
+  })
+  render(<CollaborationReview {...props} />)
+  expect(await screen.findByRole('button', { name: 'Implement plan · Claude Code' })).toBeTruthy()
+  const swapButton = screen.getByRole('button', { name: 'Swap implementer' })
+  fireEvent.click(swapButton)
+  expect(
+    await screen.findByText('Use Claude Code instead of Codex to implement this plan.'),
+  ).toBeTruthy()
+})

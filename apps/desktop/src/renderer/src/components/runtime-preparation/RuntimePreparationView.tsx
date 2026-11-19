@@ -27,7 +27,19 @@ const agentCopy = {
     mark: 'X',
     install: 'Install Codex, then run codex login in your terminal.',
   },
+  agy: {
+    name: 'Antigravity',
+    mark: 'A',
+    install: 'Install Antigravity CLI, then run agy in your terminal to sign in.',
+  },
 } as const
+
+function formatAgentNames(names: readonly string[]): string {
+  if (names.length === 0) return ''
+  if (names.length === 1) return names[0] ?? ''
+  if (names.length === 2) return `${names[0]} and ${names[1]}`
+  return `${names.slice(0, -1).join(', ')}, and ${names[names.length - 1]}`
+}
 
 function statusCopy(
   agent: RuntimeAgentReadiness | undefined,
@@ -69,7 +81,9 @@ function statusCopy(
           agent.detail ??
           (agent.agentId === 'claude'
             ? 'Sign in or configure a compatible API backend, then check again.'
-            : 'Run codex login, then check again.'),
+            : agent.agentId === 'agy'
+              ? 'Run agy in your terminal to sign in, then check again.'
+              : 'Run codex login, then check again.'),
         tone: 'warning',
       }
     case 'startup_failed':
@@ -107,19 +121,23 @@ function AgentBridge({
     <div
       className="runtime-bridge"
       data-loading={loading}
-      aria-label={`${readyCount} of 2 agents ready`}
+      aria-label={`${readyCount} of 3 agents ready`}
     >
       <span className="runtime-bridge-node bg-speaker-claude">C</span>
       <span className="runtime-bridge-track" aria-hidden="true">
         <span className="runtime-bridge-signal" />
       </span>
+      <span className="runtime-bridge-node bg-speaker-codex">X</span>
+      <span className="runtime-bridge-track" aria-hidden="true">
+        <span className="runtime-bridge-signal runtime-bridge-signal-delayed" />
+      </span>
       <span className="runtime-bridge-core" aria-hidden="true">
         <Plus className="size-4" strokeWidth={1.75} />
       </span>
       <span className="runtime-bridge-track" aria-hidden="true">
-        <span className="runtime-bridge-signal runtime-bridge-signal-delayed" />
+        <span className="runtime-bridge-signal" />
       </span>
-      <span className="runtime-bridge-node bg-speaker-codex">X</span>
+      <span className="runtime-bridge-node bg-speaker-agy">A</span>
     </div>
   )
 }
@@ -203,6 +221,14 @@ function RuntimeRow({
   )
 }
 
+export function runtimeReadinessUnavailableReason(
+  agent: RuntimeAgentReadiness | undefined,
+): string | undefined {
+  if (!agent) return 'Not checked'
+  if (agent.state === 'ready') return undefined
+  return statusCopy(agent, false).label
+}
+
 export function RuntimePreparationView({
   preparation,
   loading,
@@ -216,7 +242,7 @@ export function RuntimePreparationView({
 }: RuntimePreparationViewProps): React.JSX.Element {
   const readiness = new Map(preparation?.agents.map((agent) => [agent.agentId, agent]))
   const readyCount = preparation?.agents.filter((agent) => agent.state === 'ready').length ?? 0
-  const ready = readyCount === 2
+  const ready = readyCount >= 2
   return (
     <section
       className="flex h-full min-h-0 w-full flex-col overflow-hidden bg-canvas text-primary"
@@ -249,13 +275,14 @@ export function RuntimePreparationView({
                 Connect your coding agents
               </h1>
               <p className="mt-group max-w-[60ch] text-body leading-relaxed text-secondary">
-                Uses Claude Code and Codex installed on this device.
+                Uses Claude Code, Codex, and Antigravity installed on this device. Connect at least
+                2 to get started.
               </p>
             </div>
             <div className="justify-self-start sm:justify-self-end">
               <AgentBridge preparation={preparation} loading={loading} />
-              <p className="mt-2 text-center text-caption text-tertiary">
-                {loading ? 'Checking locally…' : `${readyCount} of 2 ready`}
+              <p className="mt-2 text-center text-caption text-tertiary tabular-nums">
+                {loading ? 'Checking locally…' : `${readyCount} of 3 ready · Minimum 2 required`}
               </p>
             </div>
           </div>
@@ -291,6 +318,13 @@ export function RuntimePreparationView({
               choosing={choosingAgent === 'codex'}
               onChooseExecutable={onChooseExecutable}
             />
+            <RuntimeRow
+              agentId="agy"
+              readiness={readiness.get('agy')}
+              loading={loading}
+              choosing={choosingAgent === 'agy'}
+              onChooseExecutable={onChooseExecutable}
+            />
           </div>
 
           <footer className="mt-auto flex flex-wrap items-center justify-between gap-group pt-spacious">
@@ -304,7 +338,7 @@ export function RuntimePreparationView({
                   ? canReturnToWorkspace
                     ? 'Ready to use in your sessions.'
                     : 'Next: choose your default session settings.'
-                  : 'Finish setting up both agents, then click Check again.'}
+                  : 'Connect at least two coding agents, then click Check again.'}
               </span>
             </output>
             <button
@@ -333,24 +367,34 @@ export function RuntimePreparationView({
 
 export function RuntimeDegradedNotice({
   preparation,
+  relevantAgentIds,
   onReview,
   onRetry,
 }: {
   preparation: RuntimePreparation
+  relevantAgentIds?: readonly RuntimeAgentId[] | undefined
   onReview: () => void
   onRetry: () => void
-}): React.JSX.Element {
-  const unavailable = preparation.agents.filter((agent) => agent.state !== 'ready')
-  const unavailableNames = unavailable.map((agent) => agentCopy[agent.agentId].name).join(' and ')
+}): React.JSX.Element | null {
+  const relevantSet = relevantAgentIds ? new Set(relevantAgentIds) : undefined
+  const unavailable = preparation.agents.filter(
+    (agent) => agent.state !== 'ready' && (!relevantSet || relevantSet.has(agent.agentId)),
+  )
+  if (unavailable.length === 0) return null
+  const unavailableNames = formatAgentNames(
+    unavailable.map((agent) => agentCopy[agent.agentId].name),
+  )
   const attentionVerb = unavailable.length === 1 ? 'needs' : 'need'
   const outdated = unavailable.filter((agent) => agent.state === 'unsupported_version')
-  const upgradeDetails = outdated
-    .map((agent) => `${agentCopy[agent.agentId].name} ${RUNTIME_MINIMUM_VERSIONS[agent.agentId]}+`)
-    .join(' and ')
+  const upgradeDetails = formatAgentNames(
+    outdated.map(
+      (agent) => `${agentCopy[agent.agentId].name} ${RUNTIME_MINIMUM_VERSIONS[agent.agentId]}+`,
+    ),
+  )
   const otherUnavailable = unavailable.filter((agent) => agent.state !== 'unsupported_version')
-  const otherUnavailableNames = otherUnavailable
-    .map((agent) => agentCopy[agent.agentId].name)
-    .join(' and ')
+  const otherUnavailableNames = formatAgentNames(
+    otherUnavailable.map((agent) => agentCopy[agent.agentId].name),
+  )
   return (
     <div
       className="flex min-h-11 shrink-0 flex-wrap items-center justify-between gap-group border-b border-status-warning bg-status-warning-muted px-section py-2 text-status-warning-foreground"

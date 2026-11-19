@@ -45,7 +45,13 @@ interface NativeReminder {
 }
 
 function agentLabel(agentId: SessionReminder['agentId']): string {
-  return agentId === 'codex' ? 'Codex' : agentId === 'claude' ? 'Claude Code' : 'Pact'
+  return agentId === 'codex'
+    ? 'Codex'
+    : agentId === 'claude'
+      ? 'Claude Code'
+      : agentId === 'agy'
+        ? 'Antigravity'
+        : 'Pact'
 }
 
 function systemBody(reminder: SessionReminder): string {

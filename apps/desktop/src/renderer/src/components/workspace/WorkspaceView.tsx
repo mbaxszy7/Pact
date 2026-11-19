@@ -3,11 +3,13 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import type { SkillSelection } from '@pact/contracts'
 import type {
   CollaborationSession,
+  CollaborationTask,
   AnchoredComment,
   FileCommentAnchor,
   DefaultSessionSettings,
   DefaultSessionSettingsEditorState,
   Project,
+  RuntimePreparation,
   SessionSettingsEditorState,
   SessionPermissionSaveInput,
   SessionSpeedSaveInput,
@@ -53,6 +55,7 @@ import { ProjectEmptyState, ProjectReadyState } from './WorkspaceEmptyStates'
 import { WorkspaceShell } from './WorkspaceShell'
 
 interface WorkspaceViewProps {
+  runtimePreparation?: RuntimePreparation | undefined
   onForkSessionCreated: (
     change: SessionCatalogChange,
     enter: boolean,
@@ -98,6 +101,7 @@ interface WorkspaceViewProps {
   sessionSettingsEditorState?: SessionSettingsEditorState | undefined
   sessionSettingsLoading: boolean
   sessionSettingsOpen: boolean
+  collaborationTask?: CollaborationTask | null | undefined
   sideChatsOpen?: boolean | undefined
   sideChatActiveCount?: number | undefined
   sideChatAttentionCount?: number | undefined
@@ -501,6 +505,12 @@ function ContextPanel({
     <SessionSettingsPanel
       key={`${selectedSession.id}-${props.sessionSettingsEditorState?.session.settingsRevision ?? 'loading'}`}
       editorState={props.sessionSettingsEditorState}
+      runtimePreparation={props.runtimePreparation}
+      conversation={
+        props.conversation && props.collaborationTask !== undefined
+          ? { ...props.conversation, collaborationTask: props.collaborationTask }
+          : props.conversation
+      }
       loading={props.sessionSettingsLoading}
       saving={props.savingSessionSettings}
       error={props.sessionError}
@@ -542,6 +552,7 @@ function WorkspaceContent({
         key={creatingProject.id}
         project={creatingProject}
         editorState={props.creationEditorState}
+        runtimePreparation={props.runtimePreparation}
         loading={props.creationLoading}
         creating={props.creatingSession}
         error={props.sessionError}

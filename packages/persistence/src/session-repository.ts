@@ -57,6 +57,8 @@ import type {
 } from '@pact/contracts'
 
 import {
+  isAgentInPair,
+  resolveActiveAgentPair,
   SESSION_CATALOG_PAGE_BYTES,
   SESSION_CATALOG_PAGE_ITEMS,
   SESSION_GROUP_PAGE_BYTES,
@@ -64,14 +66,24 @@ import {
   SIDE_CHAT_LIST_PAGE_BYTES,
   SIDE_CHAT_LIST_PAGE_ITEMS,
   sideChatAnchorSchema,
+  type RuntimeAgentId,
 } from '@pact/contracts'
 
 import type { PactDrizzleDatabase } from './drizzle-database.js'
 
-import { updateSessionNativeMetadata } from './native-presence-metadata.js'
+import {
+  refreshNativeSessionMetadata,
+  updateSessionNativeMetadata,
+} from './native-presence-metadata.js'
 import {
   agentRuns,
+  collaborationInputs,
+  collaborationTasks,
+  conversationInputBatches,
   conversationMessages,
+  nativeForkIntents,
+  nativeRebuildOperations,
+  relayDecisions,
   sessionCatalogRevisions,
   sessionSettingsRevisions,
   sessions,
@@ -83,6 +95,7 @@ import {
   sessionGroups,
   sessionGroupMembers,
 } from './schema/index.js'
+import { isRetiredAgentRecoverySettled } from './session-issues.js'
 import {
   deriveSessionActivity,
   hasUnreadSessionMessage,
@@ -195,6 +208,30 @@ export class OversizedCatalogSessionError extends Error {
     super(`${identity} exceeds the 1 MiB Catalog limit. Its saved data was not truncated.`)
   }
 }
+
+export class SessionSettingsConflictError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'SessionSettingsConflictError'
+  }
+}
+
+const sessionForkErrorExpr = sql<number>`EXISTS (
+  SELECT 1 FROM ${sessionForkOperations} f
+  WHERE f.session_id=${sessions.id}
+    AND (
+      f.ready=0
+      OR (SELECT count(*) FROM ${nativeAgentContexts} c WHERE c.session_id=f.session_id)<2
+      OR EXISTS (
+        SELECT 1 FROM ${nativeForkIntents} i
+        WHERE i.operation_id=f.id
+          AND NOT EXISTS (
+            SELECT 1 FROM ${nativeAgentContexts} c
+            WHERE c.session_id=f.session_id AND c.agent_id=i.agent_id
+          )
+      )
+    )
+)`
 
 export class SessionRepository {
   constructor(private readonly database: PactDrizzleDatabase) {}
@@ -519,7 +556,7 @@ export class SessionRepository {
       const rows = transaction
         .select({
           session: sessions,
-          forkError: sql<number>`EXISTS (SELECT 1 FROM ${sessionForkOperations} f WHERE f.session_id=${sessions.id} AND (f.ready=0 OR (SELECT count(*) FROM ${nativeAgentContexts} c WHERE c.session_id=f.session_id)<>2))`,
+          forkError: sessionForkErrorExpr,
           settings: sessionSettingsRevisions,
           latestRun: {
             agentId: agentRuns.agentId,
@@ -946,7 +983,7 @@ export class SessionRepository {
       .select({
         session: sessions,
         settings: sessionSettingsRevisions,
-        forkError: sql<number>`EXISTS (SELECT 1 FROM ${sessionForkOperations} f WHERE f.session_id=${sessions.id} AND (f.ready=0 OR (SELECT count(*) FROM ${nativeAgentContexts} c WHERE c.session_id=f.session_id)<>2))`,
+        forkError: sessionForkErrorExpr,
         latestRun: {
           agentId: agentRuns.agentId,
           status: agentRuns.status,
@@ -1888,7 +1925,7 @@ export class SessionRepository {
       .select({
         session: sessions,
         settings: sessionSettingsRevisions,
-        forkError: sql<number>`EXISTS (SELECT 1 FROM ${sessionForkOperations} f WHERE f.session_id=${sessions.id} AND (f.ready=0 OR (SELECT count(*) FROM ${nativeAgentContexts} c WHERE c.session_id=f.session_id)<>2))`,
+        forkError: sessionForkErrorExpr,
         sideChatHasContext: sql<
           number | null
         >`CASE WHEN ${sessions.parentSessionId} IS NOT NULL THEN EXISTS (SELECT 1 FROM conversation_cutoffs c WHERE c.id = ${sessions.anchorCutoffId} AND c.max_message_sequence >= 0) ELSE NULL END`,
@@ -2009,9 +2046,15 @@ export class SessionRepository {
             1,
             {
               ...settings,
+              permissionModes: {
+                claude: 'ask',
+                codex: 'native',
+                agy: 'ask',
+              },
               agents: {
                 claude: { ...settings.agents.claude, speed: 'native' },
                 codex: { ...settings.agents.codex, speed: 'native' },
+                agy: { ...settings.agents.agy, speed: 'native' },
               },
             },
             record.createdAt,
@@ -2039,23 +2082,101 @@ export class SessionRepository {
   }
 
   saveSettings(sessionId: string, settings: SessionSettings): SessionCatalogChange {
+    let pairReplaced = false
     this.database.transaction((transaction) => {
+      if (settings.primaryAgentId === settings.secondaryAgentId) {
+        throw new SessionSettingsConflictError('Primary and Secondary Agents must be distinct.')
+      }
       const current = transaction.select().from(sessions).where(eq(sessions.id, sessionId)).get()
       if (!current) throw new Error('Session does not exist.')
-      if (current.parentSessionId)
-        throw new Error('Side chat settings are inherited from the parent Session.')
+      if (current.archivedAt || current.status === 'archived') {
+        throw new SessionSettingsConflictError('This Session is archived.')
+      }
+      if (current.parentSessionId) {
+        throw new SessionSettingsConflictError(
+          'Side chat settings are inherited from the parent Session.',
+        )
+      }
+
+      const currentSettingsRow = transaction
+        .select()
+        .from(sessionSettingsRevisions)
+        .where(
+          and(
+            eq(sessionSettingsRevisions.sessionId, sessionId),
+            eq(sessionSettingsRevisions.revision, current.settingsRevision),
+          ),
+        )
+        .get()
+      if (!currentSettingsRow) {
+        throw new Error('Current Session settings revision is missing.')
+      }
+
+      const previousPair = resolveActiveAgentPair({
+        primaryAgentId: currentSettingsRow.primaryAgentId,
+        secondaryAgentId: currentSettingsRow.secondaryAgentId,
+      })
+      const nextPair = resolveActiveAgentPair({
+        primaryAgentId: settings.primaryAgentId,
+        secondaryAgentId: settings.secondaryAgentId,
+      })
+      const retiredAgents = previousPair.filter((id) => !isAgentInPair(id, nextPair))
+
+      const baseModes: NonNullable<SessionSettings['permissionModes']> = {
+        claude: settings.permissionModes?.claude ?? currentSettingsRow.claudePermissionMode,
+        codex: settings.permissionModes?.codex ?? currentSettingsRow.codexPermissionMode,
+        agy: settings.permissionModes?.agy ?? currentSettingsRow.agyPermissionMode,
+      }
+
+      if (retiredAgents.length > 0) {
+        pairReplaced = true
+        SessionRepository.assertSafeAgentReplacement(transaction, sessionId, retiredAgents)
+        for (const retiredAgent of retiredAgents) {
+          if (baseModes[retiredAgent] === 'full') {
+            baseModes[retiredAgent] = 'ask'
+          }
+        }
+      }
+
+      for (const candidate of ['claude', 'codex', 'agy'] as const) {
+        if (!isAgentInPair(candidate, nextPair) && baseModes[candidate] === 'full') {
+          const previousMode =
+            candidate === 'claude'
+              ? currentSettingsRow.claudePermissionMode
+              : candidate === 'codex'
+                ? currentSettingsRow.codexPermissionMode
+                : currentSettingsRow.agyPermissionMode
+          if (previousMode !== 'full') {
+            throw new SessionSettingsConflictError('Cannot grant Full access to an inactive Agent.')
+          }
+          baseModes[candidate] = 'ask'
+        }
+      }
 
       const revision = current.settingsRevision + 1
       const updatedAt = new Date().toISOString()
       transaction
         .insert(sessionSettingsRevisions)
-        .values(SessionRepository.settingsValues(sessionId, revision, settings, updatedAt))
+        .values(
+          SessionRepository.settingsValues(
+            sessionId,
+            revision,
+            {
+              ...settings,
+              permissionModes: baseModes,
+            },
+            updatedAt,
+          ),
+        )
         .run()
       transaction
         .update(sessions)
         .set({ settingsRevision: revision, updatedAt })
         .where(eq(sessions.id, sessionId))
         .run()
+      if (pairReplaced) {
+        refreshNativeSessionMetadata(transaction, sessionId)
+      }
       transaction
         .update(sessionCatalogRevisions)
         .set({ revision: sql`${sessionCatalogRevisions.revision} + 1` })
@@ -2066,11 +2187,217 @@ export class SessionRepository {
     return this.change(sessionId)
   }
 
+  static replacementGateQueries(sessionId: string, retiredAgents: readonly RuntimeAgentId[]) {
+    return {
+      activeRun: sql`
+        SELECT id FROM ${agentRuns} INDEXED BY agent_runs_one_active_per_session
+        WHERE ${agentRuns.sessionId} = ${sessionId}
+          AND ${agentRuns.forkSourceRunId} IS NULL
+          AND ${agentRuns.controlDisposition} <> 'abandoned'
+          AND ${agentRuns.status} IN ('starting', 'running', 'recovering')
+        LIMIT 1
+      `,
+      unreadyFork: sql`
+        SELECT id FROM ${sessionForkOperations}
+        WHERE ${sessionForkOperations.sessionId} = ${sessionId}
+          AND ${sessionForkOperations.ready} = 0
+        LIMIT 1
+      `,
+      queuedInput: sql`
+        SELECT id FROM ${collaborationInputs} INDEXED BY collaboration_inputs_pending_session
+        WHERE ${collaborationInputs.sessionId} = ${sessionId}
+          AND ${collaborationInputs.state} IN ('accepted', 'blocked')
+        LIMIT 1
+      `,
+      pendingRoute: sql`
+        SELECT id FROM ${conversationMessages} INDEXED BY conversation_messages_pending_route_idx
+        WHERE ${conversationMessages.routePendingAgentId} IN ('claude', 'codex', 'agy')
+          AND ${conversationMessages.sessionId} = ${sessionId}
+          AND ${conversationMessages.routePendingAgentId} IS NOT NULL
+        LIMIT 1
+      `,
+      pendingPreparedBatch: sql`
+        SELECT id FROM ${conversationInputBatches} INDEXED BY conversation_input_batches_preparing_session_idx
+        WHERE ${conversationInputBatches.sessionId} = ${sessionId}
+          AND ${conversationInputBatches.dispatchState} = 'prepared'
+        LIMIT 1
+      `,
+      pendingPausedBatch: sql`
+        SELECT id FROM ${conversationInputBatches} INDEXED BY conversation_input_batches_paused_session_idx
+        WHERE ${conversationInputBatches.sessionId} = ${sessionId}
+          AND ${conversationInputBatches.dispatchState} = 'paused'
+        LIMIT 1
+      `,
+      unansweredDecision: sql`
+        SELECT id FROM ${relayDecisions} INDEXED BY relay_decisions_session_active
+        WHERE ${relayDecisions.sessionId} = ${sessionId}
+          AND ${relayDecisions.active} = 1
+          AND ${relayDecisions.state} IN ('requested', 'awaiting_answer')
+        LIMIT 1
+      `,
+      activeTask: sql`
+        SELECT state_json AS stateJson FROM ${collaborationTasks} INDEXED BY collaboration_tasks_active_session
+        WHERE ${collaborationTasks.sessionId} = ${sessionId}
+          AND ${collaborationTasks.active} = 1
+        LIMIT 1
+      `,
+      retired: retiredAgents.map((retiredAgent) => ({
+        retiredAgent,
+        unsettledRun: sql`
+          SELECT id FROM ${agentRuns} INDEXED BY agent_runs_native_quit_unsettled_idx
+          WHERE ${agentRuns.sessionId} = ${sessionId}
+            AND ${agentRuns.forkSourceRunId} IS NULL
+            AND ((${agentRuns.status} IN ('starting', 'running', 'recovering') AND ${agentRuns.controlDisposition} <> 'abandoned')
+              OR ${agentRuns.nativeEffectsState} IN ('pending', 'unknown')
+              OR (${agentRuns.dispatchPhase} IN ('possibly_sent', 'accepted', 'ended') AND ${agentRuns.nativeOutcome} IS NULL))
+            AND ${agentRuns.agentId} = ${retiredAgent}
+            AND (${agentRuns.nativeEffectsState} IN ('pending', 'unknown')
+              OR (${agentRuns.controlDisposition} <> 'abandoned'
+                AND ${agentRuns.dispatchPhase} IN ('possibly_sent', 'accepted')
+                AND ${agentRuns.nativeOutcome} IS NULL))
+          LIMIT 1
+        `,
+        pendingRebuildStage: sql`
+          SELECT id FROM ${nativeRebuildOperations} INDEXED BY native_rebuild_operations_one_pending_idx
+          WHERE ${nativeRebuildOperations.sessionId} = ${sessionId}
+            AND ${nativeRebuildOperations.agentId} = ${retiredAgent}
+            AND ${nativeRebuildOperations.stage} IN ('preparing', 'creating', 'seeding', 'unconfirmed')
+          LIMIT 1
+        `,
+        pendingRebuildWork: sql`
+          SELECT id FROM ${nativeRebuildOperations} INDEXED BY native_rebuild_operations_unsettled_work_idx
+          WHERE ${nativeRebuildOperations.sessionId} = ${sessionId}
+            AND ${nativeRebuildOperations.agentId} = ${retiredAgent}
+            AND ${nativeRebuildOperations.nativeWorkState} IN ('pending', 'unknown')
+          LIMIT 1
+        `,
+        context: sql`
+          SELECT
+            continuation_state AS continuationState,
+            recovery_action AS recoveryAction,
+            recovery_failure_kind AS recoveryFailureKind,
+            permission_requests_json AS permissionRequestsJson
+          FROM ${nativeAgentContexts}
+          WHERE ${nativeAgentContexts.sessionId} = ${sessionId}
+            AND ${nativeAgentContexts.agentId} = ${retiredAgent}
+          LIMIT 1
+        `,
+      })),
+    }
+  }
+
+  private static assertSafeAgentReplacement(
+    transaction: DrizzleTransaction,
+    sessionId: string,
+    retiredAgents: readonly RuntimeAgentId[],
+  ): void {
+    const queries = SessionRepository.replacementGateQueries(sessionId, retiredAgents)
+    if (transaction.get<{ id: string }>(queries.activeRun)) {
+      throw new SessionSettingsConflictError(
+        'Wait until the current Agent turn finishes before replacing an Agent in this Session.',
+      )
+    }
+
+    if (transaction.get<{ id: string }>(queries.unreadyFork)) {
+      throw new SessionSettingsConflictError(
+        'Finish initializing the forked Session before replacing an Agent.',
+      )
+    }
+
+    if (transaction.get<{ id: string }>(queries.queuedInput)) {
+      throw new SessionSettingsConflictError(
+        'Send, return, or remove the queued message before replacing an Agent in this Session.',
+      )
+    }
+
+    if (transaction.get<{ id: string }>(queries.pendingRoute)) {
+      throw new SessionSettingsConflictError(
+        'Wait for the @all message sequence to finish before replacing an Agent in this Session.',
+      )
+    }
+
+    if (
+      transaction.get<{ id: string }>(queries.pendingPreparedBatch) ||
+      transaction.get<{ id: string }>(queries.pendingPausedBatch)
+    ) {
+      throw new SessionSettingsConflictError(
+        'Finish or cancel the pending message preparation before replacing an Agent in this Session.',
+      )
+    }
+
+    if (transaction.get<{ id: string }>(queries.unansweredDecision)) {
+      throw new SessionSettingsConflictError(
+        'Resolve the pending decision card before replacing an Agent in this Session.',
+      )
+    }
+
+    const activeTask = transaction.get<{ stateJson: string }>(queries.activeTask)
+    if (activeTask) {
+      const parsedTask: unknown = JSON.parse(activeTask.stateJson)
+      const status =
+        typeof parsedTask === 'object' && parsedTask !== null
+          ? Reflect.get(parsedTask, 'status')
+          : undefined
+      const ending =
+        typeof parsedTask === 'object' && parsedTask !== null
+          ? Reflect.get(parsedTask, 'ending')
+          : undefined
+      if (status !== 'complete' && !ending) {
+        throw new SessionSettingsConflictError(
+          'Finish or end the current collaboration task before replacing an Agent in this Session.',
+        )
+      }
+    }
+
+    for (const retired of queries.retired) {
+      if (transaction.get<{ id: string }>(retired.unsettledRun)) {
+        throw new SessionSettingsConflictError(
+          'Wait for the retiring Agent’s background effects and turn status to settle before replacing it.',
+        )
+      }
+
+      if (
+        transaction.get<{ id: string }>(retired.pendingRebuildStage) ||
+        transaction.get<{ id: string }>(retired.pendingRebuildWork)
+      ) {
+        throw new SessionSettingsConflictError(
+          'Finish or resolve the retiring Agent’s session rebuild before replacing it.',
+        )
+      }
+
+      const context = transaction.get<{
+        continuationState: string
+        recoveryAction: string | null
+        recoveryFailureKind: string | null
+        permissionRequestsJson: string | null
+      }>(retired.context)
+      if (context) {
+        const hasPendingPermission =
+          context.permissionRequestsJson !== null && context.permissionRequestsJson !== '[]'
+        if (
+          !isRetiredAgentRecoverySettled({
+            continuationState: context.continuationState,
+            recoveryAction: context.recoveryAction,
+            recoveryFailureKind: context.recoveryFailureKind,
+            hasPendingPermission,
+          })
+        ) {
+          throw new SessionSettingsConflictError(
+            'Resolve the retiring Agent’s pending approval, question, or recovery check before replacing it.',
+          )
+        }
+      }
+    }
+  }
+
   savePermission(input: SessionPermissionSaveInput): SessionCatalogChange {
     return this.database.transaction(() => {
       const current = this.find(input.sessionId)
-      if (current?.parentSessionId)
-        throw new Error('Side chat settings are inherited from the parent Session.')
+      if (current?.parentSessionId) {
+        throw new SessionSettingsConflictError(
+          'Side chat settings are inherited from the parent Session.',
+        )
+      }
       if (
         !current ||
         current.status === 'archived' ||
@@ -2079,9 +2406,16 @@ export class SessionRepository {
         throw new Error('Session settings changed. Reopen the permissions menu and try again.')
       if (input.mode === 'full' && !input.confirmedFullAccess)
         throw new Error('Full access requires explicit confirmation.')
+      const pair = resolveActiveAgentPair(current.settings)
+      if (!isAgentInPair(input.agentId, pair)) {
+        throw new SessionSettingsConflictError(
+          'Permissions can only be changed for the Session’s active Agent pair.',
+        )
+      }
       const modes = current.settings.permissionModes ?? {
         claude: 'ask' as const,
         codex: 'native' as const,
+        agy: 'ask' as const,
       }
       if (modes[input.agentId] === input.mode) return this.change(input.sessionId)
       return this.saveSettings(input.sessionId, {
@@ -2094,14 +2428,23 @@ export class SessionRepository {
   saveSpeed(input: SessionSpeedSaveInput): SessionCatalogChange {
     return this.database.transaction(() => {
       const current = this.find(input.sessionId)
-      if (current?.parentSessionId)
-        throw new Error('Side chat settings are inherited from the parent Session.')
+      if (current?.parentSessionId) {
+        throw new SessionSettingsConflictError(
+          'Side chat settings are inherited from the parent Session.',
+        )
+      }
       if (
         !current ||
         current.status === 'archived' ||
         current.settingsRevision !== input.expectedRevision
       )
         throw new Error('Session settings changed. Reopen the Speed menu and try again.')
+      const pair = resolveActiveAgentPair(current.settings)
+      if (!isAgentInPair(input.agentId, pair)) {
+        throw new SessionSettingsConflictError(
+          'Speed can only be changed for the Session’s active Agent pair.',
+        )
+      }
       const selected = current.settings.agents[input.agentId]
       if ((selected.speed ?? 'native') === input.speed) return this.change(input.sessionId)
       return this.saveSettings(input.sessionId, {
@@ -2351,14 +2694,19 @@ export class SessionRepository {
       sessionId,
       revision,
       primaryAgentId: settings.primaryAgentId,
+      secondaryAgentId: settings.secondaryAgentId,
       claudeModel: settings.agents.claude.model,
       claudeEffort: settings.agents.claude.effort,
       claudeSpeed: settings.agents.claude.speed ?? 'native',
       codexModel: settings.agents.codex.model,
       codexEffort: settings.agents.codex.effort,
       codexSpeed: settings.agents.codex.speed ?? 'native',
+      agyModel: settings.agents.agy.model,
+      agyEffort: settings.agents.agy.effort,
+      agySpeed: settings.agents.agy.speed ?? 'native',
       claudePermissionMode: settings.permissionModes?.claude ?? 'ask',
       codexPermissionMode: settings.permissionModes?.codex ?? 'native',
+      agyPermissionMode: settings.permissionModes?.agy ?? 'ask',
       maxDiscussionRounds: settings.maxDiscussionRounds,
       runningMessagePolicy: 'next_round',
       maxReviewCycles: settings.maxReviewCycles,
@@ -2426,9 +2774,11 @@ export class SessionRepository {
   private static toSettings(settings: SettingsRevisionRow): SessionSettings {
     return {
       primaryAgentId: settings.primaryAgentId,
+      secondaryAgentId: settings.secondaryAgentId,
       permissionModes: {
         claude: settings.claudePermissionMode,
         codex: settings.codexPermissionMode,
+        agy: settings.agyPermissionMode,
       },
       agents: {
         claude: {
@@ -2440,6 +2790,11 @@ export class SessionRepository {
           model: settings.codexModel,
           effort: settings.codexEffort,
           speed: settings.codexSpeed,
+        },
+        agy: {
+          model: settings.agyModel,
+          effort: settings.agyEffort,
+          speed: settings.agySpeed,
         },
       },
       maxDiscussionRounds: settings.maxDiscussionRounds,

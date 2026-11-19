@@ -73,7 +73,12 @@ export function collaborationFixture() {
     updatedAt: timestamp,
     settings: {
       primaryAgentId: 'codex' as const,
-      agents: { codex: { model: null, effort: null }, claude: { model: null, effort: null } },
+      secondaryAgentId: 'claude' as const,
+      agents: {
+        codex: { model: null, effort: null },
+        claude: { model: null, effort: null },
+        agy: { model: null, effort: null },
+      },
       maxDiscussionRounds: 6,
       maxReviewCycles: 3,
       maxRepairAttempts: 3,

@@ -15,7 +15,7 @@ import type { SessionWorkspaceFlow } from './useSessionWorkspace'
 
 import { ProjectNavigation } from './ProjectNavigation'
 import { ProviderUsagePanel } from './ProviderUsagePanel'
-import { useProviderUsage } from './useProviderUsage'
+import { isUsageSnapshotStale, useProviderUsage } from './useProviderUsage'
 
 function UsageStatusHarness() {
   const state = useProviderUsage(true)
@@ -131,6 +131,14 @@ describe('ProviderUsagePanel & useProviderUsage', () => {
         checkedAt: new Date().toISOString(),
         identityConfirmed: true,
       }),
+      agy: makeSnapshot('agy', {
+        status: 'ready',
+        fiveHour: { usedPercent: 15, resetsAt: new Date(Date.now() + 3600_000).toISOString() },
+        sevenDay: null,
+        checkedAt: new Date().toISOString(),
+        identityConfirmed: true,
+        message: 'Gemini Models quota',
+      }),
     })
 
     const project: Project = {
@@ -180,6 +188,7 @@ describe('ProviderUsagePanel & useProviderUsage', () => {
     vi.setSystemTime(now)
     const resetFive = new Date(now.getTime() + 90 * 60_000).toISOString()
     const resetSeven = new Date(now.getTime() + 3600_000).toISOString()
+    const resetAgy = new Date(now.getTime() + 45 * 60_000).toISOString()
 
     setupUsageBridge({
       codex: makeSnapshot('codex', {
@@ -196,6 +205,14 @@ describe('ProviderUsagePanel & useProviderUsage', () => {
         sevenDay: { usedPercent: 95, resetsAt: resetSeven }, // 5% left -> danger
         checkedAt: now.toISOString(),
         identityConfirmed: true,
+      }),
+      agy: makeSnapshot('agy', {
+        status: 'ready',
+        fiveHour: { usedPercent: 30, resetsAt: resetAgy }, // 70% left -> normal
+        sevenDay: null,
+        checkedAt: now.toISOString(),
+        identityConfirmed: true,
+        message: 'Gemini Models quota',
       }),
     })
 
@@ -230,6 +247,11 @@ describe('ProviderUsagePanel & useProviderUsage', () => {
     expect(claudeSection.querySelector('.bg-status-danger')).not.toBeNull()
     expect(claudeSection.querySelector('.text-status-danger-foreground')).not.toBeNull()
 
+    const agySection = compact.querySelector<HTMLElement>('[data-provider-usage="agy"]')!
+    expect(within(agySection).getByText('Antigravity')).not.toBeNull()
+    expect(within(agySection).getByText('Gemini Models quota')).not.toBeNull()
+    expect(screen.getByText('Antigravity 5h: 70% left')).not.toBeNull()
+
     // Leaving hover closes compact popover after 140ms.
     fireEvent.mouseLeave(trigger)
     act(() => {
@@ -243,6 +265,7 @@ describe('ProviderUsagePanel & useProviderUsage', () => {
     expect(detailed.getAttribute('data-provider-usage-popover')).toBe('detailed')
     expect(within(detailed).getByText('Resets in 1h 30m')).not.toBeNull()
     expect(within(detailed).getByText('Resets in 1h')).not.toBeNull()
+    expect(within(detailed).getByText('Resets in 45m')).not.toBeNull()
     const refreshCodex = within(detailed).getByRole<HTMLButtonElement>('button', {
       name: 'Refresh Codex',
     })
@@ -277,25 +300,36 @@ describe('ProviderUsagePanel & useProviderUsage', () => {
       identityConfirmed: true,
     })
 
+    const readyAgy = makeSnapshot('agy', {
+      status: 'ready',
+      fiveHour: { usedPercent: 25, resetsAt: new Date(now + 3600_000).toISOString() },
+      sevenDay: null,
+      checkedAt: new Date(now).toISOString(),
+      cooldownUntil,
+      identityConfirmed: true,
+      message: 'Gemini Models quota',
+    })
+
     const bridge = setupUsageBridge(
       {
         codex: makeSnapshot('codex'),
         claude: makeSnapshot('claude'),
+        agy: makeSnapshot('agy'),
       },
       async (provider) => ({
         ok: true,
-        value: provider === 'codex' ? failedCodex : readyClaude,
+        value: provider === 'codex' ? failedCodex : provider === 'agy' ? readyAgy : readyClaude,
       }),
     )
 
     // Passive mount must only read cached snapshots and never spawn external probes before user interaction.
     const view = render(<ProviderUsagePanel visible />)
-    await waitFor(() => expect(bridge.getProviderUsage).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(bridge.getProviderUsage).toHaveBeenCalledTimes(3))
     expect(bridge.refreshProviderUsage).not.toHaveBeenCalled()
 
     // First click opens detailed popover and triggers initial probes -> unavailable during cooldown.
     fireEvent.click(screen.getByRole('button', { name: 'Usage' }))
-    await waitFor(() => expect(bridge.refreshProviderUsage).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(bridge.refreshProviderUsage).toHaveBeenCalledTimes(3))
     await waitFor(() => expect(screen.getByText('Unavailable')).not.toBeNull())
     const refreshAfterFirst = screen.getByRole<HTMLButtonElement>('button', {
       name: 'Refresh Codex',
@@ -305,16 +339,16 @@ describe('ProviderUsagePanel & useProviderUsage', () => {
     // Simulate navigating to Settings (unmounts ProjectNavigation/ProviderUsagePanel) and returning!
     view.unmount()
     render(<ProviderUsagePanel visible />)
-    await waitFor(() => expect(bridge.getProviderUsage).toHaveBeenCalledTimes(4))
+    await waitFor(() => expect(bridge.getProviderUsage).toHaveBeenCalledTimes(6))
 
     // Must NOT start another refreshProviderUsage during cooldown, and must preserve 'Unavailable'!
-    expect(bridge.refreshProviderUsage).toHaveBeenCalledTimes(2)
+    expect(bridge.refreshProviderUsage).toHaveBeenCalledTimes(3)
     fireEvent.click(screen.getByRole('button', { name: 'Usage' }))
     expect(screen.getByText('Unavailable')).not.toBeNull()
     expect(screen.getByRole<HTMLButtonElement>('button', { name: 'Refresh Codex' }).disabled).toBe(
       true,
     )
-    expect(bridge.refreshProviderUsage).toHaveBeenCalledTimes(2)
+    expect(bridge.refreshProviderUsage).toHaveBeenCalledTimes(3)
   })
 
   it('recovers from cancelling with a single scheduler in useProviderUsage', async () => {
@@ -380,14 +414,14 @@ describe('ProviderUsagePanel & useProviderUsage', () => {
     })
     expect(screen.getByRole('status', { name: 'Codex status' }).textContent).toBe('ready')
     expect(screen.getByRole('status', { name: 'Codex 5h' }).textContent).toBe('15')
-    expect(getProviderUsage).toHaveBeenCalledTimes(3) // 1 initial codex + 1 initial claude + 1 scheduled codex
+    expect(getProviderUsage).toHaveBeenCalledTimes(4) // 1 initial codex + 1 initial claude + 1 initial agy + 1 scheduled codex
 
     // Advance well past 350ms: no duplicate/stray scheduler polls run once settled.
     await act(async () => {
       vi.advanceTimersByTime(1000)
       await Promise.resolve()
     })
-    expect(getProviderUsage).toHaveBeenCalledTimes(3)
+    expect(getProviderUsage).toHaveBeenCalledTimes(4)
 
     // Also verify refreshProviderUsage -> 'cancelling' -> single 350ms sync -> 'idle' -> refreshes once.
     cleanup()
@@ -510,5 +544,112 @@ describe('ProviderUsagePanel & useProviderUsage', () => {
       await Promise.resolve()
     })
     expect(screen.getByRole('status', { name: 'Codex status' }).textContent).toBe('idle')
+  })
+
+  it('renders multiple Antigravity quota pools in compact and detailed popovers, formats >24h resets in English, and aggregates badge/stale state across all pools', async () => {
+    vi.useFakeTimers()
+    const now = new Date('2026-11-19T17:20:00.000Z')
+    vi.setSystemTime(now)
+    const resetFive = new Date(now.getTime() + 4 * 60 * 60_000).toISOString()
+    const resetSevenGemini = new Date(now.getTime() + 5 * 86_400_000).toISOString()
+    const resetSevenPartner = new Date(now.getTime() + 6 * 86_400_000).toISOString()
+
+    setupUsageBridge({
+      codex: makeSnapshot('codex', {
+        status: 'ready',
+        fiveHour: null,
+        sevenDay: { usedPercent: 22, resetsAt: resetSevenGemini },
+        checkedAt: now.toISOString(),
+        identityConfirmed: true,
+      }),
+      claude: makeSnapshot('claude', {
+        status: 'not_applicable',
+        checkedAt: now.toISOString(),
+        identityConfirmed: true,
+        message: 'No plan limits',
+      }),
+      agy: makeSnapshot('agy', {
+        status: 'ready',
+        fiveHour: { usedPercent: 1, resetsAt: resetFive },
+        sevenDay: { usedPercent: 54, resetsAt: resetSevenGemini },
+        pools: [
+          {
+            id: 'gemini',
+            label: 'Gemini Models',
+            fiveHour: { usedPercent: 1, resetsAt: resetFive },
+            sevenDay: { usedPercent: 54, resetsAt: resetSevenGemini },
+          },
+          {
+            id: 'claude-gpt',
+            label: 'Claude & GPT',
+            fiveHour: { usedPercent: 0, resetsAt: resetFive },
+            sevenDay: { usedPercent: 96, resetsAt: resetSevenPartner }, // 4% left -> danger
+          },
+        ],
+        checkedAt: now.toISOString(),
+        identityConfirmed: false,
+        message: 'Gemini Models quota',
+      }),
+    })
+
+    render(<ProviderUsagePanel visible />)
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    // Danger dot reflects <=5% left in the secondary Claude & GPT pool even when Gemini is 99% left.
+    const trigger = screen.getByRole('button', { name: 'Usage' })
+    expect(trigger.querySelector('.bg-status-danger')).not.toBeNull()
+
+    // Compact hover popover shows both pools without duplicating the single-pool message caption.
+    fireEvent.mouseEnter(trigger)
+    act(() => {
+      vi.advanceTimersByTime(75)
+    })
+    const compact = screen.getByRole('dialog', { name: 'Usage' })
+    const compactAgy = compact.querySelector<HTMLElement>('[data-provider-usage="agy"]')!
+    expect(within(compactAgy).getByText('Gemini Models')).not.toBeNull()
+    expect(within(compactAgy).getByText('Claude & GPT')).not.toBeNull()
+    expect(within(compactAgy).queryByText('Gemini Models quota')).toBeNull()
+    expect(within(compactAgy).getByText('Antigravity Gemini Models 5h: 99% left')).not.toBeNull()
+    expect(within(compactAgy).getByText('Antigravity Gemini Models 7d: 46% left')).not.toBeNull()
+    expect(within(compactAgy).getByText('Antigravity Claude & GPT 5h: 100% left')).not.toBeNull()
+    expect(within(compactAgy).getByText('Antigravity Claude & GPT 7d: 4% left')).not.toBeNull()
+
+    // Detailed click popover shows English weekday + 24h reset times (never Chinese locale text).
+    fireEvent.click(trigger)
+    const detailed = screen.getByRole('dialog', { name: 'Usage' })
+    expect(detailed.getAttribute('data-provider-usage-popover')).toBe('detailed')
+    const resetLines = within(detailed).getAllByText(/^Resets /u)
+    expect(resetLines.length).toBeGreaterThanOrEqual(3)
+    const weekdayLines = resetLines.filter((el) => !el.textContent?.startsWith('Resets in '))
+    expect(weekdayLines.length).toBeGreaterThanOrEqual(3)
+    for (const el of weekdayLines) {
+      expect(el.textContent).toMatch(/^Resets (?:Sun|Mon|Tue|Wed|Thu|Fri|Sat) \d{2}:\d{2}$/u)
+    }
+
+    // Secondary pool reset expiry triggers stale detection via isUsageSnapshotStale.
+    const expiredSecondary = makeSnapshot('agy', {
+      status: 'ready',
+      fiveHour: { usedPercent: 1, resetsAt: new Date(now.getTime() + 600_000).toISOString() },
+      sevenDay: { usedPercent: 50, resetsAt: new Date(now.getTime() + 600_000).toISOString() },
+      pools: [
+        {
+          id: 'gemini',
+          label: 'Gemini Models',
+          fiveHour: { usedPercent: 1, resetsAt: new Date(now.getTime() + 600_000).toISOString() },
+          sevenDay: { usedPercent: 50, resetsAt: new Date(now.getTime() + 600_000).toISOString() },
+        },
+        {
+          id: 'claude-gpt',
+          label: 'Claude & GPT',
+          fiveHour: { usedPercent: 10, resetsAt: new Date(now.getTime() - 1_000).toISOString() },
+          sevenDay: { usedPercent: 20, resetsAt: new Date(now.getTime() + 600_000).toISOString() },
+        },
+      ],
+      checkedAt: now.toISOString(),
+      identityConfirmed: false,
+    })
+    expect(isUsageSnapshotStale(expiredSecondary, now.getTime())).toBe(true)
   })
 })

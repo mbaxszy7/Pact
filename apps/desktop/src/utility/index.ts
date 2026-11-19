@@ -244,13 +244,17 @@ async function bootstrap(
   // has one idle waiter; Main's shutdown deadline bounds its lifetime.
   const runRequest = (work: () => Promise<void>): void => {
     activeRequests += 1
-    void work().finally(() => {
-      activeRequests -= 1
-      if (activeRequests === 0) {
-        resolveIdle?.()
-        resolveIdle = undefined
-      }
-    })
+    void work()
+      .catch(() => {
+        recordDiagnostic({ operation: 'utility', phase: 'failed', level: 'warn' })
+      })
+      .finally(() => {
+        activeRequests -= 1
+        if (activeRequests === 0) {
+          resolveIdle?.()
+          resolveIdle = undefined
+        }
+      })
   }
 
   parentPort.on('message', (event) => {
@@ -708,8 +712,9 @@ async function bootstrap(
 
       case 'default-session-settings.get.request': {
         const { requestId } = request.data
+        const activePair = request.data.input?.activePair
         runRequest(async () => {
-          const result = await defaultSessionSettings.loadEditorState()
+          const result = await defaultSessionSettings.loadEditorState(undefined, activePair)
           parentPort.postMessage(
             utilityResponseSchema.parse({
               type: 'default-session-settings.get.response',
@@ -1032,7 +1037,7 @@ async function bootstrap(
             utilityResponseSchema.parse({
               type: 'session-creation.prepare.response',
               requestId,
-              result: await sessionWorkspace.prepareCreation(input.projectId),
+              result: await sessionWorkspace.prepareCreation(input.projectId, input.activePair),
             }),
           )
         })
@@ -1137,11 +1142,29 @@ async function bootstrap(
       case 'session-settings.save.request': {
         const { input, requestId } = request.data
         runRequest(async () => {
+          let result = await sessionWorkspace.saveSettings(input)
+          if (result.ok || result.error.code === 'UNCERTAIN') {
+            try {
+              await conversationOwner.reconcileSessionSettingsChanged(input.sessionId)
+            } catch {
+              recordDiagnostic({ operation: 'utility', phase: 'failed', level: 'warn' })
+              if (result.ok) {
+                result = {
+                  ok: false,
+                  error: {
+                    code: 'UNCERTAIN',
+                    message:
+                      'Session settings were saved, but retiring the previous Full access agent process could not be confirmed.',
+                  },
+                }
+              }
+            }
+          }
           parentPort.postMessage(
             utilityResponseSchema.parse({
               type: 'session-settings.save.response',
               requestId,
-              result: await sessionWorkspace.saveSettings(input),
+              result,
             }),
           )
         })
@@ -1150,13 +1173,33 @@ async function bootstrap(
 
       case 'session-permission.save.request': {
         const { input, requestId } = request.data
-        parentPort.postMessage(
-          utilityResponseSchema.parse({
-            type: 'session-catalog.response',
-            requestId,
-            result: sessionWorkspace.savePermission(input),
-          }),
-        )
+        runRequest(async () => {
+          let result = sessionWorkspace.savePermission(input)
+          if (result.ok || result.error.code === 'UNCERTAIN') {
+            try {
+              await conversationOwner.reconcileSessionSettingsChanged(input.sessionId)
+            } catch {
+              recordDiagnostic({ operation: 'utility', phase: 'failed', level: 'warn' })
+              if (result.ok) {
+                result = {
+                  ok: false,
+                  error: {
+                    code: 'UNCERTAIN',
+                    message:
+                      'Session permission was saved, but retiring the previous Full access agent process could not be confirmed.',
+                  },
+                }
+              }
+            }
+          }
+          parentPort.postMessage(
+            utilityResponseSchema.parse({
+              type: 'session-catalog.response',
+              requestId,
+              result,
+            }),
+          )
+        })
         return
       }
 

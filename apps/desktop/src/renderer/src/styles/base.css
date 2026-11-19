@@ -473,6 +473,11 @@
   html[data-material='translucent'] [data-pact-speaker='codex'] > [data-pact-message-bubble] {
     background-color: var(--pact-material-codex);
   }
+
+  html[data-material='translucent'] [data-pact-speaker='agy'][data-pact-message-bubble],
+  html[data-material='translucent'] [data-pact-speaker='agy'] > [data-pact-message-bubble] {
+    background-color: var(--pact-material-agy);
+  }
 }
 
 @layer components {
@@ -594,7 +599,7 @@
 
   .runtime-bridge {
     display: grid;
-    grid-template-columns: 2.25rem 2.75rem 2rem 2.75rem 2.25rem;
+    grid-template-columns: 2.25rem 1.5rem 2.25rem 1.5rem 2rem 1.5rem 2.25rem;
     align-items: center;
   }
 
@@ -706,6 +711,10 @@
 
   .runtime-row[data-agent='codex'] .runtime-agent-mark {
     background: var(--pact-speaker-codex);
+  }
+
+  .runtime-row[data-agent='agy'] .runtime-agent-mark {
+    background: var(--pact-speaker-agy);
   }
 
   .runtime-status {

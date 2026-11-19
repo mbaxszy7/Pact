@@ -33,7 +33,12 @@ test(
       })
       const settings = {
         primaryAgentId: 'codex' as const,
-        agents: { claude: { model: null, effort: null }, codex: { model: null, effort: null } },
+        secondaryAgentId: 'claude' as const,
+        agents: {
+          claude: { model: null, effort: null },
+          codex: { model: null, effort: null },
+          agy: { model: null, effort: null },
+        },
         maxDiscussionRounds: 6,
         maxReviewCycles: 3,
         maxRepairAttempts: 3,

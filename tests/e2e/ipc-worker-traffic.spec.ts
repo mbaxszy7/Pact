@@ -74,7 +74,12 @@ test(
           { id: sessionId, projectId, title: 'IPC worker fixture', createdAt },
           {
             primaryAgentId: 'codex',
-            agents: { claude: { model: null, effort: null }, codex: { model: null, effort: null } },
+            secondaryAgentId: 'claude',
+            agents: {
+              claude: { model: null, effort: null },
+              codex: { model: null, effort: null },
+              agy: { model: null, effort: null },
+            },
             maxDiscussionRounds: 3,
             maxReviewCycles: 2,
             maxRepairAttempts: 2,

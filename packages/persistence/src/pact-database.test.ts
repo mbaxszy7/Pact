@@ -286,9 +286,11 @@ describe('Pact database migrations', () => {
     const sessionId = randomUUID()
     const settings = {
       primaryAgentId: 'codex' as const,
+      secondaryAgentId: 'claude' as const,
       agents: {
         claude: { model: null, effort: null },
         codex: { model: null, effort: null },
+        agy: { model: null, effort: null },
       },
       maxDiscussionRounds: 6,
 
@@ -320,8 +322,9 @@ describe('Pact database migrations', () => {
         agents: {
           claude: { ...settings.agents.claude, speed: 'native' },
           codex: { ...settings.agents.codex, speed: 'native' },
+          agy: { ...settings.agents.agy, speed: 'native' },
         },
-        permissionModes: { claude: 'ask', codex: 'native' },
+        permissionModes: { claude: 'ask', codex: 'native', agy: 'ask' },
       },
       settingsRevision: 1,
       createdAt: project.createdAt,
@@ -1074,9 +1077,11 @@ function createConversationSession(database: PactDatabase): { sessionId: string 
     { id: sessionId, projectId, title: 'New session', createdAt },
     {
       primaryAgentId: 'codex',
+      secondaryAgentId: 'claude',
       agents: {
         claude: { model: null, effort: null },
         codex: { model: 'gpt-5.6-sol', effort: 'high' },
+        agy: { model: null, effort: null },
       },
       maxDiscussionRounds: 6,
 

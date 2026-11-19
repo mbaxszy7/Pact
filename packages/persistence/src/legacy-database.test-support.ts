@@ -114,7 +114,7 @@ export function seedHistoricalAnswerAttempt(database: PactDatabase, originalRunI
         settingsRevision: original.settingsRevision,
         permissionMode:
           current.settings.permissionModes?.[original.agentId] ??
-          (original.agentId === 'claude' ? 'ask' : 'native'),
+          (original.agentId === 'codex' ? 'native' : 'ask'),
         model: original.model,
         effort: original.effort,
         handoffSourceIds: stored.handoffSourceIds,

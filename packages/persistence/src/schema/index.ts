@@ -76,14 +76,17 @@ export const appSetupState = sqliteTable('app_setup_state', {
 })
 
 export const runtimeCliPaths = sqliteTable('runtime_cli_paths', {
-  agentId: text('agent_id', { enum: ['claude', 'codex'] }).primaryKey(),
+  agentId: text('agent_id', { enum: ['claude', 'codex', 'agy'] }).primaryKey(),
   executablePath: text('executable_path').notNull(),
   updatedAt: text('updated_at').notNull(),
 })
 
 export const defaultSessionSettings = sqliteTable('default_session_settings', {
   id: integer('id').primaryKey(),
-  primaryAgentId: text('primary_agent_id', { enum: ['claude', 'codex'] }).notNull(),
+  primaryAgentId: text('primary_agent_id', { enum: ['claude', 'codex', 'agy'] }).notNull(),
+  secondaryAgentId: text('secondary_agent_id', { enum: ['claude', 'codex', 'agy'] })
+    .notNull()
+    .default('claude'),
   claudeModel: text('claude_model'),
   claudeEffort: text('claude_effort'),
   claudeSpeed: text('claude_speed', { enum: ['native', 'standard', 'fast'] })
@@ -92,6 +95,11 @@ export const defaultSessionSettings = sqliteTable('default_session_settings', {
   codexModel: text('codex_model'),
   codexEffort: text('codex_effort'),
   codexSpeed: text('codex_speed', { enum: ['native', 'standard', 'fast'] })
+    .notNull()
+    .default('native'),
+  agyModel: text('agy_model'),
+  agyEffort: text('agy_effort'),
+  agySpeed: text('agy_speed', { enum: ['native', 'standard', 'fast'] })
     .notNull()
     .default('native'),
   maxDiscussionRounds: integer('max_discussion_rounds').notNull(),
@@ -306,7 +314,10 @@ export const sessionSettingsRevisions = sqliteTable(
       .notNull()
       .references(() => sessions.id, { onDelete: 'cascade' }),
     revision: integer('revision').notNull(),
-    primaryAgentId: text('primary_agent_id', { enum: ['claude', 'codex'] }).notNull(),
+    primaryAgentId: text('primary_agent_id', { enum: ['claude', 'codex', 'agy'] }).notNull(),
+    secondaryAgentId: text('secondary_agent_id', { enum: ['claude', 'codex', 'agy'] })
+      .notNull()
+      .default('claude'),
     claudeModel: text('claude_model'),
     claudeEffort: text('claude_effort'),
     claudeSpeed: text('claude_speed', { enum: ['native', 'standard', 'fast'] })
@@ -317,12 +328,20 @@ export const sessionSettingsRevisions = sqliteTable(
     codexSpeed: text('codex_speed', { enum: ['native', 'standard', 'fast'] })
       .notNull()
       .default('native'),
+    agyModel: text('agy_model'),
+    agyEffort: text('agy_effort'),
+    agySpeed: text('agy_speed', { enum: ['native', 'standard', 'fast'] })
+      .notNull()
+      .default('native'),
     claudePermissionMode: text('claude_permission_mode', {
       enum: ['native', 'ask', 'auto', 'full'],
     })
       .notNull()
       .default('ask'),
     codexPermissionMode: text('codex_permission_mode', { enum: ['native', 'ask', 'auto', 'full'] })
+      .notNull()
+      .default('native'),
+    agyPermissionMode: text('agy_permission_mode', { enum: ['native', 'ask', 'auto', 'full'] })
       .notNull()
       .default('native'),
     maxDiscussionRounds: integer('max_discussion_rounds').notNull(),
@@ -347,11 +366,11 @@ export const conversationMessages = sqliteTable(
     replyToMessageId: text('reply_to_message_id'),
     isVisible: integer('is_visible', { mode: 'boolean' }).notNull().default(true),
     role: text('role', { enum: ['user', 'assistant', 'system'] }).notNull(),
-    agentId: text('agent_id', { enum: ['claude', 'codex'] }),
+    agentId: text('agent_id', { enum: ['claude', 'codex', 'agy'] }),
     routeKind: text('route_kind', { enum: ['primary', 'agent', 'all'] }),
     routeAgentsJson: text('route_agents_json'),
     skillInvocationJson: text('skill_invocation_json'),
-    routePendingAgentId: text('route_pending_agent_id', { enum: ['claude', 'codex'] }),
+    routePendingAgentId: text('route_pending_agent_id', { enum: ['claude', 'codex', 'agy'] }),
     sourceMessageId: text('source_message_id'),
     originSideChatJson: text('origin_side_chat_json'),
     content: text('content').notNull(),
@@ -638,7 +657,7 @@ export const agentRuns = sqliteTable(
       .notNull()
       .references(() => sessions.id, { onDelete: 'cascade' }),
     userMessageId: text('user_message_id').notNull(),
-    agentId: text('agent_id', { enum: ['claude', 'codex'] }).notNull(),
+    agentId: text('agent_id', { enum: ['claude', 'codex', 'agy'] }).notNull(),
     status: text('status', {
       enum: ['starting', 'running', 'recovering', 'completed', 'failed', 'interrupted'],
     }).notNull(),
@@ -703,7 +722,7 @@ export const agentRuns = sqliteTable(
     handoffMessageCount: integer('handoff_message_count').notNull().default(0),
     peerProposalId: text('peer_proposal_id'),
     peerProposalTargetAgentId: text('peer_proposal_target_agent_id', {
-      enum: ['claude', 'codex'],
+      enum: ['claude', 'codex', 'agy'],
     }),
     peerProposalKind: text('peer_proposal_kind', {
       enum: ['supplement', 'fact_check', 'challenge', 'review'],
@@ -782,7 +801,7 @@ export const agentRunActivities = sqliteTable(
     runId: text('run_id')
       .notNull()
       .references(() => agentRuns.id, { onDelete: 'cascade' }),
-    agentId: text('agent_id', { enum: ['claude', 'codex'] }).notNull(),
+    agentId: text('agent_id', { enum: ['claude', 'codex', 'agy'] }).notNull(),
     nativeId: text('native_id').notNull(),
     kind: text('kind', { enum: ['reasoning', 'tool'] }).notNull(),
     toolName: text('tool_name'),
@@ -819,7 +838,7 @@ export const workspaceChangeSets = sqliteTable(
     projectId: text('project_id')
       .notNull()
       .references(() => projects.id, { onDelete: 'restrict' }),
-    agentId: text('agent_id', { enum: ['claude', 'codex'] }).notNull(),
+    agentId: text('agent_id', { enum: ['claude', 'codex', 'agy'] }).notNull(),
     root: text('root').notNull(),
     rootDevice: text('root_device').notNull(),
     rootInode: text('root_inode').notNull(),
@@ -928,7 +947,7 @@ export const nativeAgentContexts = sqliteTable(
     sessionId: text('session_id')
       .notNull()
       .references(() => sessions.id, { onDelete: 'cascade' }),
-    agentId: text('agent_id', { enum: ['claude', 'codex'] }).notNull(),
+    agentId: text('agent_id', { enum: ['claude', 'codex', 'agy'] }).notNull(),
     nativeSessionId: text('native_session_id').notNull(),
     bindingGeneration: integer('binding_generation').notNull().default(1),
     executorId: text('executor_id'),
@@ -1022,7 +1041,7 @@ export const nativeRebuildOperations = sqliteTable(
     sessionId: text('session_id')
       .notNull()
       .references(() => sessions.id, { onDelete: 'cascade' }),
-    agentId: text('agent_id', { enum: ['claude', 'codex'] }).notNull(),
+    agentId: text('agent_id', { enum: ['claude', 'codex', 'agy'] }).notNull(),
     oldGeneration: integer('old_generation').notNull(),
     oldNativeSessionId: text('old_native_session_id'),
     oldRunId: text('old_run_id').references(() => agentRuns.id, { onDelete: 'set null' }),
@@ -1104,7 +1123,7 @@ export const nativeForkIntents = sqliteTable(
     operationId: text('operation_id')
       .notNull()
       .references(() => sessionForkOperations.id, { onDelete: 'restrict' }),
-    agentId: text('agent_id', { enum: ['claude', 'codex'] }).notNull(),
+    agentId: text('agent_id', { enum: ['claude', 'codex', 'agy'] }).notNull(),
     sourceJson: text('source_json').notNull(),
     state: text('state', {
       enum: ['prepared', 'forking', 'unconfirmed', 'initializing', 'ready', 'error'],
@@ -1144,7 +1163,7 @@ export const nativeForkCandidateReceipts = sqliteTable(
     operationId: text('operation_id')
       .notNull()
       .references(() => sessionForkOperations.id, { onDelete: 'restrict' }),
-    agentId: text('agent_id', { enum: ['claude', 'codex'] }).notNull(),
+    agentId: text('agent_id', { enum: ['claude', 'codex', 'agy'] }).notNull(),
     nativeSessionId: text('native_session_id').notNull(),
     witnessJson: text('witness_json').notNull(),
     createdAt: text('created_at').notNull(),
@@ -1249,7 +1268,7 @@ export const collaborationActionReceipts = sqliteTable(
     clientNonce: text('client_nonce').notNull(),
     requestDigest: text('request_digest').notNull(),
     action: text('action').notNull(),
-    actor: text('actor', { enum: ['claude', 'codex'] }).notNull(),
+    actor: text('actor', { enum: ['claude', 'codex', 'agy'] }).notNull(),
     handoffId: text('handoff_id').notNull(),
     decisionId: text('decision_id').references(() => relayDecisions.id),
     rootReceiptId: text('root_receipt_id').notNull(),
@@ -1356,7 +1375,7 @@ export const workflowTurns = sqliteTable(
         'reply',
       ],
     }).notNull(),
-    actor: text('actor', { enum: ['claude', 'codex'] }).notNull(),
+    actor: text('actor', { enum: ['claude', 'codex', 'agy'] }).notNull(),
     inputSequence: integer('input_sequence').notNull(),
     taskRevision: integer('task_revision').notNull().default(0),
     authorizationJson: text('authorization_json').notNull(),
@@ -1429,7 +1448,7 @@ export const schedulingEvaluations = sqliteTable(
       .references(() => schedulingHandoffs.id),
     budgetSubjectId: text('budget_subject_id').notNull(),
     factFingerprint: text('fact_fingerprint').notNull(),
-    provider: text('provider', { enum: ['codex', 'claude', 'openai'] }).notNull(),
+    provider: text('provider', { enum: ['codex', 'claude', 'agy', 'openai'] }).notNull(),
     model: text('model').notNull(),
     configurationFingerprint: text('configuration_fingerprint').notNull(),
     inputSha256: text('input_sha256'),
@@ -1468,7 +1487,7 @@ export const schedulingRuntimeOwners = sqliteTable(
     kind: text('kind', { enum: ['probe', 'evaluation', 'check'] }).notNull(),
     sessionId: text('session_id').references(() => sessions.id),
     evaluationId: text('evaluation_id').references(() => schedulingEvaluations.id),
-    provider: text('provider', { enum: ['codex', 'claude', 'openai'] }).notNull(),
+    provider: text('provider', { enum: ['codex', 'claude', 'agy', 'openai'] }).notNull(),
     model: text('model').notNull(),
     configurationFingerprint: text('configuration_fingerprint').notNull(),
     physicalWitnessJson: text('physical_witness_json'),
@@ -1570,7 +1589,7 @@ export const schedulingRecoveryFaults = sqliteTable(
     runId: text('run_id')
       .notNull()
       .references(() => agentRuns.id, { onDelete: 'restrict' }),
-    agentId: text('agent_id', { enum: ['codex', 'claude'] }).notNull(),
+    agentId: text('agent_id', { enum: ['codex', 'claude', 'agy'] }).notNull(),
     utilityEpoch: text('utility_epoch').notNull(),
     configurationGeneration: integer('configuration_generation').notNull(),
     originSequence: integer('origin_sequence').notNull(),
@@ -1721,7 +1740,7 @@ export const collaborationTurnAuthorizations = sqliteTable(
     taskId: text('task_id')
       .notNull()
       .references(() => collaborationTasks.id, { onDelete: 'cascade' }),
-    actor: text('actor', { enum: ['claude', 'codex'] }).notNull(),
+    actor: text('actor', { enum: ['claude', 'codex', 'agy'] }).notNull(),
     duty: text('duty').notNull(),
     ledgerRevision: integer('ledger_revision').notNull(),
     inputWatermark: integer('input_watermark').notNull(),
@@ -1747,7 +1766,7 @@ export const collaborationTodos = sqliteTable(
     kind: text('kind', { enum: ['opinion', 'decision', 'information'] }).notNull(),
     status: text('status', { enum: ['open', 'awaiting_review', 'done'] }).notNull(),
     titlePreview: text('title_preview').notNull(),
-    author: text('author', { enum: ['claude', 'codex'] }).notNull(),
+    author: text('author', { enum: ['claude', 'codex', 'agy'] }).notNull(),
     sourceRunId: text('source_run_id')
       .notNull()
       .references(() => agentRuns.id, { onDelete: 'cascade' }),
@@ -1764,8 +1783,8 @@ export const collaborationTodos = sqliteTable(
     questionId: text('question_id'),
     questionRevision: integer('question_revision'),
     questionJson: text('question_json'),
-    answerResolver: text('answer_resolver', { enum: ['claude', 'codex'] }),
-    confirmedBy: text('confirmed_by', { enum: ['claude', 'codex'] }),
+    answerResolver: text('answer_resolver', { enum: ['claude', 'codex', 'agy'] }),
+    confirmedBy: text('confirmed_by', { enum: ['claude', 'codex', 'agy'] }),
     confirmedRunId: text('confirmed_run_id'),
     updatedAt: text('updated_at').notNull(),
   },
@@ -1790,7 +1809,7 @@ export const collaborationTodoRevisions = sqliteTable(
     kind: text('kind', { enum: ['opinion', 'decision', 'information'] }).notNull(),
     status: text('status', { enum: ['open', 'awaiting_review', 'done'] }).notNull(),
     titlePreview: text('title_preview').notNull(),
-    author: text('author', { enum: ['claude', 'codex'] }).notNull(),
+    author: text('author', { enum: ['claude', 'codex', 'agy'] }).notNull(),
     sourceRunId: text('source_run_id')
       .notNull()
       .references(() => agentRuns.id, { onDelete: 'cascade' }),
@@ -1807,8 +1826,8 @@ export const collaborationTodoRevisions = sqliteTable(
     questionId: text('question_id'),
     questionRevision: integer('question_revision'),
     questionJson: text('question_json'),
-    answerResolver: text('answer_resolver', { enum: ['claude', 'codex'] }),
-    confirmedBy: text('confirmed_by', { enum: ['claude', 'codex'] }),
+    answerResolver: text('answer_resolver', { enum: ['claude', 'codex', 'agy'] }),
+    confirmedBy: text('confirmed_by', { enum: ['claude', 'codex', 'agy'] }),
     confirmedRunId: text('confirmed_run_id'),
     updatedAt: text('updated_at').notNull(),
   },
@@ -1847,7 +1866,7 @@ export const conversationInputBatches = sqliteTable(
     sequence: integer('sequence').notNull(),
     clientMessageId: text('client_message_id').notNull(),
     commentsRevision: integer('comments_revision').notNull(),
-    actor: text('actor', { enum: ['claude', 'codex'] }).notNull(),
+    actor: text('actor', { enum: ['claude', 'codex', 'agy'] }).notNull(),
     /** Prepared retains the frozen default actor; only Run admission binds the recipient. */
     dispatchState: text('dispatch_state', {
       enum: ['prepared', 'paused', 'superseded', 'cancelled', 'dispatched'],
@@ -1907,7 +1926,7 @@ export const conversationInputBatchMembers = sqliteTable(
     questionRevision: integer('question_revision'),
     bodySha256: text('body_sha256').notNull(),
     bodyDocumentJson: text('body_document_json'),
-    answerResolver: text('answer_resolver', { enum: ['claude', 'codex'] }),
+    answerResolver: text('answer_resolver', { enum: ['claude', 'codex', 'agy'] }),
     state: text('state', {
       enum: ['pending_response', 'responded', 'awaiting_confirmation', 'resolved', 'withdrawn'],
     })
@@ -1998,7 +2017,7 @@ export const collaborationReviewFacts = sqliteTable(
     runId: text('run_id')
       .notNull()
       .references(() => agentRuns.id, { onDelete: 'cascade' }),
-    reviewer: text('reviewer', { enum: ['claude', 'codex'] }).notNull(),
+    reviewer: text('reviewer', { enum: ['claude', 'codex', 'agy'] }).notNull(),
     phase: text('phase', { enum: ['plan', 'code'] }).notNull(),
     basisJson: text('basis_json').notNull(),
     ledgerRevision: integer('ledger_revision').notNull(),
@@ -2122,7 +2141,7 @@ export const collaborationInputs = sqliteTable(
       .references(() => conversationBodyInputs.id),
     metadataJson: text('metadata_json').notNull(),
     digest: text('digest').notNull(),
-    actor: text('actor', { enum: ['claude', 'codex'] }).notNull(),
+    actor: text('actor', { enum: ['claude', 'codex', 'agy'] }).notNull(),
     policy: text('policy', { enum: ['immediate_safe_point', 'next_round'] }).notNull(),
     state: text('state', { enum: ['accepted', 'blocked', 'cancelled', 'materialized'] }).notNull(),
     materializedRunId: text('materialized_run_id'),
@@ -2251,7 +2270,7 @@ export const conversationCutoffRevisions = sqliteTable(
     preservedMessageId: text('preserved_message_id').notNull(),
     messageSequence: integer('message_sequence').notNull(),
     role: text('role', { enum: ['user', 'assistant', 'system'] }).notNull(),
-    agentId: text('agent_id', { enum: ['claude', 'codex'] }),
+    agentId: text('agent_id', { enum: ['claude', 'codex', 'agy'] }),
     messageCreatedAt: text('message_created_at').notNull(),
     validUpToMutationSeq: integer('valid_up_to_mutation_seq').notNull(),
     state: text('state', { enum: ['complete', 'streaming', 'incomplete'] }).notNull(),

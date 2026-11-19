@@ -59,9 +59,11 @@ function session(): CollaborationSession {
     hasUnread: false,
     settings: {
       primaryAgentId: 'codex',
+      secondaryAgentId: 'claude',
       agents: {
         codex: { model: null, effort: null },
         claude: { model: 'deepseek-flash', effort: null },
+        agy: { model: null, effort: null },
       },
       maxDiscussionRounds: 3,
 
@@ -175,7 +177,7 @@ it('Full access requires confirmation, cancellation grants nothing, and duplicat
 
 it('revoking Full access and enabling it again needs a fresh confirmation at the current revision', async () => {
   const props = menuProps()
-  props.session.settings.permissionModes = { codex: 'full', claude: 'ask' }
+  props.session.settings.permissionModes = { codex: 'full', claude: 'ask', agy: 'ask' }
   function Controlled() {
     const [current, setCurrent] = useState(props.session)
     return (
@@ -224,7 +226,7 @@ it('revoking Full access and enabling it again needs a fresh confirmation at the
 
 it('shows next-task pending without answering the current native approval', async () => {
   const props = menuProps()
-  props.session.settings.permissionModes = { codex: 'full', claude: 'ask' }
+  props.session.settings.permissionModes = { codex: 'full', claude: 'ask', agy: 'ask' }
   const run: AgentRun = {
     id: crypto.randomUUID(),
     sessionId: props.session.id,
@@ -350,7 +352,10 @@ it.each([true, false])(
       stored = {
         ...initial,
         settingsRevision: 2,
-        settings: { ...initial.settings, permissionModes: { codex: 'full', claude: 'ask' } },
+        settings: {
+          ...initial.settings,
+          permissionModes: { codex: 'full', claude: 'ask', agy: 'ask' },
+        },
       }
       throw new Error('Committed reply was lost')
     })

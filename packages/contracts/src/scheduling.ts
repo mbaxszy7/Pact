@@ -16,7 +16,7 @@ const runFreshnessGuardSchema = z.strictObject({
   inputSequence: z.number().int().nonnegative(),
   runId: z.string().uuid(),
   bindingGeneration: z.number().int().positive(),
-  agentId: z.enum(['codex', 'claude']),
+  agentId: z.enum(['codex', 'claude', 'agy']),
   /** Includes complete source identities, authorization, pause and interaction facts. */
   stateFingerprint: digest,
 })

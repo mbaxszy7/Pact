@@ -453,7 +453,12 @@ export async function workflowConversation(
     { id: sessionId, projectId, title: 'Relay workflow', createdAt },
     {
       primaryAgentId,
-      agents: { codex: { model: null, effort: null }, claude: { model: null, effort: null } },
+      secondaryAgentId: primaryAgentId === 'claude' ? 'codex' : 'claude',
+      agents: {
+        codex: { model: null, effort: null },
+        claude: { model: null, effort: null },
+        agy: { model: null, effort: null },
+      },
       maxDiscussionRounds: 6,
       maxReviewCycles: 3,
       maxRepairAttempts: 3,
@@ -628,7 +633,12 @@ function sharedPlanFixture(db: PactDatabase, index: number, maxDiscussionRounds 
     createdAt = new Date().toISOString()
   const settings = {
     primaryAgentId: 'codex',
-    agents: { codex: { model: null, effort: null }, claude: { model: null, effort: null } },
+    secondaryAgentId: 'claude',
+    agents: {
+      codex: { model: null, effort: null },
+      claude: { model: null, effort: null },
+      agy: { model: null, effort: null },
+    },
     maxDiscussionRounds,
     maxReviewCycles: 3,
     maxRepairAttempts: 3,

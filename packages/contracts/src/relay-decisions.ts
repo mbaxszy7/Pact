@@ -21,7 +21,7 @@ export type RelayDecisionReference = z.infer<typeof relayDecisionReferenceSchema
 
 export const relayRebuildOperationSchema = z.strictObject({
   kind: z.literal('rebuild_native_context'),
-  agentId: z.enum(['codex', 'claude']),
+  agentId: z.enum(['codex', 'claude', 'agy']),
   expectedGeneration: z.number().int().positive(),
   expectedNativeSessionId: text(1024).nullable(),
   expectedRunId: uuid.nullable(),
@@ -32,7 +32,7 @@ export const relayPlanReviewExtensionOperationSchema = z.strictObject({
   kind: z.literal('extend_plan_review'),
   taskId: uuid,
   afterRunId: uuid,
-  actor: z.enum(['codex', 'claude']),
+  actor: z.enum(['codex', 'claude', 'agy']),
   inputSequence: z.number().int().nonnegative(),
   planReference: collaborationPlanReferenceSchema,
   expectedDiscussionRounds: z.number().int().nonnegative(),
@@ -133,7 +133,7 @@ export const relaySchedulingDecisionSchema = relayDecisionReferenceSchema
           clientMessageId: uuid,
           requestFingerprint: digest,
           sourceFingerprint: digest,
-          defaultAgentId: z.enum(['codex', 'claude']),
+          defaultAgentId: z.enum(['codex', 'claude', 'agy']),
           declaredFieldId: uuid.optional(),
         }),
         field: schedulingFieldSchema,

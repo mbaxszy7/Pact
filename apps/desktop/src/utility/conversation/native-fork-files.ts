@@ -1,21 +1,32 @@
 import { createHash } from 'node:crypto'
+import { chmodSync, mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Worker } from 'node:worker_threads'
 
 import type {
   AgentNativeForkBoundary,
+  AgentNativeForkSourceInput,
   AgentNativeForkWitness,
+  AgentPromptImage,
+  AgyNativeForkCutMetadata,
+  AgyRebuildInitializationWitness,
   ClaudePlanCheckpointSource,
 } from '@pact/agent-runtime'
 
 import {
+  agyNativeForkCutMetadataSchema,
+  agyRebuildInitializationWitnessSchema,
   collaborationRetainedPlanSchema,
   type CollaborationRetainedPlan,
   ipcTrafficMeasurementSchema,
   claudePlanCheckpointSchema,
   claudePlanCheckpointRequestSchema,
   claudePlanCheckpointWorkingBytes,
+  nativeForkBoundarySchema,
+  nativeForkWitnessSchema,
   type ClaudePlanCheckpoint,
+  type SessionPermissionMode,
 } from '@pact/contracts'
 import {
   collaborationReviewObservationSchema,
@@ -25,11 +36,44 @@ import {
 import { LogicalIpcWorkerTraffic, observeWorkerTraffic } from '../../shared/logical-ipc-traffic'
 import { AgentExecutionError } from './agent-execution-error'
 import {
+  confirmAgyRebuildColdLoad,
+  resolveAgyAppDataDir,
+  serializeAgyRebuildSeed,
+  type AgyColdInspectionInput,
+  type AgyColdInspectionResult,
+  type AgyConfirmRebuildColdLoadInput,
+  type AgyConsumedInputReceipt,
+  type AgyForkInput,
+  type AgyForkOperationResult,
+  type AgyRebuildSeedChunk,
+  type AgyRebuildSeedInput,
+  type AgyRebuildSeedResult,
+  type AgyRebuildSeedVerificationInput,
+} from './agy-native-storage'
+import {
   isClaudePlanState,
   type ClaudePlanBinding,
   type ClaudePlanState,
 } from './claude-native-plan'
 import { NativeWorkingMemory, NATIVE_OWNER_WORKING_BYTES } from './native-working-memory'
+
+export {
+  confirmAgyRebuildColdLoad,
+  resolveAgyAppDataDir,
+  serializeAgyRebuildSeed,
+  type AgyColdInspectionInput,
+  type AgyColdInspectionResult,
+  type AgyConfirmRebuildColdLoadInput,
+  type AgyConsumedInputReceipt,
+  type AgyForkInput,
+  type AgyForkOperationResult,
+  type AgyRebuildInitializationWitness,
+  type AgyNativeForkCutMetadata,
+  type AgyRebuildSeedChunk,
+  type AgyRebuildSeedInput,
+  type AgyRebuildSeedResult,
+  type AgyRebuildSeedVerificationInput,
+}
 
 function digest(hash: unknown): boolean {
   return typeof hash === 'string' && /^[a-f\d]{64}$/u.test(hash)
@@ -83,6 +127,20 @@ function isResult(value: unknown): value is NativeForkFileResult {
       (typeof item.nativeProjectDevice !== 'string' || item.nativeProjectDevice.length > 64)) ||
     (item.nativeProjectInode != null &&
       (typeof item.nativeProjectInode !== 'string' || item.nativeProjectInode.length > 64)) ||
+    (item.cutStep != null &&
+      (typeof item.cutStep !== 'number' ||
+        !Number.isSafeInteger(item.cutStep) ||
+        item.cutStep < 0 ||
+        item.cutStep > 10_000)) ||
+    (item.trajectoryId != null &&
+      (typeof item.trajectoryId !== 'string' ||
+        !item.trajectoryId.length ||
+        item.trajectoryId.length > 256)) ||
+    (item.sourceTrajectoryId != null &&
+      (typeof item.sourceTrajectoryId !== 'string' ||
+        !item.sourceTrajectoryId.length ||
+        item.sourceTrajectoryId.length > 256)) ||
+    (item.agyCut != null && !agyNativeForkCutMetadataSchema.safeParse(item.agyCut).success) ||
     new Set(item.idMap.map(([id]) => id)).size !== item.idMap.length ||
     new Set(item.idMap.map(([, id]) => id)).size !== item.idMap.length ||
     Buffer.byteLength(JSON.stringify(item)) > 1024 * 1024
@@ -96,8 +154,19 @@ function result(value: unknown): NativeForkFileResult {
 }
 
 export interface NativeForkFileInput {
-  provider: 'claude' | 'codex'
-  action: 'prepare' | 'fork' | 'inspect' | 'read' | 'read-answer' | 'verify-seed' | 'exists'
+  provider: 'claude' | 'codex' | 'agy'
+  action:
+    | 'prepare'
+    | 'fork'
+    | 'inspect'
+    | 'read'
+    | 'read-answer'
+    | 'verify-seed'
+    | 'exists'
+    | 'rebuild_seed'
+    | 'verify-agy-seed'
+    | 'confirm-agy-rebuild-cold-load'
+    | 'inspect-agy-run'
   expectedSeed?: Array<{ id: string; hash: string; images: number }>
   rejectAdditionalWork?: boolean
   /** Exact live Hook cutoff; the prefix excludes this operation. */
@@ -116,6 +185,8 @@ export interface NativeForkFileInput {
   lastDispatchedPhase?: 'fork' | 'initialize'
   cwd: string
   nativeSessionId: string
+  candidateNativeSessionId?: string
+  awaitCandidateCommit?: boolean
   nativeTurnId?: string
   /** Private exact ordered provider input identities, including the root. */
   nativeInputIds?: readonly string[]
@@ -125,6 +196,21 @@ export interface NativeForkFileInput {
   storageRoot?: string
   path?: string
   historyMode?: 'legacy' | 'paginated'
+  rebuildId?: string
+  sourceHash?: string
+  rebuildChunks?: readonly AgyRebuildSeedChunk[]
+  rebuildImages?: readonly AgentPromptImage[]
+  expectedSeedHash?: string
+  expectedTrajectoryId?: string
+  expectedPbSha256?: string
+  expectedPbBytes?: number
+  expectedVerifiedPrefixSha256?: string
+  expectedVerifiedPrefixBytes?: number
+  expectedRecordCount?: number
+  pbSha256?: string
+  pbBytes?: number
+  stepCount?: 2
+  tempStagingDir?: string
 }
 
 export interface NativeForkHistoryReference {
@@ -149,6 +235,30 @@ export interface NativeForkFileResult {
   nativeProjectKey?: string
   nativeProjectDevice?: string
   nativeProjectInode?: string
+  cutStep?: number
+  trajectoryId?: string
+  sourceTrajectoryId?: string
+  agyCut?: AgyNativeForkCutMetadata
+}
+
+export interface AgyForkSessionInput {
+  cwd: string
+  storageRoot?: string
+  candidateNativeSessionId: string
+  source: AgentNativeForkBoundary
+  nativeInputIds?: readonly string[]
+  responseHash?: string
+  model: string | null
+  effort: string | null
+  permissionMode: SessionPermissionMode
+  markInitialized?: boolean
+  onCandidate?: (nativeSessionId: string, witness: AgentNativeForkWitness) => Promise<void>
+}
+
+export interface AgyForkSessionResult {
+  nativeSessionId: string
+  witness: AgentNativeForkWitness
+  file: NativeForkFileResult
 }
 
 export interface NativeForkAnswerResult {
@@ -248,6 +358,152 @@ function answerResult(value: unknown): NativeForkAnswerResult {
   return value
 }
 
+function isAgyRebuildSeedResult(
+  value: unknown,
+  expectedSessionId: string,
+  expectedChunkCount: number,
+): value is AgyRebuildSeedResult {
+  if (
+    !isObject(value) ||
+    value.nativeSessionId !== expectedSessionId ||
+    typeof value.trajectoryId !== 'string' ||
+    !value.trajectoryId.length ||
+    value.trajectoryId.length > 256 ||
+    !digest(value.seedHash) ||
+    value.chunkCount !== expectedChunkCount ||
+    value.stepCount !== 2 ||
+    !digest(value.pbSha256) ||
+    typeof value.pbBytes !== 'number' ||
+    !Number.isSafeInteger(value.pbBytes) ||
+    value.pbBytes <= 0 ||
+    value.pbBytes > 64 * 1024 * 1024 ||
+    typeof value.verifiedPrefixBytes !== 'number' ||
+    !Number.isSafeInteger(value.verifiedPrefixBytes) ||
+    value.verifiedPrefixBytes <= 0 ||
+    value.verifiedPrefixBytes > 32 * 1024 * 1024 ||
+    !digest(value.verifiedPrefixSha256) ||
+    typeof value.recordCount !== 'number' ||
+    !Number.isSafeInteger(value.recordCount) ||
+    value.recordCount <= 0 ||
+    value.recordCount > 10_000 ||
+    typeof value.nativeStorageRoot !== 'string' ||
+    !value.nativeStorageRoot.length ||
+    value.nativeStorageRoot.length > 4096 ||
+    typeof value.nativePath !== 'string' ||
+    !value.nativePath.length ||
+    value.nativePath.length > 4096 ||
+    (value.initializationWitness !== undefined &&
+      !agyRebuildInitializationWitnessSchema.safeParse(value.initializationWitness).success) ||
+    Buffer.byteLength(JSON.stringify(value)) > 1024 * 1024
+  ) {
+    return false
+  }
+  return true
+}
+
+function validateAgyRebuildSeedResult(
+  value: unknown,
+  expectedSessionId: string,
+  expectedChunkCount: number,
+): AgyRebuildSeedResult {
+  if (!isAgyRebuildSeedResult(value, expectedSessionId, expectedChunkCount)) {
+    throw new Error('Invalid or oversized Antigravity rebuild seed worker result.')
+  }
+  return value
+}
+
+function isAgyColdInspectionResult(
+  value: unknown,
+  expectedSessionId: string,
+): value is AgyColdInspectionResult {
+  if (
+    !isObject(value) ||
+    typeof value.exists !== 'boolean' ||
+    value.nativeSessionId !== expectedSessionId ||
+    (value.trajectoryId !== undefined &&
+      (typeof value.trajectoryId !== 'string' ||
+        !value.trajectoryId.length ||
+        value.trajectoryId.length > 256)) ||
+    typeof value.nativeStorageRoot !== 'string' ||
+    !value.nativeStorageRoot.length ||
+    value.nativeStorageRoot.length > 4096 ||
+    typeof value.nativePath !== 'string' ||
+    !value.nativePath.length ||
+    value.nativePath.length > 4096 ||
+    typeof value.stepCount !== 'number' ||
+    !Number.isSafeInteger(value.stepCount) ||
+    value.stepCount < 0 ||
+    value.stepCount > 10_000
+  ) {
+    return false
+  }
+  if (value.terminalState !== undefined) {
+    const state = value.terminalState
+    if (
+      !isObject(state) ||
+      typeof state.executionId !== 'string' ||
+      !state.executionId.length ||
+      state.executionId.length > 256 ||
+      !['completed', 'failed', 'canceled', 'running'].includes(String(state.status)) ||
+      (state.terminationReason !== undefined &&
+        (typeof state.terminationReason !== 'number' ||
+          !Number.isSafeInteger(state.terminationReason))) ||
+      (state.lastStepIdx !== undefined &&
+        (typeof state.lastStepIdx !== 'number' ||
+          !Number.isSafeInteger(state.lastStepIdx) ||
+          state.lastStepIdx < 0 ||
+          state.lastStepIdx > 10_000)) ||
+      !Array.isArray(state.consumedInputStepIds) ||
+      state.consumedInputStepIds.length > 10_000 ||
+      !state.consumedInputStepIds.every(
+        (id) => typeof id === 'string' && id.length > 0 && id.length <= 1024,
+      ) ||
+      !Array.isArray(state.consumedInputs) ||
+      state.consumedInputs.length > 10_000 ||
+      !state.consumedInputs.every(
+        (entry) =>
+          isObject(entry) &&
+          typeof entry.stepIndex === 'number' &&
+          Number.isSafeInteger(entry.stepIndex) &&
+          entry.stepIndex >= 0 &&
+          (entry.stepId === undefined ||
+            (typeof entry.stepId === 'string' && entry.stepId.length <= 1024)) &&
+          (entry.clientMessageId === undefined ||
+            (typeof entry.clientMessageId === 'string' && entry.clientMessageId.length <= 1024)) &&
+          (entry.pactMessageId === undefined ||
+            (typeof entry.pactMessageId === 'string' && entry.pactMessageId.length <= 1024)) &&
+          (entry.pactRunId === undefined ||
+            (typeof entry.pactRunId === 'string' && entry.pactRunId.length <= 1024)) &&
+          digest(entry.textSha256),
+      ) ||
+      typeof state.answer !== 'string' ||
+      Buffer.byteLength(state.answer, 'utf8') > 8 * 1024 * 1024 ||
+      !digest(state.responseHash) ||
+      (state.plan !== undefined &&
+        (!isObject(state.plan) ||
+          typeof state.plan.nativeId !== 'string' ||
+          !state.plan.nativeId.length ||
+          state.plan.nativeId.length > 1024 ||
+          typeof state.plan.text !== 'string' ||
+          Buffer.byteLength(state.plan.text, 'utf8') > 8 * 1024 * 1024)) ||
+      (state.planUnavailable !== undefined && state.planUnavailable !== true)
+    ) {
+      return false
+    }
+  }
+  return true
+}
+
+function validateAgyColdInspectionResult(
+  value: unknown,
+  expectedSessionId: string,
+): AgyColdInspectionResult {
+  if (!isAgyColdInspectionResult(value, expectedSessionId)) {
+    throw new Error('Invalid Antigravity cold inspection worker result.')
+  }
+  return value
+}
+
 /** One bounded off-event-loop reader per Adapter. No native process or transcript cache. */
 export class NativeForkFiles {
   private worker: Worker | undefined
@@ -277,10 +533,251 @@ export class NativeForkFiles {
     if (
       input.action === 'read-answer' ||
       input.action === 'verify-seed' ||
-      input.action === 'exists'
+      input.action === 'exists' ||
+      input.action === 'rebuild_seed' ||
+      input.action === 'verify-agy-seed' ||
+      input.action === 'confirm-agy-rebuild-cold-load' ||
+      input.action === 'inspect-agy-run'
     )
       throw new Error('Native answers and seeds must use their typed readback interfaces.')
-    return this.run(input, signal, result, candidate, resolveReference)
+    const workerInput =
+      input.provider === 'agy' && input.action === 'fork'
+        ? { ...input, awaitCandidateCommit: Boolean(candidate) }
+        : input
+    return this.run(workerInput, signal, result, candidate, resolveReference)
+  }
+
+  async prepareAgyBoundary(
+    input: Omit<AgentNativeForkSourceInput, 'runId'> & { runId?: string; storageRoot?: string },
+    signal: AbortSignal,
+  ): Promise<AgentNativeForkBoundary> {
+    const prefix = await this.execute(
+      {
+        provider: 'agy',
+        action: 'prepare',
+        cwd: input.cwd,
+        nativeSessionId: input.nativeSessionId,
+        nativeTurnId: input.nativeTurnId,
+        ...(input.nativeInputIds ? { nativeInputIds: input.nativeInputIds } : {}),
+        responseHash: input.responseHash,
+        ...(input.storageRoot ? { storageRoot: input.storageRoot } : {}),
+      },
+      signal,
+    )
+    if (!prefix.agyCut) {
+      throw new Error('Antigravity Fork boundary preparation did not return agyCut metadata.')
+    }
+    return nativeForkBoundarySchema.parse({
+      provider: 'agy',
+      nativeSessionId: input.nativeSessionId,
+      nativeTurnId: input.nativeTurnId,
+      nativeCutId: prefix.nativeCutId,
+      ...(input.nativeInputIds ? { nativeInputIds: [...input.nativeInputIds] } : {}),
+      agyCut: prefix.agyCut,
+      bindingGeneration: input.bindingGeneration,
+      throughSequence: input.throughSequence,
+      deliveryCursor: input.deliveryCursor,
+      prefixHash: prefix.prefixHash,
+      prefixRecords: prefix.prefixRecords,
+      prefixBytes: prefix.prefixBytes,
+    })
+  }
+
+  async forkAgy(input: AgyForkSessionInput, signal: AbortSignal): Promise<AgyForkSessionResult> {
+    if (input.source.provider !== 'agy' || !input.source.agyCut) {
+      throw new Error('Antigravity Fork execution requires provider "agy" and agyCut metadata.')
+    }
+    const expectedBoundaryCut = input.source.agyCut
+    const buildWitness = (
+      file: NativeForkFileResult,
+      markInitialized: boolean,
+    ): AgentNativeForkWitness => {
+      if (
+        !file.agyCut ||
+        !file.sourceTrajectoryId ||
+        file.sourceTrajectoryId !== expectedBoundaryCut.trajectoryId ||
+        !file.trajectoryId ||
+        file.agyCut.trajectoryId !== file.trajectoryId ||
+        file.cutStep === undefined ||
+        file.cutStep !== expectedBoundaryCut.cutStepIdx ||
+        file.agyCut.cutStepIdx !== expectedBoundaryCut.cutStepIdx ||
+        file.nativeCutId !== input.source.nativeCutId ||
+        file.agyCut.executionId !== input.source.nativeCutId ||
+        file.prefixHash !== input.source.prefixHash
+      ) {
+        throw new Error(
+          'Antigravity Fork result disagrees with the prepared source boundary, agyCut, or prefixHash.',
+        )
+      }
+      const sourceTrajectoryId = file.sourceTrajectoryId
+      const candidateTrajectoryId = file.trajectoryId
+      const cutStepIdx = file.cutStep
+      return nativeForkWitnessSchema.parse({
+        version: 'pact-native-fork-v1',
+        provider: 'agy',
+        nativeSessionId: file.nativeSessionId,
+        sourceNativeSessionId: input.source.nativeSessionId,
+        sourceCutId: input.source.nativeCutId,
+        sourceTrajectoryId,
+        candidateTrajectoryId,
+        cutStepIdx,
+        agyCut: file.agyCut,
+        sourcePrefixHash: input.source.prefixHash,
+        candidatePrefixHash: file.prefixHash,
+        idMap: file.idMap,
+        candidatePrefixRecords: file.rawRecords,
+        ...(file.nativeStorageRoot ? { nativeStorageRoot: file.nativeStorageRoot } : {}),
+        ...(file.nativePath ? { nativePath: file.nativePath } : {}),
+        ...(markInitialized && file.rawHash
+          ? {
+              initializedAt: new Date().toISOString(),
+              initializedPrefixHash: file.rawHash,
+              initializedPrefixBytes: file.rawBytes,
+              initializedPrefixRecords: file.rawRecords,
+            }
+          : {}),
+        model: input.model,
+        effort: input.effort,
+        permissionMode: input.permissionMode,
+      })
+    }
+
+    const file = await this.execute(
+      {
+        provider: 'agy',
+        action: 'fork',
+        cwd: input.cwd,
+        nativeSessionId: input.source.nativeSessionId,
+        candidateNativeSessionId: input.candidateNativeSessionId,
+        nativeTurnId: input.source.nativeTurnId,
+        ...(input.nativeInputIds ? { nativeInputIds: input.nativeInputIds } : {}),
+        ...(input.responseHash ? { responseHash: input.responseHash } : {}),
+        ...(input.storageRoot ? { storageRoot: input.storageRoot } : {}),
+        source: input.source,
+      },
+      signal,
+      input.onCandidate
+        ? async (candidate) => {
+            await input.onCandidate!(candidate.nativeSessionId, buildWitness(candidate, false))
+          }
+        : undefined,
+    )
+    const witness = buildWitness(file, Boolean(input.markInitialized))
+    return { nativeSessionId: file.nativeSessionId, witness, file }
+  }
+
+  async rebuildAgySeed(
+    input: AgyRebuildSeedInput,
+    signal: AbortSignal,
+  ): Promise<AgyRebuildSeedResult> {
+    return this.run(
+      {
+        provider: 'agy',
+        action: 'rebuild_seed',
+        cwd: input.cwd,
+        nativeSessionId: input.nativeSessionId,
+        ...(input.storageRoot ? { storageRoot: input.storageRoot } : {}),
+        rebuildId: input.rebuildId,
+        ...(input.sourceHash !== undefined ? { sourceHash: input.sourceHash } : {}),
+        rebuildChunks: input.chunks,
+        ...(input.images ? { rebuildImages: input.images } : {}),
+      },
+      signal,
+      (value) => validateAgyRebuildSeedResult(value, input.nativeSessionId, input.chunks.length),
+    )
+  }
+
+  async verifyAgySeed(
+    input: AgyRebuildSeedVerificationInput,
+    signal: AbortSignal,
+  ): Promise<AgyRebuildSeedResult> {
+    return this.run(
+      {
+        provider: 'agy',
+        action: 'verify-agy-seed',
+        cwd: input.cwd,
+        nativeSessionId: input.nativeSessionId,
+        ...(input.storageRoot ? { storageRoot: input.storageRoot } : {}),
+        rebuildId: input.rebuildId,
+        ...(input.sourceHash !== undefined ? { sourceHash: input.sourceHash } : {}),
+        rebuildChunks: input.chunks,
+        ...(input.images ? { rebuildImages: input.images } : {}),
+        ...(input.expectedSeedHash ? { expectedSeedHash: input.expectedSeedHash } : {}),
+        ...(input.expectedTrajectoryId ? { expectedTrajectoryId: input.expectedTrajectoryId } : {}),
+        ...(input.expectedPbSha256 ? { expectedPbSha256: input.expectedPbSha256 } : {}),
+        ...(input.expectedPbBytes !== undefined ? { expectedPbBytes: input.expectedPbBytes } : {}),
+        ...(input.expectedVerifiedPrefixSha256
+          ? { expectedVerifiedPrefixSha256: input.expectedVerifiedPrefixSha256 }
+          : {}),
+        ...(input.expectedVerifiedPrefixBytes !== undefined
+          ? { expectedVerifiedPrefixBytes: input.expectedVerifiedPrefixBytes }
+          : {}),
+        ...(input.expectedRecordCount !== undefined
+          ? { expectedRecordCount: input.expectedRecordCount }
+          : {}),
+        ...(input.rejectAdditionalWork !== undefined
+          ? { rejectAdditionalWork: input.rejectAdditionalWork }
+          : {}),
+      },
+      signal,
+      (value) => validateAgyRebuildSeedResult(value, input.nativeSessionId, input.chunks.length),
+    )
+  }
+
+  async confirmAgyRebuildColdLoad(
+    input: AgyConfirmRebuildColdLoadInput,
+    signal: AbortSignal,
+  ): Promise<AgyRebuildInitializationWitness> {
+    const storageRoot = input.storageRoot ?? input.appDataDir
+    return this.run(
+      {
+        provider: 'agy',
+        action: 'confirm-agy-rebuild-cold-load',
+        cwd: input.cwd,
+        nativeSessionId: input.nativeSessionId,
+        ...(storageRoot ? { storageRoot } : {}),
+        sourceHash: input.sourceHash,
+        pbSha256: input.pbSha256,
+        pbBytes: input.pbBytes,
+        stepCount: input.stepCount,
+      },
+      signal,
+      (value) => {
+        const parsed = agyRebuildInitializationWitnessSchema.parse(value)
+        if (
+          parsed.nativeSessionId !== input.nativeSessionId ||
+          parsed.sourceHash !== input.sourceHash ||
+          parsed.pbSha256 !== input.pbSha256 ||
+          parsed.pbBytes !== input.pbBytes ||
+          parsed.stepCount !== 2
+        ) {
+          throw new Error(
+            'Antigravity rebuild cold-load receipt mismatched expected seed identity.',
+          )
+        }
+        return parsed
+      },
+    )
+  }
+
+  async inspectAgyRun(
+    input: AgyColdInspectionInput,
+    signal: AbortSignal,
+  ): Promise<AgyColdInspectionResult> {
+    return this.run(
+      {
+        provider: 'agy',
+        action: 'inspect-agy-run',
+        cwd: input.cwd,
+        nativeSessionId: input.nativeSessionId,
+        ...(input.storageRoot ? { storageRoot: input.storageRoot } : {}),
+        ...(input.nativeTurnId ? { nativeTurnId: input.nativeTurnId } : {}),
+        ...(input.nativeInputIds ? { nativeInputIds: input.nativeInputIds } : {}),
+        ...(input.includePlan !== undefined ? { includePlan: input.includePlan } : {}),
+      },
+      signal,
+      (value) => validateAgyColdInspectionResult(value, input.nativeSessionId),
+    )
   }
 
   async readAnswer(
@@ -376,11 +873,20 @@ export class NativeForkFiles {
   }
 
   async exists(
-    input: Pick<NativeForkFileInput, 'cwd' | 'nativeSessionId'>,
+    input: Pick<NativeForkFileInput, 'cwd' | 'nativeSessionId'> & {
+      provider?: 'claude' | 'agy'
+      storageRoot?: string
+    },
     signal: AbortSignal,
   ): Promise<boolean> {
     const existence = await this.run(
-      { ...input, provider: 'claude', action: 'exists' },
+      {
+        cwd: input.cwd,
+        nativeSessionId: input.nativeSessionId,
+        ...(input.storageRoot ? { storageRoot: input.storageRoot } : {}),
+        provider: input.provider ?? 'claude',
+        action: 'exists',
+      },
       signal,
       (value): NativeSessionExistenceResult => {
         if (
@@ -414,8 +920,31 @@ export class NativeForkFiles {
         false,
       )
     const reservation = new NativeWorkingMemory().reserve(NATIVE_OWNER_WORKING_BYTES)
+    let agyTempStagingDir: string | undefined
+    const cleanupAgyTempStagingDir = (): void => {
+      if (!agyTempStagingDir) return
+      const dir = agyTempStagingDir
+      agyTempStagingDir = undefined
+      try {
+        rmSync(dir, { recursive: true, force: true })
+      } catch {
+        /* Best-effort cleanup of caller-owned private staging directory after Worker exit. */
+      }
+    }
+    let effectiveInput = input
+    if (input.provider === 'agy') {
+      try {
+        agyTempStagingDir = mkdtempSync(join(tmpdir(), 'pact-agy-stage-'))
+        chmodSync(agyTempStagingDir, 0o700)
+        effectiveInput = { ...input, tempStagingDir: agyTempStagingDir }
+      } catch (error) {
+        cleanupAgyTempStagingDir()
+        reservation.release()
+        throw error
+      }
+    }
     const traffic = this.ipcTraffic?.collector('utility-native-fork')
-    const initialization = traffic ? { input, measure: true } : input
+    const initialization = traffic ? { input: effectiveInput, measure: true } : effectiveInput
     let worker: Worker
     try {
       worker = new Worker(join(__dirname, 'native-fork-worker.js'), {
@@ -427,6 +956,7 @@ export class NativeForkFiles {
         },
       })
     } catch (error) {
+      cleanupAgyTempStagingDir()
       reservation.release()
       throw error
     }
@@ -455,6 +985,7 @@ export class NativeForkFiles {
     const settlePhysical = (): void => {
       if (physicallySettled || !workerExited || checkpointReading) return
       physicallySettled = true
+      cleanupAgyTempStagingDir()
       reservation.release()
       if (this.worker === worker) {
         this.worker = undefined

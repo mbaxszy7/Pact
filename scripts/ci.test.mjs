@@ -446,3 +446,17 @@ void test('Windows owner admission cannot reuse another version or a non-Windows
   assert.equal(safe.LIB, '/owned/msvc/lib')
   assert.equal(safe.ANTHROPIC_API_KEY, undefined)
 })
+
+void test('CI system environment admits explicit Antigravity CLI paths without admitting auth dirs or Gemini keys', () => {
+  const safe = ciEnvironment({
+    PACT_E2E_AGY_EXECUTABLE: '/owned/bin/agy',
+    PACT_NATIVE_AGY_EXECUTABLE: '/owned/bin/agy-native',
+    PACT_E2E_AGY_AUTH_DIR: '/private/auth-never-forwarded',
+    GEMINI_API_KEY: 'synthetic-gemini-key',
+    GOOGLE_API_KEY: 'synthetic-google-key',
+  })
+  assert.deepEqual(safe, {
+    PACT_E2E_AGY_EXECUTABLE: '/owned/bin/agy',
+    PACT_NATIVE_AGY_EXECUTABLE: '/owned/bin/agy-native',
+  })
+})

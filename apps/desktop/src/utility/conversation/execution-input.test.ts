@@ -188,4 +188,48 @@ describe('immutable execution input codec', () => {
       expect(frozenExecutionEnvelopeSchema.safeParse(candidate).success).toBe(false)
     },
   )
+
+  it('freezes and restores Antigravity (agy) targetAgentId, SkillInvocation, and 3-agent handoffContext cleanly', () => {
+    const f = fixture()
+    const agySkills: FrozenSkillInvocation = {
+      version: 'pact-skills-v1',
+      arguments: 'audit transport bounds',
+      selections: [{ id: 'e'.repeat(64), agentId: 'agy', name: 'audit', start: 0, end: 6 }],
+      bindings: [
+        {
+          id: 'e'.repeat(64),
+          agentId: 'agy',
+          name: 'audit',
+          description: 'Audit ACP bounds',
+          argumentHint: 'module',
+          source: 'project',
+          path: '/private/agy-skill/SKILL.md',
+        },
+      ],
+    }
+    f.envelope.targetAgentId = 'agy'
+    f.envelope.skillInvocation = agySkills
+    f.envelope.handoffContext = [
+      {
+        messageId: randomUUID(),
+        speaker: 'claude',
+        content: 'Claude handoff message.',
+        comments: [],
+      },
+      {
+        messageId: randomUUID(),
+        speaker: 'agy',
+        content: 'Antigravity prior turn summary.',
+        comments: [],
+      },
+    ]
+
+    const frozen = pathlessExecutionInput(f.envelope)
+    expect(JSON.stringify(frozen)).not.toContain('/private/agy-skill/')
+    expect(frozen.targetAgentId).toBe('agy')
+    const restored = restoreExecutionInput(frozen, resolveOwnedImage, agySkills)
+    expect(restored.targetAgentId).toBe('agy')
+    expect(restored.skillInvocation).toBe(agySkills)
+    expect(restored.handoffContext?.map((h) => h.speaker)).toEqual(['claude', 'agy'])
+  })
 })

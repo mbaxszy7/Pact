@@ -26,12 +26,15 @@ import type {
   ConversationQueueEnabledInput,
   ConversationSnapshot,
   DefaultSessionSettings,
+  NativeContextRebuildChunk,
   NativeContextRebuildInput,
+  NativeProbeResult,
   PeerProposalAcceptInput,
   PeerProposalDismissInput,
   PeerRequestKind,
   RpcResult,
   RuntimeAgentId,
+  SessionPermissionMode,
   WorkspaceChangesReadInput,
   WorkspaceChangesPage,
   WorkspaceChangeFileReadInput,
@@ -100,10 +103,15 @@ import {
   type AgentNativeCheckOperation,
   type AgentNativeCheckContext,
   type AgentPromptEnvelope,
+  type AgentPromptImage,
   type AgentNativeForkInput,
 } from '@pact/agent-runtime'
 import { conversationStreamTraceSchema, STREAM_TRACE_TTL_MS } from '@pact/contracts'
 import {
+  AGENTS,
+  agyRebuildInitializationWitnessSchema,
+  agentDisplayName,
+  agentIdForRouteCandidate,
   COLLABORATION_PROTOCOL,
   collaborationTaskSchema,
   collaborationActor,
@@ -112,6 +120,7 @@ import {
   collaborationInitialStage,
   advanceAutomaticCollaboration,
   defaultTaskStageRoles,
+  isAgentInPair,
   pactCommandRouteAllowed,
   pactEntryPrimary,
   initialTaskRoleCandidateIdSchema,
@@ -120,7 +129,9 @@ import {
   isCollaborationOpenMode,
   collaborationInputGate,
   otherAgent,
+  resolveActiveAgentPair,
   resolveMainChatSyncTarget,
+  routeCandidateIdSchema,
   collaborationMarkdownPageSchema,
   type CollaborationTask,
   type CollaborationActionInput,
@@ -194,6 +205,7 @@ import {
   PreparedInformationConflictError,
   OversizedConversationEntityError,
   ProjectCatalogRepository,
+  projectSessionIssues,
   SessionRepository,
   SideChatPersistenceError,
   StaleConversationCursorError,
@@ -216,14 +228,26 @@ import {
   NativeCapacityError,
   NativeInputWithheldError,
   classifyAgentError,
+  isCodexArchivedSessionRejection,
 } from './agent-execution-error'
 import { AgentStreamBuffer } from './agent-stream-buffer'
+import { AgyAcpConnectionPool } from './agy-acp-connection'
+import {
+  AgyAgentAdapter,
+  type AgyAgentAdapterOptions,
+  type AgyNativeStorageClient,
+} from './agy-agent-adapter'
 import { ClaudeAgentAdapter } from './claude-agent-adapter'
 import { CodexAgentAdapter } from './codex-agent-adapter'
 import { ConversationImages } from './conversation-images'
 import { type DecisionInputLoader } from './decision-runtime'
 import { pathlessExecutionInput, restoreExecutionInput } from './execution-input'
 import { FrozenSourceReader } from './frozen-source-reader'
+import {
+  NativeForkFiles,
+  resolveAgyAppDataDir,
+  type NativeForkFileResult,
+} from './native-fork-files'
 import { setPromptCutoffSupplement } from './native-image-content'
 import { encodeNativeJsonFrame } from './native-json-encoder'
 import { safeNativePermissionText } from './native-permission-wait'
@@ -289,10 +313,617 @@ interface CachedAdapter {
   executablePath: string
   cwd: string
   adapter: AgentAdapter
+  appDataDir?: string | undefined
+  peerTargetAgentId?: Exclude<RuntimeAgentId, 'agy'> | undefined
+  poolKey?: string | undefined
+  connectionPool?: AgyAcpConnectionPool | undefined
+  disposeExtra?: (() => Promise<void>) | undefined
+  retireFullAccess?: ((options?: { cwd?: string; sessionId?: string }) => Promise<void>) | undefined
   nativeTitleObserved?: {
     nativeSessionId: string
     bindingGeneration: number
     executorId: string | undefined
+  }
+}
+
+export function resolveEffectiveAgyAppDataDir(env: NodeJS.ProcessEnv = process.env): string {
+  return resolveAgyAppDataDir(env)
+}
+
+export interface AgyColdLoadConfirmInput {
+  cwd: string
+  appDataDir?: string | undefined
+  storageRoot?: string | undefined
+  nativeSessionId: string
+  sourceHash: string
+  pbSha256: string
+  pbBytes: number
+  stepCount: 2
+}
+
+export interface AgyColdLoadStorageClient extends AgyNativeStorageClient {
+  writeRebuildSeed(
+    input: Parameters<NonNullable<AgyNativeStorageClient['writeRebuildSeed']>>[0],
+    signal: AbortSignal,
+  ): Promise<
+    Awaited<ReturnType<NonNullable<AgyNativeStorageClient['writeRebuildSeed']>>> & {
+      pbSha256: string
+      pbBytes: number
+    }
+  >
+  confirmRebuildColdLoad(
+    input: AgyColdLoadConfirmInput,
+    signal: AbortSignal,
+  ): Promise<import('@pact/agent-runtime').AgyRebuildInitializationWitness>
+  inspectRebuildSeed: NonNullable<AgyNativeStorageClient['inspectRebuildSeed']>
+}
+
+function isVerifiedAgyRebuildWitness(
+  value: unknown,
+  expectedNativeSessionId: string,
+  expectedSourceHash?: string,
+): value is import('@pact/agent-runtime').AgyRebuildInitializationWitness {
+  const parsed = agyRebuildInitializationWitnessSchema.safeParse(value)
+  if (!parsed.success) return false
+  if (parsed.data.nativeSessionId !== expectedNativeSessionId) return false
+  if (expectedSourceHash !== undefined && parsed.data.sourceHash !== expectedSourceHash) {
+    return false
+  }
+  return true
+}
+
+export interface AgyCapableForkFiles {
+  execute(
+    input: {
+      provider: 'agy'
+      action: 'prepare' | 'inspect'
+      cwd: string
+      nativeSessionId: string
+      nativeTurnId?: string
+      nativeInputIds?: readonly string[]
+      responseHash?: string
+      source?: AgentNativeForkBoundary
+      witness?: import('@pact/agent-runtime').AgentNativeForkWitness
+      lastDispatchedPhase?: 'fork' | 'initialize'
+      storageRoot?: string
+    },
+    signal: AbortSignal,
+  ): Promise<NativeForkFileResult>
+  prepareAgyBoundary(
+    input: Omit<import('@pact/agent-runtime').AgentNativeForkSourceInput, 'runId'> & {
+      runId?: string
+      storageRoot?: string
+    },
+    signal: AbortSignal,
+  ): Promise<AgentNativeForkBoundary>
+  exists(
+    input: {
+      cwd: string
+      nativeSessionId: string
+      provider?: 'claude' | 'agy'
+      storageRoot?: string
+    },
+    signal: AbortSignal,
+  ): Promise<boolean>
+  forkAgy(
+    input: {
+      cwd: string
+      storageRoot?: string
+      candidateNativeSessionId: string
+      source: AgentNativeForkBoundary
+      model: string | null
+      effort: string | null
+      permissionMode: SessionPermissionMode
+      onCandidate?: (
+        nativeSessionId: string,
+        witness: import('@pact/agent-runtime').AgentNativeForkWitness,
+      ) => Promise<void>
+    },
+    signal: AbortSignal,
+  ): Promise<{
+    nativeSessionId: string
+    witness: import('@pact/agent-runtime').AgentNativeForkWitness
+    file: NativeForkFileResult
+  }>
+  rebuildAgySeed(
+    input: {
+      cwd: string
+      storageRoot?: string
+      nativeSessionId: string
+      rebuildId: string
+      sourceHash?: string
+      chunks: readonly NativeContextRebuildChunk[]
+      images?: readonly AgentPromptImage[]
+    },
+    signal: AbortSignal,
+  ): Promise<{
+    nativeSessionId: string
+    seedHash: string
+    chunkCount: number
+    stepCount: number
+    pbSha256?: string
+    pbBytes?: number
+    verifiedPrefixBytes: number
+    verifiedPrefixSha256: string
+    initializationWitness?: import('@pact/agent-runtime').AgyRebuildInitializationWitness
+  }>
+  verifyAgySeed(
+    input: {
+      cwd: string
+      storageRoot?: string
+      nativeSessionId: string
+      rebuildId: string
+      sourceHash?: string
+      chunks: readonly NativeContextRebuildChunk[]
+      rejectAdditionalWork?: boolean
+    },
+    signal: AbortSignal,
+  ): Promise<{
+    nativeSessionId: string
+    seedHash: string
+    chunkCount: number
+    stepCount: number
+    pbSha256?: string
+    pbBytes?: number
+    verifiedPrefixBytes: number
+    verifiedPrefixSha256: string
+    initializationWitness?: import('@pact/agent-runtime').AgyRebuildInitializationWitness
+  }>
+  confirmAgyRebuildColdLoad?(
+    input: {
+      cwd: string
+      storageRoot?: string | undefined
+      appDataDir?: string | undefined
+      nativeSessionId: string
+      sourceHash: string
+      pbSha256: string
+      pbBytes: number
+      stepCount: 2
+    },
+    signal: AbortSignal,
+  ): Promise<import('@pact/agent-runtime').AgyRebuildInitializationWitness>
+  inspectAgyRun(
+    input: {
+      cwd: string
+      storageRoot?: string
+      nativeSessionId: string
+      nativeTurnId?: string
+      nativeInputIds?: readonly string[]
+      includePlan?: boolean
+    },
+    signal: AbortSignal,
+  ): Promise<{
+    exists: boolean
+    stepCount: number
+    terminalState?:
+      | {
+          executionId: string
+          status: 'completed' | 'failed' | 'canceled' | 'running'
+          consumedInputStepIds: readonly string[]
+          consumedInputs: ReadonlyArray<{
+            stepIndex: number
+            stepId?: string | undefined
+            clientMessageId?: string | undefined
+            pactMessageId?: string | undefined
+            pactRunId?: string | undefined
+            textSha256: string
+          }>
+          answer: string
+          responseHash: string
+          plan?: { nativeId: string; text: string } | undefined
+          planUnavailable?: true | undefined
+        }
+      | undefined
+  }>
+}
+
+/**
+ * Typed bridge from `AgyAgentAdapter`'s `AgyNativeStorageClient` seam onto `NativeForkFiles`
+ * (`agy-native-storage.ts` / `native-fork-worker.ts`).
+ */
+export function createAgyNativeStorageClient(
+  capable: AgyCapableForkFiles,
+  defaultAppDataDir?: string,
+): AgyColdLoadStorageClient {
+  return {
+    async probeSessionStatus(input, signal): Promise<NativeProbeResult> {
+      const storageRoot = input.appDataDir ?? defaultAppDataDir
+      const nativeTurnId = input.nativeTurnId ?? input.runId
+      const inspected = await capable.inspectAgyRun(
+        {
+          cwd: input.cwd,
+          ...(storageRoot ? { storageRoot } : {}),
+          nativeSessionId: input.nativeSessionId,
+          ...(nativeTurnId ? { nativeTurnId } : {}),
+          ...(input.nativeInputIds ? { nativeInputIds: input.nativeInputIds } : {}),
+          includePlan: Boolean(input.planSource || input.inspectMissingPlan),
+        },
+        signal,
+      )
+      const identity = {
+        sessionId: input.sessionId,
+        agentId: 'agy' as const,
+        requestId: input.requestId,
+        nativeSessionId: input.nativeSessionId,
+        ...(input.runId ? { runId: input.runId } : {}),
+        ...(input.nativeTurnId ? { nativeTurnId: input.nativeTurnId } : {}),
+        bindingGeneration: input.bindingGeneration,
+        ...(input.executorId ? { executorId: input.executorId } : {}),
+      }
+      if (!inspected.exists) return { kind: 'missing', identity, source: 'native_error' }
+      if (!inspected.terminalState) {
+        return {
+          kind: 'no_evidence',
+          identity,
+          reason: 'No matching Antigravity execution steps found in cold SQLite trajectory.',
+        }
+      }
+      if (inspected.terminalState.status === 'running') {
+        const hasPartialOutput = Boolean(
+          inspected.terminalState.answer ||
+          inspected.terminalState.plan ||
+          inspected.terminalState.planUnavailable,
+        )
+        return {
+          kind: 'no_evidence',
+          identity,
+          reason:
+            'Cold SQLite trajectory has no terminal step; live execution cannot be inferred without an active executor.',
+          ...(hasPartialOutput
+            ? {
+                output: {
+                  outputId: inspected.terminalState.executionId,
+                  text: inspected.terminalState.answer,
+                  completeness: 'partial' as const,
+                  ...(inspected.terminalState.plan ? { plan: inspected.terminalState.plan } : {}),
+                  ...(inspected.terminalState.planUnavailable ? { planUnavailable: true } : {}),
+                },
+              }
+            : {}),
+        }
+      }
+      const outcome =
+        inspected.terminalState.status === 'completed'
+          ? 'completed'
+          : inspected.terminalState.status === 'canceled'
+            ? 'interrupted'
+            : 'failed'
+      const hasOutput = Boolean(
+        inspected.terminalState.answer ||
+        inspected.terminalState.plan ||
+        inspected.terminalState.planUnavailable,
+      )
+      return {
+        kind: 'ended',
+        identity,
+        source: 'stored_terminal',
+        outcome,
+        ...(inspected.terminalState.planUnavailable ? { planUnavailable: true } : {}),
+        ...(hasOutput
+          ? {
+              output: {
+                outputId: inspected.terminalState.executionId,
+                text: inspected.terminalState.answer,
+                completeness: outcome === 'completed' ? 'complete' : 'partial',
+                ...(inspected.terminalState.plan ? { plan: inspected.terminalState.plan } : {}),
+                ...(inspected.terminalState.planUnavailable ? { planUnavailable: true } : {}),
+              },
+            }
+          : {}),
+      }
+    },
+
+    async probeInputReceipts(input, signal): Promise<readonly string[]> {
+      const candidateIds = input.nativeInputIds ?? input.unresolvedInputIds
+      const storageRoot = input.appDataDir ?? defaultAppDataDir
+      const inspected = await capable.inspectAgyRun(
+        {
+          cwd: input.cwd,
+          ...(storageRoot ? { storageRoot } : {}),
+          nativeSessionId: input.nativeSessionId,
+          ...(input.nativeTurnId ? { nativeTurnId: input.nativeTurnId } : {}),
+          nativeInputIds: candidateIds,
+        },
+        signal,
+      )
+      if (!inspected.exists || !inspected.terminalState) return []
+      const matched = new Set<string>(inspected.terminalState.consumedInputStepIds)
+      for (const entry of inspected.terminalState.consumedInputs) {
+        if (entry.pactMessageId) matched.add(entry.pactMessageId)
+        if (entry.clientMessageId) matched.add(entry.clientMessageId)
+        if (entry.stepId) matched.add(entry.stepId)
+        if (entry.pactRunId) matched.add(entry.pactRunId)
+      }
+      return input.unresolvedInputIds.filter((id) => matched.has(id))
+    },
+
+    async verifySteerConsumption(input, signal) {
+      const storageRoot = input.appDataDir || defaultAppDataDir
+      const verifyTurnId = input.executionId ?? input.nativeTurnId
+      const inspected = await capable.inspectAgyRun(
+        {
+          cwd: input.cwd,
+          ...(storageRoot ? { storageRoot } : {}),
+          nativeSessionId: input.nativeSessionId,
+          ...(verifyTurnId ? { nativeTurnId: verifyTurnId } : {}),
+          nativeInputIds: [input.inputId],
+        },
+        signal,
+      )
+      const minStep = input.minStepIdx ?? 0
+      const hit = inspected.terminalState?.consumedInputs.find(
+        (entry) =>
+          entry.stepIndex >= minStep &&
+          (entry.pactMessageId === input.inputId ||
+            entry.clientMessageId === input.inputId ||
+            entry.stepId === input.inputId),
+      )
+      return {
+        consumed: Boolean(hit),
+        ...(hit ? { stepIdx: hit.stepIndex } : {}),
+        ...(inspected.terminalState?.executionId
+          ? { executionId: inspected.terminalState.executionId }
+          : {}),
+      }
+    },
+
+    async writeRebuildSeed(input, signal) {
+      const chunks: NativeContextRebuildChunk[] = []
+      const images: AgentPromptImage[] = []
+      for await (const record of input.chunks) {
+        signal.throwIfAborted()
+        chunks.push(record.chunk)
+        if (record.resolvedImages) {
+          for (const image of record.resolvedImages.values()) images.push(image)
+        }
+      }
+      const storageRoot = input.appDataDir || defaultAppDataDir
+      const written = await capable.rebuildAgySeed(
+        {
+          cwd: input.cwd,
+          ...(storageRoot ? { storageRoot } : {}),
+          nativeSessionId: input.candidateSessionId,
+          rebuildId: input.candidateSessionId,
+          ...(input.sourceHash !== undefined ? { sourceHash: input.sourceHash } : {}),
+          chunks,
+          ...(images.length ? { images } : {}),
+        },
+        signal,
+      )
+      const seedResult = {
+        seedHash: written.seedHash,
+        pbSha256: written.pbSha256 ?? written.verifiedPrefixSha256,
+        pbBytes: written.pbBytes ?? written.verifiedPrefixBytes,
+        chunkCount: written.chunkCount,
+        stepCount: written.stepCount,
+        verifiedPrefixBytes: written.verifiedPrefixBytes,
+        verifiedPrefixSha256: written.verifiedPrefixSha256,
+      }
+      return seedResult
+    },
+
+    async confirmRebuildColdLoad(input, signal) {
+      signal.throwIfAborted()
+      if (!capable.confirmAgyRebuildColdLoad) {
+        throw new Error('Antigravity rebuild cold-load confirmation is unavailable.')
+      }
+      const storageRoot = input.appDataDir || input.storageRoot || defaultAppDataDir
+      const witness = await capable.confirmAgyRebuildColdLoad(
+        {
+          cwd: input.cwd,
+          ...(storageRoot ? { storageRoot } : {}),
+          ...(input.appDataDir ? { appDataDir: input.appDataDir } : {}),
+          nativeSessionId: input.nativeSessionId,
+          sourceHash: input.sourceHash,
+          pbSha256: input.pbSha256,
+          pbBytes: input.pbBytes,
+          stepCount: input.stepCount,
+        },
+        signal,
+      )
+      if (!isVerifiedAgyRebuildWitness(witness, input.nativeSessionId, input.sourceHash)) {
+        throw new Error(
+          'Antigravity rebuild cold-load witness did not satisfy schema or sourceHash verification.',
+        )
+      }
+      return witness
+    },
+
+    async inspectRebuildSeed(input, signal) {
+      const chunks: NativeContextRebuildChunk[] = []
+      for await (const chunk of input.chunks) {
+        signal.throwIfAborted()
+        chunks.push(chunk)
+      }
+      const storageRoot = input.appDataDir || defaultAppDataDir
+      try {
+        const verified = await capable.verifyAgySeed(
+          {
+            cwd: input.cwd,
+            ...(storageRoot ? { storageRoot } : {}),
+            nativeSessionId: input.nativeSessionId,
+            rebuildId: input.nativeSessionId,
+            ...(input.sourceHash !== undefined ? { sourceHash: input.sourceHash } : {}),
+            chunks,
+            rejectAdditionalWork: true,
+          },
+          signal,
+        )
+        if (
+          !isVerifiedAgyRebuildWitness(
+            verified.initializationWitness,
+            input.nativeSessionId,
+            input.sourceHash,
+          )
+        ) {
+          return {
+            verified: false,
+            seedHash: '',
+            stepCount: 0,
+          }
+        }
+        return {
+          verified: true,
+          seedHash: verified.seedHash,
+          stepCount: verified.stepCount,
+          initializationWitness: verified.initializationWitness,
+        }
+      } catch (error) {
+        if (signal.aborted) throw error
+        return {
+          verified: false,
+          seedHash: '',
+          stepCount: 0,
+        }
+      }
+    },
+
+    async prepareFork(input, signal) {
+      const storageRoot = input.appDataDir || defaultAppDataDir
+      return capable.prepareAgyBoundary(
+        {
+          cwd: input.cwd,
+          ...(storageRoot ? { storageRoot } : {}),
+          nativeSessionId: input.nativeSessionId,
+          nativeTurnId: input.nativeTurnId,
+          runId: input.runId,
+          ...(input.nativeInputIds ? { nativeInputIds: input.nativeInputIds } : {}),
+          bindingGeneration: input.bindingGeneration,
+          throughSequence: input.throughSequence,
+          deliveryCursor: input.deliveryCursor,
+          responseHash: input.responseHash,
+        },
+        signal,
+      )
+    },
+
+    async writeFork(input, signal) {
+      const storageRoot = input.appDataDir || defaultAppDataDir
+      const forked = await capable.forkAgy(
+        {
+          cwd: input.cwd,
+          ...(storageRoot ? { storageRoot } : {}),
+          candidateNativeSessionId: input.candidateSessionId,
+          source: input.source,
+          model: input.model,
+          effort: input.effort,
+          permissionMode: input.permissionMode,
+          ...(input.onCandidate ? { onCandidate: input.onCandidate } : {}),
+        },
+        signal,
+      )
+      return forked.witness
+    },
+
+    async inspectFork(input, signal) {
+      if (!input.nativeSessionId) {
+        return {
+          kind: 'unconfirmed',
+          reason: 'The Antigravity Fork candidate identity was not acknowledged.',
+        }
+      }
+      const storageRoot = input.appDataDir || defaultAppDataDir
+      if (!input.witness) {
+        try {
+          const candidateExists = await capable.exists(
+            {
+              cwd: input.cwd,
+              nativeSessionId: input.nativeSessionId,
+              provider: 'agy',
+              ...(storageRoot ? { storageRoot } : {}),
+            },
+            signal,
+          )
+          if (!candidateExists) {
+            const currentBoundary = await capable.execute(
+              {
+                provider: 'agy',
+                action: 'prepare',
+                cwd: input.cwd,
+                nativeSessionId: input.source.nativeSessionId,
+                nativeTurnId: input.source.nativeTurnId,
+                ...(input.source.nativeInputIds
+                  ? { nativeInputIds: input.source.nativeInputIds }
+                  : {}),
+                source: input.source,
+                ...(storageRoot ? { storageRoot } : {}),
+              },
+              signal,
+            )
+            if (
+              currentBoundary.nativeCutId === input.source.nativeCutId &&
+              currentBoundary.prefixHash === input.source.prefixHash
+            ) {
+              return {
+                kind: 'missing',
+                reason:
+                  'The Antigravity Fork candidate SQLite file is absent while the source cut remains intact.',
+              }
+            }
+          }
+        } catch (error) {
+          if (signal.aborted) throw error
+        }
+        return {
+          kind: 'unconfirmed',
+          reason:
+            'The Antigravity Fork candidate witness was not persisted; keeping the candidate unconfirmed.',
+        }
+      }
+      if (
+        input.witness.sourceNativeSessionId !== input.source.nativeSessionId ||
+        input.witness.sourceCutId !== input.source.nativeCutId ||
+        input.witness.sourcePrefixHash !== input.source.prefixHash
+      ) {
+        return {
+          kind: 'unconfirmed',
+          reason: 'The Antigravity Fork witness belongs to another source cut.',
+        }
+      }
+      try {
+        const file = await capable.execute(
+          {
+            provider: 'agy',
+            action: 'inspect',
+            cwd: input.cwd,
+            nativeSessionId: input.nativeSessionId,
+            source: input.source,
+            witness: input.witness,
+            ...(input.lastDispatchedPhase
+              ? { lastDispatchedPhase: input.lastDispatchedPhase }
+              : {}),
+            ...(storageRoot ? { storageRoot } : {}),
+          },
+          signal,
+        )
+        return {
+          kind: 'verified',
+          result: {
+            nativeSessionId: input.nativeSessionId,
+            witness: input.witness,
+          },
+          ready:
+            Boolean(file.initializedVerified) &&
+            input.witness.model === input.model &&
+            input.witness.effort === input.effort &&
+            input.witness.permissionMode === input.permissionMode,
+          workSettled: Boolean(file.initializedVerified) || input.lastDispatchedPhase === 'fork',
+          rawHash: file.rawHash,
+          rawBytes: file.rawBytes,
+          rawRecords: file.rawRecords,
+        }
+      } catch (error) {
+        if (signal.aborted) throw error
+        return {
+          kind:
+            error instanceof Error &&
+            Reflect.get(error, 'code') === 'native_file_fork_candidate_missing'
+              ? 'missing'
+              : 'unconfirmed',
+          reason: error instanceof Error ? error.message : 'Native Fork inspection failed.',
+        }
+      }
+    },
   }
 }
 
@@ -341,6 +972,7 @@ interface SendOptions {
   preserveDraftComments?: boolean
   sourceProposalId?: string
   sourceMessageId?: string
+  expectedSettingsRevision?: number | undefined
   collaboration?: CollaborationTask | undefined
   expectedCollaborationRevision?: number | undefined
   receivedInputId?: string | undefined
@@ -549,6 +1181,7 @@ export class Conversation {
     | (import('@pact/contracts').DecisionConnection & { generation: number })
     | undefined
   private schedulingListener: (() => void) | undefined
+  private readonly agyConnectionPools = new Map<string, AgyAcpConnectionPool>()
 
   constructor(
     private readonly conversations: ConversationRepository,
@@ -572,6 +1205,54 @@ export class Conversation {
     this.conversations.beginSchedulingRecoveryEpoch(this.utilityEpoch)
     this.schedulePendingRoutedContinuations()
     void this.recoverDecisionReservation()
+  }
+
+  private static adapterOwnsExecutor(adapter: AgentAdapter, expectedExecutorId: string): boolean {
+    const fn: unknown = Reflect.get(adapter, 'hasExecutor')
+    if (typeof fn === 'function') {
+      return Boolean(fn.call(adapter, expectedExecutorId))
+    }
+    return adapter.executorId === expectedExecutorId
+  }
+
+  async reconcileSessionSettingsChanged(sessionId: string): Promise<void> {
+    if (this.disposed) return
+    const session = this.sessions.find(sessionId)
+    const project = session ? this.projects.find(session.projectId) : undefined
+    const parentSession = session?.parentSessionId
+      ? this.sessions.find(session.parentSessionId)
+      : undefined
+    const isArchived = Boolean(
+      !session ||
+      session.status === 'archived' ||
+      session.archivedAt ||
+      parentSession?.status === 'archived' ||
+      parentSession?.archivedAt ||
+      project?.archivedAt,
+    )
+    const activePair = session ? resolveActiveAgentPair(session.settings) : undefined
+    const agyInPair = Boolean(!isArchived && activePair && isAgentInPair('agy', activePair))
+    const agyFullAccess = agyInPair && (session?.settings.permissionModes?.agy ?? 'ask') === 'full'
+    if (agyFullAccess) return
+
+    // Retire ONLY this sessionId's Full-access lease — never retire child Side Chats whose own
+    // persisted locked settings still authorize Full access.
+    const retireTasks: Promise<void>[] = []
+    const cached = this.adapters.get(`${sessionId}:agy`)
+    if (cached?.retireFullAccess) {
+      retireTasks.push(cached.retireFullAccess({ cwd: cached.cwd, sessionId }))
+    }
+    for (const pool of this.agyConnectionPools.values()) {
+      retireTasks.push(
+        pool.retireFullAccess({
+          ...(project ? { cwd: project.directoryPath } : {}),
+          sessionId,
+        }),
+      )
+    }
+    if (retireTasks.length) {
+      await Promise.all(retireTasks)
+    }
   }
 
   subscribeSchedulingChanges(listener: () => void): () => void {
@@ -1983,11 +2664,28 @@ export class Conversation {
         throw new WorkspaceArchiveConflictError(
           'Pact closed or timed out before archiving finished. Nothing was archived.',
         )
-      return this.conversations.archives.finish(id, outcomes, () => {
+      const archivedResult = this.conversations.archives.finish(id, outcomes, () => {
         const result = commit(id)
         if (!result.ok) throw new WorkspaceArchiveConflictError(result.error.message)
         return result
       })
+      const archivedSessionIds = new Set<string>(scopeSessionIds)
+      if (scope.kind === 'session') {
+        archivedSessionIds.add(scope.sessionId)
+      }
+      const retireTasks: Promise<unknown>[] = [...archivedSessionIds].map((archivedId) =>
+        this.reconcileSessionSettingsChanged(archivedId),
+      )
+      if (scope.kind === 'project') {
+        const project = this.projects.find(scope.projectId)
+        if (project) {
+          for (const pool of this.agyConnectionPools.values()) {
+            retireTasks.push(pool.retireFullAccess({ cwd: project.directoryPath }))
+          }
+        }
+      }
+      await Promise.allSettled(retireTasks)
+      return archivedResult
     } catch (error) {
       if (claimed) {
         for (const task of confirmedTasks)
@@ -2119,7 +2817,8 @@ export class Conversation {
       (!observed ||
         observed.nativeSessionId !== binding.nativeSessionId ||
         observed.bindingGeneration !== binding.bindingGeneration ||
-        observed.executorId !== adapter.executorId)
+        !observed.executorId ||
+        !Conversation.adapterOwnsExecutor(adapter, observed.executorId))
     )
       return undefined // A Claude title must not preempt Codex's own first Native title.
     const title = `[Pact] ${project.name} · ${session.title}`
@@ -2169,7 +2868,12 @@ export class Conversation {
         for (let attempt = 0; attempt < 3; attempt += 1) {
           if (this.disposed || owner.abortController.signal.aborted) break
           const latest = this.nativeTitleState(sessionId, owner.adapter)
-          if (!latest || owner.adapter.executorId !== owner.executorId) break
+          if (
+            !latest ||
+            !owner.executorId ||
+            !Conversation.adapterOwnsExecutor(owner.adapter, owner.executorId)
+          )
+            break
           owner.desiredKey = latest.key
           owner.dirty = false
           // oxlint-disable-next-line no-await-in-loop -- Serialize this Session's absolute metadata writes and coalesce to the newest durable title.
@@ -2180,7 +2884,10 @@ export class Conversation {
               title: latest.title,
               isCurrent: () =>
                 this.nativeTitleSyncs.get(sessionId) === owner &&
-                owner.adapter.executorId === owner.executorId &&
+                Boolean(
+                  owner.executorId &&
+                  Conversation.adapterOwnsExecutor(owner.adapter, owner.executorId),
+                ) &&
                 this.nativeTitleState(sessionId, owner.adapter)?.key === latest.key,
             },
             owner.abortController.signal,
@@ -2341,11 +3048,13 @@ export class Conversation {
           throw new Error(
             'The source conversation or settings changed. Review the fork confirmation again.',
           )
+        const forkPair = selection.pair ?? resolveActiveAgentPair(session.settings)
         const boundaries: Partial<Record<RuntimeAgentId, AgentNativeForkBoundary>> = {}
         // Two independent read-only sources; neither provider may write during preparation.
         const inspected = await Promise.allSettled(
-          (['claude', 'codex'] as const).map(async (agentId) => {
+          forkPair.map(async (agentId) => {
             const run = selection.runs[agentId]
+            if (!run) throw new Error('The selected Fork boundary is missing its native Agent run.')
             const adapter = await this.adapterFor(
               sourceSessionId,
               agentId,
@@ -2390,7 +3099,7 @@ export class Conversation {
         const operation = this.conversations.commitFork(
           input.operationId,
           selection,
-          { claude: boundaries.claude!, codex: boundaries.codex! },
+          boundaries,
           input.confirmedFullAccessAgents,
         )
         owner.sessionId = operation.sessionId
@@ -2399,9 +3108,7 @@ export class Conversation {
         // Commit receipt goes back immediately; progress/real native interactions use bounded Patches.
         continued = true
         owner.completion = Promise.allSettled(
-          (['claude', 'codex'] as const).map((agentId) =>
-            this.runForkSide(owner, agentId, 'continue'),
-          ),
+          forkPair.map((agentId) => this.runForkSide(owner, agentId, 'continue')),
         )
           .then(() => undefined)
           .finally(() => {
@@ -2458,7 +3165,7 @@ export class Conversation {
     owner: { sessionId?: string; controller: AbortController },
     agentId: RuntimeAgentId,
   ) {
-    const prepared = await this.prepareSession(owner.sessionId!, owner.controller.signal)
+    const prepared = await this.prepareSession(owner.sessionId!, owner.controller.signal, [agentId])
     if (!prepared.ok) throw new Error(prepared.error.message)
     const adapter = await this.adapterFor(
       owner.sessionId!,
@@ -2523,7 +3230,7 @@ export class Conversation {
       effort: prepared.session.settings.agents[agentId].effort,
       permissionMode:
         prepared.session.settings.permissionModes?.[agentId] ??
-        (agentId === 'claude' ? 'ask' : 'native'),
+        (agentId === 'codex' ? 'native' : 'ask'),
       source: intent.source,
       lastDispatchedPhase: intent.phase,
       ...(intent.nativeSessionId && !(phase === 'fork' && intent.candidateMissing)
@@ -3036,7 +3743,7 @@ export class Conversation {
       issues ??
       this.sessionIssues(
         sessionId,
-        (['codex', 'claude'] as const).flatMap((actor) => {
+        AGENTS.flatMap((actor) => {
           const context = this.conversations.nativeContext(sessionId, actor)
           return context ? [context] : []
         }),
@@ -3417,6 +4124,25 @@ export class Conversation {
           'The explicit Agent recipients conflict. Your draft was preserved.',
         )
       const inTaskReview = this.conversations.isInTaskReviewCommand(task, prefix.pact)
+      if (targetSession && targetSession.status !== 'archived') {
+        const allowedPair =
+          task && (!prefix.pact || inTaskReview)
+            ? ([task.owner, task.reviewer] as const)
+            : resolveActiveAgentPair(targetSession.settings)
+        const explicitRoute = input.route ?? prefix.route
+        if (explicitRoute?.type === 'agent' && !isAgentInPair(explicitRoute.agentId, allowedPair)) {
+          throw new RunOperationConflictError(
+            `${agentDisplayName(explicitRoute.agentId)} is not in this Session's active Agent pair. Your draft was preserved.`,
+          )
+        }
+        for (const selection of input.skills ?? []) {
+          if (!isAgentInPair(selection.agentId, allowedPair)) {
+            throw new RunOperationConflictError(
+              `/${selection.name} belongs to ${agentDisplayName(selection.agentId)}, which is not in this Session's active Agent pair. Your draft was preserved.`,
+            )
+          }
+        }
+      }
       this.conversations.assertTaskReplacement(input, Boolean(prefix.pact) && !inTaskReview)
       if (!preparing && (task || waitingForWork)) {
         if (task && (!prefix.pact || inTaskReview) && (input.route ?? prefix.route)?.type === 'all')
@@ -3426,6 +4152,7 @@ export class Conversation {
         const session = this.sessions.find(input.sessionId)
         if (!session || session.status === 'archived')
           throw new RunOperationConflictError('The Session is unavailable.')
+        const activePair = resolveActiveAgentPair(session.settings)
         const requestedRoute = input.route ?? prefix.route
         let actor =
           requestedRoute?.type === 'agent'
@@ -3436,18 +4163,19 @@ export class Conversation {
                 ? collaborationActor(task, 'code_review')
                 : task && !prefix.pact
                   ? this.conversations.collaborationReplyActor(task, input.replyToDecision)
-                  : session.settings.primaryAgentId
+                  : activePair[0]
         if (prefix.pact && !inTaskReview) {
           const primary = pactEntryPrimary(
             prefix.pact,
-            session.settings.primaryAgentId,
+            activePair[0],
             requestedRoute?.type === 'agent' ? requestedRoute.agentId : undefined,
+            activePair[1],
           )
           actor = collaborationActor(
             {
               kind: prefix.pact,
               owner: primary,
-              reviewer: otherAgent(primary),
+              reviewer: otherAgent(primary, activePair),
               rolePolicy: 'split-stages-v1',
             },
             prefix.pact === 'plan' ? 'plan' : prefix.pact === 'build' ? 'implement' : 'code_review',
@@ -3497,10 +4225,7 @@ export class Conversation {
         const anchor =
           this.activeExecutions.get(input.sessionId)?.run ??
           (task ? this.conversations.findRun(task.runId) : undefined) ??
-          [
-            this.conversations.latestAgentRun(input.sessionId, 'claude'),
-            this.conversations.latestAgentRun(input.sessionId, 'codex'),
-          ]
+          AGENTS.map((agentId) => this.conversations.latestAgentRun(input.sessionId, agentId))
             .filter((run): run is AgentRun => Boolean(run))
             .toSorted((left, right) => right.createdAt.localeCompare(left.createdAt))[0]
         if (!anchor)
@@ -3984,9 +4709,9 @@ export class Conversation {
         !['completed', 'failed', 'superseded'].includes(operation.stage) &&
         (context?.bindingGeneration ?? 1) === operation.oldGeneration &&
         pending.bindingGeneration === operation.oldGeneration + 1 &&
-        adapter?.executorId === pending.executorId &&
+        Boolean(adapter && Conversation.adapterOwnsExecutor(adapter, pending.executorId)) &&
         (rebuild?.rebuildId === pending.operationId ||
-          adapter.hasActiveBackgroundWork?.(pending.operationId) === true)
+          adapter?.hasActiveBackgroundWork?.(pending.operationId) === true)
       )
     }
     const run = this.conversations.findRun(pending.operationId)
@@ -4810,7 +5535,11 @@ export class Conversation {
     const settings = this.conversations.schedulingSettings()
     if (!settings.enabled || !settings.credential.configured) return
     if (this.decisionRuntimeAdmission() !== 'may_attempt') return
-    const opportunity = this.conversations.initialTaskRoleOpportunity(input, ['codex', 'claude'])
+    const activePair = resolveActiveAgentPair(prepared.session.settings)
+    const orderedPair = (['codex', 'claude', 'agy'] as const).filter((actor) =>
+      isAgentInPair(actor, activePair),
+    )
+    const opportunity = this.conversations.initialTaskRoleOpportunity(input, orderedPair)
     if (!opportunity) return
     const configurationKey = this.runtimePreparation.catalogIdentity(prepared.projectDirectory)
     let material: { inputSha256: string; sourceFingerprint: string } | undefined
@@ -4821,7 +5550,7 @@ export class Conversation {
           const receipt = this.conversations.prepareInputDispatch(
             input,
             randomUUID(),
-            ['codex', 'claude'],
+            orderedPair,
             decisionContext,
             'task_roles',
           )
@@ -5132,8 +5861,22 @@ export class Conversation {
         error: { code: 'CONFLICT', message: 'This peer request is no longer available.' },
       })
     const targetAgentId = proposal.run.peerProposal.targetAgentId
-    const target = targetAgentId === 'claude' ? 'claude' : 'codex'
-    const source = proposal.run.agentId === 'claude' ? 'Claude Code' : 'Codex'
+    const session = this.sessions.find(input.sessionId)
+    if (
+      !session ||
+      session.status === 'archived' ||
+      !isAgentInPair(targetAgentId, resolveActiveAgentPair(session.settings))
+    ) {
+      return Promise.resolve({
+        ok: false,
+        error: {
+          code: 'CONFLICT',
+          message: `${agentDisplayName(targetAgentId)} is no longer in this Session's active Agent pair.`,
+        },
+      })
+    }
+    const target = targetAgentId
+    const source = agentDisplayName(proposal.run.agentId)
     const action = Conversation.peerActionCopy(proposal.run.peerProposal.kind, source)
     const drafts = this.conversations.readPage({ scope: 'drafts', sessionId: input.sessionId })
     if (drafts.scope !== 'drafts')
@@ -5154,6 +5897,7 @@ export class Conversation {
         preserveDraftComments: true,
         sourceProposalId: input.proposalId,
         sourceMessageId: proposal.sourceMessageId,
+        expectedSettingsRevision: session.settingsRevision,
       },
     )
   }
@@ -5402,7 +6146,7 @@ export class Conversation {
         return cached.entries
       }
 
-      const context = await this.prepareSession(sessionId, controller.signal)
+      const context = await this.prepareSession(sessionId, controller.signal, [agentId])
       if (!context.ok) throw new Error(context.error.message)
       const adapter = await this.adapterFor(
         sessionId,
@@ -5558,7 +6302,7 @@ export class Conversation {
         throw new RunOperationConflictError('The selected Skill token changed. Select it again.')
       if (!targets.includes(selection.agentId))
         throw new RunOperationConflictError(
-          `/${selection.name} belongs to ${selection.agentId === 'claude' ? 'Claude Code' : 'Codex'}, not the message target.`,
+          `/${selection.name} belongs to ${agentDisplayName(selection.agentId)}, not the message target.`,
         )
     }
     const bindings: SkillBinding[] = []
@@ -5570,7 +6314,7 @@ export class Conversation {
         const entry = catalog.find((candidate) => candidate.name === name)
         if (!entry)
           throw new RunOperationConflictError(
-            `/${name} is unavailable for ${target === 'claude' ? 'Claude Code' : 'Codex'}.`,
+            `/${name} is unavailable for ${agentDisplayName(target)}.`,
           )
         if (
           selections.some(
@@ -5621,7 +6365,9 @@ export class Conversation {
         !this.pendingNativeInteractions(input.sessionId).length &&
         this.conversations.ordinaryInputWorthConsulting(input, session.settings.primaryAgentId)
       ) {
-        const allowed = (['codex', 'claude'] as const).filter((actor) => {
+        const activePair = resolveActiveAgentPair(session.settings)
+        const allowed = (['codex', 'claude', 'agy'] as const).filter((actor) => {
+          if (!isAgentInPair(actor, activePair)) return false
           const context = this.conversations.nativeContext(input.sessionId, actor)
           return !context || context.continuationState === 'ready'
         })
@@ -5688,6 +6434,7 @@ export class Conversation {
                 handoffId: handoff.id,
                 budgetSubjectId: handoff.budgetSubjectId,
                 primary: frozen.metadata.defaultAgentId,
+                activePair,
                 route: 'implicit',
                 inputSourceId: 's0',
                 referencedSourceIds: read.sources
@@ -5748,6 +6495,7 @@ export class Conversation {
           controller.signal,
         )
         const selected = outcome.kind === 'selection' ? outcome.selection.candidateId : undefined
+        const parsedSelectedRoute = routeCandidateIdSchema.safeParse(selected)
         recordDiagnostic({
           operation: 'send',
           phase: outcome.kind === 'selection' ? 'ready' : 'blocked',
@@ -5758,23 +6506,23 @@ export class Conversation {
               ? outcome.reason
               : selected === null
                 ? 'no_advice'
-                : selected === 'clarify_prepared_input' ||
-                    selected === 'route_codex' ||
-                    selected === 'route_claude'
+                : selected === 'clarify_prepared_input'
                   ? selected
-                  : 'other_candidate',
+                  : parsedSelectedRoute.success
+                    ? parsedSelectedRoute.data
+                    : 'other_candidate',
         })
         if (
           outcome.kind === 'selection' &&
           material &&
-          (outcome.selection.candidateId === 'route_codex' ||
-            outcome.selection.candidateId === 'route_claude')
+          parsedSelectedRoute.success &&
+          isAgentInPair(agentIdForRouteCandidate(parsedSelectedRoute.data), activePair)
         ) {
           options.inputRouting = {
             version: 'input-routing-v1',
             ...material,
             ...outcome.evaluationReceipt,
-            candidateId: outcome.selection.candidateId,
+            candidateId: parsedSelectedRoute.data,
           }
           options.preparedSelectionCurrent = () =>
             Boolean(
@@ -5928,8 +6676,8 @@ export class Conversation {
           'The explicit Agent recipients conflict. Your draft was preserved.',
         )
       const requestedRoute = input.route ?? commandPrefix.route
-      const primaryAgentId = context.value.session.settings.primaryAgentId
-      const secondaryAgentId: RuntimeAgentId = primaryAgentId === 'claude' ? 'codex' : 'claude'
+      const activePair = resolveActiveAgentPair(context.value.session.settings)
+      const [primaryAgentId, secondaryAgentId] = activePair
       let route: ConversationMessageRoute =
         options.queuedRoute ??
         (requestedRoute?.type === 'agent'
@@ -5978,7 +6726,7 @@ export class Conversation {
       const entryPrimary =
         taskRoles?.primaryAgentId ??
         (commandPrefix.pact
-          ? pactEntryPrimary(commandPrefix.pact, primaryAgentId, entryAgent)
+          ? pactEntryPrimary(commandPrefix.pact, primaryAgentId, entryAgent, secondaryAgentId)
           : primaryAgentId)
       const entryStageRoles = taskRoles
         ? this.conversations.preparedInitialTaskRoles(
@@ -5986,7 +6734,7 @@ export class Conversation {
             options.initialTaskRoles,
           )
         : entryRolePolicy
-          ? defaultTaskStageRoles(entryPrimary)
+          ? defaultTaskStageRoles(entryPrimary, otherAgent(entryPrimary, activePair))
           : undefined
       if (!options.collaboration && commandPrefix.pact && entryRolePolicy) {
         const stage = collaborationInitialStage(commandPrefix.pact)
@@ -5994,7 +6742,7 @@ export class Conversation {
           {
             kind: commandPrefix.pact,
             owner: entryPrimary,
-            reviewer: otherAgent(entryPrimary),
+            reviewer: otherAgent(entryPrimary, activePair),
             rolePolicy: entryRolePolicy,
             ...(entryStageRoles ? { stageRoles: entryStageRoles } : {}),
           },
@@ -6008,6 +6756,16 @@ export class Conversation {
       }
       const targets =
         route.type === 'all' ? [route.firstAgentId, route.secondAgentId] : [route.agentId]
+      const allowedTargetPair: readonly [RuntimeAgentId, RuntimeAgentId] = options.collaboration
+        ? [options.collaboration.owner, options.collaboration.reviewer]
+        : activePair
+      for (const target of targets) {
+        if (!isAgentInPair(target, allowedTargetPair)) {
+          throw new RunOperationConflictError(
+            `${agentDisplayName(target)} is not in this Session's active Agent pair. Your draft was preserved.`,
+          )
+        }
+      }
       const agentId = targets[0]!
       const skillInvocation = await this.prepareSkillInvocation(input, targets, controller.signal)
       const agentSettings = context.value.session.settings.agents[agentId]
@@ -6065,7 +6823,7 @@ export class Conversation {
         const owner = entryRolePolicy
           ? entryPrimary
           : kind === 'review'
-            ? otherAgent(agentId)
+            ? otherAgent(agentId, activePair)
             : agentId
         collaboration = collaborationTaskSchema.parse({
           protocol: COLLABORATION_PROTOCOL,
@@ -6075,10 +6833,10 @@ export class Conversation {
           revision: 0,
           owner,
           reviewer: entryRolePolicy
-            ? otherAgent(owner)
+            ? otherAgent(owner, activePair)
             : kind === 'review'
               ? agentId
-              : otherAgent(owner),
+              : otherAgent(owner, activePair),
           ...(entryStageRoles ? { stageRoles: entryStageRoles } : {}),
           ...(entryRolePolicy ? { rolePolicy: entryRolePolicy } : {}),
           task,
@@ -6186,6 +6944,59 @@ export class Conversation {
         )
         if (gateFailure) return gateFailure
       }
+      let effectiveSettingsRevision = context.value.session.settingsRevision
+      let effectiveSessionSettings = context.value.session.settings
+      let effectiveAgentSettings = agentSettings
+      if (
+        (!options.sourceMessageId || Boolean(options.sourceProposalId)) &&
+        !options.receivedInputId &&
+        !options.collaborationActionReceiptId
+      ) {
+        const latestSession = this.sessions.find(input.sessionId)
+        const latestAllowedPair: readonly [RuntimeAgentId, RuntimeAgentId] | undefined =
+          latestSession
+            ? options.collaboration
+              ? [options.collaboration.owner, options.collaboration.reviewer]
+              : resolveActiveAgentPair(latestSession.settings)
+            : undefined
+        if (
+          !latestSession ||
+          latestSession.status === 'archived' ||
+          latestSession.settingsRevision !== context.value.session.settingsRevision ||
+          (options.expectedSettingsRevision !== undefined &&
+            latestSession.settingsRevision !== options.expectedSettingsRevision) ||
+          !latestAllowedPair ||
+          targets.some((target) => !isAgentInPair(target, latestAllowedPair))
+        ) {
+          await this.reconcileSessionSettingsChanged(input.sessionId).catch(() => undefined)
+          throw new RunOperationConflictError(
+            options.sourceProposalId
+              ? 'Session settings changed while preparing this peer request. The request remains pending.'
+              : 'Session settings changed while preparing your message. Your draft was preserved.',
+          )
+        }
+      } else if (options.receivedInputId) {
+        const liveSession = this.sessions.find(input.sessionId)
+        if (!liveSession || liveSession.status === 'archived') {
+          throw new RunOperationConflictError('Session is unavailable.')
+        }
+        const liveAllowedPair: readonly [RuntimeAgentId, RuntimeAgentId] = options.collaboration
+          ? [options.collaboration.owner, options.collaboration.reviewer]
+          : resolveActiveAgentPair(liveSession.settings)
+        const retiredTarget = targets.find((target) => !isAgentInPair(target, liveAllowedPair))
+        if (retiredTarget) {
+          await this.reconcileSessionSettingsChanged(input.sessionId).catch(() => undefined)
+          throw new RunOperationConflictError(
+            `${agentDisplayName(retiredTarget)} is no longer in this Session's active Agent pair.`,
+          )
+        }
+        if (liveSession.settingsRevision !== context.value.session.settingsRevision) {
+          await this.reconcileSessionSettingsChanged(input.sessionId).catch(() => undefined)
+        }
+        effectiveSettingsRevision = liveSession.settingsRevision
+        effectiveSessionSettings = liveSession.settings
+        effectiveAgentSettings = liveSession.settings.agents[agentId]
+      }
       const started = this.conversations.beginRun({
         preparedInput: options.preparedInput,
         inputRouting: options.inputRouting,
@@ -6217,9 +7028,9 @@ export class Conversation {
         freezeDrafts: input.freezeDrafts ?? !options.preserveDraftComments,
         ...(input.batchId ? { batchId: input.batchId } : {}),
         agentId,
-        settingsRevision: context.value.session.settingsRevision,
-        model: agentSettings.model,
-        effort: agentSettings.effort,
+        settingsRevision: effectiveSettingsRevision,
+        model: effectiveAgentSettings.model,
+        effort: effectiveAgentSettings.effort,
         route,
         ...(options.sourceMessageId ? { sourceMessageId: options.sourceMessageId } : {}),
         ...(options.sourceProposalId ? { sourceProposalId: options.sourceProposalId } : {}),
@@ -6262,16 +7073,22 @@ export class Conversation {
       this.publish(started.patch)
       if (started.created) {
         this.cancelTitleEnrichment(input.sessionId)
+        const frozenSettingsForExecution =
+          this.sessions.findSettingsRevision(input.sessionId, started.run.settingsRevision) ??
+          effectiveSessionSettings
         void this.execute(
           started.run,
           prompt,
           context.value.projectDirectory,
-          context.value.session.settings,
+          frozenSettingsForExecution,
           context.value.executablePaths,
         )
       }
       return { ok: true, value: started.patch }
     } catch (error) {
+      if (error instanceof RunOperationConflictError) {
+        await this.reconcileSessionSettingsChanged(input.sessionId).catch(() => undefined)
+      }
       return Conversation.sendFailure(error)
     } finally {
       clearTimeout(timeout)
@@ -6604,7 +7421,7 @@ export class Conversation {
       : page.runs.toReversed()
     const run = candidates.find(
       (entry) =>
-        entry.agentId === 'codex' &&
+        (entry.agentId === 'codex' || entry.agentId === 'agy') &&
         entry.nativeSessionId &&
         entry.nativeTurnId &&
         !entry.forkSourceRunId &&
@@ -6624,7 +7441,7 @@ export class Conversation {
     controller: AbortController,
   ): Promise<void> {
     if (
-      run.agentId !== 'codex' ||
+      (run.agentId !== 'codex' && run.agentId !== 'agy') ||
       run.forkSourceRunId ||
       !run.nativeSessionId ||
       !run.nativeTurnId ||
@@ -7456,7 +8273,15 @@ export class Conversation {
           })
           if (controller.signal.aborted) throw new Error('The native check was interrupted.')
           if (this.disposed) throw new Error('Pact is shutting down.')
-          if (!result) {
+          if (
+            !result ||
+            (agentId === 'agy' &&
+              !isVerifiedAgyRebuildWitness(
+                result.initializationWitness,
+                result.nativeSessionId,
+                operation.sourceHash ?? undefined,
+              ))
+          ) {
             this.publish(
               this.conversations.recordNativeRebuildCheck(
                 sessionId,
@@ -7504,7 +8329,9 @@ export class Conversation {
     rebuild: ActiveNativeRebuild,
   ): Promise<void> {
     try {
-      const prepared = await this.prepareSession(sessionId, rebuild.abortController.signal)
+      const prepared = await this.prepareSession(sessionId, rebuild.abortController.signal, [
+        rebuild.agentId,
+      ])
       if (!prepared.ok) throw new Error(prepared.error.message)
       const settings = prepared.value.session.settings.agents[rebuild.agentId]
       // The existing slot owner reserves a compatible Adapter or refuses before native creation.
@@ -7523,7 +8350,8 @@ export class Conversation {
           'All 8 native interaction slots are occupied. No replacement native session was created.',
           false,
         )
-      rebuild.executorId = adapter.executorId
+      let dispatchedExecutorId = adapter.executorId
+      rebuild.executorId = dispatchedExecutorId
       const chunks: import('@pact/contracts').NativeContextRebuildChunk[] = []
       const sourceRevisions = new Map<string, number>()
 
@@ -7566,7 +8394,7 @@ export class Conversation {
         sessionId,
         agentId: rebuild.agentId,
         bindingGeneration: operation.oldGeneration + 1,
-        executorId: adapter.executorId,
+        executorId: dispatchedExecutorId,
         valid: () => current(),
       })
       const result = await adapter.rebuildNativeContext(
@@ -7585,6 +8413,8 @@ export class Conversation {
             : {}),
           onNativeCreationDispatched: async (executorId) => {
             if (!current()) throw new Error('The rebuild creation owner changed.')
+            dispatchedExecutorId = executorId
+            rebuild.executorId = executorId
             this.conversations.markNativeRebuildDispatched(rebuild.rebuildId, executorId)
           },
           onNativeSessionCreated: async (nativeId) => {
@@ -7592,13 +8422,16 @@ export class Conversation {
             this.conversations.recordNativeRebuildIdentity(rebuild.rebuildId, nativeId)
           },
 
-          reportNativeWork: (report) =>
+          reportNativeWork: (report) => {
+            dispatchedExecutorId = report.executorId
+            rebuild.executorId = report.executorId
             this.conversations.recordNativeRebuildWork(
               rebuild.rebuildId,
               report.executorId,
               report.nativeSessionId,
               report.state,
-            ),
+            )
+          },
           requestPermission: (request, signal) =>
             this.requestNativePermission(owner(), request, signal),
           requestUserInput: (request, signal) =>
@@ -7610,11 +8443,21 @@ export class Conversation {
         rebuild.abortController.signal,
       )
       if (!current()) return
+      if (
+        rebuild.agentId === 'agy' &&
+        !isVerifiedAgyRebuildWitness(
+          result.initializationWitness,
+          result.nativeSessionId,
+          sourceHash ?? operation.sourceHash ?? undefined,
+        )
+      ) {
+        throw new Error('Antigravity rebuild cold-load receipt could not be confirmed.')
+      }
       this.publish(
         this.conversations.completeNativeRebuild(
           rebuild.rebuildId,
           result.nativeSessionId,
-          adapter.executorId,
+          dispatchedExecutorId,
           result.initializationWitness,
         ),
       )
@@ -8211,13 +9054,13 @@ export class Conversation {
           const saved = this.conversations.findRun(execution.run.id)
           const owner = this.nativeObservations.get(execution.run.id)
           if (
-            saved?.agentId !== 'codex' ||
+            (saved?.agentId !== 'codex' && saved?.agentId !== 'agy') ||
             saved.dispatchPhase !== 'accepted' ||
             !saved.nativeSessionId ||
             !saved.nativeTurnId ||
             !saved.executorId ||
             !owner ||
-            owner.adapter.executorId !== saved.executorId ||
+            !Conversation.adapterOwnsExecutor(owner.adapter, saved.executorId) ||
             this.adapters.get(`${saved.sessionId}:${saved.agentId}`)?.adapter !== owner.adapter ||
             !this.conversations.isCurrentBackgroundCursor(saved.id)
           )
@@ -8258,8 +9101,12 @@ export class Conversation {
     }
     // Even late shutdown delivery retains Main's original physical cleanup cap.
     if (flushDeadlineAt) {
+      for (const pool of this.agyConnectionPools.values()) {
+        pool.capShutdownDeadline(flushDeadlineAt)
+      }
       for (const { adapter } of this.adapters.values()) {
-        if (adapter.id !== 'codex' || foregroundDisposals.has(adapter)) continue
+        if ((adapter.id !== 'codex' && adapter.id !== 'agy') || foregroundDisposals.has(adapter))
+          continue
         let disposal: Promise<void>
         try {
           disposal = adapter.dispose({ flushDeadlineAt })
@@ -8285,6 +9132,8 @@ export class Conversation {
     await this.adapterSlotTail
     const adapters = [...this.adapters.values()]
     this.adapters.clear()
+    const agyPools = [...this.agyConnectionPools.values()]
+    this.agyConnectionPools.clear()
     for (const owner of this.nativeObservations.values()) {
       owner.sourceReader?.retire()
       this.clearBackgroundStop(owner)
@@ -8314,9 +9163,23 @@ export class Conversation {
 
       ...(this.decisionRecovery ? [this.decisionRecovery] : []),
       ...[...this.collaborationActions.values()].map((owner) => owner.task),
-      ...adapters.map(async ({ adapter }) => {
-        await (foregroundDisposals.get(adapter) ?? adapter.dispose())
-      }),
+      (async () => {
+        const adapterResults = await Promise.allSettled(
+          adapters.map(async ({ adapter, disposeExtra }) => {
+            await Promise.all([
+              foregroundDisposals.get(adapter) ?? adapter.dispose(),
+              disposeExtra ? disposeExtra() : Promise.resolve(),
+            ])
+          }),
+        )
+        const poolResults = await Promise.allSettled(
+          agyPools.map((pool) => pool.dispose(flushDeadlineAt)),
+        )
+        const rejected = [...adapterResults, ...poolResults].find(
+          (item) => item.status === 'rejected',
+        )
+        if (rejected?.status === 'rejected') throw rejected.reason
+      })(),
       ...forkOwners.flatMap((owner) => (owner.completion ? [owner.completion] : [])),
       ...forkPreparations.map((owner) => owner.task),
       ...nativeChecks.map((owner) => owner.physicalCompletion),
@@ -8388,6 +9251,7 @@ export class Conversation {
   private async prepareSession(
     sessionId: string,
     signal?: AbortSignal,
+    extraRequiredAgents: readonly RuntimeAgentId[] = [],
   ): Promise<RpcResult<PreparedSession>> {
     if (this.nativeQuitSealed()) return Conversation.quitPrepared()
     if (this.conversations.archives.blocksSession(sessionId)) return Conversation.archiveBusy()
@@ -8402,27 +9266,28 @@ export class Conversation {
     const readiness = await this.runtimePreparation.inspectReadiness(signal)
     if (!readiness.ok) return readiness
     if (this.conversations.archives.blocksSession(sessionId)) return Conversation.archiveBusy()
-    let claudeExecutablePath: string | undefined
-    let codexExecutablePath: string | undefined
+    const discoveredPaths: Partial<Record<RuntimeAgentId, string>> = {}
     for (const agent of readiness.value.agents) {
-      if (agent.state !== 'ready' || !agent.executablePath) {
+      if (agent.state === 'ready' && agent.executablePath) {
+        discoveredPaths[agent.agentId] = agent.executablePath
+      }
+    }
+    const requiredAgents = new Set<RuntimeAgentId>([
+      ...resolveActiveAgentPair(session.settings),
+      ...extraRequiredAgents,
+    ])
+    for (const requiredAgent of requiredAgents) {
+      if (!discoveredPaths[requiredAgent]) {
         return {
           ok: false,
           error: { code: 'RUNTIME_UNAVAILABLE', message: 'Both Agents must be ready.' },
         }
       }
-      if (agent.agentId === 'claude') claudeExecutablePath = agent.executablePath
-      else codexExecutablePath = agent.executablePath
-    }
-    if (!claudeExecutablePath || !codexExecutablePath) {
-      return {
-        ok: false,
-        error: { code: 'RUNTIME_UNAVAILABLE', message: 'Both Agents must be ready.' },
-      }
     }
     const executablePaths: Record<RuntimeAgentId, string> = {
-      claude: claudeExecutablePath,
-      codex: codexExecutablePath,
+      claude: discoveredPaths.claude ?? '',
+      codex: discoveredPaths.codex ?? '',
+      agy: discoveredPaths.agy ?? '',
     }
     return {
       ok: true,
@@ -8454,7 +9319,12 @@ export class Conversation {
           !execution.abortController.signal.aborted &&
           !execution.cancelledByUser
         ) {
-          const targetAgentId: RuntimeAgentId = run.agentId === 'claude' ? 'codex' : 'claude'
+          const activePair = resolveActiveAgentPair(settings)
+          const targetAgentId: RuntimeAgentId = isAgentInPair(run.agentId, activePair)
+            ? otherAgent(run.agentId, activePair)
+            : activePair[0] === run.agentId
+              ? activePair[1]
+              : activePair[0]
           this.publish(
             this.conversations.failPendingRoutedContinuation(
               run.sessionId,
@@ -8796,7 +9666,10 @@ export class Conversation {
           return
         }
         activeTask = freshTask
-        if (targetActor !== freshInput.actor)
+        if (
+          targetActor !== freshInput.actor &&
+          isAgentInPair(targetActor, [freshTask.owner, freshTask.reviewer])
+        )
           this.conversations.adoptOpenModeInputRecipient(sessionId, freshInput.id, targetActor)
       }
       next = this.conversations.workflowReply(activeTask, targetActor)
@@ -8804,6 +9677,8 @@ export class Conversation {
     }
     const currentDrafts = this.conversations.readPage({ scope: 'drafts', sessionId })
     if (currentDrafts.scope !== 'drafts') return
+    const queuedSession = this.sessions.find(sessionId)
+    const queuedPair = queuedSession ? resolveActiveAgentPair(queuedSession.settings) : undefined
     const result = await this.enqueueSend(
       {
         sessionId,
@@ -8831,7 +9706,13 @@ export class Conversation {
         queuedRolePolicy: input.metadata.rolePolicy,
         queuedRoute:
           input.metadata.route?.type === 'all'
-            ? { type: 'all', firstAgentId: targetActor, secondAgentId: otherAgent(targetActor) }
+            ? 'firstAgentId' in input.metadata.route && 'secondAgentId' in input.metadata.route
+              ? input.metadata.route
+              : {
+                  type: 'all',
+                  firstAgentId: targetActor,
+                  secondAgentId: otherAgent(targetActor, queuedPair),
+                }
             : { type: 'agent', agentId: targetActor },
         preserveDraftComments: true,
         receivedInputId: input.id,
@@ -8859,14 +9740,18 @@ export class Conversation {
       this.pendingNativeInteractions(sessionId).length > 0
     )
       return fallbackActor
-    const bothReady = (['codex', 'claude'] as const).every((actor) => {
+    const taskPair: readonly [RuntimeAgentId, RuntimeAgentId] = [task.owner, task.reviewer]
+    const orderedTaskActors = (['codex', 'claude', 'agy'] as const).filter((actor) =>
+      isAgentInPair(actor, taskPair),
+    )
+    const bothReady = orderedTaskActors.every((actor) => {
       const ctx = this.conversations.nativeContext(sessionId, actor)
       return !ctx || ctx.continuationState === 'ready'
     })
     if (!bothReady) return fallbackActor
     const handoff = this.conversations.workflowHandoff(task, fallbackActor, receivedId)
     if (this.conversations.decisionEvaluationReceipt(handoff)) return fallbackActor
-    const candidates = (['codex', 'claude'] as const).map((actor) => ({
+    const candidates = orderedTaskActors.map((actor) => ({
       id: `route_${actor}`,
       description: `Send this open-mode task message to ${actor}, preserving its current session permissions and task context.`,
     }))
@@ -8889,6 +9774,7 @@ export class Conversation {
               handoffId: read.handoff.id,
               budgetSubjectId: read.handoff.budgetSubjectId,
               primary: fallbackActor,
+              activePair: taskPair,
               route: 'implicit',
               inputSourceId: 's0',
               referencedSourceIds: read.sources
@@ -8908,7 +9794,7 @@ export class Conversation {
                   frozen: true,
                 })),
               },
-              legalActions: (['codex', 'claude'] as const).map((actor) => ({
+              legalActions: orderedTaskActors.map((actor) => ({
                 action: 'route_send',
                 actor,
                 authorizationId: read.handoff.id,
@@ -8938,8 +9824,11 @@ export class Conversation {
           : AbortSignal.timeout(15_000),
       )
       if (outcome.kind === 'selection') {
-        if (outcome.selection.candidateId === 'route_claude') return 'claude'
-        if (outcome.selection.candidateId === 'route_codex') return 'codex'
+        const parsedRoute = routeCandidateIdSchema.safeParse(outcome.selection.candidateId)
+        if (parsedRoute.success) {
+          const selectedActor = agentIdForRouteCandidate(parsedRoute.data)
+          if (isAgentInPair(selectedActor, taskPair)) return selectedActor
+        }
       }
       return fallbackActor
     } catch {
@@ -9194,7 +10083,7 @@ export class Conversation {
     if (
       !saved?.proof ||
       !cached ||
-      cached.adapter.executorId !== saved.proof.executorId ||
+      !Conversation.adapterOwnsExecutor(cached.adapter, saved.proof.executorId) ||
       !settings ||
       this.hasBlockingBackgroundWork(original.sessionId)
     )
@@ -9220,6 +10109,7 @@ export class Conversation {
       const prepared = await this.prepareSession(
         original.sessionId,
         execution.abortController.signal,
+        [original.agentId],
       )
       if (!prepared.ok)
         throw new AgentExecutionError('runtime_incompatible', prepared.error.message, false)
@@ -9256,6 +10146,7 @@ export class Conversation {
       const preparedSession = await this.prepareSession(
         pending.sessionId,
         continuation.controller.signal,
+        [pending.agentId],
       )
       if (!preparedSession.ok)
         throw new AgentExecutionError('runtime_incompatible', preparedSession.error.message, false)
@@ -9526,7 +10417,7 @@ export class Conversation {
         Date.now() >= shutdown.deadlineAt ||
         this.nativeObservations.get(run.id) !== owner ||
         owner.adapter !== adapter ||
-        adapter.executorId !== shutdown.executorId
+        !Conversation.adapterOwnsExecutor(adapter, shutdown.executorId)
       )
         return undefined
       const saved = this.conversations.findRun(run.id)
@@ -10337,17 +11228,28 @@ export class Conversation {
               throw this.failRunOutput(run, error)
             }
           } else {
+            const appliedFact =
+              fact.type === 'session.title.updated' && run.agentId === 'agy' && !fact.origin
+                ? { ...fact, origin: 'turn_result' as const }
+                : fact
             try {
-              const patch = this.conversations.applyEvent(run.sessionId, run.id, fact)
+              const patch = this.conversations.applyEvent(run.sessionId, run.id, appliedFact)
               this.publish(patch)
-              if (fact.type === 'turn.started' || fact.type === 'turn.completed')
+              if (appliedFact.type === 'turn.started' || appliedFact.type === 'turn.completed')
                 markInjectedCutoffs()
-              if (fact.type === 'session.title.updated' && fact.origin === 'turn_result')
+              if (
+                appliedFact.type === 'session.title.updated' &&
+                appliedFact.origin === 'turn_result'
+              )
                 reportedTitle =
-                  patch.session.titleSource === 'agent' && patch.session.title === fact.title
+                  patch.session.titleSource === 'agent' && patch.session.title === appliedFact.title
             } catch (error) {
               // Failed optional metadata keeps the local title; the substantive Turn continues.
-              if (fact.type === 'session.title.updated' && fact.origin === 'turn_result') continue
+              if (
+                appliedFact.type === 'session.title.updated' &&
+                appliedFact.origin === 'turn_result'
+              )
+                continue
               if (fact.type === 'text.completed' || fact.type === 'reasoning.summary.completed')
                 throw this.failRunOutput(run, error)
               throw error
@@ -10438,26 +11340,40 @@ export class Conversation {
         this.publish(this.conversations.failRun(run.id, failure.kind, failure.message, false))
         const currentContext = this.conversations.nativeContext(run.sessionId, run.agentId)
         const unsentProof = this.conversations.executionInput(run.id)?.proof
-        const confirmedUnsentBinding = Boolean(
-          unsentProof &&
+        const unsentReadyQuotaOrAuthRejection = Boolean(
+          context?.continuationState === 'ready' &&
           currentContext &&
+          currentContext.nativeSessionId === context.nativeSessionId &&
+          currentContext.bindingGeneration === context.bindingGeneration &&
+          (!execution.deliveryPossible || saved.dispatchPhase === 'rejected') &&
           !saved.nativeTurnId &&
           !saved.nativeOutcome &&
-          ['not_dispatched', 'settled'].includes(saved.nativeEffectsState ?? '') &&
-          currentContext.nativeSessionId === unsentProof.nativeSessionId &&
-          currentContext.bindingGeneration === unsentProof.bindingGeneration &&
-          currentContext.executorId === unsentProof.executorId &&
-          adapter.executorId === unsentProof.executorId &&
+          (saved.nativeEffectsState === undefined ||
+            ['not_dispatched', 'settled'].includes(saved.nativeEffectsState)) &&
           !adapter.hasActiveBackgroundWork?.(run.id) &&
           !this.pendingNativeInteractions(run.sessionId).length &&
-          ![
-            'authentication_required',
-            'quota_or_rate_limit',
-            'permission_blocked',
-            'runtime_incompatible',
-            'context_resume_failed',
-            'native_session_occupied',
-          ].includes(failure.kind),
+          ['authentication_required', 'quota_or_rate_limit'].includes(failure.kind),
+        )
+        const confirmedUnsentBinding = Boolean(
+          unsentReadyQuotaOrAuthRejection ||
+          (unsentProof &&
+            currentContext &&
+            !saved.nativeTurnId &&
+            !saved.nativeOutcome &&
+            (saved.nativeEffectsState === undefined ||
+              ['not_dispatched', 'settled'].includes(saved.nativeEffectsState)) &&
+            currentContext.nativeSessionId === unsentProof.nativeSessionId &&
+            currentContext.bindingGeneration === unsentProof.bindingGeneration &&
+            currentContext.executorId === unsentProof.executorId &&
+            Conversation.adapterOwnsExecutor(adapter, unsentProof.executorId) &&
+            !adapter.hasActiveBackgroundWork?.(run.id) &&
+            !this.pendingNativeInteractions(run.sessionId).length &&
+            ![
+              'permission_blocked',
+              'runtime_incompatible',
+              'context_resume_failed',
+              'native_session_occupied',
+            ].includes(failure.kind)),
         )
         if (confirmedUnsentBinding)
           this.publish(
@@ -10735,7 +11651,7 @@ export class Conversation {
             const [sessionId, agentId] = key.split(':')
             if (
               sessionId &&
-              (agentId === 'codex' || agentId === 'claude') &&
+              (agentId === 'codex' || agentId === 'claude' || agentId === 'agy') &&
               !this.pendingNativeInteractions(sessionId).length &&
               this.conversations.schedulingSettings().credential.configured &&
               this.conversations.proposeRelayNativeRecovery(
@@ -11027,13 +11943,88 @@ export class Conversation {
         throw new Error('Pact is shutting down or recovery was cancelled.')
       if (this.nativeQuitSealed()) throw new RunOperationConflictError('Pact is preparing to exit.')
       if (!cwd) throw new Error('The Agent Adapter requires a confirmed project directory.')
+      if (!executablePath)
+        throw new RunOperationConflictError(`${agentDisplayName(agentId)} is not ready.`)
+      const resolvePeerTarget = (targetSessionId: string): RuntimeAgentId | undefined => {
+        const currentSession = this.sessions.find(targetSessionId)
+        if (!currentSession) return undefined
+        const pair = resolveActiveAgentPair(currentSession.settings)
+        return isAgentInPair(agentId, pair) ? otherAgent(agentId, pair) : undefined
+      }
+      const peerCandidate = agentId === 'agy' ? resolvePeerTarget(sessionId) : undefined
+      const expectedAgyPeer: Exclude<RuntimeAgentId, 'agy'> | undefined =
+        agentId === 'agy'
+          ? peerCandidate && peerCandidate !== 'agy'
+            ? peerCandidate
+            : 'codex'
+          : undefined
+      const agyAppDataDir = agentId === 'agy' ? resolveEffectiveAgyAppDataDir() : undefined
       const key = `${sessionId}:${agentId}`
       const cached = this.adapters.get(key)
-      if (cached?.executablePath === executablePath && cached.cwd === cwd) {
+      if (
+        cached?.executablePath === executablePath &&
+        cached.cwd === cwd &&
+        (agentId !== 'agy' ||
+          (cached.peerTargetAgentId === expectedAgyPeer &&
+            cached.appDataDir === agyAppDataDir &&
+            cached.connectionPool !== undefined &&
+            cached.poolKey !== undefined &&
+            this.agyConnectionPools.get(cached.poolKey) === cached.connectionPool))
+      ) {
         this.adapters.delete(key)
         this.adapters.set(key, cached)
         onAcquired?.(cached.adapter)
         return cached.adapter
+      }
+      const isCachedAdapterIdleEligible = (candidate: CachedAdapter): boolean =>
+        !candidate.adapter.hasActiveBackgroundWork?.() &&
+        [...this.nativeChecks.values()].every((owner) => owner.adapter !== candidate.adapter) &&
+        [...this.skillDiscoveries.values()].every(
+          (owner) => owner.sessionId !== candidate.sessionId || owner.agentId !== candidate.agentId,
+        ) &&
+        [...this.activeExecutions.values()].every(
+          (execution) =>
+            execution.run.sessionId !== candidate.sessionId ||
+            execution.protectedAgentId !== candidate.agentId,
+        ) &&
+        [...this.nativeRebuilds.entries()].every(
+          ([rebuildSessionId, rebuild]) =>
+            rebuildSessionId !== candidate.sessionId || rebuild.agentId !== candidate.agentId,
+        ) &&
+        [...this.preparingSends.values()].every(
+          (preparing) =>
+            preparing.input.sessionId !== candidate.sessionId ||
+            preparing.protectedAgentId !== candidate.agentId,
+        ) &&
+        [...this.preparingContinuations.values()].every(
+          (preparing) =>
+            preparing.sessionId !== candidate.sessionId ||
+            preparing.protectedAgentId !== candidate.agentId,
+        ) &&
+        [...this.nativeForks.values()].every(
+          (owner) => (owner.sessionId ?? owner.sourceSessionId) !== candidate.sessionId,
+        )
+      const disposeIdleCachedAdapter = async (
+        targetKey: string,
+        candidate: CachedAdapter,
+        retireSessionLease = false,
+      ): Promise<void> => {
+        const title = this.titleEnrichments.get(candidate.sessionId)
+        if (title?.agentId === candidate.agentId) {
+          this.cancelTitleEnrichment(candidate.sessionId)
+          await title.promise
+        }
+        if (candidate.agentId === 'codex') {
+          await this.cancelNativeTitleSync(candidate.sessionId)
+        }
+        await Promise.all([
+          candidate.adapter.dispose(),
+          retireSessionLease && candidate.retireFullAccess
+            ? candidate.retireFullAccess({ cwd: candidate.cwd, sessionId: candidate.sessionId })
+            : Promise.resolve(),
+          candidate.disposeExtra ? candidate.disposeExtra() : Promise.resolve(),
+        ])
+        this.adapters.delete(targetKey)
       }
       if (cached) {
         if ([...this.nativeChecks.values()].some((owner) => owner.adapter === cached.adapter))
@@ -11044,14 +12035,7 @@ export class Conversation {
           throw new RunOperationConflictError(
             'The previous native runtime still has background work. Its configuration will not be replaced while it is running.',
           )
-        const title = this.titleEnrichments.get(sessionId)
-        if (title?.agentId === agentId) {
-          this.cancelTitleEnrichment(sessionId)
-          await title.promise
-        }
-        if (agentId === 'codex') await this.cancelNativeTitleSync(sessionId)
-        await cached.adapter.dispose()
-        this.adapters.delete(key)
+        await disposeIdleCachedAdapter(key, cached)
       }
       const acquiringParentId = this.sessions.find(sessionId)?.parentSessionId
       const evictionPriority = (candidateSessionId: string): number => {
@@ -11066,42 +12050,11 @@ export class Conversation {
         return 3
       }
       while (this.adapters.size >= MAX_ADAPTER_SLOTS) {
-        let idle:
-          | [string, typeof this.adapters extends Map<string, infer V> ? V : never]
-          | undefined
+        let idle: [string, CachedAdapter] | undefined
         let idleScore = Number.POSITIVE_INFINITY
         for (const entry of this.adapters) {
           const [, candidate] = entry
-          const isEligible =
-            !candidate.adapter.hasActiveBackgroundWork?.() &&
-            [...this.nativeChecks.values()].every((owner) => owner.adapter !== candidate.adapter) &&
-            [...this.skillDiscoveries.values()].every(
-              (owner) =>
-                owner.sessionId !== candidate.sessionId || owner.agentId !== candidate.agentId,
-            ) &&
-            [...this.activeExecutions.values()].every(
-              (execution) =>
-                execution.run.sessionId !== candidate.sessionId ||
-                execution.protectedAgentId !== candidate.agentId,
-            ) &&
-            [...this.nativeRebuilds.entries()].every(
-              ([rebuildSessionId, rebuild]) =>
-                rebuildSessionId !== candidate.sessionId || rebuild.agentId !== candidate.agentId,
-            ) &&
-            [...this.preparingSends.values()].every(
-              (preparing) =>
-                preparing.input.sessionId !== candidate.sessionId ||
-                preparing.protectedAgentId !== candidate.agentId,
-            ) &&
-            [...this.preparingContinuations.values()].every(
-              (preparing) =>
-                preparing.sessionId !== candidate.sessionId ||
-                preparing.protectedAgentId !== candidate.agentId,
-            ) &&
-            [...this.nativeForks.values()].every(
-              (owner) => (owner.sessionId ?? owner.sourceSessionId) !== candidate.sessionId,
-            )
-          if (!isEligible) continue
+          if (!isCachedAdapterIdleEligible(candidate)) continue
           const score = evictionPriority(candidate.sessionId)
           if (score < idleScore) {
             idle = entry
@@ -11111,27 +12064,114 @@ export class Conversation {
         }
         if (!idle) throw new Error('No idle Agent Adapter slot is available.')
         const [idleKey, candidate] = idle
-        const title = this.titleEnrichments.get(candidate.sessionId)
-        if (title?.agentId === candidate.agentId) {
-          this.cancelTitleEnrichment(candidate.sessionId)
-          // oxlint-disable-next-line eslint/no-await-in-loop -- A title must release this slot before its Adapter can be disposed.
-          await title.promise
-        }
-        if (candidate.agentId === 'codex') {
-          // oxlint-disable-next-line no-await-in-loop -- Metadata writes settle before their Adapter slot can be reclaimed.
-          await this.cancelNativeTitleSync(candidate.sessionId)
-        }
         // oxlint-disable-next-line eslint/no-await-in-loop -- Reclaim each slot completely before admitting its replacement.
-        await candidate.adapter.dispose()
-        this.adapters.delete(idleKey)
+        await disposeIdleCachedAdapter(idleKey, candidate, true)
       }
       if (this.disposed || signal?.aborted)
         throw new Error('Pact is shutting down or recovery was cancelled.')
-      const adapter =
-        agentId === 'claude'
-          ? new ClaudeAgentAdapter(executablePath, undefined, this.ipcTraffic)
-          : new CodexAgentAdapter(executablePath, undefined, {}, this.ipcTraffic)
-      this.adapters.set(key, { sessionId, agentId, executablePath, cwd, adapter })
+      let adapter: AgentAdapter
+      let disposeExtra: (() => Promise<void>) | undefined
+      let retireFullAccess:
+        | ((options?: { cwd?: string; sessionId?: string }) => Promise<void>)
+        | undefined
+      let assignedPoolKey: string | undefined
+      let assignedPool: AgyAcpConnectionPool | undefined
+      if (agentId === 'claude') {
+        adapter = new ClaudeAgentAdapter(
+          executablePath,
+          undefined,
+          this.ipcTraffic,
+          resolvePeerTarget,
+        )
+      } else if (agentId === 'codex') {
+        adapter = new CodexAgentAdapter(
+          executablePath,
+          undefined,
+          {},
+          this.ipcTraffic,
+          resolvePeerTarget,
+        )
+      } else {
+        const resolvedAppDataDir = agyAppDataDir ?? resolveEffectiveAgyAppDataDir()
+        const poolKey = JSON.stringify([executablePath, resolvedAppDataDir])
+        let connectionPool = this.agyConnectionPools.get(poolKey)
+        if (connectionPool) {
+          this.agyConnectionPools.delete(poolKey)
+          this.agyConnectionPools.set(poolKey, connectionPool)
+        } else {
+          if (this.agyConnectionPools.size >= 8) {
+            let evictedPool = false
+            for (const [candidatePoolKey, candidatePool] of this.agyConnectionPools) {
+              if (candidatePool.activeLeaseCount > 0) continue
+              const referencingEntries = [...this.adapters.entries()].filter(
+                ([, entry]) => entry.connectionPool === candidatePool,
+              )
+              if (referencingEntries.length === 0) {
+                this.agyConnectionPools.delete(candidatePoolKey)
+                // oxlint-disable-next-line eslint/no-await-in-loop -- Wait for unreferenced pool shutdown before allocating replacement.
+                await candidatePool.dispose().catch(() => undefined)
+                evictedPool = true
+                break
+              }
+            }
+            if (!evictedPool) {
+              for (const [candidatePoolKey, candidatePool] of this.agyConnectionPools) {
+                if (candidatePool.activeLeaseCount > 0) continue
+                const referencingEntries = [...this.adapters.entries()].filter(
+                  ([, entry]) => entry.connectionPool === candidatePool,
+                )
+                if (referencingEntries.every(([, entry]) => isCachedAdapterIdleEligible(entry))) {
+                  for (const [refKey, refEntry] of referencingEntries) {
+                    // oxlint-disable-next-line eslint/no-await-in-loop -- Evict referencing idle adapters completely before disposing their shared pool.
+                    await disposeIdleCachedAdapter(refKey, refEntry, true)
+                  }
+                  this.agyConnectionPools.delete(candidatePoolKey)
+                  // oxlint-disable-next-line eslint/no-await-in-loop -- Dispose shared pool only after zero adapter references remain.
+                  await candidatePool.dispose().catch(() => undefined)
+                  evictedPool = true
+                  break
+                }
+              }
+            }
+            if (!evictedPool) {
+              throw new Error('No idle Antigravity connection pool slot is available.')
+            }
+          }
+          connectionPool = new AgyAcpConnectionPool({
+            executablePath,
+            ...(this.ipcTraffic ? { ipcTraffic: this.ipcTraffic } : {}),
+          })
+          this.agyConnectionPools.set(poolKey, connectionPool)
+        }
+        assignedPoolKey = poolKey
+        assignedPool = connectionPool
+        const agyForkFiles = new NativeForkFiles(this.ipcTraffic)
+        disposeExtra = () => agyForkFiles.dispose()
+        const agyOptions: AgyAgentAdapterOptions = {
+          executablePath,
+          appDataDir: resolvedAppDataDir,
+          connectionPool,
+          ...(this.ipcTraffic ? { ipcTraffic: this.ipcTraffic } : {}),
+          ...(expectedAgyPeer ? { peerTargetAgentId: expectedAgyPeer } : {}),
+          storageClient: createAgyNativeStorageClient(agyForkFiles, resolvedAppDataDir),
+        }
+        const agyAdapter = new AgyAgentAdapter(agyOptions)
+        retireFullAccess = (opts) => agyAdapter.retireFullAccess(opts)
+        adapter = agyAdapter
+      }
+      this.adapters.set(key, {
+        sessionId,
+        agentId,
+        executablePath,
+        cwd,
+        adapter,
+        ...(agyAppDataDir ? { appDataDir: agyAppDataDir } : {}),
+        ...(expectedAgyPeer ? { peerTargetAgentId: expectedAgyPeer } : {}),
+        ...(assignedPoolKey ? { poolKey: assignedPoolKey } : {}),
+        ...(assignedPool ? { connectionPool: assignedPool } : {}),
+        ...(disposeExtra ? { disposeExtra } : {}),
+        ...(retireFullAccess ? { retireFullAccess } : {}),
+      })
       adapter.setSkillCatalogListener?.(() => {
         if (this.adapters.get(key)?.adapter !== adapter) return
         this.skillCatalogs.delete(key)
@@ -11401,7 +12441,7 @@ export class Conversation {
       )
     )
       return { sessionId, inputGate: 'send_blocked', agents: [] }
-    const runs = (['codex', 'claude'] as const).map((agentId) => {
+    const runs = AGENTS.map((agentId) => {
       const context = contexts.find((item) => item.agentId === agentId)
       return (
         (!context ? this.conversations.unacknowledgedNativeRun(sessionId, agentId) : undefined) ??
@@ -11416,14 +12456,16 @@ export class Conversation {
         ? [run.id]
         : [],
     )
-    const projection = presentSessionIssues(
-      sessionId,
-      contexts,
-      runs,
-      cursors,
-      incomplete,
-      this.conversations.rebuildOperations(sessionId),
-    )
+    const session = this.sessions.find(sessionId)
+    const activeAgents = session ? resolveActiveAgentPair(session.settings) : undefined
+    const rebuildOperations = this.conversations.rebuildOperations(sessionId)
+    const projection = activeAgents
+      ? projectSessionIssues(sessionId, contexts, runs, cursors, incomplete, rebuildOperations, {
+          isArchivedRejection: isCodexArchivedSessionRejection,
+          sanitize: safeNativePermissionText,
+          activeAgents,
+        })
+      : presentSessionIssues(sessionId, contexts, runs, cursors, incomplete, rebuildOperations)
     for (const issue of projection.agents) {
       const run = [...runs, ...cursors].find((candidate) => candidate?.id === issue.runId)
       const currentBackground = run && this.isCurrentBackground(run)
@@ -11464,7 +12506,7 @@ export class Conversation {
       if (this.nativeChecks.has(`${sessionId}:${issue.agentId}:rebuild`)) {
         issue.phase = 'checking'
         issue.action = 'none'
-        issue.title = `Checking ${issue.agentId === 'codex' ? 'Codex' : 'Claude Code'} session`
+        issue.title = `Checking ${agentDisplayName(issue.agentId)} session`
         issue.reason = ''
       }
       issue.abandon ||= this.conversations.bindingHasUnsettledWork(
@@ -11810,10 +12852,7 @@ export class Conversation {
         const anchor =
           this.activeExecutions.get(parentSessionId)?.run ??
           (parentTask ? this.conversations.findRun(parentTask.runId) : undefined) ??
-          [
-            this.conversations.latestAgentRun(parentSessionId, 'claude'),
-            this.conversations.latestAgentRun(parentSessionId, 'codex'),
-          ]
+          AGENTS.map((agentId) => this.conversations.latestAgentRun(parentSessionId, agentId))
             .filter((run): run is AgentRun => Boolean(run))
             .toSorted((left, right) => right.createdAt.localeCompare(left.createdAt))[0]
         if (!anchor) {
@@ -12104,7 +13143,7 @@ export class Conversation {
   }
 
   private static pendingContinuationFailureCopy(agentId: RuntimeAgentId, error: unknown): string {
-    const name = agentId === 'claude' ? 'Claude Code' : 'Codex'
+    const name = agentDisplayName(agentId)
     const detail = error instanceof Error ? error.message.trim() : ''
     return `${name} could not start the second @all response.${detail ? ` ${detail.slice(0, 300)}` : ''}`
   }

@@ -17,7 +17,7 @@ import { nativeSkillCatalog } from './native-skill-catalog.js'
 
 type Record = Parameters<typeof nativeSkillCatalog>[3][number]
 const native = vi.hoisted(() => ({
-  records: { codex: [] as Record[], claude: [] as Record[] },
+  records: { codex: [] as Record[], claude: [] as Record[], agy: [] as Record[] },
   inputs: [] as AgentRunInput[],
   discoveries: [] as AbortSignal[],
   blocked: undefined as Promise<void> | undefined,
@@ -131,7 +131,12 @@ async function fixture() {
     { id: sessionId, projectId, title: 'Owned Skills', createdAt },
     {
       primaryAgentId: 'codex',
-      agents: { codex: { model: null, effort: null }, claude: { model: null, effort: null } },
+      secondaryAgentId: 'claude',
+      agents: {
+        codex: { model: null, effort: null },
+        claude: { model: null, effort: null },
+        agy: { model: null, effort: null },
+      },
       maxDiscussionRounds: 3,
 
       maxReviewCycles: 3,

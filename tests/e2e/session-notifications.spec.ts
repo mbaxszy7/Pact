@@ -287,7 +287,12 @@ async function seedProjectWithSessions(
   const createdAt = new Date().toISOString()
   const settings = {
     primaryAgentId: 'codex' as const,
-    agents: { claude: { model: null, effort: null }, codex: { model: null, effort: null } },
+    secondaryAgentId: 'claude' as const,
+    agents: {
+      claude: { model: null, effort: null },
+      codex: { model: null, effort: null },
+      agy: { model: null, effort: null },
+    },
     maxDiscussionRounds: 3,
     maxReviewCycles: 3,
     maxRepairAttempts: 3,

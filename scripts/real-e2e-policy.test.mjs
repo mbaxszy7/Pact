@@ -78,7 +78,7 @@ await test('actual Playwright discovery is completely classified and core select
       .toSorted(compare),
   )
   assert.equal(core.size, 1)
-  assert.equal(listed.size - core.size, 76)
+  assert.equal(listed.size - core.size, 77)
   assert.deepEqual(
     realCases.filter((item) => item.tier === 'core').map((item) => item.title),
     ['real @all completes each Agent once and keeps ordered distinct response rows'],
@@ -97,7 +97,7 @@ await test('core success reports every deferred case without claiming a complete
     notRun: 0,
     notApplicable: 0,
   })
-  assert.equal(report.tiers.extended.notRun + report.tiers.extended.notApplicable, 76)
+  assert.equal(report.tiers.extended.notRun + report.tiers.extended.notApplicable, 77)
   assert(
     report.cases
       .filter((item) => item.tier === 'extended')
@@ -343,7 +343,7 @@ await test('the reporting entry still lists all cases and fails when CI identity
       (error) => error.status === 1,
     )
     const report = JSON.parse(await readFile(join(directory, 'real-summary.json'), 'utf8'))
-    assert.equal(report.cases.length, 77)
+    assert.equal(report.cases.length, 78)
     assert.equal(report.gatePassed, false)
     assert(report.issues.includes('missing-or-invalid-ci-code-identity'))
   } finally {
@@ -375,7 +375,7 @@ await test('the actual CI reporting entry preserves exact source and run metadat
       },
     )
     const report = JSON.parse(await readFile(join(directory, 'real-summary.json'), 'utf8'))
-    assert.equal(report.cases.length, 77)
+    assert.equal(report.cases.length, 78)
     assert.equal(report.gatePassed, true)
     assert.deepEqual(report.identity, reportIdentity)
     assert.equal(JSON.stringify(report).includes(privateCanary), false)
@@ -422,7 +422,64 @@ await test('CI report entry rejects local or null metadata while preserving ever
     const report = JSON.parse(await readFile(join(directory, 'real-summary.json')))
     assert.equal(report.gatePassed, false)
     assert.equal(report.identity, null)
-    assert.equal(report.cases.length, 77)
+    assert.equal(report.cases.length, 78)
     assert(report.issues.includes('missing-or-invalid-ci-code-identity'))
   }
+})
+
+await test('opt-in extended Antigravity case is deferred when not opted in and strictly evaluated when opted in or executed', () => {
+  const agy = realCases.find((item) => item.optIn === 'PACT_E2E_REAL_AGY')
+  assert(agy)
+  assert.equal(realCaseRequired({ ...agy, project: 'real' }, 'full', 'darwin', {}), false)
+  assert.equal(
+    realCaseRequired({ ...agy, project: 'real' }, 'full', 'darwin', { PACT_E2E_REAL_AGY: '1' }),
+    true,
+  )
+
+  const skippedWhenUnopted = fixture('full')
+  const agySpec = skippedWhenUnopted.suites[0].specs.find((spec) => spec.file === agy.path)
+  agySpec.tests[0].status = 'skipped'
+  agySpec.tests[0].results[0] = { status: 'skipped', duration: 2 }
+
+  const deferredReport = evaluateRealReport(skippedWhenUnopted, {
+    suite: 'full',
+    gate: 'full',
+    platform: 'darwin',
+    env: {},
+  })
+  const deferredEntry = deferredReport.cases.find((item) => item.path === agy.path)
+  assert.equal(deferredEntry.required, false)
+  assert.equal(deferredEntry.status, 'not-run')
+  assert.equal(deferredEntry.failureCategory, 'deferred')
+  assert(deferredEntry.reason.includes('Deferred'))
+  assert.equal(deferredReport.gatePassed, true)
+  assert.equal(deferredReport.fullSuitePassed, false)
+
+  // When opted in via env, a skipped result fails the full gate:
+  const optedInSkipped = evaluateRealReport(skippedWhenUnopted, {
+    suite: 'full',
+    gate: 'full',
+    platform: 'darwin',
+    env: { PACT_E2E_REAL_AGY: '1' },
+  })
+  const optedSkippedEntry = optedInSkipped.cases.find((item) => item.path === agy.path)
+  assert.equal(optedSkippedEntry.required, true)
+  assert.equal(optedSkippedEntry.status, 'skipped')
+  assert.equal(optedInSkipped.gatePassed, false)
+
+  // When executed and failed in the report (even without env opt-in), full gate fails strictly:
+  const executedFailure = fixture('full')
+  const failedSpec = executedFailure.suites[0].specs.find((spec) => spec.file === agy.path)
+  fail(failedSpec.tests[0], 'failed')
+  const failedReport = evaluateRealReport(executedFailure, {
+    suite: 'full',
+    gate: 'full',
+    platform: 'darwin',
+    env: {},
+  })
+  const failedEntry = failedReport.cases.find((item) => item.path === agy.path)
+  assert.equal(failedEntry.required, true)
+  assert.equal(failedEntry.status, 'failed')
+  assert.equal(failedEntry.failureCategory, 'case-failed')
+  assert.equal(failedReport.gatePassed, false)
 })

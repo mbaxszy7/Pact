@@ -6,6 +6,7 @@ import {
   parseComposerCommandPrefix,
   skillArguments,
   SKILL_CATALOG_ITEMS,
+  validateSideChatMainSyncContent,
   type SkillSelection,
 } from './skills.js'
 
@@ -18,17 +19,50 @@ const selected = (name: string, start: number): SkillSelection => ({
 })
 
 describe('Composer command boundary', () => {
-  it.each(['/first @claude /second', '@claude /first /second'])(
-    'routes %s and shares the exact trailing task across all Skills',
-    (commands) => {
+  it.each([
+    ['/first @claude /second', 'claude'],
+    ['@claude /first /second', 'claude'],
+    ['/first @agy /second', 'agy'],
+    ['@agy /first /second', 'agy'],
+  ] as const)(
+    'routes %s to %s and shares the exact trailing task across all Skills',
+    (commands, agentId) => {
       const content = `${commands} --flag 中文\nnext line`
       const prefix = parseComposerCommandPrefix(content)
       expect(prefix.error).toBeUndefined()
-      expect(prefix.route).toEqual({ type: 'agent', agentId: 'claude' })
+      expect(prefix.route).toEqual({ type: 'agent', agentId })
       expect(prefix.skills.map((entry) => entry.name)).toEqual(['first', 'second'])
       expect(skillArguments(content, [])).toBe('--flag 中文\nnext line')
     },
   )
+
+  it('supports /btw with @agy and explicitly rejects @gemini in the command prefix', () => {
+    const btwAgy = parseComposerCommandPrefix('@agy /btw quick question')
+    expect(btwAgy.error).toBeUndefined()
+    expect(btwAgy.btw).toEqual({ start: 5, end: 9 })
+    expect(btwAgy.route).toEqual({ type: 'agent', agentId: 'agy' })
+
+    for (const invalid of ['@gemini explain this', '/first @gemini check', '@gemini /btw']) {
+      const parsed = parseComposerCommandPrefix(invalid)
+      expect(parsed.error).toContain('@agy')
+      expect(parsed.error).toContain('@gemini')
+    }
+
+    expect(
+      parseComposerCommandPrefix('install @gemini/genai in package.json').error,
+    ).toBeUndefined()
+    expect(parseComposerCommandPrefix('@gemini/sdk explain package').error).toBeUndefined()
+
+    expect(validateSideChatMainSyncContent('@agy sync back')).toMatchObject({
+      ok: false,
+      message: expect.stringContaining('@agy'),
+    })
+    expect(validateSideChatMainSyncContent('@gemini sync back')).toMatchObject({
+      ok: false,
+      message: expect.stringContaining('@agy'),
+    })
+    expect(validateSideChatMainSyncContent('Plain conclusion summary')).toEqual({ ok: true })
+  })
 
   it('keeps body references and code text out of explicit command syntax', () => {
     const content = '请解释 /check 和 @claude，代码：`/other`'

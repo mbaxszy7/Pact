@@ -267,9 +267,11 @@ describe('SessionRepository Catalog projection', () => {
           },
           {
             primaryAgentId: 'codex',
+            secondaryAgentId: 'claude',
             agents: {
               claude: { model: null, effort: null },
               codex: { model: null, effort: null },
+              agy: { model: null, effort: null },
             },
             maxDiscussionRounds: 6,
 
@@ -346,9 +348,11 @@ describe('SessionRepository Catalog projection', () => {
           },
           {
             primaryAgentId: 'codex',
+            secondaryAgentId: 'claude',
             agents: {
               claude: { model: null, effort: null },
               codex: { model: null, effort: null },
+              agy: { model: null, effort: null },
             },
             maxDiscussionRounds: 6,
 

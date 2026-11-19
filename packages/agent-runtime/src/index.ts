@@ -33,7 +33,7 @@ import type {
 } from '@pact/contracts'
 import type { ConversationImage } from '@pact/contracts/images'
 
-export type AgentId = 'claude' | 'codex'
+export type AgentId = 'claude' | 'codex' | 'agy'
 
 export interface AgentProbeResult {
   id: AgentId
@@ -166,7 +166,14 @@ export interface AgentNativeForkSourceInput {
   responseHash: string
 }
 
-export type { AgentNativeForkBoundary, AgentNativeForkWitness } from '@pact/contracts'
+export type {
+  AgentNativeForkBoundary,
+  AgentNativeForkWitness,
+  AgyNativeForkCutMetadata,
+  AgyRebuildInitializationWitness,
+  CodexInitializationWitness,
+  NativeInitializationWitness,
+} from '@pact/contracts'
 
 export interface AgentNativeForkInput extends Pick<
   AgentRunInput,

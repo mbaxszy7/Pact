@@ -16,7 +16,9 @@ test('shows independent first-use readiness for both CLIs', { tag: '@ui' }, asyn
   try {
     const window = await app.firstWindow()
     await expect(window.getByRole('heading', { name: 'Connect your coding agents' })).toBeVisible()
-    await expect(window.getByText('2 of 2 ready', { exact: true })).toBeVisible()
+    await expect(
+      window.getByText('2 of 3 ready · Minimum 2 required', { exact: true }),
+    ).toBeVisible()
     await expect(window.getByRole('heading', { name: 'Claude Code' })).toBeVisible()
     await expect(window.getByRole('heading', { name: 'Codex' })).toBeVisible()
     await expect(window.getByText('Ready', { exact: true })).toHaveCount(2)
@@ -86,7 +88,7 @@ test('keeps returning work readable while Agent actions are gated', { tag: '@ui'
           const result = await bridge.getRuntimePreparation()
           return result.ok ? result.value.agents.map((agent) => agent.state) : []
         })
-        expect(direct).toEqual(['ready', 'ready'])
+        expect(direct.slice(0, 2)).toEqual(['ready', 'ready'])
         await expect(window.locator('[data-agent-actions="disabled"]')).toBeVisible()
         await waitForWindowsRuntimeReady(window, fixture)
         await expect(window.locator('[data-agent-actions="enabled"]')).toBeVisible()
@@ -124,7 +126,9 @@ test(
       await expect(
         window.getByText('Requires Codex 0.159.2 or later.', { exact: false }),
       ).toBeVisible()
-      await expect(window.getByText('0 of 2 ready', { exact: true })).toBeVisible()
+      await expect(
+        window.getByText('0 of 3 ready · Minimum 2 required', { exact: true }),
+      ).toBeVisible()
       await expect(window.getByRole('button', { name: 'Continue', exact: true })).toHaveCount(0)
       const claudePath = join(
         fixture.directory,
@@ -140,7 +144,9 @@ test(
       )
       await writeFile(codexPath, (await readFile(codexPath, 'utf8')).replace('0.159.1', '0.159.2'))
       await window.getByRole('button', { name: 'Check again', exact: true }).click()
-      await expect(window.getByText('2 of 2 ready', { exact: true })).toBeVisible()
+      await expect(
+        window.getByText('2 of 3 ready · Minimum 2 required', { exact: true }),
+      ).toBeVisible()
       await expect(window.getByRole('button', { name: 'Continue', exact: true })).toBeEnabled()
       await expect(window.getByText('Upgrade required', { exact: true })).toHaveCount(0)
     } finally {
@@ -176,7 +182,7 @@ test(
       await expect(window.getByText('Detected: codex-cli 0.159.1', { exact: true })).toBeVisible()
       await expect(window.getByText('Upgrade required', { exact: true })).toHaveCount(1)
       await expect(
-        window.getByText('Finish setting up both agents, then click Check again.', {
+        window.getByText('Connect at least two coding agents, then click Check again.', {
           exact: true,
         }),
       ).toBeVisible()

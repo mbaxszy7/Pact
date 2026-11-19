@@ -1,8 +1,10 @@
 import { useEffect, useEffectEvent, useMemo, useRef, useState } from 'react'
 
 import {
+  agentDisplayName,
   PACT_COMPOSER_SKILLS,
   parseComposerCommandPrefix,
+  resolveActiveAgentPair,
   type NativeSkill,
   type PactComposerSkill,
   type RuntimeAgentId,
@@ -24,7 +26,7 @@ export type PactSkillOption = {
   description: string
 }
 export type ComposerSkillOption = NativeSkill | PactSkillOption
-type Agent = 'claude' | 'codex'
+type Agent = RuntimeAgentId
 interface Query {
   sessionId: string
   start: number
@@ -38,7 +40,7 @@ export interface ComposerEdit {
 }
 type Page = SkillCatalogPage & { startOffset: number }
 const encoder = new TextEncoder()
-const agentName = (id: string): string => (id === 'claude' ? 'Claude Code' : 'Codex')
+const agentName = (id: RuntimeAgentId): string => agentDisplayName(id)
 const queryAt = (
   sessionId: string,
   value: string,
@@ -103,10 +105,12 @@ export function useSkillComposer(input: {
     () => parseComposerCommandPrefix(input.text, input.selections),
     [input.text, input.selections],
   )
+  const [activePrimary, activeSecondary] = resolveActiveAgentPair(input.session.settings)
+  const activePair: readonly [Agent, Agent] = [activePrimary, activeSecondary]
   const { route, targets } = resolveComposerRoute(
     { ...input, skills: input.selections },
-    input.session.settings.primaryAgentId,
-    { allowMainRoute: isSideChat },
+    activePrimary,
+    { allowMainRoute: isSideChat, secondaryAgentId: activeSecondary },
   )
   const btwHandoffActive = !isSideChat && Boolean(prefix.btw && !prefix.error)
   const btwDraft = useMemo(
@@ -129,26 +133,20 @@ export function useSkillComposer(input: {
       input.returnedInputOperationId,
     ],
   )
-  const btwTargets = useMemo(
-    () =>
-      btwDraft
-        ? resolveComposerRoute(
-            {
-              text: btwDraft.text,
-              skills: btwDraft.skills,
-              route: btwDraft.route,
-              mention: btwDraft.mention,
-            },
-            input.session.settings.primaryAgentId,
-            { allowMainRoute: false },
-          ).targets
-        : undefined,
-    [btwDraft, input.session.settings.primaryAgentId],
-  )
+  const btwTargets = btwDraft
+    ? resolveComposerRoute(
+        {
+          text: btwDraft.text,
+          skills: btwDraft.skills,
+          route: btwDraft.route,
+          mention: btwDraft.mention,
+        },
+        activePrimary,
+        { allowMainRoute: false, secondaryAgentId: activeSecondary },
+      ).targets
+    : undefined
   const effectiveTargets: Agent[] =
-    route.type === 'main'
-      ? [input.mainTargetAgentId ?? input.session.settings.primaryAgentId]
-      : (btwTargets ?? targets)
+    route.type === 'main' ? [input.mainTargetAgentId ?? activePair[0]] : (btwTargets ?? targets)
   const names = [
     ...new Set([
       ...prefix.skills.map((entry) => entry.name),
@@ -168,30 +166,29 @@ export function useSkillComposer(input: {
   const menuIdentity = JSON.stringify([input.session.id, input.session.settingsRevision])
   const menuKey = JSON.stringify([menuIdentity, query?.text])
   const paging = pagingOwner === menuKey
+  const preferredFirst = effectiveTargets[0] ?? activePair[0]
   const agents: Agent[] =
-    effectiveTargets[0] === 'claude' ? ['claude', 'codex'] : ['codex', 'claude']
+    preferredFirst === activePair[0]
+      ? [activePair[0], activePair[1]]
+      : activePair.includes(preferredFirst)
+        ? [activePair[1], activePair[0]]
+        : [preferredFirst, activePair[0], activePair[1]]
   const settled = menuReady === menuKey
   // Retain one bounded window while its replacement arrives; never blank it per keystroke.
   const currentPages = menuOwner === menuIdentity ? pages : {}
   const search = (query?.text ?? '').toLocaleLowerCase()
-  const visiblePages = Object.fromEntries(
-    agents.flatMap((agent) => {
-      const page = currentPages[agent]
-      return page
-        ? [
-            [
-              agent,
-              {
-                ...page,
-                skills: page.skills.filter((entry) =>
-                  `${entry.name} ${entry.description}`.toLocaleLowerCase().includes(search),
-                ),
-              },
-            ],
-          ]
-        : []
-    }),
-  ) as Partial<Record<Agent, Page>>
+  const visiblePages: Partial<Record<Agent, Page>> = {}
+  for (const agent of agents) {
+    const page = currentPages[agent]
+    if (page) {
+      visiblePages[agent] = {
+        ...page,
+        skills: page.skills.filter((entry) =>
+          `${entry.name} ${entry.description}`.toLocaleLowerCase().includes(search),
+        ),
+      }
+    }
+  }
   const editingBtwToken = Boolean(
     query && prefix.btw && query.start === prefix.btw.start && query.end === prefix.btw.end,
   )
@@ -224,8 +221,14 @@ export function useSkillComposer(input: {
     const start = optionStarts[agent] ?? 0
     return visiblePages[agent]?.skills.slice(start, start + VISIBLE_SKILLS_PER_AGENT) ?? []
   })
-  const beforeAgent = (agent: Agent): number =>
-    pactOptions.length + (agent === agents[0] ? 0 : (visiblePages[agents[0]!]?.skills.length ?? 0))
+  const beforeAgent = (agent: Agent): number => {
+    let offset = pactOptions.length
+    for (const item of agents) {
+      if (item === agent) break
+      offset += visiblePages[item]?.skills.length ?? 0
+    }
+    return offset
+  }
   const showOptions = (agent: Agent, start: number, activeOffset = 0): void => {
     setRevealActive(true)
     setOptionStarts((current) => ({ ...current, [agent]: start }))
@@ -272,6 +275,13 @@ export function useSkillComposer(input: {
         : route.type === 'agent'
           ? `your selected Agent @${target} (${agentName(target)})`
           : `${agentName(target)} in @all`
+  const inactiveTarget =
+    !input.returnedInputOperationId && route.type !== 'main'
+      ? effectiveTargets.find((target) => !activePair.includes(target))
+      : undefined
+  const inactiveTargetWarning = inactiveTarget
+    ? `@${inactiveTarget} (${agentName(inactiveTarget)}) is not active in this ${isSideChat ? 'side chat' : 'session'}.`
+    : undefined
   const wrong = btwHandoffActive
     ? undefined
     : input.selections.find((entry) => !effectiveTargets.includes(entry.agentId))
@@ -299,8 +309,9 @@ export function useSkillComposer(input: {
         else failures[agent] = result.error.message
       }),
     ).catch(() => {
-      failures.claude = 'Skills could not be loaded.'
-      failures.codex = 'Skills could not be loaded.'
+      for (const agent of agents) {
+        failures[agent] = 'Skills could not be loaded.'
+      }
     })
     if (alive()) {
       setPagingOwner('')
@@ -334,7 +345,14 @@ export function useSkillComposer(input: {
   }, [input.session.id])
 
   const verify = useEffectEvent(async (expectedKey: string, alive: () => boolean) => {
-    if (!names.length || btwHandoffActive || sourceWarning || sideChatCommandError) return
+    if (
+      !names.length ||
+      btwHandoffActive ||
+      inactiveTargetWarning ||
+      sourceWarning ||
+      sideChatCommandError
+    )
+      return
     const deadline = Date.now() + 10_000
     try {
       for (const target of effectiveTargets) {
@@ -540,11 +558,13 @@ export function useSkillComposer(input: {
     warning:
       prefix.error ??
       sideChatCommandError ??
+      inactiveTargetWarning ??
       sourceWarning ??
       (validation.key === key ? validation.warning : undefined),
     checking:
       !btwHandoffActive &&
       names.length > 0 &&
+      !inactiveTargetWarning &&
       !sourceWarning &&
       !sideChatCommandError &&
       validation.key !== key,

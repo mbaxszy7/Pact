@@ -1,8 +1,12 @@
 import { useCallback, useEffect, useEffectEvent, useRef, useState } from 'react'
 
-import type { ProviderUsageProvider, ProviderUsageSnapshot } from '@pact/contracts'
+import type {
+  ProviderUsageProvider,
+  ProviderUsageSnapshot,
+  ProviderUsageWindow,
+} from '@pact/contracts'
 
-const PROVIDERS: readonly ProviderUsageProvider[] = ['codex', 'claude']
+const PROVIDERS: readonly ProviderUsageProvider[] = ['codex', 'claude', 'agy']
 const CLOCK_TICK_MS = 30_000
 const STALE_AFTER_MS = 5 * 60 * 1000
 
@@ -24,7 +28,10 @@ export function isUsageSnapshotStale(snapshot: ProviderUsageSnapshot, nowMs: num
   if (snapshot.status !== 'ready' && snapshot.status !== 'partial') return false
   const checkedAtMs = snapshot.checkedAt ? Date.parse(snapshot.checkedAt) : Number.NaN
   if (Number.isFinite(checkedAtMs) && nowMs - checkedAtMs > STALE_AFTER_MS) return true
-  for (const window of [snapshot.fiveHour, snapshot.sevenDay]) {
+  const windows: Array<ProviderUsageWindow | null> = snapshot.pools?.length
+    ? snapshot.pools.flatMap((pool) => [pool.fiveHour, pool.sevenDay])
+    : [snapshot.fiveHour, snapshot.sevenDay]
+  for (const window of windows) {
     if (!window?.resetsAt) continue
     const resetsMs = Date.parse(window.resetsAt)
     if (Number.isFinite(resetsMs) && resetsMs <= nowMs) return true
@@ -44,11 +51,13 @@ export function useProviderUsage(visible: boolean): ProviderUsageViewState {
     () => ({
       codex: createIdleSnapshot('codex'),
       claude: createIdleSnapshot('claude'),
+      agy: createIdleSnapshot('agy'),
     }),
   )
   const [refreshing, setRefreshing] = useState<Record<ProviderUsageProvider, boolean>>(() => ({
     codex: false,
     claude: false,
+    agy: false,
   }))
   const [documentVisible, setDocumentVisible] = useState<boolean>(
     () => typeof document === 'undefined' || !document.hidden,
@@ -104,7 +113,7 @@ export function useProviderUsage(visible: boolean): ProviderUsageViewState {
     if (activeEntries.length === 0) return
     inFlightRef.current = {}
     if (mountedRef.current) {
-      setRefreshing({ codex: false, claude: false })
+      setRefreshing({ codex: false, claude: false, agy: false })
     }
     if (typeof window.pact?.cancelProviderUsage === 'function') {
       for (const entry of activeEntries) {
@@ -135,14 +144,20 @@ export function useProviderUsage(visible: boolean): ProviderUsageViewState {
       setRefreshing((current) => ({ ...current, [provider]: true }))
       setSnapshots((current) => {
         const baseline = hintSnapshot ?? current[provider]
-        const retainWindows = baseline.identityConfirmed && (baseline.fiveHour || baseline.sevenDay)
+        const retainWindows =
+          baseline.identityConfirmed &&
+          (baseline.fiveHour ||
+            baseline.sevenDay ||
+            Boolean(baseline.pools?.some((pool) => pool.fiveHour || pool.sevenDay)))
+        const { pools: _previousPools, ...baselineWithoutPools } = baseline
         return {
           ...current,
           [provider]: {
-            ...baseline,
+            ...baselineWithoutPools,
             status: 'loading',
             fiveHour: retainWindows ? baseline.fiveHour : null,
             sevenDay: retainWindows ? baseline.sevenDay : null,
+            ...(retainWindows && baseline.pools ? { pools: baseline.pools } : {}),
             message: undefined,
           },
         }
@@ -166,17 +181,20 @@ export function useProviderUsage(visible: boolean): ProviderUsageViewState {
               scheduleSync(provider, 350)
             }
           } else {
-            setSnapshots((current) => ({
-              ...current,
-              [provider]: {
-                ...current[provider],
-                status: 'unavailable',
-                fiveHour: null,
-                sevenDay: null,
-                identityConfirmed: false,
-                message: 'Unavailable',
-              },
-            }))
+            setSnapshots((current) => {
+              const { pools: _previousPools, ...previousWithoutPools } = current[provider]
+              return {
+                ...current,
+                [provider]: {
+                  ...previousWithoutPools,
+                  status: 'unavailable',
+                  fiveHour: null,
+                  sevenDay: null,
+                  identityConfirmed: false,
+                  message: 'Unavailable',
+                },
+              }
+            })
           }
           return undefined
         })
@@ -185,17 +203,20 @@ export function useProviderUsage(visible: boolean): ProviderUsageViewState {
           delete inFlightRef.current[provider]
           setRefreshing((current) => ({ ...current, [provider]: false }))
           setNowMs(Date.now())
-          setSnapshots((current) => ({
-            ...current,
-            [provider]: {
-              ...current[provider],
-              status: 'unavailable',
-              fiveHour: null,
-              sevenDay: null,
-              identityConfirmed: false,
-              message: 'Unavailable',
-            },
-          }))
+          setSnapshots((current) => {
+            const { pools: _previousPools, ...previousWithoutPools } = current[provider]
+            return {
+              ...current,
+              [provider]: {
+                ...previousWithoutPools,
+                status: 'unavailable',
+                fiveHour: null,
+                sevenDay: null,
+                identityConfirmed: false,
+                message: 'Unavailable',
+              },
+            }
+          })
           return undefined
         })
     },

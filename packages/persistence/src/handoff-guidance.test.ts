@@ -203,7 +203,7 @@ describe('current workflow sources and historical handoff guidance', () => {
     const boundary = (
       agentId: 'claude' | 'codex',
     ): import('@pact/contracts').AgentNativeForkBoundary => {
-      const run = selection.runs[agentId],
+      const run = selection.runs[agentId]!,
         response = f.repo.forkResponse(run.id, selection.prepared.sequence)
       return {
         nativeSessionId: run.nativeSessionId!,
@@ -363,7 +363,7 @@ describe('current workflow sources and historical handoff guidance', () => {
     const boundary = (
       agentId: 'claude' | 'codex',
     ): import('@pact/contracts').AgentNativeForkBoundary => {
-      const nativeRun = selection.runs[agentId],
+      const nativeRun = selection.runs[agentId]!,
         response = f.repo.forkResponse(nativeRun.id, selection.prepared.sequence)
       return {
         nativeSessionId: nativeRun.nativeSessionId!,

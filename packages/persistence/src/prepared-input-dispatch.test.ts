@@ -45,7 +45,12 @@ const databases = new Set<PactDatabase>()
 const directories: string[] = []
 const settings: DefaultSessionSettings = {
   primaryAgentId: 'codex',
-  agents: { codex: { model: null, effort: null }, claude: { model: null, effort: null } },
+  secondaryAgentId: 'claude',
+  agents: {
+    codex: { model: null, effort: null },
+    claude: { model: null, effort: null },
+    agy: { model: null, effort: null },
+  },
   maxDiscussionRounds: 6,
   maxReviewCycles: 3,
   maxRepairAttempts: 3,
@@ -955,7 +960,7 @@ describe('saved ordinary input information consumer', () => {
         current.settingsRevision,
       )
     const boundary = (agentId: 'codex' | 'claude') => {
-      const sourceRun = selection.runs[agentId],
+      const sourceRun = selection.runs[agentId]!,
         prefix = repo.forkResponse(sourceRun.id, selection.prepared.sequence)
       return {
         nativeSessionId: sourceRun.nativeSessionId!,
@@ -1538,6 +1543,7 @@ describe('prepared ordinary input through repository admission', () => {
     f.db.sessionRepository.saveSettings(f.sessionId, {
       ...current.settings,
       primaryAgentId: 'claude',
+      secondaryAgentId: 'codex',
     })
     const before = businessFacts(f)
     expect(() => f.repo.preparedInputHandoff(e.receipt.batchId)).toThrow(

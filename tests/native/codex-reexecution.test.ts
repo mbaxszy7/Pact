@@ -150,9 +150,11 @@ async function verifyNativeReplacement(materialized: boolean): Promise<void> {
       { id: sessionId, projectId, title: 'Owned native unsent fixture', createdAt },
       {
         primaryAgentId: 'codex',
+        secondaryAgentId: 'claude',
         agents: {
           codex: { model: null, effort: null, speed: 'standard' },
           claude: { model: null, effort: null },
+          agy: { model: null, effort: null },
         },
         maxDiscussionRounds: 6,
         maxReviewCycles: 3,

@@ -34,7 +34,12 @@ export async function decisionFixture(filePath = ':memory:', directoryPath = '/d
     { id: sessionId, projectId, title: 'Decision fixture', createdAt: now },
     {
       primaryAgentId: 'codex',
-      agents: { codex: { model: null, effort: null }, claude: { model: null, effort: null } },
+      secondaryAgentId: 'claude',
+      agents: {
+        codex: { model: null, effort: null },
+        claude: { model: null, effort: null },
+        agy: { model: null, effort: null },
+      },
       maxDiscussionRounds: 6,
       maxReviewCycles: 3,
       maxRepairAttempts: 3,

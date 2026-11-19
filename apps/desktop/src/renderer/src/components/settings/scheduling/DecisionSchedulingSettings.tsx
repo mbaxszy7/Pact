@@ -575,6 +575,7 @@ const activityActions: Record<NonNullable<SchedulingActivityRow['action']>, stri
   reply: 'Reply to message',
   route_codex: 'Route to Codex',
   route_claude: 'Route to Claude Code',
+  route_agy: 'Route to Antigravity',
   clarify_prepared_input: 'Clarify input',
   supplement_plan: 'Clarify Plan',
   supplement_code_response: 'Clarify review',

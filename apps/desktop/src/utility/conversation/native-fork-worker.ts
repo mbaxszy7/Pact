@@ -13,9 +13,12 @@ import {
   claudePlanCheckpointSchema,
   claudePlanCheckpointReplySchema,
   claudePlanCheckpointWorkingBytes,
+  type AgyRebuildInitializationWitness,
 } from '@pact/contracts'
 
 import type {
+  AgyColdInspectionResult,
+  AgyRebuildSeedResult,
   NativeForkFileInput,
   NativeForkFileResult,
   NativeForkAnswerResult,
@@ -24,6 +27,16 @@ import type {
   NativeSessionExistenceResult,
 } from './native-fork-files'
 
+import {
+  confirmAgyRebuildColdLoad,
+  executeAgyFork,
+  inspectAgyTrajectory,
+  inspectAgyFork,
+  prepareAgyFork,
+  verifyAgyRebuildSeed,
+  withAgyTempStagingRoot,
+  writeAgyRebuildSeed,
+} from './agy-native-storage'
 import { ClaudeAnswerAssembler } from './claude-answer-assembler'
 import {
   ClaudeNativePlan,
@@ -114,16 +127,102 @@ function isClaudeCostState(entry: RecordValue, nativeSessionId: string): boolean
   }
   return true
 }
+function isValidAgyRebuildChunk(entry: unknown): boolean {
+  if (
+    !isObject(entry) ||
+    typeof entry.messageId !== 'string' ||
+    !uuid.test(entry.messageId) ||
+    typeof entry.sequence !== 'number' ||
+    !Number.isSafeInteger(entry.sequence) ||
+    entry.sequence < 0
+  ) {
+    return false
+  }
+  if (entry.kind === 'message') {
+    return (
+      ['user', 'claude', 'codex', 'agy'].includes(String(entry.speaker)) &&
+      ['complete', 'incomplete'].includes(String(entry.state)) &&
+      typeof entry.part === 'number' &&
+      Number.isSafeInteger(entry.part) &&
+      entry.part >= 0 &&
+      typeof entry.final === 'boolean' &&
+      typeof entry.content === 'string' &&
+      entry.content.length <= 64 * 1024
+    )
+  }
+  if (entry.kind === 'comment') return isObject(entry.comment)
+  if (entry.kind === 'image') {
+    return (
+      isObject(entry.image) &&
+      typeof entry.image.id === 'string' &&
+      uuid.test(entry.image.id) &&
+      ['image/png', 'image/jpeg', 'image/webp'].includes(String(entry.image.mediaType)) &&
+      typeof entry.image.bytes === 'number' &&
+      Number.isSafeInteger(entry.image.bytes) &&
+      entry.image.bytes > 0 &&
+      typeof entry.image.sha256 === 'string' &&
+      /^[a-f\d]{64}$/iu.test(entry.image.sha256)
+    )
+  }
+  return false
+}
+
+function isValidPromptImage(entry: unknown): boolean {
+  return (
+    isObject(entry) &&
+    typeof entry.id === 'string' &&
+    uuid.test(entry.id) &&
+    typeof entry.path === 'string' &&
+    entry.path.length > 0 &&
+    entry.path.length <= 4096 &&
+    ['image/png', 'image/jpeg', 'image/webp'].includes(String(entry.mediaType)) &&
+    typeof entry.bytes === 'number' &&
+    Number.isSafeInteger(entry.bytes) &&
+    entry.bytes > 0 &&
+    entry.bytes <= MAX_BYTES &&
+    typeof entry.width === 'number' &&
+    Number.isSafeInteger(entry.width) &&
+    entry.width > 0 &&
+    typeof entry.height === 'number' &&
+    Number.isSafeInteger(entry.height) &&
+    entry.height > 0 &&
+    typeof entry.sha256 === 'string' &&
+    /^[a-f\d]{64}$/iu.test(entry.sha256)
+  )
+}
+
 function isInput(value: unknown): value is NativeForkFileInput {
   if (
     !isObject(value) ||
-    !['claude', 'codex'].includes(String(value.provider)) ||
-    !['prepare', 'fork', 'inspect', 'read', 'read-answer', 'verify-seed', 'exists'].includes(
-      String(value.action),
-    )
+    !['claude', 'codex', 'agy'].includes(String(value.provider)) ||
+    ![
+      'prepare',
+      'fork',
+      'inspect',
+      'read',
+      'read-answer',
+      'verify-seed',
+      'exists',
+      'rebuild_seed',
+      'verify-agy-seed',
+      'confirm-agy-rebuild-cold-load',
+      'inspect-agy-run',
+    ].includes(String(value.action))
   )
     return false
-  if (value.action === 'exists' && value.provider !== 'claude') return false
+  if (value.action === 'exists' && !['claude', 'agy'].includes(String(value.provider))) return false
+  if (
+    [
+      'rebuild_seed',
+      'verify-agy-seed',
+      'confirm-agy-rebuild-cold-load',
+      'inspect-agy-run',
+    ].includes(String(value.action)) &&
+    value.provider !== 'agy'
+  )
+    return false
+  if (value.provider === 'agy' && ['read-answer', 'verify-seed'].includes(String(value.action)))
+    return false
   if (
     value.planHook !== undefined &&
     (value.action !== 'read-answer' ||
@@ -203,7 +302,139 @@ function isInput(value: unknown): value is NativeForkFileInput {
       Buffer.byteLength(JSON.stringify(value.expectedSeed)) > 1024 * 1024
     )
       return false
-  } else if (value.expectedSeed !== undefined || value.rejectAdditionalWork !== undefined)
+  } else if (
+    value.expectedSeed !== undefined ||
+    (value.rejectAdditionalWork !== undefined &&
+      !(value.action === 'verify-agy-seed' && typeof value.rejectAdditionalWork === 'boolean'))
+  )
+    return false
+  if (
+    value.tempStagingDir !== undefined &&
+    (value.provider !== 'agy' ||
+      typeof value.tempStagingDir !== 'string' ||
+      !value.tempStagingDir.length ||
+      value.tempStagingDir.length > 4096 ||
+      !isAbsolute(value.tempStagingDir))
+  )
+    return false
+  if (
+    value.candidateNativeSessionId !== undefined &&
+    (value.provider !== 'agy' ||
+      value.action !== 'fork' ||
+      typeof value.candidateNativeSessionId !== 'string' ||
+      !uuid.test(value.candidateNativeSessionId))
+  )
+    return false
+  if (
+    value.awaitCandidateCommit !== undefined &&
+    (value.provider !== 'agy' ||
+      value.action !== 'fork' ||
+      typeof value.awaitCandidateCommit !== 'boolean')
+  )
+    return false
+  if (value.action === 'rebuild_seed' || value.action === 'verify-agy-seed') {
+    if (
+      typeof value.rebuildId !== 'string' ||
+      !uuid.test(value.rebuildId) ||
+      (value.sourceHash !== undefined &&
+        (typeof value.sourceHash !== 'string' || !/^[a-f\d]{64}$/iu.test(value.sourceHash))) ||
+      !Array.isArray(value.rebuildChunks) ||
+      value.rebuildChunks.length > 4096 ||
+      !value.rebuildChunks.every(isValidAgyRebuildChunk) ||
+      Buffer.byteLength(JSON.stringify(value.rebuildChunks)) > TEXT_BYTES ||
+      (value.rebuildImages !== undefined &&
+        (!Array.isArray(value.rebuildImages) ||
+          value.rebuildImages.length > 4096 ||
+          !value.rebuildImages.every(isValidPromptImage)))
+    )
+      return false
+    if (value.action === 'verify-agy-seed') {
+      if (
+        (value.expectedSeedHash !== undefined &&
+          (typeof value.expectedSeedHash !== 'string' ||
+            !/^[a-f\d]{64}$/iu.test(value.expectedSeedHash))) ||
+        (value.expectedTrajectoryId !== undefined &&
+          (typeof value.expectedTrajectoryId !== 'string' ||
+            !value.expectedTrajectoryId.length ||
+            value.expectedTrajectoryId.length > 256)) ||
+        (value.expectedPbSha256 !== undefined &&
+          (typeof value.expectedPbSha256 !== 'string' ||
+            !/^[a-f\d]{64}$/iu.test(value.expectedPbSha256))) ||
+        (value.expectedPbBytes !== undefined &&
+          (typeof value.expectedPbBytes !== 'number' ||
+            !Number.isSafeInteger(value.expectedPbBytes) ||
+            value.expectedPbBytes <= 0 ||
+            value.expectedPbBytes > 64 * 1024 * 1024)) ||
+        (value.expectedVerifiedPrefixSha256 !== undefined &&
+          (typeof value.expectedVerifiedPrefixSha256 !== 'string' ||
+            !/^[a-f\d]{64}$/iu.test(value.expectedVerifiedPrefixSha256))) ||
+        (value.expectedVerifiedPrefixBytes !== undefined &&
+          (typeof value.expectedVerifiedPrefixBytes !== 'number' ||
+            !Number.isSafeInteger(value.expectedVerifiedPrefixBytes) ||
+            value.expectedVerifiedPrefixBytes <= 0 ||
+            value.expectedVerifiedPrefixBytes > MAX_BYTES)) ||
+        (value.expectedRecordCount !== undefined &&
+          (typeof value.expectedRecordCount !== 'number' ||
+            !Number.isSafeInteger(value.expectedRecordCount) ||
+            value.expectedRecordCount <= 0 ||
+            value.expectedRecordCount > MAX_RECORDS))
+      )
+        return false
+    } else if (
+      value.expectedSeedHash !== undefined ||
+      value.expectedTrajectoryId !== undefined ||
+      value.expectedPbSha256 !== undefined ||
+      value.expectedPbBytes !== undefined ||
+      value.expectedVerifiedPrefixSha256 !== undefined ||
+      value.expectedVerifiedPrefixBytes !== undefined ||
+      value.expectedRecordCount !== undefined
+    )
+      return false
+    if (
+      value.pbSha256 !== undefined ||
+      value.pbBytes !== undefined ||
+      value.stepCount !== undefined
+    )
+      return false
+  } else if (value.action === 'confirm-agy-rebuild-cold-load') {
+    if (
+      typeof value.sourceHash !== 'string' ||
+      !/^[a-f0-9]{64}$/u.test(value.sourceHash) ||
+      typeof value.pbSha256 !== 'string' ||
+      !/^[a-f0-9]{64}$/u.test(value.pbSha256) ||
+      typeof value.pbBytes !== 'number' ||
+      !Number.isSafeInteger(value.pbBytes) ||
+      value.pbBytes <= 0 ||
+      value.pbBytes > 64 * 1024 * 1024 ||
+      value.stepCount !== 2 ||
+      value.rebuildId !== undefined ||
+      value.rebuildChunks !== undefined ||
+      value.rebuildImages !== undefined ||
+      value.expectedSeedHash !== undefined ||
+      value.expectedTrajectoryId !== undefined ||
+      value.expectedPbSha256 !== undefined ||
+      value.expectedPbBytes !== undefined ||
+      value.expectedVerifiedPrefixSha256 !== undefined ||
+      value.expectedVerifiedPrefixBytes !== undefined ||
+      value.expectedRecordCount !== undefined
+    )
+      return false
+  } else if (
+    value.rebuildId !== undefined ||
+    value.sourceHash !== undefined ||
+    value.rebuildChunks !== undefined ||
+    value.rebuildImages !== undefined ||
+    value.expectedSeedHash !== undefined ||
+    value.expectedTrajectoryId !== undefined ||
+    value.expectedPbSha256 !== undefined ||
+    value.expectedPbBytes !== undefined ||
+    value.expectedVerifiedPrefixSha256 !== undefined ||
+    value.expectedVerifiedPrefixBytes !== undefined ||
+    value.expectedRecordCount !== undefined ||
+    value.pbSha256 !== undefined ||
+    value.pbBytes !== undefined ||
+    value.stepCount !== undefined
+  )
     return false
   for (const key of ['cwd', 'nativeSessionId'])
     if (typeof value[key] !== 'string' || !value[key].length || value[key].length > 4096)
@@ -220,7 +451,7 @@ function isInput(value: unknown): value is NativeForkFileInput {
       value.nativeInputIds.length < 1 ||
       value.nativeInputIds.length > 64 ||
       new Set(value.nativeInputIds).size !== value.nativeInputIds.length ||
-      value.nativeInputIds[0] !== value.nativeTurnId ||
+      (value.provider === 'claude' && value.nativeInputIds[0] !== value.nativeTurnId) ||
       !value.nativeInputIds.every(
         (id) =>
           typeof id === 'string' &&
@@ -2225,6 +2456,123 @@ async function codex(input: NativeForkFileInput): Promise<NativeForkFileResult> 
   }
 }
 
+async function agy(
+  input: NativeForkFileInput,
+): Promise<
+  | NativeForkFileResult
+  | AgyRebuildSeedResult
+  | AgyRebuildInitializationWitness
+  | AgyColdInspectionResult
+  | NativeSessionExistenceResult
+> {
+  return withAgyTempStagingRoot(input.tempStagingDir, async () => {
+    if (input.action === 'exists') {
+      const inspected = inspectAgyTrajectory({
+        cwd: input.cwd,
+        nativeSessionId: input.nativeSessionId,
+        ...(input.storageRoot ? { storageRoot: input.storageRoot } : {}),
+      })
+      return { nativeSessionId: input.nativeSessionId, exists: inspected.exists }
+    }
+    if (input.action === 'inspect-agy-run') {
+      return inspectAgyTrajectory({
+        cwd: input.cwd,
+        nativeSessionId: input.nativeSessionId,
+        ...(input.storageRoot ? { storageRoot: input.storageRoot } : {}),
+        ...(input.nativeTurnId ? { nativeTurnId: input.nativeTurnId } : {}),
+        ...(input.nativeInputIds ? { nativeInputIds: input.nativeInputIds } : {}),
+        ...(input.includePlan !== undefined ? { includePlan: input.includePlan } : {}),
+      })
+    }
+    if (input.action === 'rebuild_seed') {
+      return writeAgyRebuildSeed({
+        cwd: input.cwd,
+        nativeSessionId: input.nativeSessionId,
+        ...(input.storageRoot ? { storageRoot: input.storageRoot } : {}),
+        rebuildId: input.rebuildId!,
+        ...(input.sourceHash !== undefined ? { sourceHash: input.sourceHash } : {}),
+        chunks: input.rebuildChunks!,
+        ...(input.rebuildImages ? { images: input.rebuildImages } : {}),
+      })
+    }
+    if (input.action === 'confirm-agy-rebuild-cold-load') {
+      return confirmAgyRebuildColdLoad({
+        cwd: input.cwd,
+        nativeSessionId: input.nativeSessionId,
+        ...(input.storageRoot ? { storageRoot: input.storageRoot } : {}),
+        sourceHash: input.sourceHash!,
+        pbSha256: input.pbSha256!,
+        pbBytes: input.pbBytes!,
+        stepCount: 2,
+      })
+    }
+    if (input.action === 'verify-agy-seed') {
+      return verifyAgyRebuildSeed({
+        cwd: input.cwd,
+        nativeSessionId: input.nativeSessionId,
+        ...(input.storageRoot ? { storageRoot: input.storageRoot } : {}),
+        rebuildId: input.rebuildId!,
+        ...(input.sourceHash !== undefined ? { sourceHash: input.sourceHash } : {}),
+        chunks: input.rebuildChunks!,
+        ...(input.rebuildImages ? { images: input.rebuildImages } : {}),
+        ...(input.expectedSeedHash ? { expectedSeedHash: input.expectedSeedHash } : {}),
+        ...(input.expectedTrajectoryId ? { expectedTrajectoryId: input.expectedTrajectoryId } : {}),
+        ...(input.expectedPbSha256 ? { expectedPbSha256: input.expectedPbSha256 } : {}),
+        ...(input.expectedPbBytes !== undefined ? { expectedPbBytes: input.expectedPbBytes } : {}),
+        ...(input.expectedVerifiedPrefixSha256
+          ? { expectedVerifiedPrefixSha256: input.expectedVerifiedPrefixSha256 }
+          : {}),
+        ...(input.expectedVerifiedPrefixBytes !== undefined
+          ? { expectedVerifiedPrefixBytes: input.expectedVerifiedPrefixBytes }
+          : {}),
+        ...(input.expectedRecordCount !== undefined
+          ? { expectedRecordCount: input.expectedRecordCount }
+          : {}),
+        ...(input.rejectAdditionalWork !== undefined
+          ? { rejectAdditionalWork: input.rejectAdditionalWork }
+          : {}),
+      })
+    }
+    const forkInput = {
+      cwd: input.cwd,
+      nativeSessionId: input.nativeSessionId,
+      ...(input.candidateNativeSessionId
+        ? { candidateNativeSessionId: input.candidateNativeSessionId }
+        : {}),
+      ...(input.nativeTurnId ? { nativeTurnId: input.nativeTurnId } : {}),
+      ...(input.nativeInputIds ? { nativeInputIds: input.nativeInputIds } : {}),
+      ...(input.responseHash ? { responseHash: input.responseHash } : {}),
+      ...(input.lastDispatchedPhase ? { lastDispatchedPhase: input.lastDispatchedPhase } : {}),
+      ...(input.source ? { source: input.source } : {}),
+      ...(input.witness ? { witness: input.witness } : {}),
+      ...(input.storageRoot ? { storageRoot: input.storageRoot } : {}),
+    }
+    if (input.action === 'prepare') return prepareAgyFork(forkInput)
+    if (input.action === 'inspect') return inspectAgyFork(forkInput)
+    if (input.action === 'read') {
+      return input.witness ? inspectAgyFork(forkInput) : prepareAgyFork(forkInput)
+    }
+    if (input.action === 'fork') {
+      return executeAgyFork(
+        forkInput,
+        input.awaitCandidateCommit
+          ? async (candidate) => {
+              await postReply({ type: 'candidate', result: candidate })
+              await new Promise<void>((resolve, reject) =>
+                parentPort!.once('message', (message) =>
+                  message?.type === 'candidate_committed'
+                    ? resolve()
+                    : reject(new Error('Candidate persistence was not acknowledged.')),
+                ),
+              )
+            }
+          : undefined,
+      )
+    }
+    throw new Error('Unsupported Antigravity native Fork worker action.')
+  })
+}
+
 const measureTraffic =
   workerData !== null && typeof workerData === 'object' && workerData.measure === true
 async function postReply(reply: Record<string, unknown>): Promise<void> {
@@ -2237,7 +2585,13 @@ async function postReply(reply: Record<string, unknown>): Promise<void> {
 if (parentPort) {
   const input: unknown = measureTraffic ? workerData.input : workerData
   if (!isInput(input)) throw new Error('Invalid native Fork worker input.')
-  void (input.provider === 'claude' ? claude(input) : codex(input)).then(
+  void (
+    input.provider === 'claude'
+      ? claude(input)
+      : input.provider === 'agy'
+        ? agy(input)
+        : codex(input)
+  ).then(
     (result) => postReply({ type: 'result', result }),
     (error: unknown) =>
       postReply({

@@ -465,7 +465,12 @@ async function fixture(
     { id: sessionId, projectId, title: 'Collaboration', createdAt },
     {
       primaryAgentId,
-      agents: { codex: { model: null, effort: null }, claude: { model: null, effort: null } },
+      secondaryAgentId: primaryAgentId === 'claude' ? 'codex' : 'claude',
+      agents: {
+        codex: { model: null, effort: null },
+        claude: { model: null, effort: null },
+        agy: { model: null, effort: null },
+      },
       maxDiscussionRounds: 6,
       maxReviewCycles: 3,
       maxRepairAttempts: 3,
@@ -1380,6 +1385,7 @@ describe('Native workflow admission and durable dispatch', () => {
         f.db.sessionRepository.saveSettings(f.sessionId, {
           ...f.db.sessionRepository.find(f.sessionId)!.settings,
           primaryAgentId: primary === 'codex' ? 'claude' : 'codex',
+          secondaryAgentId: primary,
         })
         native.hold = undefined
         hold.resolve()
@@ -1568,6 +1574,7 @@ describe('Native workflow admission and durable dispatch', () => {
         f.db.sessionRepository.saveSettings(f.sessionId, {
           ...f.db.sessionRepository.find(f.sessionId)!.settings,
           primaryAgentId: primary === 'codex' ? 'claude' : 'codex',
+          secondaryAgentId: primary,
         })
         native.hold = undefined
         hold.resolve()
@@ -3567,6 +3574,7 @@ describe('Explicit Plan questions', () => {
     f.db.sessionRepository.saveSettings(child.sessionId, {
       ...session.settings,
       primaryAgentId: 'claude',
+      secondaryAgentId: 'codex',
     })
     const drafts = f.repo.readPage({ scope: 'drafts', sessionId: child.sessionId })
     if (drafts.scope !== 'drafts') throw Error('Missing Fork drafts.')
@@ -4580,7 +4588,12 @@ it('waits for terminal workspace finalization before serving collaboration repor
     { id: sessionId, projectId, title: 'Collaboration Settling', createdAt },
     {
       primaryAgentId: 'codex',
-      agents: { codex: { model: null, effort: null }, claude: { model: null, effort: null } },
+      secondaryAgentId: 'claude',
+      agents: {
+        codex: { model: null, effort: null },
+        claude: { model: null, effort: null },
+        agy: { model: null, effort: null },
+      },
       maxDiscussionRounds: 6,
       maxReviewCycles: 3,
       maxRepairAttempts: 3,

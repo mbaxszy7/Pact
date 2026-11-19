@@ -25,6 +25,7 @@ import type {
   CollaborationInputObservation,
   SessionPermissionMode,
   RunEffectiveExecutionSettings,
+  RuntimeAgentId,
 } from '@pact/contracts'
 import type { DiagnosticEvent } from '@pact/contracts/diagnostics'
 
@@ -346,6 +347,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
     private readonly executablePath: string,
     private readonly dependencies: ClaudeAgentDependencies = defaultClaudeAgentDependencies,
     ipcTraffic?: LogicalIpcWorkerTraffic,
+    private readonly resolvePeerTarget?: (sessionId: string) => RuntimeAgentId | undefined,
   ) {
     this.nativeForkFiles = new NativeForkFiles(ipcTraffic, (signal, physicalCompletion) =>
       this.nativeCheck.observeRequest(signal, physicalCompletion),
@@ -1971,7 +1973,10 @@ export class ClaudeAgentAdapter implements AgentAdapter {
     }
     const planCalls = new Set<string>()
     const peerAssistanceAllowed = !workflow && input.peerAssistanceAllowed !== false
-    const peerAssistance = new PeerAssistanceTurn('codex', peerAssistanceAllowed)
+    const resolvedPeerCandidate = this.resolvePeerTarget?.(input.sessionId)
+    const peerTargetAgentId: RuntimeAgentId =
+      resolvedPeerCandidate && resolvedPeerCandidate !== 'claude' ? resolvedPeerCandidate : 'codex'
+    const peerAssistance = new PeerAssistanceTurn(peerTargetAgentId, peerAssistanceAllowed)
     const permissionWait = new NativePermissionWait()
     const releasePermissionObservation = permissionWait.subscribe(() => {
       if (currentRequestMatched && !terminalKnown)
@@ -2125,7 +2130,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
               tool(
                 'request_peer_assistance',
                 PEER_ASSISTANCE_TOOL_DESCRIPTION,
-                peerRequestToolInputShapeFor('codex'),
+                peerRequestToolInputShapeFor(peerTargetAgentId),
                 async (request) => {
                   const admission = peerAssistance.accept(request)
                   if (!admission.ok)
@@ -2139,7 +2144,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
                     type: 'peer.assistance.requested',
                     turnId: input.runId,
                     proposalId: randomUUID(),
-                    targetAgentId: 'codex',
+                    targetAgentId: accepted.target,
                     kind: accepted.kind,
                     ...(accepted.reason ? { reason: accepted.reason } : {}),
                   })

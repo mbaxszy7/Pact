@@ -1,16 +1,17 @@
 import { Check, LoaderCircle, Split, TriangleAlert } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 
-import type {
-  NativeInputRespond,
-  NativePermissionDecision,
-  NativePermissionRequest,
-  PendingNativeInteraction,
-  RuntimeAgentId,
-  SessionCatalogChange,
-  SessionForkInput,
-  SessionForkOperation,
-  SessionForkPrepared,
+import {
+  resolveActiveAgentPair,
+  type NativeInputRespond,
+  type NativePermissionDecision,
+  type NativePermissionRequest,
+  type PendingNativeInteraction,
+  type RuntimeAgentId,
+  type SessionCatalogChange,
+  type SessionForkInput,
+  type SessionForkOperation,
+  type SessionForkPrepared,
 } from '@pact/contracts'
 
 import type { NativeInputDraft } from './useConversation'
@@ -20,7 +21,11 @@ import { NativePermissionCard } from './NativePermissionCard'
 
 const secondary =
   'inline-flex min-h-8 items-center justify-center gap-1.5 rounded-control px-3 text-caption text-secondary hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-focus disabled:cursor-default disabled:opacity-40'
-const names = { claude: 'Claude Code', codex: 'Codex' }
+const names: Record<RuntimeAgentId, string> = {
+  claude: 'Claude Code',
+  codex: 'Codex',
+  agy: 'Antigravity',
+}
 const modeNames = { native: 'Native', ask: 'Ask', auto: 'Auto', full: 'Full access' }
 const working = (operation: SessionForkOperation | undefined): boolean =>
   !!operation &&
@@ -254,9 +259,9 @@ export function SessionForkDialog({
             ) {
               const catalogs = settingsResult.value.value.modelCatalogs
               const labels: Partial<Record<RuntimeAgentId, string>> = {}
-              for (const agentId of ['claude', 'codex'] as const) {
+              for (const agentId of resolveActiveAgentPair(snapshot.settings)) {
                 const selected = snapshot.settings.agents[agentId].model
-                const model = catalogs[agentId].models.find((entry) => entry.id === selected)
+                const model = catalogs[agentId]?.models.find((entry) => entry.id === selected)
                 if (selected && model)
                   labels[agentId] =
                     model.displayName.toLowerCase() === selected.toLowerCase()
@@ -302,7 +307,7 @@ export function SessionForkDialog({
     setCreating(true)
     setError(undefined)
     try {
-      const full = (['claude', 'codex'] as const).filter(
+      const full = resolveActiveAgentPair(prepared.settings).filter(
         (agentId) => prepared.settings.permissionModes?.[agentId] === 'full',
       )
       const request: Extract<SessionForkInput, { action: 'create' }> = {
@@ -392,7 +397,7 @@ export function SessionForkDialog({
   )
   const full =
     prepared &&
-    (['claude', 'codex'] as const).filter(
+    resolveActiveAgentPair(prepared.settings).filter(
       (agentId) => prepared.settings.permissionModes?.[agentId] === 'full',
     )
   return (
@@ -429,7 +434,7 @@ export function SessionForkDialog({
               {prepared.preview}
             </blockquote>
             <dl className="space-y-2 text-caption">
-              {(['claude', 'codex'] as const).map((agentId) => (
+              {resolveActiveAgentPair(prepared.settings).map((agentId) => (
                 <div key={agentId} className="flex flex-wrap justify-between gap-2">
                   <dt className="font-medium">
                     {names[agentId]}
@@ -443,7 +448,7 @@ export function SessionForkDialog({
                     {
                       modeNames[
                         prepared.settings.permissionModes?.[agentId] ??
-                          (agentId === 'claude' ? 'ask' : 'native')
+                          (agentId === 'codex' ? 'native' : 'ask')
                       ]
                     }
                   </dd>

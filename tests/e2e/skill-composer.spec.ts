@@ -336,7 +336,12 @@ async function prepare() {
         { id: sessionId, projectId, title: 'Skill Composer', createdAt },
         {
           primaryAgentId: 'codex',
-          agents: { codex: { model: null, effort: null }, claude: { model: null, effort: null } },
+          secondaryAgentId: 'claude',
+          agents: {
+            codex: { model: null, effort: null },
+            claude: { model: null, effort: null },
+            agy: { model: null, effort: null },
+          },
           maxDiscussionRounds: 3,
           maxReviewCycles: 3,
           maxRepairAttempts: 3,

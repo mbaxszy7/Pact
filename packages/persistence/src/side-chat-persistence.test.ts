@@ -47,9 +47,11 @@ const databases: PactDatabase[] = []
 
 const DEFAULT_SETTINGS: DefaultSessionSettings = {
   primaryAgentId: 'codex',
+  secondaryAgentId: 'claude',
   agents: {
     claude: { model: 'claude-sonnet-4-5', effort: 'high' },
     codex: { model: 'gpt-5.4', effort: 'medium' },
+    agy: { model: 'gemini-3.1-pro', effort: 'high' },
   },
   maxDiscussionRounds: 6,
   maxReviewCycles: 3,
@@ -251,6 +253,7 @@ describe('side-chat persistence', () => {
       db.sessionRepository.saveSettings(parentId, {
         ...parentBefore.settings,
         primaryAgentId: 'claude',
+        secondaryAgentId: 'codex',
         maxDiscussionRounds: 9,
       })
       const sideChatSession = db.sessionRepository.find(receipt.sideChat.id)!

@@ -104,7 +104,12 @@ function idleSession(f: Awaited<ReturnType<typeof fixture>>) {
     { id: sessionId, projectId: f.projectId, title: 'Idle session', createdAt },
     {
       primaryAgentId: 'codex',
-      agents: { codex: { model: null, effort: null }, claude: { model: null, effort: null } },
+      secondaryAgentId: 'claude',
+      agents: {
+        codex: { model: null, effort: null },
+        claude: { model: null, effort: null },
+        agy: { model: null, effort: null },
+      },
       maxDiscussionRounds: 6,
       maxReviewCycles: 3,
       maxRepairAttempts: 3,

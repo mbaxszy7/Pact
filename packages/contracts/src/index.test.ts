@@ -1,13 +1,17 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  activeAgentPairInputSchema,
   agentModelOptionSchema,
   appearanceSettingsUpdateSchema,
   appearanceSnapshotSchema,
   appInfoSchema,
   conversationSendInputSchema,
+  defaultSessionSettingsGetInputSchema,
   runtimePreparationSchema,
   runtimeHealthSchema,
+  sessionCreationPrepareInputSchema,
+  sessionSettingsInputSchema,
   IPC_TRAFFIC_UNIT,
   ipcTrafficSchema,
   monacoIpcObservationSchema,
@@ -341,5 +345,420 @@ describe('foundation contracts', () => {
         commentIds: [...input.commentIds, input.commentIds[0]],
       }).success,
     ).toBe(false)
+  })
+})
+
+import {
+  AGENTS,
+  RUNTIME_MINIMUM_VERSIONS,
+  agentDisplayName,
+  agentIdForRouteCandidate,
+  agentRunSchema,
+  confirmedUnsentBoundarySchema,
+  defaultSessionSettingsSchema,
+  nativeBackgroundReportIdentitySchema,
+  nativeForkBoundarySchema,
+  nativeForkWitnessSchema,
+  nativeInitializationWitnessSchema,
+  otherAgent,
+  pactEntryPrimary,
+  pactSessionEntryPrimary,
+  preparedInputMetadataSchema,
+  providerUsageProviderSchema,
+  resolveLegacyCompatibleTaskStageRoles,
+  routeCandidateIdForAgent,
+  runEffectiveExecutionSettingsSchema,
+  sessionSettingsSchema,
+  unsentBoundaryMatchesProvider,
+} from './index.js'
+
+describe('Antigravity (agy) and 2-of-3 active pair contracts', () => {
+  it('defines AGENTS, minimum versions, display labels, and 2-or-3 unique agent readiness', () => {
+    expect(AGENTS).toEqual(['claude', 'codex', 'agy'])
+    expect(RUNTIME_MINIMUM_VERSIONS).toEqual({
+      claude: '2.1.272',
+      codex: '0.159.2',
+      agy: '1.5.9',
+    })
+    expect(agentDisplayName('agy')).toBe('Antigravity')
+    expect(providerUsageProviderSchema.options).toEqual(['claude', 'codex', 'agy'])
+    expect(
+      nativeBackgroundReportIdentitySchema.safeParse({
+        agentId: 'agy',
+        runId: uuid(60),
+        nativeSessionId: 'agy-1',
+        nativeTurnId: 'turn-1',
+        bindingGeneration: 1,
+        executorId: 'exec-1',
+        frameId: uuid(61),
+        nativeMessageId: 'msg-1',
+      }).success,
+    ).toBe(true)
+
+    const checkedAt = new Date().toISOString()
+    const threeAgents = runtimePreparationSchema.parse({
+      firstUse: false,
+      agents: [
+        { agentId: 'claude', state: 'ready', version: '2.1.272', checkedAt },
+        { agentId: 'codex', state: 'ready', version: '0.159.2', checkedAt },
+        {
+          agentId: 'agy',
+          state: 'ready',
+          version: '1.5.9',
+          agentInfoVersion: '1.0.0',
+          acpVersion: '1',
+          checkedAt,
+        },
+      ],
+    })
+    expect(threeAgents.agents).toHaveLength(3)
+    expect(
+      runtimePreparationSchema.safeParse({
+        firstUse: false,
+        agents: [threeAgents.agents[0], threeAgents.agents[0]],
+      }).success,
+    ).toBe(false)
+  })
+
+  it('enforces distinct (primaryAgentId, secondaryAgentId) across all 6 permutations and agy settings', () => {
+    const base = {
+      agents: {
+        claude: { model: null, effort: null },
+        codex: { model: null, effort: null },
+        agy: { model: 'gemini-3.1-pro', effort: 'high' },
+      },
+      maxDiscussionRounds: 6,
+      maxReviewCycles: 3,
+      maxRepairAttempts: 3,
+    }
+    for (const primaryAgentId of AGENTS) {
+      expect(
+        defaultSessionSettingsSchema.safeParse({
+          ...base,
+          primaryAgentId,
+          secondaryAgentId: primaryAgentId,
+        }).success,
+      ).toBe(false)
+      for (const secondaryAgentId of AGENTS) {
+        if (primaryAgentId === secondaryAgentId) continue
+        const parsedDefault = defaultSessionSettingsSchema.parse({
+          ...base,
+          primaryAgentId,
+          secondaryAgentId,
+        })
+        expect(parsedDefault.secondaryAgentId).toBe(secondaryAgentId)
+        expect(otherAgent(primaryAgentId, [primaryAgentId, secondaryAgentId])).toBe(
+          secondaryAgentId,
+        )
+        expect(otherAgent(secondaryAgentId, [primaryAgentId, secondaryAgentId])).toBe(
+          primaryAgentId,
+        )
+        expect(pactEntryPrimary('plan', primaryAgentId, undefined, secondaryAgentId)).toBe(
+          primaryAgentId,
+        )
+
+        const parsedSession = sessionSettingsSchema.parse({
+          ...base,
+          primaryAgentId,
+          secondaryAgentId,
+          agents: {
+            claude: { model: null, effort: null, speed: 'native' },
+            codex: { model: null, effort: null, speed: 'native' },
+            agy: { model: 'gemini-3.1-pro', effort: 'high', speed: 'native' },
+          },
+          permissionModes: { claude: 'ask', codex: 'native', agy: 'ask' },
+        })
+        expect(parsedSession.permissionModes?.agy).toBe('ask')
+      }
+    }
+    expect(() => otherAgent('agy')).toThrow(/explicit 2-member Agent pair/)
+  })
+
+  it('validates agy execution-settings boundaries, unsent proof matching, rebuild witness, and route candidates', () => {
+    expect(
+      runEffectiveExecutionSettingsSchema.safeParse({
+        version: 1,
+        provider: 'agy',
+        model: 'gemini-3.1-pro',
+        effort: { known: true, value: 'high' },
+        speed: 'native',
+        permissionMode: 'ask',
+        configurationSha256: 'a'.repeat(64),
+        provenance: 'agy_applied_settings',
+      }).success,
+    ).toBe(true)
+    for (const unsupportedSpeed of ['standard', 'fast'] as const) {
+      expect(
+        runEffectiveExecutionSettingsSchema.safeParse({
+          version: 1,
+          provider: 'agy',
+          model: 'gemini-3.1-pro',
+          effort: { known: true, value: 'high' },
+          speed: unsupportedSpeed,
+          permissionMode: 'ask',
+          configurationSha256: 'a'.repeat(64),
+          provenance: 'agy_applied_settings',
+        }).success,
+      ).toBe(false)
+    }
+    expect(
+      confirmedUnsentBoundarySchema.safeParse({
+        kind: 'agy_root_frame_not_written',
+        requestId: 'req-1',
+      }).success,
+    ).toBe(true)
+
+    const boundaries = [
+      ['codex', 'codex_root_frame_not_written', true],
+      ['codex', 'claude_root_not_yielded', false],
+      ['codex', 'agy_root_frame_not_written', false],
+      ['claude', 'claude_root_not_yielded', true],
+      ['claude', 'codex_root_frame_not_written', false],
+      ['claude', 'agy_root_frame_not_written', false],
+      ['agy', 'agy_root_frame_not_written', true],
+      ['agy', 'codex_root_frame_not_written', false],
+      ['agy', 'claude_root_not_yielded', false],
+      ['agy', 'host_before_root_start', true],
+    ] as const
+    for (const [provider, boundary, expected] of boundaries) {
+      expect(unsentBoundaryMatchesProvider(provider, boundary)).toBe(expected)
+    }
+
+    const validAgyRebuildWitness = {
+      kind: 'agy_rebuild_v1' as const,
+      nativeSessionId: '00000000-0000-4000-8000-000000000001',
+      pbSha256: 'a'.repeat(64),
+      pbBytes: 256,
+      stepCount: 2 as const,
+      sourceHash: 'b'.repeat(64),
+      coldLoadVerifiedAt: '2026-11-19T12:00:00.000Z',
+    }
+    expect(nativeInitializationWitnessSchema.safeParse(validAgyRebuildWitness).success).toBe(true)
+    expect(
+      nativeInitializationWitnessSchema.safeParse({
+        ...validAgyRebuildWitness,
+        pbBytes: 0,
+      }).success,
+    ).toBe(false)
+    for (const badStepCount of [0, 1, 3] as const) {
+      expect(
+        nativeInitializationWitnessSchema.safeParse({
+          ...validAgyRebuildWitness,
+          stepCount: badStepCount,
+        }).success,
+      ).toBe(false)
+    }
+    const { sourceHash: _missingSourceHash, ...withoutSourceHash } = validAgyRebuildWitness
+    expect(nativeInitializationWitnessSchema.safeParse(withoutSourceHash).success).toBe(false)
+    const { coldLoadVerifiedAt: _missingColdLoad, ...withoutColdLoad } = validAgyRebuildWitness
+    expect(nativeInitializationWitnessSchema.safeParse(withoutColdLoad).success).toBe(false)
+
+    const baseRun = {
+      id: uuid(70),
+      sessionId: uuid(71),
+      userMessageId: uuid(72),
+      agentId: 'agy' as const,
+      status: 'completed' as const,
+      attemptCount: 1,
+      settingsRevision: 1,
+      model: 'gemini-3.1-pro',
+      effort: 'high',
+      createdAt: '2026-11-19T12:00:00.000Z',
+      updatedAt: '2026-11-19T12:00:01.000Z',
+    }
+    expect(agentRunSchema.safeParse(baseRun).success).toBe(true)
+    expect(
+      agentRunSchema.safeParse({
+        ...baseRun,
+        handoffMessageCount: 2,
+        handoffSourceAgents: ['claude', 'codex'],
+      }).success,
+    ).toBe(true)
+    expect(
+      agentRunSchema.safeParse({
+        ...baseRun,
+        handoffSourceAgents: [],
+      }).success,
+    ).toBe(false)
+    expect(
+      agentRunSchema.safeParse({
+        ...baseRun,
+        handoffSourceAgents: ['claude', 'codex', 'agy', 'claude'],
+      }).success,
+    ).toBe(false)
+
+    const agyCut = {
+      version: 'pact-agy-fork-cut-v1' as const,
+      trajectoryId: 'traj-parent',
+      executionId: 'exec-1',
+      cutStepIdx: 4,
+    }
+    const baseBoundary = {
+      nativeSessionId: 'sid-1',
+      nativeCutId: 'exec-1',
+      nativeTurnId: 'turn-1',
+      bindingGeneration: 1,
+      throughSequence: 2,
+      deliveryCursor: 1,
+      prefixHash: 'c'.repeat(64),
+      prefixRecords: 5,
+      prefixBytes: 512,
+    }
+    expect(
+      nativeForkBoundarySchema.safeParse({
+        ...baseBoundary,
+        provider: 'agy',
+        agyCut,
+      }).success,
+    ).toBe(true)
+    expect(
+      nativeForkBoundarySchema.safeParse({
+        ...baseBoundary,
+        provider: 'agy',
+      }).success,
+    ).toBe(false)
+    for (const nonAgyProvider of [undefined, 'claude', 'codex'] as const) {
+      expect(
+        nativeForkBoundarySchema.safeParse({
+          ...baseBoundary,
+          ...(nonAgyProvider ? { provider: nonAgyProvider } : {}),
+        }).success,
+      ).toBe(true)
+      expect(
+        nativeForkBoundarySchema.safeParse({
+          ...baseBoundary,
+          ...(nonAgyProvider ? { provider: nonAgyProvider } : {}),
+          agyCut,
+        }).success,
+      ).toBe(false)
+    }
+
+    const baseWitness = {
+      version: 'pact-native-fork-v1' as const,
+      sourceNativeSessionId: 'sid-parent',
+      nativeSessionId: 'sid-child',
+      sourceCutId: 'exec-1',
+      sourcePrefixHash: 'c'.repeat(64),
+      candidatePrefixHash: 'd'.repeat(64),
+      idMap: [['turn-1', 'turn-1']] as [string, string][],
+      model: 'gemini-3.1-pro',
+      effort: 'high',
+      permissionMode: 'ask' as const,
+    }
+    const validAgyWitness = {
+      ...baseWitness,
+      provider: 'agy' as const,
+      sourceTrajectoryId: 'traj-parent',
+      candidateTrajectoryId: 'traj-child',
+      cutStepIdx: 4,
+      agyCut,
+    }
+    expect(nativeForkWitnessSchema.safeParse(validAgyWitness).success).toBe(true)
+    expect(
+      nativeForkWitnessSchema.safeParse({
+        ...validAgyWitness,
+        cutStepIdx: 3,
+      }).success,
+    ).toBe(false)
+    for (const omittedKey of [
+      'agyCut',
+      'sourceTrajectoryId',
+      'candidateTrajectoryId',
+      'cutStepIdx',
+    ] as const) {
+      const copy = { ...validAgyWitness }
+      delete copy[omittedKey]
+      expect(nativeForkWitnessSchema.safeParse(copy).success).toBe(false)
+    }
+    for (const nonAgyProvider of [undefined, 'claude', 'codex'] as const) {
+      expect(
+        nativeForkWitnessSchema.safeParse({
+          ...baseWitness,
+          ...(nonAgyProvider ? { provider: nonAgyProvider } : {}),
+        }).success,
+      ).toBe(true)
+      expect(
+        nativeForkWitnessSchema.safeParse({
+          ...baseWitness,
+          ...(nonAgyProvider ? { provider: nonAgyProvider } : {}),
+          agyCut,
+        }).success,
+      ).toBe(false)
+    }
+
+    expect(pactSessionEntryPrimary('build', ['claude', 'agy'], 'claude')).toBe('agy')
+    expect(
+      resolveLegacyCompatibleTaskStageRoles({ owner: 'claude', reviewer: 'claude' }).planReviewer,
+    ).toBe('codex')
+
+    expect(routeCandidateIdForAgent('agy')).toBe('route_agy')
+    expect(agentIdForRouteCandidate('route_agy')).toBe('agy')
+    const basePrepared = {
+      version: 'prepared-input-v1' as const,
+      ownerId: uuid(50),
+      requestFingerprint: 'a'.repeat(64),
+      inputId: uuid(51),
+      routeSpecified: false,
+      defaultAgentId: 'claude' as const,
+      allowedAgentIds: ['claude', 'agy'] as const,
+      routeIntent: 'implicit' as const,
+      composerRevision: 1,
+      settingsRevision: 1,
+      sourceFingerprint: 'b'.repeat(64),
+    }
+    expect(preparedInputMetadataSchema.safeParse(basePrepared).success).toBe(true)
+    expect(
+      preparedInputMetadataSchema.safeParse({
+        ...basePrepared,
+        allowedAgentIds: ['claude', 'codex', 'agy'],
+      }).success,
+    ).toBe(false)
+
+    // Optional activePair input schemas for active-pair model catalog loading
+    expect(
+      activeAgentPairInputSchema.safeParse({
+        primaryAgentId: 'claude',
+        secondaryAgentId: 'agy',
+      }).success,
+    ).toBe(true)
+    expect(
+      activeAgentPairInputSchema.safeParse({
+        primaryAgentId: 'agy',
+        secondaryAgentId: 'agy',
+      }).success,
+    ).toBe(false)
+    expect(defaultSessionSettingsGetInputSchema.safeParse({}).success).toBe(true)
+    expect(
+      utilityRequestSchema.safeParse({
+        type: 'default-session-settings.get.request',
+        requestId: uuid(60),
+      }).success,
+    ).toBe(true)
+    expect(
+      utilityRequestSchema.safeParse({
+        type: 'default-session-settings.get.request',
+        requestId: uuid(61),
+        input: { activePair: { primaryAgentId: 'claude', secondaryAgentId: 'agy' } },
+      }).success,
+    ).toBe(true)
+    expect(
+      utilityRequestSchema.safeParse({
+        type: 'default-session-settings.get.request',
+        requestId: uuid(62),
+        input: { activePair: { primaryAgentId: 'claude', secondaryAgentId: 'claude' } },
+      }).success,
+    ).toBe(false)
+    expect(
+      sessionCreationPrepareInputSchema.safeParse({
+        projectId: uuid(63),
+        activePair: { primaryAgentId: 'codex', secondaryAgentId: 'agy' },
+      }).success,
+    ).toBe(true)
+    expect(
+      sessionSettingsInputSchema.safeParse({
+        sessionId: uuid(64),
+        activePair: { primaryAgentId: 'agy', secondaryAgentId: 'claude' },
+      }).success,
+    ).toBe(true)
   })
 })

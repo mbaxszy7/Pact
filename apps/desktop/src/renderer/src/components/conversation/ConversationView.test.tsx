@@ -1172,6 +1172,7 @@ it.each([
     const props = fixture()
     props.session.id = task.sessionId
     props.session.settings.primaryAgentId = 'claude'
+    props.session.settings.secondaryAgentId = 'codex'
     props.snapshot!.sessionId = task.sessionId
     props.composer = 'Please use the relevant skills to read this information.'
     props.onPlanAvailable = vi.fn<NonNullable<typeof props.onPlanAvailable>>()
@@ -1226,7 +1227,12 @@ function fixture(): ComponentProps<typeof ConversationView> {
       createdAt: timestamp,
       settings: {
         primaryAgentId: 'codex',
-        agents: { codex: { model: null, effort: null }, claude: { model: null, effort: null } },
+        secondaryAgentId: 'claude',
+        agents: {
+          codex: { model: null, effort: null },
+          claude: { model: null, effort: null },
+          agy: { model: null, effort: null },
+        },
         maxDiscussionRounds: 3,
 
         maxReviewCycles: 3,
@@ -1962,6 +1968,7 @@ it.each([true, false])(
   async (recorded) => {
     const { props, run } = recordingFixture()
     props.session.settings.primaryAgentId = 'claude'
+    props.session.settings.secondaryAgentId = 'codex'
     run.collaboration = { taskId: crypto.randomUUID(), kind: 'plan', stage: 'reply' }
     delete run.workspaceChanges
     props.snapshot!.nativeContexts = []
@@ -2522,7 +2529,7 @@ describe('Side-chat UI, /btw, and @Main routing', () => {
     expect(base.onSend).not.toHaveBeenCalled()
   })
 
-  it('orders @Main below @claude in side-chat autocomplete and switches Send to Send to main', async () => {
+  it('orders @Main below active member mentions and @all in side-chat autocomplete and switches Send to Send to main', async () => {
     const parentId = crypto.randomUUID()
     const base = fixture()
     base.session = {
@@ -2532,6 +2539,7 @@ describe('Side-chat UI, /btw, and @Main routing', () => {
       settings: {
         ...base.session.settings,
         primaryAgentId: 'claude',
+        secondaryAgentId: 'codex',
       },
     }
     base.snapshot!.messages = []
@@ -2593,14 +2601,14 @@ describe('Side-chat UI, /btw, and @Main routing', () => {
     const listbox = await screen.findByRole('listbox', { name: 'Message recipients' })
     const options = within(listbox).getAllByRole('option')
     expect(options.map((option) => option.textContent)).toEqual([
-      expect.stringContaining('@codex'),
       expect.stringContaining('@claude'),
-      expect.stringContaining('@Main'),
+      expect.stringContaining('@codex'),
       expect.stringContaining('@all'),
+      expect.stringContaining('@Main'),
     ])
 
     // Choosing @Main switches Send button to "Send to main".
-    fireEvent.click(options[2]!)
+    fireEvent.click(options[3]!)
     const sendMainButton = await screen.findByRole<HTMLButtonElement>('button', {
       name: 'Send to main',
     })
@@ -2729,5 +2737,460 @@ describe('Side-chat UI, /btw, and @Main routing', () => {
         true,
       )
     }
+  })
+
+  it('scopes main-chat @ mentions and footer controls to the active (claude, agy) pair and hands off /btw @agy', async () => {
+    const base = fixture()
+    base.session = {
+      ...base.session,
+      settings: {
+        ...base.session.settings,
+        primaryAgentId: 'claude',
+        secondaryAgentId: 'agy',
+      },
+    }
+    base.snapshot!.messages = []
+    const onOpenBtwSideChat = vi
+      .fn<NonNullable<ComponentProps<typeof ConversationView>['onOpenBtwSideChat']>>()
+      .mockResolvedValue(true)
+
+    function MainPairHarness() {
+      const [composer, setComposer] = useState('')
+      const [mention, setMention] =
+        useState<ComponentProps<typeof ConversationView>['composerMention']>()
+      const [route, setRoute] = useState<ComponentProps<typeof ConversationView>['composerRoute']>()
+      return (
+        <ConversationView
+          {...base}
+          composer={composer}
+          composerMention={mention}
+          composerRoute={route}
+          onComposerChange={setComposer}
+          onComposerDocumentChange={(doc) => {
+            setComposer(doc.text)
+            setMention(doc.mention)
+            setRoute(doc.route)
+          }}
+          onComposerMentionChange={setMention}
+          onSaveSessionPermission={vi.fn<() => Promise<boolean>>().mockResolvedValue(true)}
+          onSaveSessionSpeed={vi.fn<() => Promise<boolean>>().mockResolvedValue(true)}
+          onOpenBtwSideChat={onOpenBtwSideChat}
+        />
+      )
+    }
+
+    render(<MainPairHarness />)
+    expect(screen.getByRole('group', { name: 'Claude Code settings' })).toBeTruthy()
+    expect(screen.getByRole('group', { name: 'Antigravity settings' })).toBeTruthy()
+    expect(screen.queryByRole('group', { name: 'Codex settings' })).toBeNull()
+
+    const editor = screen.getByRole('combobox', { name: 'Message' })
+    act(() => editor.focus())
+    const typeAt = new InputEvent('beforeinput', {
+      inputType: 'insertText',
+      data: '@',
+      bubbles: true,
+      cancelable: true,
+    })
+    Object.defineProperty(typeAt, 'getTargetRanges', { value: () => [] })
+    fireEvent(editor, typeAt)
+
+    const listbox = await screen.findByRole('listbox', { name: 'Message recipients' })
+    const options = within(listbox).getAllByRole('option')
+    expect(options.map((option) => option.textContent)).toEqual([
+      expect.stringContaining('@claude'),
+      expect.stringContaining('@agy'),
+      expect.stringContaining('@all'),
+    ])
+
+    // Insert "/btw @agy quick question" and submit to verify side-chat draft handoff.
+    const replaceWithBtw = new InputEvent('beforeinput', {
+      inputType: 'insertText',
+      data: 'agy',
+      bubbles: true,
+      cancelable: true,
+    })
+    Object.defineProperty(replaceWithBtw, 'getTargetRanges', { value: () => [] })
+    fireEvent(editor, replaceWithBtw)
+    fireEvent.click(within(listbox).getByRole('option', { name: /^Antigravity/u }))
+
+    // Prepend "/btw " before "@agy "
+    editor.focus()
+    const selection = window.getSelection()
+    if (selection && editor.firstChild) {
+      selection.collapse(editor.firstChild, 0)
+    }
+    const prependBtw = new InputEvent('beforeinput', {
+      inputType: 'insertText',
+      data: '/btw ',
+      bubbles: true,
+      cancelable: true,
+    })
+    Object.defineProperty(prependBtw, 'getTargetRanges', { value: () => [] })
+    fireEvent(editor, prependBtw)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }))
+    await waitFor(() => expect(onOpenBtwSideChat).toHaveBeenCalledTimes(1))
+    expect(onOpenBtwSideChat).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: '@agy ',
+        mention: expect.objectContaining({
+          token: '@agy',
+          route: { type: 'agent', agentId: 'agy' },
+          start: 0,
+          end: 4,
+        }),
+      }),
+    )
+  })
+
+  it('renders /plan, /build, and /review explicit @mention command hints across all 6 ordered active pairs without throwing', () => {
+    const orderedPairs: ReadonlyArray<
+      readonly ['claude' | 'codex' | 'agy', 'claude' | 'codex' | 'agy']
+    > = [
+      ['claude', 'codex'],
+      ['codex', 'claude'],
+      ['claude', 'agy'],
+      ['agy', 'claude'],
+      ['codex', 'agy'],
+      ['agy', 'codex'],
+    ]
+    const labels: Record<'claude' | 'codex' | 'agy', string> = {
+      claude: 'Claude Code',
+      codex: 'Codex',
+      agy: 'Antigravity',
+    }
+    const base = fixture()
+    base.snapshot!.messages = []
+    const view = render(<ConversationView {...base} />)
+
+    for (const [primary, secondary] of orderedPairs) {
+      const sessionForPair = {
+        ...base.session,
+        settings: {
+          ...base.session.settings,
+          primaryAgentId: primary,
+          secondaryAgentId: secondary,
+        },
+      }
+      for (const actor of [primary, secondary] as const) {
+        const other = actor === primary ? secondary : primary
+        view.rerender(
+          <ConversationView
+            {...base}
+            session={sessionForPair}
+            composer={`/plan @${actor} design parity`}
+          />,
+        )
+        expect(
+          screen.getByText(`${labels[actor]} drafts plan · ${labels[other]} reviews plan.`),
+        ).toBeTruthy()
+
+        view.rerender(
+          <ConversationView
+            {...base}
+            session={sessionForPair}
+            composer={`/build @${actor} ship parity`}
+          />,
+        )
+        expect(screen.getByText(`${labels[actor]} implements.`)).toBeTruthy()
+
+        view.rerender(
+          <ConversationView
+            {...base}
+            session={sessionForPair}
+            composer={`/review @${actor} audit parity`}
+          />,
+        )
+        expect(screen.getByText(`${labels[actor]} reviews code.`)).toBeTruthy()
+      }
+    }
+  })
+
+  it('renders ContextReceipt from frozen run.handoffSourceAgents across pagination + 3rd-agent swap, and neutral count copy for legacy runs', () => {
+    const base = fixture()
+    const createdAt = base.session.createdAt
+    // Session active pair was swapped to (codex, agy), and earlier Claude messages are paged out of snapshot.messages!
+    base.session = {
+      ...base.session,
+      settings: {
+        ...base.session.settings,
+        primaryAgentId: 'codex',
+        secondaryAgentId: 'agy',
+      },
+    }
+    const frozenUserId = crypto.randomUUID()
+    const frozenAssistantId = crypto.randomUUID()
+    const frozenRunId = crypto.randomUUID()
+    const legacyUserId = crypto.randomUUID()
+    const legacyAssistantId = crypto.randomUUID()
+    const legacyRunId = crypto.randomUUID()
+
+    base.snapshot!.messages = [
+      {
+        id: frozenUserId,
+        sessionId: base.session.id,
+        role: 'user',
+        content: '@agy Continue from earlier context',
+        contentRevision: 0,
+        state: 'complete',
+        sequence: 10,
+        createdAt,
+        updatedAt: createdAt,
+      },
+      {
+        id: frozenAssistantId,
+        sessionId: base.session.id,
+        runId: frozenRunId,
+        role: 'assistant',
+        agentId: 'agy',
+        content: 'Antigravity reply with frozen handoff.',
+        contentRevision: 0,
+        state: 'complete',
+        sequence: 11,
+        createdAt,
+        updatedAt: createdAt,
+      },
+      {
+        id: legacyUserId,
+        sessionId: base.session.id,
+        role: 'user',
+        content: '@codex Legacy handoff turn',
+        contentRevision: 0,
+        state: 'complete',
+        sequence: 12,
+        createdAt,
+        updatedAt: createdAt,
+      },
+      {
+        id: legacyAssistantId,
+        sessionId: base.session.id,
+        runId: legacyRunId,
+        role: 'assistant',
+        agentId: 'codex',
+        content: 'Codex reply with legacy handoff count only.',
+        contentRevision: 0,
+        state: 'complete',
+        sequence: 13,
+        createdAt,
+        updatedAt: createdAt,
+      },
+    ]
+    base.snapshot!.runs = [
+      {
+        id: frozenRunId,
+        sessionId: base.session.id,
+        userMessageId: frozenUserId,
+        responseMessageId: frozenAssistantId,
+        agentId: 'agy',
+        status: 'completed',
+        attemptCount: 1,
+        settingsRevision: 2,
+        model: null,
+        effort: null,
+        nativeSessionId: 'agy-sid-1',
+        nativeTurnId: 'agy-turn-1',
+        dispatchPhase: 'ended',
+        nativeOutcome: 'completed',
+        nativeEffectsState: 'settled',
+        handoffMessageCount: 4,
+        handoffSourceAgents: ['claude', 'codex'],
+        createdAt,
+        updatedAt: createdAt,
+      },
+      {
+        id: legacyRunId,
+        sessionId: base.session.id,
+        userMessageId: legacyUserId,
+        responseMessageId: legacyAssistantId,
+        agentId: 'codex',
+        status: 'completed',
+        attemptCount: 1,
+        settingsRevision: 1,
+        model: null,
+        effort: null,
+        nativeSessionId: 'codex-sid-1',
+        nativeTurnId: 'codex-turn-1',
+        dispatchPhase: 'ended',
+        nativeOutcome: 'completed',
+        nativeEffectsState: 'settled',
+        handoffMessageCount: 3,
+        createdAt,
+        updatedAt: createdAt,
+      },
+    ]
+
+    render(<ConversationView {...base} />)
+    expect(screen.getByText('Shared 4 earlier messages from Claude Code and Codex')).toBeTruthy()
+    expect(screen.getByText('Included 3 earlier messages')).toBeTruthy()
+    expect(screen.queryByText('Shared 3 earlier messages from Antigravity')).toBeNull()
+  })
+
+  it('renders all frozen handoffSourceAgents in order without filtering run.agentId (including forked ancestor 3-agent lineage)', () => {
+    const base = fixture()
+    const createdAt = base.session.createdAt
+    const userId = crypto.randomUUID()
+    const assistantId = crypto.randomUUID()
+    const runId = crypto.randomUUID()
+    base.snapshot!.messages = [
+      {
+        id: userId,
+        sessionId: base.session.id,
+        role: 'user',
+        content: '@agy Continue forked child session',
+        contentRevision: 0,
+        state: 'complete',
+        sequence: 1,
+        createdAt,
+        updatedAt: createdAt,
+      },
+      {
+        id: assistantId,
+        sessionId: base.session.id,
+        runId,
+        role: 'assistant',
+        agentId: 'agy',
+        content: 'Antigravity reply including ancestor lineage.',
+        contentRevision: 0,
+        state: 'complete',
+        sequence: 2,
+        createdAt,
+        updatedAt: createdAt,
+      },
+    ]
+    base.snapshot!.runs = [
+      {
+        id: runId,
+        sessionId: base.session.id,
+        userMessageId: userId,
+        responseMessageId: assistantId,
+        agentId: 'agy',
+        status: 'completed',
+        attemptCount: 1,
+        settingsRevision: 1,
+        model: null,
+        effort: null,
+        nativeSessionId: 'agy-sid-forked',
+        nativeTurnId: 'agy-turn-forked',
+        dispatchPhase: 'ended',
+        nativeOutcome: 'completed',
+        nativeEffectsState: 'settled',
+        handoffMessageCount: 5,
+        handoffSourceAgents: ['agy', 'claude', 'codex'],
+        createdAt,
+        updatedAt: createdAt,
+      },
+    ]
+
+    render(<ConversationView {...base} />)
+    expect(
+      screen.getByText('Shared 5 earlier messages from Antigravity, Claude Code, and Codex'),
+    ).toBeTruthy()
+  })
+
+  it('gates Side Chat ordinary Send and @Main sync independently in both directions via button and Enter key', async () => {
+    const base = fixture()
+    base.session = {
+      ...base.session,
+      parentSessionId: crypto.randomUUID(),
+      sideChatOrigin: 'btw',
+      settings: {
+        ...base.session.settings,
+        primaryAgentId: 'claude',
+        secondaryAgentId: 'agy',
+      },
+    }
+    base.snapshot!.messages = []
+    const onSend = vi
+      .fn<ComponentProps<typeof ConversationView>['onSend']>()
+      .mockResolvedValue(true)
+    const onSyncToMain = vi
+      .fn<NonNullable<ComponentProps<typeof ConversationView>['onSyncToMain']>>()
+      .mockResolvedValue({
+        operationId: crypto.randomUUID(),
+        sideChatId: base.session.id,
+        parentSessionId: base.session.parentSessionId!,
+        cutoffId: crypto.randomUUID(),
+        disposition: 'sent',
+        mainMessageId: crypto.randomUUID(),
+        queuedOperationId: null,
+      })
+
+    // Direction 1: agentActionsEnabled=false, mainSyncEnabled=true
+    const view = render(
+      <ConversationView
+        {...base}
+        agentActionsEnabled={false}
+        mainSyncEnabled={true}
+        mainTargetAgentId="claude"
+        onSend={onSend}
+        onSyncToMain={onSyncToMain}
+        composer="@agy Follow up inside offline side chat"
+      />,
+    )
+
+    const editor = screen.getByRole('combobox', { name: 'Message' })
+    const normalSend = screen.getByRole<HTMLButtonElement>('button', { name: 'Send message' })
+    expect(normalSend.disabled).toBe(true)
+    fireEvent.click(normalSend)
+    fireEvent.keyDown(editor, { key: 'Enter' })
+    expect(onSend).not.toHaveBeenCalled()
+
+    view.rerender(
+      <ConversationView
+        {...base}
+        agentActionsEnabled={false}
+        mainSyncEnabled={true}
+        mainTargetAgentId="claude"
+        onSend={onSend}
+        onSyncToMain={onSyncToMain}
+        composer="@Main Sync verified takeaway to ready parent"
+      />,
+    )
+    const sendToMain = screen.getByRole<HTMLButtonElement>('button', { name: 'Send to main' })
+    expect(sendToMain.disabled).toBe(false)
+    fireEvent.click(sendToMain)
+    await waitFor(() => expect(onSyncToMain).toHaveBeenCalledTimes(1))
+    expect(onSyncToMain).toHaveBeenCalledWith('Sync verified takeaway to ready parent', [], [])
+    fireEvent.keyDown(screen.getByRole('combobox', { name: 'Message' }), { key: 'Enter' })
+    await waitFor(() => expect(onSyncToMain).toHaveBeenCalledTimes(2))
+
+    // Direction 2: agentActionsEnabled=true, mainSyncEnabled=false (parent switched to offline codex while side chat locked ready claude+agy!)
+    view.rerender(
+      <ConversationView
+        {...base}
+        agentActionsEnabled={true}
+        mainSyncEnabled={false}
+        mainTargetAgentId="codex"
+        onSend={onSend}
+        onSyncToMain={onSyncToMain}
+        composer="@Main Blocked sync to offline parent"
+      />,
+    )
+    const blockedMainBtn = screen.getByRole<HTMLButtonElement>('button', { name: 'Send to main' })
+    expect(blockedMainBtn.disabled).toBe(true)
+    fireEvent.click(blockedMainBtn)
+    fireEvent.keyDown(screen.getByRole('combobox', { name: 'Message' }), { key: 'Enter' })
+    expect(onSyncToMain).toHaveBeenCalledTimes(2)
+
+    view.rerender(
+      <ConversationView
+        {...base}
+        agentActionsEnabled={true}
+        mainSyncEnabled={false}
+        mainTargetAgentId="codex"
+        onSend={onSend}
+        onSyncToMain={onSyncToMain}
+        composer="@agy Ask ready Antigravity in side chat"
+      />,
+    )
+    const enabledNormalBtn = screen.getByRole<HTMLButtonElement>('button', {
+      name: 'Send message',
+    })
+    expect(enabledNormalBtn.disabled).toBe(false)
+    fireEvent.click(enabledNormalBtn)
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1))
+    fireEvent.keyDown(screen.getByRole('combobox', { name: 'Message' }), { key: 'Enter' })
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(2))
   })
 })

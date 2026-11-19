@@ -54,6 +54,7 @@ it('reads both actual native model catalogs with idle input, shared ownership an
         agents: [
           { agentId: 'claude', state: 'ready' },
           { agentId: 'codex', state: 'ready' },
+          { agentId: 'agy' },
         ],
       },
     })

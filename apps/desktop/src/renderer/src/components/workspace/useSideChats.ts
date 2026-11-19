@@ -680,7 +680,12 @@ export function useSideChats({
         if (index === -1) return current
 
         const existing = current.items[index]!
-        const nextHasUnread = 'hasUnread' in session ? session.hasUnread : existing.hasUnread
+        const nextHasUnread =
+          'hasUnread' in session
+            ? !existing.hasUnread && session.hasUnread && session.updatedAt <= existing.updatedAt
+              ? false
+              : session.hasUnread
+            : existing.hasUnread
         const nextPreview = previewText ?? existing.previewText
         const updated: SideChatSummary = {
           ...existing,

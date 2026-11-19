@@ -597,7 +597,7 @@ describe('Relay v2 supplement transactions through the existing workflow owner',
         session.settingsRevision,
       )
     const boundary = (agentId: 'codex' | 'claude'): AgentNativeForkBoundary => {
-      const run = selection.runs[agentId],
+      const run = selection.runs[agentId]!,
         response = f.repo.forkResponse(run.id, selection.prepared.sequence)
       return {
         nativeSessionId: run.nativeSessionId!,
@@ -758,10 +758,10 @@ function roleEventCount(f: RoleFixture) {
 
 function expectedRoleSwap(previous: {
   revision: number
-  planAuthor: 'codex' | 'claude'
-  planReviewer: 'codex' | 'claude'
-  codeAuthor: 'codex' | 'claude'
-  codeReviewer: 'codex' | 'claude'
+  planAuthor: 'codex' | 'claude' | 'agy'
+  planReviewer: 'codex' | 'claude' | 'agy'
+  codeAuthor: 'codex' | 'claude' | 'agy'
+  codeReviewer: 'codex' | 'claude' | 'agy'
 }) {
   return {
     ...previous,
@@ -1224,7 +1224,7 @@ describe('Relay v2 future code-role change at accepted plan-ready', () => {
       session.settingsRevision,
     )
     const boundary = (agentId: 'codex' | 'claude'): AgentNativeForkBoundary => {
-      const run = selection.runs[agentId]
+      const run = selection.runs[agentId]!
       const response = f.repo.forkResponse(run.id, selection.prepared.sequence)
       return {
         nativeSessionId: run.nativeSessionId!,

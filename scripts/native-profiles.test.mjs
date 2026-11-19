@@ -3,6 +3,8 @@ import { readFile } from 'node:fs/promises'
 import { test } from 'node:test'
 
 import {
+  agyNativeCases,
+  agyNativeFiles,
   codexExecutionNativeCases,
   codexExecutionNativeFiles,
   nativeProfile,
@@ -54,14 +56,26 @@ await test('both native configs consume one inventory and never permit a platfor
     new URL('../vitest.native-execution.config.ts', import.meta.url),
     'utf8',
   )
-  assert.deepEqual(legacy.test.exclude, [...codexExecutionNativeFiles, ...windowsOwnerNativeFiles])
+  const agyConfig = await readFile(
+    new URL('../vitest.agy.native.config.ts', import.meta.url),
+    'utf8',
+  )
+  assert.deepEqual(legacy.test.exclude, [
+    ...codexExecutionNativeFiles,
+    ...windowsOwnerNativeFiles,
+    ...agyNativeFiles,
+  ])
   assert.match(execution, /include:\s*\[\.\.\.codexExecutionNativeFiles\]/u)
   assert.match(execution, /!nativeProfileSupports\(nativeProfile\('execution-codex'\)\)/u)
   assert.match(execution, /throw new Error/u)
+  assert.match(agyConfig, /include:\s*\[\.\.\.agyNativeFiles\]/u)
+  assert.match(agyConfig, /!nativeProfileSupports\(nativeProfile\('agy'\)\)/u)
+  assert.match(agyConfig, /throw new Error/u)
   const scripts = JSON.parse(
     await readFile(new URL('../package.json', import.meta.url), 'utf8'),
   ).scripts
   assert.equal(scripts['test:native'], 'vitest run --config vitest.native.config.ts')
+  assert.equal(scripts['test:native:agy'], 'vitest run --config vitest.agy.native.config.ts')
   assert.equal(
     scripts['test:native:execution'],
     'vitest run --config vitest.native-execution.config.ts',
@@ -84,7 +98,7 @@ await test('Windows execution CLI setup is explicit without admitting Darwin-onl
     assert(!nativeProfileSetupSupports(execution, platform, arch))
     assert(!nativeProfileSupports(execution, platform, arch))
   }
-  for (const name of ['legacy', 'windows-owner']) {
+  for (const name of ['legacy', 'windows-owner', 'agy']) {
     const profile = nativeProfile(name)
     for (const platform of ['darwin', 'win32', 'linux'])
       for (const arch of ['x64', 'arm64', 'ia32'])
@@ -93,6 +107,31 @@ await test('Windows execution CLI setup is explicit without admitting Darwin-onl
           nativeProfileSupports(profile, platform, arch),
         )
   }
+})
+
+await test('Antigravity native profile isolates its dedicated CLI inventory from the npm-pinned legacy profile', async () => {
+  const agy = nativeProfile('agy')
+  assert.equal(agy.command, 'test:native:agy')
+  assert.equal(agy.codexVersion, null)
+  assert.equal(agy.claudeVersion, null)
+  assert.equal(agy.directory, 'pact-agy-native-cli')
+  assert.equal(agy.files, agyNativeFiles)
+  assert.equal(agy.cases, agyNativeCases)
+  assert.deepEqual(agyNativeFiles, ['tests/native/agy-native.test.ts'])
+  assert(Object.isFrozen(agyNativeFiles))
+  assert(Object.isFrozen(agyNativeCases))
+  assert.equal(agyNativeCases.length, 4)
+  assert.equal(new Set(agyNativeCases).size, 4)
+  for (const platform of ['darwin', 'win32', 'linux']) {
+    assert(nativeProfileSupports(agy, platform, 'arm64'))
+    assert(nativeProfileSupports(agy, platform, 'x64'))
+    assert(!nativeProfileSupports(agy, platform, 'ia32'))
+  }
+  const source = await readFile(
+    new URL('../tests/native/agy-native.test.ts', import.meta.url),
+    'utf8',
+  )
+  for (const title of agyNativeCases) assert(source.includes(`'${title}'`))
 })
 
 await test('Windows owner inventory keeps exact obligations and a separate native platform gate', async () => {

@@ -37,9 +37,11 @@ async function seedSessions(fixture: RuntimeFixture, count: number): Promise<str
         },
         {
           primaryAgentId: 'codex',
+          secondaryAgentId: 'claude',
           agents: {
             claude: { model: null, effort: null },
             codex: { model: null, effort: null },
+            agy: { model: null, effort: null },
           },
           maxDiscussionRounds: 6,
           maxReviewCycles: 3,

@@ -14,6 +14,8 @@ import type {
   ProjectCatalogState,
   RuntimeAgentId,
   RuntimePreparation,
+  SessionIssue,
+  SessionIssues,
   SessionSettingsEditorState,
   SessionCatalogChange,
   SessionReminder as SessionReminderModel,
@@ -32,6 +34,7 @@ import {
   MESSAGE_ANCHOR_TEXT_BASIS,
   NATIVE_METADATA_TIMEOUT_MS,
   NATIVE_RECENT_CANDIDATES,
+  resolveActiveAgentPair,
   resolveMainChatSyncTarget,
 } from '@pact/contracts'
 
@@ -65,6 +68,7 @@ import {
   DefaultSessionOnboardingView,
   DefaultSessionSettingsView,
 } from './components/settings/session/DefaultSessionSettingsView'
+import { initialSessionSettings } from './components/settings/session/SessionSettingsFields'
 import { useDefaultSessionSettings } from './components/settings/session/useDefaultSessionSettings'
 import { AboutUpdatesView } from './components/settings/updates/AboutUpdatesView'
 import { useAppUpdates } from './components/settings/updates/useAppUpdates'
@@ -104,6 +108,27 @@ function archiveItem(item: WorkspaceArchivePreview): ArchivedItem {
 
 const MAX_CACHED_SIDE_CHAT_SESSIONS = 100
 const MAX_PENDING_CREATE_SIDE_CHATS = 32
+
+export function isBlockingSessionIssuePhase(phase: SessionIssue['phase']): boolean {
+  return phase !== 'resolved' && phase !== 'warning'
+}
+
+export function isRequiredSessionIssue(issue: SessionIssue): boolean {
+  return isBlockingSessionIssuePhase(issue.phase) || issue.abandon
+}
+
+export function requiredAgentsForSession(
+  session: CollaborationSession,
+  issues?: SessionIssues,
+): RuntimeAgentId[] {
+  const required = new Set<RuntimeAgentId>(resolveActiveAgentPair(session.settings))
+  for (const agentIssue of issues?.agents ?? []) {
+    if (isRequiredSessionIssue(agentIssue)) {
+      required.add(agentIssue.agentId)
+    }
+  }
+  return [...required]
+}
 
 function upsertSideChatSessionMap(
   current: Record<string, CollaborationSession>,
@@ -215,6 +240,12 @@ function App(): React.JSX.Element {
   const [sideChatSessionsById, setSideChatSessionsById] = useState<
     Record<string, CollaborationSession>
   >({})
+  const [sideChatSettingsState, setSideChatSettingsState] = useState<{
+    sideChatId?: string | undefined
+    loading: boolean
+    error?: string | undefined
+    retryToken: number
+  }>({ loading: false, retryToken: 0 })
   const [previewBackToSideChatId, setPreviewBackToSideChatId] = useState<string | undefined>()
   const [creatingSideChat, setCreatingSideChat] = useState(false)
   const [sideChatHandoffKey, setSideChatHandoffKey] = useState<string | undefined>()
@@ -548,7 +579,9 @@ function App(): React.JSX.Element {
       'collaboration',
       mainCollaborationKey,
     ] as const,
-    enabled: Boolean(mainParentSessionId && sideChatsOpen && activeSideChatId),
+    enabled: Boolean(
+      mainParentSessionId && ((sideChatsOpen && activeSideChatId) || sessionSettingsOpen),
+    ),
     queryFn: async () => {
       const response = unwrapRpcResult(
         await window.pact.getConversation({
@@ -575,39 +608,92 @@ function App(): React.JSX.Element {
   useEffect(() => {
     if (!activeSideChatId) return undefined
     let active = true
+    setSideChatSettingsState((previous) => ({
+      sideChatId: activeSideChatId,
+      loading: true,
+      error: undefined,
+      retryToken: previous.retryToken,
+    }))
     void window.pact
       .getSessionSettings(activeSideChatId)
       .then((result) => {
-        if (!active || !result.ok) return undefined
+        if (!active) return undefined
+        if (!result.ok) {
+          setSideChatSettingsState((previous) =>
+            previous.sideChatId === activeSideChatId
+              ? {
+                  ...previous,
+                  loading: false,
+                  error: result.error.message || 'Could not load side chat settings.',
+                }
+              : previous,
+          )
+          return undefined
+        }
         const loaded = result.value.session
-        setSideChatSessionsById((current) =>
-          upsertSideChatSessionMap(current, loaded, protectedSideChatIdsRef.current),
+        setSideChatSessionsById((current) => {
+          const existing = current[loaded.id]
+          const nextLoaded =
+            existing && !existing.hasUnread && loaded.updatedAt <= existing.updatedAt
+              ? { ...loaded, hasUnread: false }
+              : loaded
+          return upsertSideChatSessionMap(current, nextLoaded, protectedSideChatIdsRef.current)
+        })
+        setSideChatSettingsState((previous) =>
+          previous.sideChatId === activeSideChatId
+            ? { ...previous, loading: false, error: undefined }
+            : previous,
         )
         updateSideChatFromSession(loaded)
         return undefined
       })
-      .catch(() => undefined)
+      .catch((error: unknown) => {
+        if (!active) return undefined
+        setSideChatSettingsState((previous) =>
+          previous.sideChatId === activeSideChatId
+            ? {
+                ...previous,
+                loading: false,
+                error:
+                  error instanceof Error && error.message
+                    ? error.message
+                    : 'Could not load side chat settings.',
+              }
+            : previous,
+        )
+        return undefined
+      })
     return () => {
       active = false
     }
-  }, [activeSideChatId, updateSideChatFromSession])
+  }, [activeSideChatId, sideChatSettingsState.retryToken, updateSideChatFromSession])
   useEffect(() => {
     if (!sideChatSnapshotSession) return
-    const existing = sideChatSessionsById[sideChatSnapshotSession.id]
-    const nextMerged = existing ? { ...existing, ...sideChatSnapshotSession } : undefined
-    if (
-      nextMerged &&
-      (existing?.title !== sideChatSnapshotSession.title ||
-        existing?.titleSource !== sideChatSnapshotSession.titleSource ||
-        existing?.status !== sideChatSnapshotSession.status ||
-        existing?.updatedAt !== sideChatSnapshotSession.updatedAt)
-    ) {
-      setSideChatSessionsById((current) =>
-        upsertSideChatSessionMap(current, nextMerged, protectedSideChatIdsRef.current),
-      )
-    }
-    updateSideChatFromSession(nextMerged ?? sideChatSnapshotSession)
-  }, [sideChatSessionsById, sideChatSnapshotSession, updateSideChatFromSession])
+    setSideChatSessionsById((current) => {
+      const existing = current[sideChatSnapshotSession.id]
+      if (!existing) return current
+      const resolvedHasUnread =
+        !existing.hasUnread && sideChatSnapshotSession.updatedAt <= existing.updatedAt
+          ? false
+          : sideChatSnapshotSession.hasUnread
+      const nextMerged: CollaborationSession = {
+        ...existing,
+        ...sideChatSnapshotSession,
+        hasUnread: resolvedHasUnread,
+      }
+      if (
+        existing.title === nextMerged.title &&
+        existing.titleSource === nextMerged.titleSource &&
+        existing.status === nextMerged.status &&
+        existing.hasUnread === nextMerged.hasUnread &&
+        existing.updatedAt === nextMerged.updatedAt
+      ) {
+        return current
+      }
+      return upsertSideChatSessionMap(current, nextMerged, protectedSideChatIdsRef.current)
+    })
+    updateSideChatFromSession(sideChatSnapshotSession)
+  }, [sideChatSnapshotSession, updateSideChatFromSession])
   const refreshAfterUtilityRecovery = useEffectEvent(() => {
     void runtimePreparationQuery.refetch()
     conversation.history.retryRead()
@@ -835,7 +921,10 @@ function App(): React.JSX.Element {
   }
 
   const preparation = runtimePreparationQuery.data
-  const allAgentsReady = preparation?.agents.every((agent) => agent.state === 'ready') ?? false
+  const readyAgentSet = new Set<RuntimeAgentId>(
+    preparation?.agents.filter((agent) => agent.state === 'ready').map((agent) => agent.agentId) ??
+      [],
+  )
   const preparationError =
     runtimePreparationQuery.error instanceof Error
       ? runtimePreparationQuery.error.message
@@ -2476,6 +2565,7 @@ function App(): React.JSX.Element {
       <>
         <DefaultSessionOnboardingView
           editorState={defaultSessionSettings.editorState}
+          runtimePreparation={preparation}
           loading={defaultSessionSettings.loading}
           saving={defaultSessionSettings.saving}
           saveError={defaultSessionSettings.saveError}
@@ -2486,6 +2576,13 @@ function App(): React.JSX.Element {
         {toastNotice}
         {quitConfirmation}
       </>
+    )
+  }
+
+  const hasLockedSideChatSettings = (sideChatId: string): boolean => {
+    const cached = sideChatSessionsById[sideChatId]
+    return Boolean(
+      cached && (!selectedMainSession || cached.parentSessionId === selectedMainSession.id),
     )
   }
 
@@ -2515,8 +2612,8 @@ function App(): React.JSX.Element {
             : 'idle',
       },
       hasUnread: false,
-      settings: selectedMainSession.settings,
-      settingsRevision: selectedMainSession.settingsRevision,
+      settings: initialSessionSettings,
+      settingsRevision: 1,
       createdAt: summary?.createdAt ?? selectedMainSession.createdAt,
       updatedAt: summary?.updatedAt ?? selectedMainSession.updatedAt,
       ...(summary ? { sideChatOrigin: summary.origin } : {}),
@@ -2526,6 +2623,39 @@ function App(): React.JSX.Element {
   const activeSideChatSession = activeSideChatId
     ? resolveSideChatSession(activeSideChatId)
     : undefined
+  const activeSideChatHasLockedSettings = activeSideChatId
+    ? hasLockedSideChatSettings(activeSideChatId)
+    : false
+  const mainRequiredAgents = selectedMainSession
+    ? requiredAgentsForSession(selectedMainSession, conversation.snapshot?.sessionIssues)
+    : undefined
+  const activeSideChatRequiredAgents =
+    sideChatsOpen &&
+    activeSideChatSession &&
+    activeSideChatHasLockedSettings &&
+    !previewBackToSideChatId
+      ? requiredAgentsForSession(
+          activeSideChatSession,
+          sideChatConversation.snapshot?.session.id === activeSideChatSession.id
+            ? sideChatConversation.snapshot.sessionIssues
+            : undefined,
+        )
+      : undefined
+  const relevantWorkspaceAgents = mainRequiredAgents
+    ? [...new Set([...mainRequiredAgents, ...(activeSideChatRequiredAgents ?? [])])]
+    : undefined
+  const mainActionsEnabled = Boolean(
+    preparation &&
+    (mainRequiredAgents
+      ? mainRequiredAgents.every((agentId) => readyAgentSet.has(agentId))
+      : readyAgentSet.size >= 2),
+  )
+  const showRuntimeNotice = Boolean(
+    preparation &&
+    (relevantWorkspaceAgents
+      ? relevantWorkspaceAgents.some((agentId) => !readyAgentSet.has(agentId))
+      : readyAgentSet.size < 2),
+  )
 
   return (
     <div className="relative h-full min-h-0">
@@ -2536,6 +2666,7 @@ function App(): React.JSX.Element {
         style={{ visibility: nativeAttentionOpen ? 'hidden' : 'visible' }}
       >
         <WorkspaceView
+          runtimePreparation={preparation}
           onForkSessionStarted={() => ({
             selectionEpoch: beginUserSelection(),
             openingId: crypto.randomUUID(),
@@ -2604,6 +2735,7 @@ function App(): React.JSX.Element {
           sessionSettingsEditorState={sessionSettingsEditorState}
           sessionSettingsLoading={sessionSettingsLoading}
           sessionSettingsOpen={sessionSettingsOpen}
+          collaborationTask={mainCollaborationQuery.data}
           sideChatsOpen={sideChatsOpen}
           sideChatActiveCount={sideChats.activeCount}
           sideChatAttentionCount={sideChats.attentionCount}
@@ -2646,119 +2778,208 @@ function App(): React.JSX.Element {
                   if (!sideSession || sideSession.parentSessionId !== mainParentSessionId) {
                     return null
                   }
+                  const lockedSettingsLoaded = hasLockedSideChatSettings(sideChatId)
+                  const sideChatSettingsError =
+                    !lockedSettingsLoaded && sideChatSettingsState.sideChatId === sideChatId
+                      ? sideChatSettingsState.error
+                      : undefined
+                  const sideChatSettingsLoading = !lockedSettingsLoaded && !sideChatSettingsError
+                  const sideSnapshot =
+                    sideChatConversation.snapshot?.session.id === sideSession.id
+                      ? sideChatConversation.snapshot
+                      : undefined
+                  const sideChatInTakeoverOrRecovering =
+                    sideSession.activity.state === 'recovering' ||
+                    Boolean(sideSnapshot?.runs.some((run) => run.status === 'recovering')) ||
+                    (sideSnapshot?.pendingNativeInteractions?.length ?? 0) > 0 ||
+                    Boolean(sideSnapshot?.relaySchedulingDecision) ||
+                    Boolean(
+                      sideSnapshot?.rebuildOperations?.some((entry) =>
+                        ['preparing', 'creating', 'seeding', 'unconfirmed'].includes(
+                          entry.operation.stage,
+                        ),
+                      ),
+                    ) ||
+                    (sideSnapshot?.sessionIssues?.inputGate ?? 'open') === 'read_only' ||
+                    Boolean(
+                      sideSnapshot?.nativeContexts.some(
+                        (ctx) =>
+                          (ctx.permissionRequests?.length ?? 0) > 0 ||
+                          ['waiting_user', 'checking', 'rebuilding'].includes(
+                            ctx.continuationState ?? '',
+                          ),
+                      ),
+                    )
+                  const sideChatAgentActionsEnabled =
+                    lockedSettingsLoaded &&
+                    !sideChatSettingsLoading &&
+                    Boolean(preparation) &&
+                    requiredAgentsForSession(sideSession, sideSnapshot?.sessionIssues).every(
+                      (agentId) => readyAgentSet.has(agentId),
+                    ) &&
+                    sideSession.status !== 'archived'
+                  const sideChatMainSyncEnabled =
+                    lockedSettingsLoaded &&
+                    !sideChatSettingsLoading &&
+                    mainActionsEnabled &&
+                    sideSession.status !== 'archived' &&
+                    !sideChatInTakeoverOrRecovering
                   return (
                     <ConversationErrorBoundary key={sideChatId}>
-                      <ConversationView
-                        nativePresentationSuspended={
-                          nativeAttentionOpen || Boolean(nativeQuitState)
-                        }
-                        platform={appInfo?.platform}
-                        session={sideSession}
-                        schedulingState={schedulingSettings.state}
-                        visible={sideChatVisible && sideChatId === activeSideChatId}
-                        snapshot={sideChatConversation.snapshot}
-                        history={sideChatConversation.history}
-                        composer={sideChatConversation.composer}
-                        composerImages={sideChatConversation.composerImages}
-                        choosingImages={sideChatConversation.choosingImages}
-                        onAddComposerImages={sideChatConversation.addComposerImages}
-                        onChooseComposerImages={sideChatConversation.chooseComposerImages}
-                        onRemoveComposerImage={sideChatConversation.removeComposerImage}
-                        onComposerChange={(value) => sideChatConversation.setComposer(value)}
-                        onComposerDocumentChange={(value) =>
-                          sideChatConversation.setComposerDocument(value)
-                        }
-                        onOpenSkillDocument={(skill) =>
-                          openSideChatSkillDocument(sideChatId, skill)
-                        }
-                        composerSkills={sideChatConversation.composerSkills}
-                        onComposerSkillsChange={(values) =>
-                          sideChatConversation.setComposerSkills(values)
-                        }
-                        composerMention={sideChatConversation.composerMention}
-                        composerRoute={sideChatConversation.composerRoute}
-                        composerReturnedInputOperationId={
-                          sideChatConversation.composerReturnedInputOperationId
-                        }
-                        composerUserInformation={sideChatConversation.composerUserInformation}
-                        composerRevision={sideChatConversation.composerRevision}
-                        onClearSubmittedDraft={(expectedRevision) =>
-                          sideChatConversation.clearSubmittedComposerDraft(
-                            sideChatId,
-                            expectedRevision,
-                          )
-                        }
-                        handoffArriveKey={
-                          sideChatId === activeSideChatId ? sideChatHandoffKey : undefined
-                        }
-                        mainTargetAgentId={mainTargetAgentId}
-                        onSyncToMain={sideChatConversation.syncToMain}
-                        onViewMainMessage={viewSyncedMainMessage}
-                        onComposerMentionChange={(value) =>
-                          sideChatConversation.setComposerMention(value)
-                        }
-                        loading={sideChatConversation.loading}
-                        sending={sideChatConversation.sending}
-                        stopping={sideChatConversation.stopping}
-                        agentActionsEnabled={allAgentsReady && sideSession.status !== 'archived'}
-                        error={sideChatConversation.error}
-                        onSend={(...args) => sideChatConversation.send(...args)}
-                        onSaveCommentDraft={(input) => sideChatConversation.saveCommentDraft(input)}
-                        onRemoveCommentDraft={(commentId) =>
-                          sideChatConversation.removeCommentDraft(commentId)
-                        }
-                        onOpenComment={openSentComment}
-                        onNotice={showWarning}
-                        onStop={(background) => sideChatConversation.stop(background)}
-                        onRebuildNativeContext={(agentId, options) =>
-                          sideChatConversation.rebuildNativeContext(agentId, options)
-                        }
-                        onCheckNativeContext={(agentId, runId) =>
-                          sideChatConversation.checkNativeContext(agentId, runId)
-                        }
-                        onAcceptPeerProposal={(proposalId) =>
-                          sideChatConversation.acceptPeerProposal(proposalId)
-                        }
-                        onDismissPeerProposal={(proposalId) =>
-                          sideChatConversation.dismissPeerProposal(proposalId)
-                        }
-                        onUndoWorkspaceChanges={async (changeSetId) => {
-                          try {
-                            return await sideChatConversation.undoWorkspaceChanges(changeSetId)
-                          } catch {
-                            showError('Pact could not undo these changes.')
-                            return false
-                          }
-                        }}
-                        onRespondNativePermission={(operationId, permissionId, decision) =>
-                          sideChatConversation.respondNativePermission(
-                            operationId,
-                            permissionId,
-                            decision,
-                          )
-                        }
-                        onRespondNativeInput={(input) =>
-                          sideChatConversation.respondNativeInput(input)
-                        }
-                        nativeInputDrafts={sideChatConversation.nativeInputDrafts}
-                        onNativeInputDraftChange={sideChatConversation.setNativeInputDraft}
-                        onOpenWorkspaceChanges={(changeSetId, path, expectedGeneration, revision) =>
-                          openSideChatWorkspaceChanges(
-                            sideChatId,
-                            changeSetId,
-                            path,
-                            expectedGeneration,
-                            revision,
-                          )
-                        }
-                        onPrepareWorkspaceChanges={invalidateContextRead}
-                        onOpenProjectFile={(target) => openSideChatProjectFile(target, sideChatId)}
-                        messageNavigation={
-                          messageNavigation?.sessionId === sideChatId
-                            ? messageNavigation
-                            : undefined
-                        }
-                      />
+                      <div className="flex h-full min-h-0 flex-1 flex-col">
+                        {sideChatSettingsError ? (
+                          <div
+                            className="mx-section mt-group flex shrink-0 items-center justify-between gap-group rounded-card bg-danger-muted p-group text-caption text-danger"
+                            role="alert"
+                          >
+                            <span>{sideChatSettingsError}</span>
+                            <button
+                              className="shrink-0 font-medium underline underline-offset-4"
+                              type="button"
+                              onClick={() =>
+                                setSideChatSettingsState((previous) => ({
+                                  sideChatId,
+                                  loading: true,
+                                  error: undefined,
+                                  retryToken: previous.retryToken + 1,
+                                }))
+                              }
+                            >
+                              Try again
+                            </button>
+                          </div>
+                        ) : null}
+                        <div className="flex min-h-0 flex-1 flex-col">
+                          <ConversationView
+                            nativePresentationSuspended={
+                              nativeAttentionOpen || Boolean(nativeQuitState)
+                            }
+                            platform={appInfo?.platform}
+                            session={sideSession}
+                            schedulingState={schedulingSettings.state}
+                            visible={sideChatVisible && sideChatId === activeSideChatId}
+                            snapshot={sideChatConversation.snapshot}
+                            history={sideChatConversation.history}
+                            composer={sideChatConversation.composer}
+                            composerImages={sideChatConversation.composerImages}
+                            choosingImages={sideChatConversation.choosingImages}
+                            onAddComposerImages={sideChatConversation.addComposerImages}
+                            onChooseComposerImages={sideChatConversation.chooseComposerImages}
+                            onRemoveComposerImage={sideChatConversation.removeComposerImage}
+                            onComposerChange={(value) => sideChatConversation.setComposer(value)}
+                            onComposerDocumentChange={(value) =>
+                              sideChatConversation.setComposerDocument(value)
+                            }
+                            onOpenSkillDocument={(skill) =>
+                              openSideChatSkillDocument(sideChatId, skill)
+                            }
+                            composerSkills={sideChatConversation.composerSkills}
+                            onComposerSkillsChange={(values) =>
+                              sideChatConversation.setComposerSkills(values)
+                            }
+                            composerMention={sideChatConversation.composerMention}
+                            composerRoute={sideChatConversation.composerRoute}
+                            composerReturnedInputOperationId={
+                              sideChatConversation.composerReturnedInputOperationId
+                            }
+                            composerUserInformation={sideChatConversation.composerUserInformation}
+                            composerRevision={sideChatConversation.composerRevision}
+                            onClearSubmittedDraft={(expectedRevision) =>
+                              sideChatConversation.clearSubmittedComposerDraft(
+                                sideChatId,
+                                expectedRevision,
+                              )
+                            }
+                            handoffArriveKey={
+                              sideChatId === activeSideChatId ? sideChatHandoffKey : undefined
+                            }
+                            mainTargetAgentId={mainTargetAgentId}
+                            onSyncToMain={sideChatConversation.syncToMain}
+                            onViewMainMessage={viewSyncedMainMessage}
+                            onComposerMentionChange={(value) =>
+                              sideChatConversation.setComposerMention(value)
+                            }
+                            loading={sideChatConversation.loading}
+                            sending={sideChatConversation.sending}
+                            stopping={sideChatConversation.stopping}
+                            agentActionsEnabled={sideChatAgentActionsEnabled}
+                            mainSyncEnabled={sideChatMainSyncEnabled}
+                            sideChatSettingsState={
+                              sideChatSettingsLoading
+                                ? 'loading'
+                                : sideChatSettingsError
+                                  ? 'error'
+                                  : undefined
+                            }
+                            error={sideChatConversation.error}
+                            onSend={(...args) => sideChatConversation.send(...args)}
+                            onSaveCommentDraft={(input) =>
+                              sideChatConversation.saveCommentDraft(input)
+                            }
+                            onRemoveCommentDraft={(commentId) =>
+                              sideChatConversation.removeCommentDraft(commentId)
+                            }
+                            onOpenComment={openSentComment}
+                            onNotice={showWarning}
+                            onStop={(background) => sideChatConversation.stop(background)}
+                            onRebuildNativeContext={(agentId, options) =>
+                              sideChatConversation.rebuildNativeContext(agentId, options)
+                            }
+                            onCheckNativeContext={(agentId, runId) =>
+                              sideChatConversation.checkNativeContext(agentId, runId)
+                            }
+                            onAcceptPeerProposal={(proposalId) =>
+                              sideChatConversation.acceptPeerProposal(proposalId)
+                            }
+                            onDismissPeerProposal={(proposalId) =>
+                              sideChatConversation.dismissPeerProposal(proposalId)
+                            }
+                            onUndoWorkspaceChanges={async (changeSetId) => {
+                              try {
+                                return await sideChatConversation.undoWorkspaceChanges(changeSetId)
+                              } catch {
+                                showError('Pact could not undo these changes.')
+                                return false
+                              }
+                            }}
+                            onRespondNativePermission={(operationId, permissionId, decision) =>
+                              sideChatConversation.respondNativePermission(
+                                operationId,
+                                permissionId,
+                                decision,
+                              )
+                            }
+                            onRespondNativeInput={(input) =>
+                              sideChatConversation.respondNativeInput(input)
+                            }
+                            nativeInputDrafts={sideChatConversation.nativeInputDrafts}
+                            onNativeInputDraftChange={sideChatConversation.setNativeInputDraft}
+                            onOpenWorkspaceChanges={(
+                              changeSetId,
+                              path,
+                              expectedGeneration,
+                              revision,
+                            ) =>
+                              openSideChatWorkspaceChanges(
+                                sideChatId,
+                                changeSetId,
+                                path,
+                                expectedGeneration,
+                                revision,
+                              )
+                            }
+                            onPrepareWorkspaceChanges={invalidateContextRead}
+                            onOpenProjectFile={(target) =>
+                              openSideChatProjectFile(target, sideChatId)
+                            }
+                            messageNavigation={
+                              messageNavigation?.sessionId === sideChatId
+                                ? messageNavigation
+                                : undefined
+                            }
+                          />
+                        </div>
+                      </div>
                     </ConversationErrorBoundary>
                   )
                 }}
@@ -2918,11 +3139,12 @@ function App(): React.JSX.Element {
           toastNotice={toastNotice}
           sessionReminderNotice={sessionReminderNotice}
           settingsButtonRef={settingsButtonRef}
-          agentActionsEnabled={allAgentsReady}
+          agentActionsEnabled={mainActionsEnabled}
           runtimeNotice={
-            allAgentsReady || !preparation ? undefined : (
+            !showRuntimeNotice || !preparation ? undefined : (
               <RuntimeDegradedNotice
                 preparation={preparation}
+                relevantAgentIds={relevantWorkspaceAgents}
                 onReview={() => {
                   invalidateContextRead()
                   setWorkspaceChangesPanel(undefined)
@@ -2962,6 +3184,7 @@ function App(): React.JSX.Element {
                   defaultSessionSettings.editorState?.current?.updatedAt ?? 'default-session-new'
                 }
                 editorState={defaultSessionSettings.editorState}
+                runtimePreparation={preparation}
                 loading={defaultSessionSettings.loading}
                 saving={defaultSessionSettings.saving}
                 saveError={defaultSessionSettings.saveError}

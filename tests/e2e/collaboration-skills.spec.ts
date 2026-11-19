@@ -69,7 +69,12 @@ async function prepare(
       { id: sessionId, projectId, title: 'Collaboration', createdAt },
       {
         primaryAgentId: primary,
-        agents: { codex: { model: null, effort: null }, claude: { model: null, effort: null } },
+        secondaryAgentId: primary === 'claude' ? 'codex' : 'claude',
+        agents: {
+          codex: { model: null, effort: null },
+          claude: { model: null, effort: null },
+          agy: { model: null, effort: null },
+        },
         maxDiscussionRounds: 6,
         maxReviewCycles: 3,
         maxRepairAttempts: 3,

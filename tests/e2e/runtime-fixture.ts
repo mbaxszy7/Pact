@@ -28,11 +28,32 @@ import { OwnedProcessGroup } from '../../apps/desktop/src/utility/owned-process-
 import { PactDatabase } from '../../packages/persistence/src/index.js'
 import { readCiProviderConfiguration } from '../../scripts/ci.mjs'
 import {
+  copyIsolatedAgyAuthConfig,
   createWindowsFixtureProcessScope,
+  isolatedAgyAllowlistEnv,
+  isUnsafeWindowsCmdPath,
   NativeRpc,
+  parseSupportedAgySemver,
+  redactRealAgyText,
+  requireExplicitAgyAuthDir,
+  verifyAgyMinimumVersion,
   within,
+  type CopiedAgyAuthManifest,
+  type VerifyAgyMinimumVersionOptions,
   type WindowsFixtureProcessScope,
 } from '../native/native-harness.js'
+
+export {
+  copyIsolatedAgyAuthConfig,
+  isolatedAgyAllowlistEnv,
+  isUnsafeWindowsCmdPath,
+  parseSupportedAgySemver,
+  redactRealAgyText,
+  requireExplicitAgyAuthDir,
+  verifyAgyMinimumVersion,
+  type CopiedAgyAuthManifest,
+  type VerifyAgyMinimumVersionOptions,
+}
 import { MacCredentialStore } from './mac-credential-store.js'
 import {
   writeNativeTransportFault,
@@ -118,6 +139,9 @@ export interface RuntimeFixtureOptions {
   nativeCredentialStore?: boolean
   /** Owned OS store for the private-file Relay bootstrap in real-provider fixtures. */
   realRelayCredentialStore?: true
+  /** Enforces real-provider redaction, artifact suppression, and Windows process-scope receipts on hybrid opt-in fixtures. */
+  realProviderProtection?: boolean
+  redactText?: (text: string) => string
   mode?: 'ui' | 'real' | 'deterministic'
   configuration?: ProviderConfiguration
   transportFault?: NativeTransportFault
@@ -125,6 +149,7 @@ export interface RuntimeFixtureOptions {
   sessionTitles?: boolean
   claude?: ProbeState
   codex?: ProbeState
+  agy?: ProbeState
   claudeConversation?:
     | 'complete'
     | 'failure_once'
@@ -354,6 +379,111 @@ async function writeCli(
   return executablePath
 }
 
+async function writeAgyCli(directory: string, state: ProbeState): Promise<string> {
+  const scriptPath = join(directory, 'agy-fixture-script.mjs')
+  const versionText = state === 'unsupported_version' ? '1.5.8' : '1.5.11'
+  const versionExit = state === 'startup_failed' ? 2 : 0
+  const scriptSource = `import { createInterface } from 'node:readline'
+
+const state = ${JSON.stringify(state)}
+const args = process.argv.slice(2)
+
+if (args[0] === '--version') {
+  if (${versionExit} !== 0) process.exit(${versionExit})
+  process.stdout.write('agy version ${versionText}\\n')
+  process.exit(0)
+}
+
+if (args[0] === '-p' && args[1] === '/usage') {
+  if (state === 'ready') {
+    process.stdout.write(JSON.stringify({ groups: [{ name: 'Gemini Models', buckets: [] }] }) + '\\n')
+    process.exit(0)
+  }
+  process.stderr.write('Authentication required. Run agy to sign in.\\n')
+  process.exit(1)
+}
+
+if (args[0] === '-p' && args[1] === '/skills') {
+  process.stdout.write('{"skills":[]}\\n')
+  process.exit(0)
+}
+
+if (args[0] === 'acp') {
+  if (state === 'cannot_verify') {
+    process.stdout.write('x'.repeat(300_000) + '\\n')
+    process.exit(1)
+  }
+  const send = (frame) => process.stdout.write(JSON.stringify(frame) + '\\n')
+  const rl = createInterface({ input: process.stdin })
+  rl.on('line', (line) => {
+    const trimmed = line.trim()
+    if (!trimmed) return
+    let req
+    try {
+      req = JSON.parse(trimmed)
+    } catch {
+      return
+    }
+    if (req.method === 'initialize') {
+      send({
+        jsonrpc: '2.0',
+        id: req.id,
+        result: { protocolVersion: 1, agentInfo: { name: 'agy', version: '1.5.11' } },
+      })
+      return
+    }
+    if (req.method === 'session/new') {
+      if (state === 'authentication_required') {
+        send({
+          jsonrpc: '2.0',
+          id: req.id,
+          error: { code: -32000, message: 'Authentication required. Run agy to sign in.' },
+        })
+        return
+      }
+      send({
+        jsonrpc: '2.0',
+        id: req.id,
+        result: {
+          sessionId: 'agy-fixture-probe-session',
+          modes: {
+            currentModeId: 'default',
+            availableModes: ['default', 'accept-edits', 'auto', 'plan'],
+          },
+          models: {
+            currentModelId: 'gemini-4-carbon-high',
+            availableModels: [
+              { modelId: 'gemini-4-carbon-high', name: 'Gemini 4 Carbon (High)' },
+            ],
+          },
+          configOptions: [],
+        },
+      })
+      return
+    }
+    if (req.method === 'session/close') {
+      send({ jsonrpc: '2.0', id: req.id, result: {} })
+    }
+  })
+  rl.on('close', () => process.exit(0))
+} else {
+  process.exit(2)
+}
+`
+  await writeFile(scriptPath, scriptSource, { mode: 0o600 })
+  if (process.platform === 'win32') {
+    return writeWindowsNodeLauncher(directory, 'agy-fixture', [scriptPath])
+  }
+  const executablePath = join(directory, 'agy-fixture')
+  const quotedExec = process.execPath.replace(/'/gu, "'\\''")
+  const quotedScript = scriptPath.replace(/'/gu, "'\\''")
+  await writeFile(executablePath, `#!/bin/sh\nexec '${quotedExec}' '${quotedScript}' "$@"\n`, {
+    mode: 0o755,
+  })
+  await chmod(executablePath, 0o755)
+  return executablePath
+}
+
 function remainingStartupTime(deadline: number): number {
   const remaining = Math.ceil(deadline - performance.now())
   if (remaining <= 0) throw new Error('Windows launch exceeded its caller startup deadline')
@@ -438,7 +568,8 @@ export async function createRuntimeFixture(
         options.codexSkills ||
         options.claudeConversation ||
         options.claude ||
-        options.codex)
+        options.codex ||
+        options.agy)
     ) {
       throw new Error('A real E2E fixture cannot select synthetic CLI or protocol behavior.')
     }
@@ -491,7 +622,15 @@ export async function createRuntimeFixture(
     let transport: NativeTransportFaultFiles | undefined
     let credentialStore: MacCredentialStore | undefined
     let controlGeneration = 0
-    const redact = (text: string): string => configuration?.redact(text) ?? text
+    const realProtected = mode === 'real' || options.realProviderProtection === true
+    const redact = (text: string): string => {
+      const base = configuration
+        ? configuration.redact(text)
+        : realProtected
+          ? redactRealAgyText(text)
+          : text
+      return options.redactText ? options.redactText(base) : base
+    }
     const releaseLaunch = (owner: WindowsLaunchOwner): Promise<void> => {
       if (!launchOwners.has(owner)) return Promise.resolve()
       const existing = releasingOwners.get(owner)
@@ -740,9 +879,9 @@ export async function createRuntimeFixture(
     try {
       if (creationCancelled) throw new Error('E2E fixture construction was cancelled')
       environment = await prepareProviderEnvironment(directory, configuration, undefined, {
-        disableCodexPlugins: mode === 'real',
+        disableCodexPlugins: realProtected,
       })
-      if (mode === 'real' && process.platform === 'win32')
+      if (realProtected && process.platform === 'win32')
         windowsProcessScope = await createWindowsFixtureProcessScope(directory)
       if (creationCancelled) throw new Error('E2E fixture construction was cancelled')
       if (options.nativeCredentialStore || options.realRelayCredentialStore) {
@@ -771,7 +910,7 @@ export async function createRuntimeFixture(
       environment.env.PACT_TEST_DB_FILE = databaseFile
       environment.env.PACT_E2E_ROOT = directory
       if (options.measureIpcTraffic) {
-        if (mode === 'real')
+        if (realProtected)
           throw new Error('IPC performance fixtures cannot authorize real provider generation')
         environment.env.PACT_E2E_IPC_NONCE = randomBytes(32).toString('hex')
       }
@@ -792,27 +931,40 @@ export async function createRuntimeFixture(
             options.sessionTitles,
           )
         : undefined
+      let agyPath: string | undefined
       if (mode === 'real') {
         claudePath = configuration!.claudePath
         codexPath = configuration!.codexPath
+        if (configuration!.agyPath) {
+          agyPath = configuration!.agyPath
+        }
         if (options.transportFault) {
           transport = await writeNativeTransportFault(directory, codexPath, options.transportFault)
           codexPath = transport.executablePath
         }
       } else {
-        ;[claudePath, codexPath] = await Promise.all([
+        ;[claudePath, codexPath, agyPath] = await Promise.all([
           writeCli(directory, 'claude', options.claude ?? 'ready', undefined, claudeSdkPath),
           writeCli(directory, 'codex', options.codex ?? 'ready', codexAppServerPath),
+          writeAgyCli(directory, options.agy ?? 'authentication_required'),
         ])
       }
       const database = await PactDatabase.open({ filePath: databaseFile, migrationsFolder })
       try {
         database.runtimePreparationRepository.saveSelectedExecutablePath('claude', claudePath)
         database.runtimePreparationRepository.saveSelectedExecutablePath('codex', codexPath)
+        if (agyPath) {
+          database.runtimePreparationRepository.saveSelectedExecutablePath('agy', agyPath)
+        }
         if (options.firstUse !== true) {
           database.defaultSessionSettingsRepository.save({
             primaryAgentId: 'codex',
-            agents: { claude: { model: null, effort: null }, codex: { model: null, effort: null } },
+            secondaryAgentId: 'claude',
+            agents: {
+              claude: { model: null, effort: null },
+              codex: { model: null, effort: null },
+              agy: { model: null, effort: null, speed: 'native' },
+            },
             maxDiscussionRounds: 6,
             maxReviewCycles: 3,
             maxRepairAttempts: 3,
@@ -955,7 +1107,7 @@ export async function createRuntimeFixture(
                 'PACT_TEST_APPEARANCE_WRITE_FAILURE',
                 'PACT_TEST_DIRECTORY_READ_DELAY',
                 'PACT_TEST_DIRECTORY_FAIL_ONCE',
-                ...(mode !== 'real' ? ['PACT_TEST_RECOVERY_RUN_ID'] : []),
+                ...(realProtected ? [] : ['PACT_TEST_RECOVERY_RUN_ID']),
               ])
               for (const key of Object.keys(extraEnvironment)) {
                 if (permitted.has(key)) continue
@@ -1085,8 +1237,7 @@ export async function createRuntimeFixture(
             }
           }),
         async captureUiFailure(info) {
-          if (mode === 'real')
-            throw new Error('Real Provider fixtures cannot export Renderer state')
+          if (realProtected) throw new Error('Real Provider fixtures cannot export Renderer state')
           const current = [...apps]
           if (current.length !== 1)
             throw new Error('No unique owned Electron window for diagnostics')
@@ -1534,6 +1685,15 @@ for await (const line of lines) {
       const complete = () => {
         native(threadId).status = 'idle'
         if (scenario === 'native_title' && !native(threadId).name) native(threadId).name = 'Native auto title'
+        if (scenario === 'fork_complete') {
+          const userInputText = request.params.input.filter((item) => item.type === 'text').map((item) => item.text).join('\\n')
+          appendFileSync(native(threadId).path, [
+            { type: 'event_msg', payload: { type: 'task_started', turn_id: turnId } },
+            { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: userInputText }] } },
+            { type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text }] }, metadata: { client_authored: false } },
+            { type: 'event_msg', payload: { type: 'task_complete', turn_id: turnId } },
+          ].map((record) => JSON.stringify(record) + '\\n').join(''))
+        }
         native(threadId).turns.push({ id: turnId, status: 'completed', startedAt: 1, completedAt: 2, durationMs: 1, error: null })
         native(threadId).items.push({ turnId, item: { type: 'userMessage', id: 'fixture-user', clientId: request.params.clientUserMessageId, content: [] } }, { turnId, item: { type: 'agentMessage', id: 'fixture-message', text } }); persist()
         send({ method: 'item/completed', params: { threadId, turnId, item: { type: 'agentMessage', id: 'fixture-message', text } } })

@@ -11,6 +11,7 @@ import {
   relaySchedulingDecisionProofSchema,
   relayNativeRecoveryProofSchema,
   relayDecisionReceiptSchema,
+  routeCandidateIdForAgent,
   preparedInformationControlSchema,
   schedulingActivityActionResultSchema,
   schedulingActivityActionSchema,
@@ -78,6 +79,7 @@ function actionFor(value: string | null): SchedulingActivityAction | null {
     'workflow:reply': 'reply',
     'input:route_codex': 'route_codex',
     'input:route_claude': 'route_claude',
+    'input:route_agy': 'route_agy',
   }
   if (!value) return null
   return known[value] ?? schedulingActivityActionSchema.safeParse(value).data ?? null
@@ -99,6 +101,7 @@ function suggestionFor(candidate: string | null): string | null {
     propose_extend_plan_review: 'Request one additional Plan review.',
     route_codex: 'Route the input to Codex.',
     route_claude: 'Route the input to Claude Code.',
+    route_agy: 'Route the input to Antigravity.',
     clarify_prepared_input: 'Ask for missing information.',
   }
   return candidate ? (labels[candidate] ?? null) : null
@@ -350,6 +353,7 @@ function recordNativeDecisionActivity(
           generation: nativeRebuildOperations.oldGeneration,
           oldNativeSessionId: nativeRebuildOperations.oldNativeSessionId,
           nativeSessionId: nativeRebuildOperations.provisionalNativeSessionId,
+          sourceHash: nativeRebuildOperations.sourceHash,
           stage: nativeRebuildOperations.stage,
           work: nativeRebuildOperations.nativeWorkState,
           witness: nativeRebuildOperations.initializationWitnessJson,
@@ -371,7 +375,15 @@ function recordNativeDecisionActivity(
         if (!operation.witness || Buffer.byteLength(operation.witness) >= 4096) return false
         try {
           const witness = nativeInitializationWitnessSchema.safeParse(JSON.parse(operation.witness))
-          return witness.success && witness.data.nativeSessionId === operation.nativeSessionId
+          if (!witness.success || witness.data.nativeSessionId !== operation.nativeSessionId)
+            return false
+          return operation.agentId === 'codex'
+            ? witness.data.kind === 'codex_rollout_v1'
+            : witness.data.kind === 'agy_rebuild_v1' &&
+                Boolean(operation.sourceHash) &&
+                witness.data.sourceHash === operation.sourceHash &&
+                witness.data.stepCount === 2 &&
+                Boolean(witness.data.coldLoadVerifiedAt)
         } catch {
           return false
         }
@@ -790,9 +802,7 @@ export function recordBusinessActivity(
         suggestionState: fallback ? 'fallback' : 'adopted',
         action:
           fallback && proof.card.request.category === 'necessary_information'
-            ? proof.card.request.consumer.defaultAgentId === 'codex'
-              ? 'route_codex'
-              : 'route_claude'
+            ? routeCandidateIdForAgent(proof.card.request.consumer.defaultAgentId)
             : 'clarify_prepared_input',
       })
     }

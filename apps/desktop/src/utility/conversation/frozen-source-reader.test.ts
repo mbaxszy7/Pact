@@ -51,7 +51,12 @@ async function fixture(
     { id: sessionId, projectId, title: 'Source reader', createdAt },
     {
       primaryAgentId: 'codex',
-      agents: { codex: { model: null, effort: null }, claude: { model: null, effort: null } },
+      secondaryAgentId: 'claude',
+      agents: {
+        codex: { model: null, effort: null },
+        claude: { model: null, effort: null },
+        agy: { model: null, effort: null },
+      },
       maxDiscussionRounds: 6,
       maxReviewCycles: 3,
       maxRepairAttempts: 3,
@@ -1229,4 +1234,98 @@ it('current declaration selector derives its immutable metadata from the origina
   const authorized = vi.spyOn(f.repo, 'sourceDocumentAuthorized').mockReturnValue(false)
   expect(() => f.reader.readNativeRoot(request, root)).toThrow(/repository_scope/u)
   expect(authorized).toHaveBeenCalledWith(f.started.run.id, page.document)
+})
+
+it('navigates and reads all 4 cutoff parts (catalog, message, comments, comment) only when authorized for the root', async () => {
+  const f = await fixture(true)
+  const cutoffId = randomUUID()
+  const cutoffMsgId = randomUUID()
+  const cutoffCommentId = randomUUID()
+  const root = { threadId: randomUUID(), turnId: randomUUID() }
+
+  vi.spyOn(f.repo, 'readCutoffSource').mockImplementation((target) => {
+    const base = {
+      source: 'cutoff' as const,
+      cutoffId,
+      part: target.part,
+      sourceSessionId: f.sessionId,
+      maxMessageSequence: 3,
+      offset: 0,
+      nextOffset: null,
+    }
+    if (target.part === 'catalog') {
+      return {
+        ...base,
+        text: JSON.stringify({
+          cutoffId,
+          sourceSessionId: f.sessionId,
+          maxMessageSequence: 3,
+        }),
+        items: [
+          {
+            sequence: 1,
+            messageId: cutoffMsgId,
+            role: 'assistant' as const,
+            agentId: 'agy' as const,
+            state: 'complete' as const,
+            contentBytes: 28,
+            preview: 'Antigravity cutoff body text',
+            hasComments: true,
+          },
+        ],
+      }
+    }
+    if (target.part === 'comments') {
+      return {
+        ...base,
+        text: JSON.stringify({
+          cutoffId,
+          messageId: cutoffMsgId,
+          items: [
+            {
+              commentId: cutoffCommentId,
+              createdAt: '2026-11-19T10:01:00.000Z',
+              bytes: 12,
+              chars: 12,
+            },
+          ],
+        }),
+      }
+    }
+    return {
+      ...base,
+      text: target.part === 'message' ? 'Antigravity cutoff body text' : 'Comment body',
+    }
+  })
+
+  // Unauthorized cutoffId MUST be rejected before reading!
+  expect(() =>
+    f.reader.navigation({ source: 'cutoff', cutoffId, part: 'catalog' }, 'nativeRoot'),
+  ).toThrow(/navigation|repository_scope|cutoff/iu)
+
+  // Authorize cutoffId for this root and verify all 4 parts!
+  expect(f.reader.authorizeCutoffs([cutoffId])).toEqual([cutoffId])
+  const catalogNav = f.reader.navigation(
+    { source: 'cutoff', cutoffId, part: 'catalog' },
+    'nativeRoot',
+  )
+  const catalogPage = f.reader.readNativeRoot(catalogNav, root).page
+  const catalogParsed: unknown = JSON.parse(catalogPage.text)
+  const catalogItems = isTestObject(catalogParsed) ? catalogParsed['items'] : undefined
+  expect(Array.isArray(catalogItems) ? catalogItems : []).toHaveLength(1)
+  const firstCatalogItem = Array.isArray(catalogItems) ? testObject(catalogItems[0]) : {}
+
+  const msgPage = f.reader.readNativeRoot(firstCatalogItem['messageRead'], root).page
+  expect(msgPage.text).toBe('Antigravity cutoff body text')
+
+  const commentsPage = f.reader.readNativeRoot(firstCatalogItem['commentsRead'], root).page
+  const commentsParsed: unknown = JSON.parse(commentsPage.text)
+  const commentItems = isTestObject(commentsParsed) ? commentsParsed['items'] : undefined
+  const firstCommentItem = Array.isArray(commentItems) ? testObject(commentItems[0]) : {}
+  const commentPage = f.reader.readNativeRoot(firstCommentItem['commentRead'], root).page
+  expect(commentPage.text).toBe('Comment body')
+
+  // Revoking cutoff immediately blocks further reads!
+  f.reader.revokeCutoffs([cutoffId])
+  expect(() => f.reader.readNativeRoot(catalogNav, root)).toThrow(/repository_scope|cutoff/iu)
 })

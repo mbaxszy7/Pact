@@ -2,9 +2,11 @@ import { Check, Workflow } from 'lucide-react'
 import { useId } from 'react'
 
 import {
+  agentDisplayName,
   isOptionalRelaySuggestion,
   type RelayDecisionAnswer,
   type RelaySchedulingDecision,
+  type RuntimeAgentId,
 } from '@pact/contracts'
 
 /**
@@ -26,7 +28,7 @@ export interface RelayDecisionPresentation {
   onCancel: () => void
 }
 
-const agentName = (id: 'codex' | 'claude'): string => (id === 'codex' ? 'Codex' : 'Claude Code')
+const agentName = (id: RuntimeAgentId): string => agentDisplayName(id)
 
 export function RelayDecisionCard({
   decision,

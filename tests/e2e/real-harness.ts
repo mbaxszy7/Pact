@@ -107,7 +107,11 @@ export async function launchRealWorkspace(
           page.evaluate(async () => {
             const bridge: DesktopBridge = Reflect.get(globalThis, 'pact')
             const state = await bridge.getRuntimePreparation()
-            return state.ok ? state.value.agents.map((agent) => agent.state) : []
+            return state.ok
+              ? state.value.agents
+                  .filter((agent) => agent.agentId === 'claude' || agent.agentId === 'codex')
+                  .map((agent) => agent.state)
+              : []
           }),
         { timeout: 30_000 },
       )
@@ -334,6 +338,10 @@ export async function selectRealConfiguredEffort(
       sessionId: ctx.sessionId,
       settings: {
         primaryAgentId: primaryAgentId ?? previous.primaryAgentId,
+        secondaryAgentId:
+          (primaryAgentId ?? previous.primaryAgentId) === previous.secondaryAgentId
+            ? previous.primaryAgentId
+            : previous.secondaryAgentId,
         agents,
         maxDiscussionRounds: previous.maxDiscussionRounds,
         maxReviewCycles: previous.maxReviewCycles,

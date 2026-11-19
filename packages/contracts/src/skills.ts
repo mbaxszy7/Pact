@@ -13,7 +13,7 @@ export const SKILL_PAGE_BYTES = 64 * 1_024
 export const SKILL_INVOCATION_BYTES = 64 * 1_024
 export const SKILL_ITEM_BYTES = 8 * 1_024
 
-const agentSchema = z.enum(['claude', 'codex'])
+const agentSchema = z.enum(['claude', 'codex', 'agy'])
 const nameSchema = z
   .string()
   .min(1)
@@ -185,7 +185,7 @@ export interface FrozenSkillInvocation {
   bindings: SkillBinding[]
 }
 
-type AgentRoute = { type: 'agent'; agentId: 'claude' | 'codex' } | { type: 'all' }
+type AgentRoute = { type: 'agent'; agentId: 'claude' | 'codex' | 'agy' } | { type: 'all' }
 export interface ComposerCommandPrefix {
   pact?: PactSkill
   btw?: { start: number; end: number }
@@ -236,7 +236,12 @@ export function parseComposerCommandPrefix(
       if (offset < content.length && !/\s/u.test(content[offset]!) && !atoms.has(offset)) break
       continue
     }
-    const token = /^(?:@(claude|codex|all)|\/([\p{L}\p{N}_.:-]+))(?=\s|$)/iu.exec(
+    const unsupportedGemini = /^@gemini(?=\s|$)/iu.exec(content.slice(offset))
+    if (unsupportedGemini) {
+      result.error = 'Use @agy to route to Antigravity; @gemini is not supported.'
+      break
+    }
+    const token = /^(?:@(claude|codex|agy|all)|\/([\p{L}\p{N}_.:-]+))(?=\s|$)/iu.exec(
       content.slice(offset),
     )
     if (!token) break
@@ -250,7 +255,10 @@ export function parseComposerCommandPrefix(
       result.route =
         target === 'all'
           ? { type: 'all' }
-          : { type: 'agent', agentId: target === 'claude' ? 'claude' : 'codex' }
+          : {
+              type: 'agent',
+              agentId: target === 'claude' ? 'claude' : target === 'codex' ? 'codex' : 'agy',
+            }
     } else if (token[2] === 'btw') {
       if (result.pact || result.btw) {
         result.error = 'Choose one Pact Skill for this task.'
@@ -319,7 +327,7 @@ export function validateSideChatMainSyncContent(
   if (prefix.route) {
     return {
       ok: false,
-      message: 'Remove @claude, @codex, or @all after @Main before sending to the main chat.',
+      message: 'Remove @claude, @codex, @agy, or @all after @Main before sending to the main chat.',
     }
   }
   return { ok: true }

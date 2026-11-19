@@ -102,6 +102,7 @@ test.describe('real business input return', { tag: '@real' }, () => {
               sessionId,
               settings: {
                 primaryAgentId: 'claude',
+                secondaryAgentId: 'codex',
                 agents: current.value.session.settings.agents,
                 maxDiscussionRounds: current.value.session.settings.maxDiscussionRounds,
                 maxReviewCycles: current.value.session.settings.maxReviewCycles,

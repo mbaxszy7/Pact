@@ -200,7 +200,12 @@ describe('complete migration compatibility through PactDatabase.open', () => {
     const createdAt = '2026-10-14T00:00:00.000Z'
     const settings: DefaultSessionSettings = {
       primaryAgentId: 'codex',
-      agents: { claude: { model: null, effort: null }, codex: { model: null, effort: null } },
+      secondaryAgentId: 'claude',
+      agents: {
+        claude: { model: null, effort: null },
+        codex: { model: null, effort: null },
+        agy: { model: null, effort: null },
+      },
       maxDiscussionRounds: 6,
       maxReviewCycles: 3,
       maxRepairAttempts: 3,
@@ -546,6 +551,223 @@ describe('complete migration compatibility through PactDatabase.open', () => {
       })
     } finally {
       inspect.close()
+    }
+  })
+
+  it('upgrades a 0106 Side Chat database cleanly to 0107 without fabricating agy contexts and enforces distinct active pairs', async () => {
+    const { filePath } = await fixture()
+    const staging = await PactDatabase.open({ filePath: ':memory:', migrationsFolder: folder })
+    const projectId = randomUUID(),
+      codexMainId = randomUUID(),
+      claudeMainId = randomUUID(),
+      createdAt = '2026-11-19T00:00:00.000Z'
+    let sideChatId = ''
+    try {
+      staging.defaultSessionSettingsRepository.save({
+        primaryAgentId: 'claude',
+        secondaryAgentId: 'codex',
+        agents: {
+          claude: { model: 'claude-sonnet-4-5', effort: 'high' },
+          codex: { model: 'gpt-5.4', effort: 'medium' },
+          agy: { model: null, effort: null },
+        },
+        maxDiscussionRounds: 6,
+        maxReviewCycles: 3,
+        maxRepairAttempts: 3,
+      })
+      staging.projectCatalogRepository.add({
+        id: projectId,
+        name: '0106 Upgrade Fixture',
+        directoryPath: '/0106-upgrade-fixture',
+        kind: 'git',
+        createdAt,
+      })
+      staging.sessionRepository.create(
+        { id: codexMainId, projectId, title: 'Codex Main', createdAt },
+        {
+          primaryAgentId: 'codex',
+          secondaryAgentId: 'claude',
+          agents: {
+            claude: { model: null, effort: null },
+            codex: { model: 'gpt-5.4', effort: 'high' },
+            agy: { model: null, effort: null },
+          },
+          maxDiscussionRounds: 6,
+          maxReviewCycles: 3,
+          maxRepairAttempts: 3,
+        },
+      )
+      staging.sessionRepository.create(
+        { id: claudeMainId, projectId, title: 'Claude Main', createdAt },
+        {
+          primaryAgentId: 'claude',
+          secondaryAgentId: 'codex',
+          agents: {
+            claude: { model: 'claude-sonnet-4-5', effort: 'high' },
+            codex: { model: null, effort: null },
+            agy: { model: null, effort: null },
+          },
+          maxDiscussionRounds: 6,
+          maxReviewCycles: 3,
+          maxRepairAttempts: 3,
+        },
+      )
+      const drafts = staging.conversationRepository.readPage({
+        scope: 'drafts',
+        sessionId: codexMainId,
+      })
+      if (drafts.scope !== 'drafts') throw new Error('Expected drafts page')
+      const started = staging.conversationRepository.beginRun({
+        sessionId: codexMainId,
+        clientMessageId: randomUUID(),
+        content: 'Inspect SQLite WAL checkpoint invariant.',
+        expectedCommentsRevision: drafts.commentsRevision,
+        commentIds: [],
+        agentId: 'codex',
+        settingsRevision: 1,
+        model: null,
+        effort: null,
+      })
+      staging.conversationRepository.applyEvent(codexMainId, started.run.id, {
+        agentId: 'codex',
+        type: 'session.started',
+        nativeSessionId: 'codex-0106-native',
+      })
+      staging.conversationRepository.applyEvent(codexMainId, started.run.id, {
+        agentId: 'codex',
+        type: 'turn.started',
+        turnId: 'turn-0106',
+      })
+      staging.conversationRepository.applyEvent(codexMainId, started.run.id, {
+        agentId: 'codex',
+        type: 'text.completed',
+        turnId: 'turn-0106',
+        outputId: 'out-0106',
+        text: 'SQLite WAL checkpoint invariant verified.',
+      })
+      staging.conversationRepository.applyEvent(codexMainId, started.run.id, {
+        agentId: 'codex',
+        type: 'turn.completed',
+        turnId: 'turn-0106',
+        outcome: 'completed',
+      })
+      const responseMessageId = staging.conversationRepository.findRun(
+        started.run.id,
+      )!.responseMessageId!
+      const sideReceipt = staging.conversationRepository.createSideChat({
+        origin: 'selection',
+        operationId: randomUUID(),
+        parentSessionId: codexMainId,
+        messageId: responseMessageId,
+        quote: 'SQLite WAL checkpoint invariant',
+        startOffset: 0,
+        endOffset: 'SQLite WAL checkpoint invariant'.length,
+      })
+      sideChatId = sideReceipt.sideChat.id
+
+      // Build authentic 0106 SQLite file (migrations 0000..0106, omitting 0107 columns)
+      copyLegacyDatabase(staging, filePath, folder, 106)
+    } finally {
+      staging.close()
+    }
+
+    const upgraded = await PactDatabase.open({ filePath, migrationsFolder: folder })
+    try {
+      const defaults = upgraded.defaultSessionSettingsRepository.read()
+      expect(defaults?.settings).toMatchObject({
+        primaryAgentId: 'claude',
+        secondaryAgentId: 'codex',
+        agents: {
+          agy: { model: null, effort: null, speed: 'native' },
+        },
+      })
+
+      const codexMain = upgraded.sessionRepository.find(codexMainId)!
+      expect(codexMain.settings).toMatchObject({
+        primaryAgentId: 'codex',
+        secondaryAgentId: 'claude',
+        agents: {
+          agy: { model: null, effort: null, speed: 'native' },
+        },
+        permissionModes: {
+          claude: 'ask',
+          codex: 'native',
+          agy: 'native',
+        },
+      })
+
+      const claudeMain = upgraded.sessionRepository.find(claudeMainId)!
+      expect(claudeMain.settings).toMatchObject({
+        primaryAgentId: 'claude',
+        secondaryAgentId: 'codex',
+        permissionModes: {
+          agy: 'native',
+        },
+      })
+
+      const sideChat = upgraded.sessionRepository.find(sideChatId)!
+      expect(sideChat.parentSessionId).toBe(codexMainId)
+      expect(sideChat.settings).toMatchObject({
+        primaryAgentId: 'codex',
+        secondaryAgentId: 'claude',
+        permissionModes: {
+          agy: 'native',
+        },
+      })
+      expect(upgraded.conversationRepository.read(sideChatId).comments).toHaveLength(1)
+
+      // Never fabricate 'agy' rows in native_agent_contexts on upgrade
+      const agyContexts = upgraded.drizzle.all(
+        "SELECT session_id FROM native_agent_contexts WHERE agent_id = 'agy'",
+      )
+      expect(agyContexts).toEqual([])
+
+      // New sessions created post-0107 default permissionModes.agy to 'ask'
+      const freshId = randomUUID()
+      const fresh = upgraded.sessionRepository.create(
+        { id: freshId, projectId, title: 'Post-0107 Session', createdAt },
+        {
+          primaryAgentId: 'claude',
+          secondaryAgentId: 'agy',
+          agents: {
+            claude: { model: null, effort: null },
+            codex: { model: null, effort: null },
+            agy: { model: 'gemini-3.1-pro', effort: 'high' },
+          },
+          maxDiscussionRounds: 6,
+          maxReviewCycles: 3,
+          maxRepairAttempts: 3,
+        },
+      )
+      expect(fresh.session.settings.permissionModes).toEqual({
+        claude: 'ask',
+        codex: 'native',
+        agy: 'ask',
+      })
+
+      // SQLite distinct-pair triggers reject primary_agent_id = secondary_agent_id
+      const expectTriggerAbort = (stmt: string) => {
+        let caught: unknown
+        try {
+          upgraded.drizzle.run(stmt)
+        } catch (err) {
+          caught = err
+        }
+        expect(caught).toBeInstanceOf(Error)
+        const causeMessage =
+          caught instanceof Error && caught.cause instanceof Error
+            ? caught.cause.message
+            : String(caught)
+        expect(causeMessage).toMatch(/_distinct_pair/)
+      }
+      expectTriggerAbort(
+        'UPDATE default_session_settings SET secondary_agent_id = primary_agent_id WHERE id = 1',
+      )
+      expectTriggerAbort(
+        `UPDATE session_settings_revisions SET secondary_agent_id = primary_agent_id WHERE session_id = '${codexMainId}'`,
+      )
+    } finally {
+      upgraded.close()
     }
   })
 })

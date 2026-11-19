@@ -33,7 +33,12 @@ test(
         { id: sessionId, projectId, title: 'New session', createdAt },
         {
           primaryAgentId: 'codex',
-          agents: { codex: { model: null, effort: null }, claude: { model: null, effort: null } },
+          secondaryAgentId: 'claude',
+          agents: {
+            codex: { model: null, effort: null },
+            claude: { model: null, effort: null },
+            agy: { model: null, effort: null },
+          },
           maxDiscussionRounds: 3,
           maxReviewCycles: 2,
           maxRepairAttempts: 2,
@@ -122,7 +127,12 @@ for (const command of ['ordinary', '/plan', '/build', '/review'] as const)
         { id: sessionId, projectId, title: 'New session', createdAt: now },
         {
           primaryAgentId: command === '/build' ? 'claude' : 'codex',
-          agents: { codex: { model: null, effort: null }, claude: { model: null, effort: null } },
+          secondaryAgentId: command === '/build' ? 'codex' : 'claude',
+          agents: {
+            codex: { model: null, effort: null },
+            claude: { model: null, effort: null },
+            agy: { model: null, effort: null },
+          },
           maxDiscussionRounds: 6,
           maxReviewCycles: 3,
           maxRepairAttempts: 3,
@@ -235,7 +245,12 @@ test(
       { id: sessionId, projectId, title: 'New session', createdAt: now },
       {
         primaryAgentId: 'claude',
-        agents: { codex: { model: null, effort: null }, claude: { model: null, effort: null } },
+        secondaryAgentId: 'codex',
+        agents: {
+          codex: { model: null, effort: null },
+          claude: { model: null, effort: null },
+          agy: { model: null, effort: null },
+        },
         maxDiscussionRounds: 6,
         maxReviewCycles: 3,
         maxRepairAttempts: 3,
@@ -290,7 +305,12 @@ test(
         { id: sessionId, projectId, title: 'Title fixture', createdAt: now },
         {
           primaryAgentId: 'codex',
-          agents: { claude: { model: null, effort: null }, codex: { model: null, effort: null } },
+          secondaryAgentId: 'claude',
+          agents: {
+            claude: { model: null, effort: null },
+            codex: { model: null, effort: null },
+            agy: { model: null, effort: null },
+          },
           maxDiscussionRounds: 3,
           maxReviewCycles: 2,
           maxRepairAttempts: 2,

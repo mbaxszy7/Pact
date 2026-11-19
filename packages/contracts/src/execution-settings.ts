@@ -10,7 +10,7 @@ export type SessionPermissionMode = z.infer<typeof sessionPermissionModeSchema>
 const digest = z.string().regex(/^[a-f0-9]{64}$/u)
 const nativeId = z.string().min(1).max(1024)
 export const runRequestedExecutionSettingsSchema = z.strictObject({
-  provider: z.enum(['codex', 'claude']),
+  provider: z.enum(['codex', 'claude', 'agy']),
   model: z.string().min(1).max(160).nullable(),
   effort: z.string().min(1).max(80).nullable(),
   speed: agentSpeedSchema,
@@ -22,18 +22,27 @@ export type RunRequestedExecutionSettings = z.infer<typeof runRequestedExecution
 export const runEffectiveExecutionSettingsSchema = z
   .strictObject({
     version: z.literal(1),
-    provider: z.enum(['codex', 'claude']),
+    provider: z.enum(['codex', 'claude', 'agy']),
     model: z.string().min(1).max(160),
     effort: z.strictObject({ known: z.literal(true), value: z.string().min(1).max(80).nullable() }),
-    speed: z.enum(['standard', 'fast']),
+    speed: agentSpeedSchema,
     permissionMode: sessionPermissionModeSchema,
     configurationSha256: digest,
-    provenance: z.enum(['codex_thread_configuration', 'claude_applied_settings']),
+    provenance: z.enum([
+      'codex_thread_configuration',
+      'claude_applied_settings',
+      'agy_applied_settings',
+    ]),
   })
   .refine(
     (value) =>
       value.provenance ===
-      (value.provider === 'codex' ? 'codex_thread_configuration' : 'claude_applied_settings'),
+        (value.provider === 'codex'
+          ? 'codex_thread_configuration'
+          : value.provider === 'claude'
+            ? 'claude_applied_settings'
+            : 'agy_applied_settings') &&
+      (value.provider === 'agy' ? value.speed === 'native' : value.speed !== 'native'),
   )
 export type RunEffectiveExecutionSettings = z.infer<typeof runEffectiveExecutionSettingsSchema>
 
@@ -44,8 +53,22 @@ export const confirmedUnsentBoundarySchema = z.discriminatedUnion('kind', [
     requestId: z.number().int().nonnegative(),
   }),
   z.strictObject({ kind: z.literal('claude_root_not_yielded') }),
+  z.strictObject({
+    kind: z.literal('agy_root_frame_not_written'),
+    requestId: z.union([z.number().int().nonnegative(), z.string().min(1).max(256)]).optional(),
+  }),
 ])
 export type ConfirmedUnsentBoundary = z.infer<typeof confirmedUnsentBoundarySchema>
+
+export function unsentBoundaryMatchesProvider(
+  provider: 'claude' | 'codex' | 'agy',
+  boundaryKind: ConfirmedUnsentBoundary['kind'],
+): boolean {
+  if (boundaryKind === 'host_before_root_start') return true
+  if (provider === 'claude') return boundaryKind === 'claude_root_not_yielded'
+  if (provider === 'codex') return boundaryKind === 'codex_root_frame_not_written'
+  return boundaryKind === 'agy_root_frame_not_written'
+}
 export const confirmedUnsentProofSchema = z
   .strictObject({
     version: z.literal(1),

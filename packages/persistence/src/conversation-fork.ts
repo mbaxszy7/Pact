@@ -18,8 +18,11 @@ import {
 import { createHash, randomUUID } from 'node:crypto'
 
 import {
+  AGENTS,
   collaborationTaskSchema,
+  isAgentInPair,
   isConversationBackgroundReport,
+  resolveActiveAgentPair,
   collaborationTurnAuthorizationSchema,
   collaborationDocumentSchema,
   preparedInformationControlSchema,
@@ -76,12 +79,95 @@ import { assertSessionAvailable } from './workspace-archive-repository.js'
 
 const MAX_ENTITIES = 10_000
 const MAX_BYTES = 8 * 1024 * 1024
-const AGENTS = ['claude', 'codex'] as const
 type RunRow = typeof agentRuns.$inferSelect
+
+function orderedPairMembers(
+  pair: readonly [RuntimeAgentId, RuntimeAgentId],
+): [RuntimeAgentId, RuntimeAgentId] {
+  const ordered = AGENTS.filter((agentId) => isAgentInPair(agentId, pair))
+  return [ordered[0]!, ordered[1]!]
+}
+
+function assertForkBoundaryMatchesAgent(
+  agentId: RuntimeAgentId,
+  boundary: AgentNativeForkBoundary,
+): void {
+  if (agentId === 'agy') {
+    if (
+      boundary.provider !== 'agy' ||
+      !boundary.agyCut ||
+      boundary.agyCut.executionId !== boundary.nativeCutId
+    ) {
+      throw new Error(
+        'Antigravity Fork boundaries require provider "agy" and matching agyCut execution metadata.',
+      )
+    }
+    return
+  }
+  if (
+    (boundary.provider !== undefined && boundary.provider !== agentId) ||
+    boundary.agyCut !== undefined
+  ) {
+    throw new Error(`The native Fork boundary provider does not match ${agentId}.`)
+  }
+}
+
+function assertForkWitnessMatchesAgent(
+  agentId: RuntimeAgentId,
+  source: AgentNativeForkBoundary,
+  witness: AgentNativeForkWitness,
+  expectedCandidateId: string | null,
+  requireInitialized = false,
+): void {
+  assertForkBoundaryMatchesAgent(agentId, source)
+  if (
+    witness.nativeSessionId !== expectedCandidateId ||
+    witness.sourceNativeSessionId !== source.nativeSessionId ||
+    witness.sourceCutId !== source.nativeCutId ||
+    witness.sourcePrefixHash !== source.prefixHash ||
+    witness.candidatePrefixHash !== source.prefixHash
+  ) {
+    throw new Error('The native witness does not belong to this source cutoff.')
+  }
+  if (requireInitialized && !witness.initializedAt) {
+    throw new Error(
+      'Native fork identity, cutoff, initialization or settlement has not been confirmed.',
+    )
+  }
+  if (agentId === 'agy') {
+    if (
+      witness.provider !== 'agy' ||
+      !witness.agyCut ||
+      !source.agyCut ||
+      witness.agyCut.executionId !== source.nativeCutId ||
+      witness.agyCut.cutStepIdx !== source.agyCut.cutStepIdx ||
+      witness.cutStepIdx !== witness.agyCut.cutStepIdx ||
+      witness.sourceTrajectoryId !== source.agyCut.trajectoryId ||
+      !witness.candidateTrajectoryId ||
+      (requireInitialized &&
+        (!witness.initializedPrefixHash ||
+          (witness.initializedPrefixRecords !== undefined &&
+            witness.candidatePrefixRecords !== undefined &&
+            witness.initializedPrefixRecords !== witness.candidatePrefixRecords)))
+    ) {
+      throw new Error(
+        'The Antigravity Fork witness does not match its provider, trajectory, prefix hash, or initialization metadata.',
+      )
+    }
+    return
+  }
+  if (
+    (witness.provider !== undefined && witness.provider !== agentId) ||
+    witness.agyCut !== undefined
+  ) {
+    throw new Error(`The native Fork witness provider does not match ${agentId}.`)
+  }
+}
 
 export interface ForkSelection {
   prepared: SessionForkPrepared
-  runs: Record<RuntimeAgentId, RunRow>
+  pair?: [RuntimeAgentId, RuntimeAgentId]
+  runs: Partial<Record<RuntimeAgentId, RunRow>>
 }
 
 /** One explicit cold read, owned by ConversationRepository, never a streaming/Catalog scan. */
@@ -93,6 +179,7 @@ export function selectForkSource(
   expectedSettingsRevision: number,
 ): ForkSelection {
   return database.transaction(() => {
+    const pair = orderedPairMembers(resolveActiveAgentPair(settings))
     const session = database.select().from(sessions).where(eq(sessions.id, sourceSessionId)).get()
     const selected = database
       .select()
@@ -152,8 +239,31 @@ export function selectForkSource(
       .where(eq(nativeAgentContexts.sessionId, sourceSessionId))
       .orderBy(asc(nativeAgentContexts.agentId))
       .all()
+    const ownForkIntents = new Map(
+      database
+        .select({
+          agentId: nativeForkIntents.agentId,
+          state: nativeForkIntents.state,
+          nativeSessionId: nativeForkIntents.nativeSessionId,
+        })
+        .from(sessionForkOperations)
+        .innerJoin(nativeForkIntents, eq(nativeForkIntents.operationId, sessionForkOperations.id))
+        .where(
+          and(
+            eq(sessionForkOperations.sessionId, sourceSessionId),
+            eq(sessionForkOperations.ready, true),
+          ),
+        )
+        .all()
+        .map((row) => [row.agentId, row]),
+    )
     const runs: Partial<Record<RuntimeAgentId, RunRow>> = {}
-    for (const agentId of AGENTS) {
+    for (const agentId of pair) {
+      const ownIntent = ownForkIntents.get(agentId)
+      const allowedForkedSessionId =
+        ownIntent?.state === 'ready' && ownIntent.nativeSessionId
+          ? ownIntent.nativeSessionId
+          : undefined
       const result = database
         .select({ run: agentRuns })
         .from(conversationMessages)
@@ -166,15 +276,24 @@ export function selectForkSource(
             eq(conversationMessages.state, 'complete'),
             eq(conversationMessages.isVisible, true),
             lte(conversationMessages.sequence, selectedSequence),
+            allowedForkedSessionId
+              ? or(
+                  isNull(agentRuns.forkSourceRunId),
+                  eq(agentRuns.nativeSessionId, allowedForkedSessionId),
+                )
+              : isNull(agentRuns.forkSourceRunId),
           ),
         )
         .orderBy(desc(conversationMessages.sequence))
         .limit(1)
         .get()
-      if (!result?.run.nativeSessionId || !result.run.nativeTurnId || !result.run.nativeOutcome)
+      if (!result?.run.nativeSessionId || !result.run.nativeTurnId || !result.run.nativeOutcome) {
+        const label =
+          agentId === 'claude' ? 'Claude' : agentId === 'codex' ? 'Codex' : 'Antigravity'
         throw new Error(
-          `${agentId === 'claude' ? 'Claude' : 'Codex'} has no confirmed native history at this message. Both Agents need native history before a fork can be created.`,
+          `${label} has no confirmed native history at this message. Both Agents need native history before a fork can be created.`,
         )
+      }
       runs[agentId] = result.run
     }
     const sourceRevision = createHash('sha256')
@@ -189,7 +308,8 @@ export function selectForkSource(
       )
       .digest('hex')
     return {
-      runs: { claude: runs.claude!, codex: runs.codex! },
+      pair,
+      runs,
       prepared: {
         sourceSessionId,
         messageId,
@@ -259,7 +379,7 @@ export function commitFork(
   database: PactDrizzleDatabase,
   operationId: string,
   selection: ForkSelection,
-  boundaries: Record<RuntimeAgentId, AgentNativeForkBoundary>,
+  boundaries: Partial<Record<RuntimeAgentId, AgentNativeForkBoundary>>,
   fullConsent: RuntimeAgentId[],
   authorizationForRun?: (runId: string) => CollaborationTurnAuthorization | undefined,
 ): SessionForkOperation {
@@ -328,12 +448,14 @@ export function commitFork(
       ).prepared.sourceRevision !== prepared.sourceRevision
     )
       throw new Error('Source history changed. Review the fork confirmation again.')
-    for (const agentId of AGENTS) {
+    const forkPair = orderedPairMembers(resolveActiveAgentPair(prepared.settings))
+    for (const agentId of forkPair) {
       const mode =
-        prepared.settings.permissionModes?.[agentId] ?? (agentId === 'claude' ? 'ask' : 'native')
+        prepared.settings.permissionModes?.[agentId] ?? (agentId === 'codex' ? 'native' : 'ask')
       if (mode === 'full' && !fullConsent.includes(agentId))
         throw new Error(`Full access for the new ${agentId} session must be explicitly confirmed.`)
-      nativeForkBoundarySchema.parse(boundaries[agentId])
+      const parsedBoundary = nativeForkBoundarySchema.parse(boundaries[agentId])
+      assertForkBoundaryMatchesAgent(agentId, parsedBoundary)
     }
     const sessionId = randomUUID()
     const now = new Date().toISOString()
@@ -1379,7 +1501,7 @@ export function commitFork(
         createdAt: now,
       })
       .run()
-    for (const agentId of AGENTS)
+    for (const agentId of forkPair)
       database
         .insert(nativeForkIntents)
         .values({
@@ -1455,11 +1577,20 @@ export function readFork(
     revision: operation.revision,
     ready:
       operation.ready &&
-      database
-        .select({ count: sql<number>`count(*)` })
-        .from(nativeAgentContexts)
-        .where(eq(nativeAgentContexts.sessionId, sessionId))
-        .get()?.count === 2,
+      sides.length === 2 &&
+      sides.every(
+        (side) =>
+          !!database
+            .select({ agentId: nativeAgentContexts.agentId })
+            .from(nativeAgentContexts)
+            .where(
+              and(
+                eq(nativeAgentContexts.sessionId, sessionId),
+                eq(nativeAgentContexts.agentId, side.agentId),
+              ),
+            )
+            .get(),
+      ),
     sides: sides.map((side) => ({
       agentId: side.agentId,
       state: side.state,
@@ -1607,19 +1738,27 @@ export function updateForkIntent(
       }
     else if (replacingIdentity && !patch.witnessJson)
       patch = { ...patch, witnessJson: null, candidateVerified: false }
-    if (patch.witnessJson) {
-      if (Buffer.byteLength(patch.witnessJson) > 1024 * 1024)
-        throw new Error('The native fork witness is oversized.')
-      const witness = nativeForkWitnessSchema.parse(JSON.parse(patch.witnessJson))
-      const source = nativeForkBoundarySchema.parse(JSON.parse(current.sourceJson))
-      if (
-        witness.nativeSessionId !==
-          (patch.nativeSessionId === undefined ? current.nativeSessionId : patch.nativeSessionId) ||
-        witness.sourceNativeSessionId !== source.nativeSessionId ||
-        witness.sourceCutId !== source.nativeCutId ||
-        witness.sourcePrefixHash !== source.prefixHash
+    const nextState = patch.state ?? current.state
+    const effectiveWitnessJson =
+      patch.witnessJson === undefined ? current.witnessJson : patch.witnessJson
+    if (nextState === 'ready' && !effectiveWitnessJson) {
+      throw new Error(
+        'Native fork identity, cutoff, initialization or settlement has not been confirmed.',
       )
-        throw new Error('The native witness does not belong to this source cutoff.')
+    }
+    if (patch.witnessJson || nextState === 'ready') {
+      const rawJson = effectiveWitnessJson!
+      if (Buffer.byteLength(rawJson) > 1024 * 1024)
+        throw new Error('The native fork witness is oversized.')
+      const witness = nativeForkWitnessSchema.parse(JSON.parse(rawJson))
+      const source = nativeForkBoundarySchema.parse(JSON.parse(current.sourceJson))
+      assertForkWitnessMatchesAgent(
+        agentId,
+        source,
+        witness,
+        patch.nativeSessionId === undefined ? current.nativeSessionId : patch.nativeSessionId,
+        nextState === 'ready',
+      )
     }
     database
       .update(nativeForkIntents)
@@ -1694,16 +1833,13 @@ export function completeForkSide(
     const validated = nativeForkWitnessSchema.parse(witness)
     if (
       nativeSessionId !== intent.nativeSessionId ||
-      validated.nativeSessionId !== nativeSessionId ||
-      validated.sourceNativeSessionId !== intent.source.nativeSessionId ||
-      validated.sourceCutId !== intent.source.nativeCutId ||
-      validated.sourcePrefixHash !== intent.source.prefixHash ||
       !validated.initializedAt ||
       intent.nativeWorkState !== 'settled'
     )
       throw new Error(
         'Native fork identity, cutoff, initialization or settlement has not been confirmed.',
       )
+    assertForkWitnessMatchesAgent(agentId, intent.source, validated, intent.nativeSessionId, true)
     const map = new Map(validated.idMap)
     const inherited = database
       .select({
@@ -1736,12 +1872,12 @@ export function completeForkSide(
           nativeInputIds.length > 64 ||
           new Set(nativeInputIds).size !== nativeInputIds.length ||
           nativeInputIds.some((id) => typeof id !== 'string' || !id || id.length > 1024) ||
-          (nativeInputIds.length > 0 && nativeInputIds[0] !== run.turnId)
+          (nativeInputIds.length > 0 && agentId === 'claude' && nativeInputIds[0] !== run.turnId)
         )
           throw new Error('The inherited native input identities are incomplete or invalid.')
         const mappedInputIds = nativeInputIds.map((id) => {
           // Codex preserves opaque Turn/client-message identities verbatim; its
-          // witness maps Turn boundaries only. Claude remaps native message UUIDs.
+          // witness maps Turn boundaries only. Claude and Antigravity remap native input/step IDs.
           const mapped = map.get(String(id)) ?? (agentId === 'codex' ? String(id) : undefined)
           if (!mapped)
             throw new Error('The native Fork omitted a consumed input from its identity map.')
@@ -1808,7 +1944,18 @@ export function forkBlocksInput(database: PactDrizzleDatabase, sessionId: string
     .where(
       and(
         eq(sessionForkOperations.sessionId, sessionId),
-        sql`(${sessionForkOperations.ready}=0 OR (SELECT count(*) FROM ${nativeAgentContexts} c WHERE c.session_id=${sessionForkOperations.sessionId})<>2)`,
+        sql`(
+          ${sessionForkOperations.ready}=0
+          OR (SELECT count(*) FROM ${nativeAgentContexts} c WHERE c.session_id=${sessionForkOperations.sessionId})<2
+          OR EXISTS (
+            SELECT 1 FROM ${nativeForkIntents} i
+            WHERE i.operation_id=${sessionForkOperations.id}
+              AND NOT EXISTS (
+                SELECT 1 FROM ${nativeAgentContexts} c
+                WHERE c.session_id=${sessionForkOperations.sessionId} AND c.agent_id=i.agent_id
+              )
+          )
+        )`,
       ),
     )
     .limit(1)

@@ -46,9 +46,11 @@ async function seedParentSession(
       { id: sessionId, projectId, title: sessionTitle, createdAt },
       {
         primaryAgentId: 'codex',
+        secondaryAgentId: 'claude',
         agents: {
           claude: { model: null, effort: null },
           codex: { model: null, effort: null },
+          agy: { model: null, effort: null },
         },
         maxDiscussionRounds: 6,
         maxReviewCycles: 3,
@@ -595,9 +597,11 @@ test(
       await expect(recipients).toBeVisible()
       const optionTexts = await recipients.getByRole('option').allInnerTexts()
       const claudeIndex = optionTexts.findIndex((text) => text.includes('@claude'))
+      const allIndex = optionTexts.findIndex((text) => text.includes('@all'))
       const mainIndex = optionTexts.findIndex((text) => text.includes('@Main'))
       expect(claudeIndex).toBeGreaterThanOrEqual(0)
-      expect(mainIndex).toBe(claudeIndex + 1)
+      expect(allIndex).toBe(claudeIndex + 1)
+      expect(mainIndex).toBe(allIndex + 1)
 
       const claudeOption = recipients.getByRole('option', { name: /^Claude Code/u })
       const mainOption = recipients.getByRole('option', { name: /^Main chat/u })

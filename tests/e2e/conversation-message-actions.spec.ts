@@ -37,9 +37,11 @@ test('renders Pact command badges from saved user messages', { tag: '@ui' }, asy
         { id: sessionId, projectId, title: 'Pact message badges', createdAt },
         {
           primaryAgentId: 'codex',
+          secondaryAgentId: 'claude',
           agents: {
             claude: { model: null, effort: null },
             codex: { model: null, effort: null },
+            agy: { model: null, effort: null },
           },
           maxDiscussionRounds: 6,
           maxReviewCycles: 3,
@@ -117,9 +119,11 @@ test(
           { id: sessionId, projectId, title: 'Message actions preview', createdAt },
           {
             primaryAgentId: 'codex',
+            secondaryAgentId: 'claude',
             agents: {
               claude: { model: null, effort: null },
               codex: { model: null, effort: null },
+              agy: { model: null, effort: null },
             },
             maxDiscussionRounds: 6,
             maxReviewCycles: 3,

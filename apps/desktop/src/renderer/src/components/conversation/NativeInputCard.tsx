@@ -11,12 +11,13 @@ import {
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 
-import type {
-  NativeInputField,
-  NativeInputRespond,
-  NativeInputValues,
-  NativePermissionRequest,
-  RuntimeAgentId,
+import {
+  agentDisplayName,
+  type NativeInputField,
+  type NativeInputRespond,
+  type NativeInputValues,
+  type NativePermissionRequest,
+  type RuntimeAgentId,
 } from '@pact/contracts'
 
 import type { NativeInputDraft } from './useConversation'
@@ -55,7 +56,7 @@ export function NativeInputCard({
   const [actionError, setError] = useState<string>()
   const error = actionError ?? reader.error
   const identity = { operationId: request.operationId!, requestId: request.id }
-  const agentName = agentId === 'codex' ? 'Codex' : 'Claude Code'
+  const agentName = agentDisplayName(agentId)
   const heading = `${agentName} needs ${request.kind === 'url' ? 'authorization' : 'your input'}`
   const load = (): void => {
     setError(undefined)

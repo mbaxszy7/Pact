@@ -4,6 +4,7 @@ import { setImmediate as immediate } from 'node:timers/promises'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
+  collaborationSourceAnyReadSchema,
   collaborationSourceReadSchema,
   type CollaborationSourceReadResult,
   type CollaborationTask,
@@ -970,4 +971,399 @@ describe('workflow tool root capabilities', () => {
       expect((await workflowCall(`${url}/${current}`, name, args)).isError).toBe(false)
     },
   )
+
+  it.each(['agy', 'claude', 'codex'] as const)(
+    'binds dynamic request_peer_assistance target enum [%s] and rejects inactive 3rd-agent targets',
+    async (expectedTarget) => {
+      const server = new PactPeerToolServer()
+      servers.push(server)
+      const url = await server.start()
+      const receipt = server.beginTurn(expectedTarget, true)
+      const listRes: unknown = await fetch(url, {
+        method: 'POST',
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+      }).then((r) => r.json())
+      const resultObj =
+        typeof listRes === 'object' && listRes !== null ? Reflect.get(listRes, 'result') : undefined
+      const rawTools =
+        typeof resultObj === 'object' && resultObj !== null
+          ? Reflect.get(resultObj, 'tools')
+          : undefined
+      const tools = Array.isArray(rawTools) ? rawTools : []
+      const peerTool: unknown = tools.find(
+        (t): t is Record<string, unknown> =>
+          typeof t === 'object' &&
+          t !== null &&
+          Reflect.get(t, 'name') === 'request_peer_assistance',
+      )
+      const schemaObj =
+        typeof peerTool === 'object' && peerTool !== null
+          ? Reflect.get(peerTool, 'inputSchema')
+          : undefined
+      const propsObj =
+        typeof schemaObj === 'object' && schemaObj !== null
+          ? Reflect.get(schemaObj, 'properties')
+          : undefined
+      const targetProp =
+        typeof propsObj === 'object' && propsObj !== null
+          ? Reflect.get(propsObj, 'target')
+          : undefined
+      const targetEnum =
+        typeof targetProp === 'object' && targetProp !== null
+          ? Reflect.get(targetProp, 'enum')
+          : undefined
+      expect(targetEnum).toEqual([expectedTarget])
+
+      const otherTargets = (['agy', 'claude', 'codex'] as const).filter((a) => a !== expectedTarget)
+      for (const badTarget of otherTargets) {
+        // oxlint-disable-next-line no-await-in-loop -- Sequential tool call validation per inactive target.
+        const rejected = await workflowCall(url, 'request_peer_assistance', {
+          target: badTarget,
+          kind: 'review',
+        })
+        expect(rejected.isError).toBe(true)
+        expect(server.acceptCompleted({ target: badTarget, kind: 'review' }, receipt)).toBe(false)
+      }
+
+      const accepted = await workflowCall(url, 'request_peer_assistance', {
+        target: expectedTarget,
+        kind: 'review',
+      })
+      expect(accepted.isError).toBe(false)
+      expect(server.acceptCompleted({ target: expectedTarget, kind: 'review' }, receipt)).toBe(true)
+    },
+  )
+
+  it('supports all 4 cutoff source parts (catalog, message, comments, comment) over read_collaboration_source', async () => {
+    const server = new PactPeerToolServer()
+    servers.push(server)
+    const url = await server.start()
+    const owner = { runId: randomUUID(), grant: randomUUID() }
+    const cutoffId = randomUUID()
+    const messageId = randomUUID()
+    const commentId = randomUUID()
+    server.beginTurn(
+      'agy',
+      false,
+      undefined,
+      false,
+      (raw) => {
+        const parsed = collaborationSourceAnyReadSchema.parse(raw)
+        if (parsed.source !== 'cutoff') throw new Error('Expected cutoff source')
+        return {
+          source: 'cutoff',
+          offset: parsed.offset,
+          nextOffset: null,
+          text: JSON.stringify({ part: parsed.part }),
+        }
+      },
+      owner,
+    )
+
+    const requests = [
+      { ...owner, source: 'cutoff', cutoffId, part: 'catalog', offset: 0 },
+      { ...owner, source: 'cutoff', cutoffId, part: 'message', messageId, offset: 0 },
+      { ...owner, source: 'cutoff', cutoffId, part: 'comments', messageId, offset: 0 },
+      { ...owner, source: 'cutoff', cutoffId, part: 'comment', commentId, offset: 0 },
+    ]
+    for (const req of requests) {
+      // oxlint-disable-next-line no-await-in-loop -- Verify each cutoff part sequentially.
+      const res = await callSource(url, req)
+      expect(res.value).toMatchObject({
+        result: {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                source: 'cutoff',
+                text: JSON.stringify({ part: req.part }),
+                offset: 0,
+                nextOffset: null,
+              }),
+            },
+          ],
+        },
+      })
+    }
+  })
+
+  it('enforces 4-way Antigravity root authentication, stage-filtered tools/list, exact progressToken confirmation, and immediate endTurn sourceGrant revocation', async () => {
+    const server = new PactPeerToolServer()
+    servers.push(server)
+    const url = await server.start()
+    const owner = { runId: randomUUID(), grant: randomUUID() }
+    const planTask = workflowTask({ stage: 'plan', owner: 'agy', reviewer: 'codex', actor: 'agy' })
+    let current = true
+    const receipt = server.beginTurn(
+      'codex',
+      false,
+      planTask,
+      true,
+      (raw) => {
+        const parsed = collaborationSourceAnyReadSchema.parse(raw)
+        return { source: parsed.source, offset: parsed.offset, nextOffset: null, text: '[]' }
+      },
+      owner,
+      undefined,
+      planTask.authorization,
+    )
+    server.bindAgyNativeRoot(
+      owner,
+      {
+        executorId: 'agy-exec-1',
+        bindingGeneration: 1,
+        nativeSessionId: 'sid-agy-root',
+        trajectoryId: 'traj-root-1',
+      },
+      () => current,
+    )
+
+    // Stage-filtered tools/list in Phase-1 plan mode: exposes read_collaboration_source & publish_session_title, NEVER publish_plan or swap_code_roles!
+    const listRes: unknown = await fetch(`${url}/${receipt}`, {
+      method: 'POST',
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+    }).then((r) => r.json())
+    const listResult =
+      typeof listRes === 'object' && listRes !== null ? Reflect.get(listRes, 'result') : undefined
+    const rawListTools =
+      typeof listResult === 'object' && listResult !== null
+        ? Reflect.get(listResult, 'tools')
+        : undefined
+    const toolNames = (Array.isArray(rawListTools) ? rawListTools : []).flatMap((t) =>
+      typeof t === 'object' && t !== null && typeof Reflect.get(t, 'name') === 'string'
+        ? [String(Reflect.get(t, 'name'))]
+        : [],
+    )
+    expect(toolNames).toEqual(['read_collaboration_source', 'publish_session_title'])
+    expect(toolNames).not.toContain('publish_plan')
+    expect(toolNames).not.toContain('swap_code_roles')
+
+    const callAgy = async (name: string, args: unknown, meta?: unknown) =>
+      jsonRpcResult(
+        await fetch(`${url}/${receipt}`, {
+          method: 'POST',
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: 2,
+            method: 'tools/call',
+            params: { name, arguments: args, ...(meta !== undefined ? { _meta: meta } : {}) },
+          }),
+        }).then((r) => r.json()),
+      )
+
+    // 1. Subagent sharing root_conversation_id MUST be rejected!
+    expect(
+      (
+        await callAgy(
+          'publish_session_title',
+          { title: 'Subagent spoof' },
+          {
+            'antigravity.google/root_conversation_id': 'sid-agy-root',
+            'antigravity.google/conversation_id': 'subagent-child-1',
+            progressToken: 'traj-root-1:0',
+          },
+        )
+      ).result.isError,
+    ).toBe(true)
+
+    // 2. Missing conversation_id MUST be rejected!
+    expect(
+      (
+        await callAgy(
+          'publish_session_title',
+          { title: 'Missing conv' },
+          {
+            'antigravity.google/root_conversation_id': 'sid-agy-root',
+            progressToken: 'traj-root-1:1',
+          },
+        )
+      ).result.isError,
+    ).toBe(true)
+
+    // 3. Wrong trajectoryId in progressToken MUST be rejected!
+    expect(
+      (
+        await callAgy(
+          'publish_session_title',
+          { title: 'Wrong trajectory' },
+          {
+            'antigravity.google/root_conversation_id': 'sid-agy-root',
+            'antigravity.google/conversation_id': 'sid-agy-root',
+            progressToken: 'foreign-traj:2',
+          },
+        )
+      ).result.isError,
+    ).toBe(true)
+
+    // 4. Valid 4-tuple stages outcome, refuses mismatched progressToken fallback, and admits ONLY after exact confirmAgyToolCallCompleted!
+    const validTitleCall = await callAgy(
+      'publish_session_title',
+      { title: 'Verified Agy Title' },
+      {
+        'antigravity.google/root_conversation_id': 'sid-agy-root',
+        'antigravity.google/conversation_id': 'sid-agy-root',
+        progressToken: 'traj-root-1:3',
+      },
+    )
+    expect(validTitleCall.result.isError).toBe(false)
+    expect(server.acceptSessionTitle({ title: 'Verified Agy Title' }, receipt)).toBeUndefined()
+    expect(server.confirmAgyToolCallCompleted('traj-root-1:999', receipt)).toBe(false)
+    expect(server.acceptSessionTitle({ title: 'Verified Agy Title' }, receipt)).toBeUndefined()
+    expect(server.confirmAgyToolCallCompleted('traj-root-1:3', receipt)).toBe(true)
+    expect(server.acceptSessionTitle({ title: 'Verified Agy Title' }, receipt)).toBe(
+      'Verified Agy Title',
+    )
+
+    // 5. Valid source read succeeds during active Turn, and endTurn immediately revokes sourceGrant!
+    const validRead: unknown = await fetch(`${url}/${receipt}`, {
+      method: 'POST',
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 3,
+        method: 'tools/call',
+        params: {
+          name: 'read_collaboration_source',
+          arguments: { ...owner, source: 'inputs', offset: 0 },
+          _meta: {
+            'antigravity.google/root_conversation_id': 'sid-agy-root',
+            'antigravity.google/conversation_id': 'sid-agy-root',
+            progressToken: 'traj-root-1:4',
+          },
+        },
+      }),
+    }).then((r) => r.json())
+    const validReadResult =
+      typeof validRead === 'object' && validRead !== null
+        ? Reflect.get(validRead, 'result')
+        : undefined
+    expect(
+      typeof validReadResult === 'object' && validReadResult !== null
+        ? Reflect.get(validReadResult, 'isError')
+        : undefined,
+    ).toBeUndefined()
+
+    server.endTurn(receipt)
+    expect(server.hasSourceGrant()).toBe(false)
+    current = false
+  })
+
+  it('rejects stale roots, legacy-only conversation_id, unformatted progressTokens, and unconfirmed peer proposals on Antigravity turns', async () => {
+    const server = new PactPeerToolServer()
+    servers.push(server)
+    server.setExpectedTarget('codex')
+    const url = await server.start()
+    const owner = { runId: randomUUID(), grant: randomUUID() }
+    let current = true
+    const receipt = server.beginTurn('codex', true, undefined, true, undefined, owner)
+    server.bindAgyNativeRoot(
+      owner,
+      {
+        executorId: 'agy-exec-2',
+        bindingGeneration: 2,
+        nativeSessionId: 'sid-agy-current',
+        trajectoryId: 'traj-current-2',
+      },
+      () => current,
+    )
+
+    const callTool = async (name: string, args: unknown, meta?: unknown) =>
+      jsonRpcResult(
+        await fetch(`${url}/${receipt}`, {
+          method: 'POST',
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: 10,
+            method: 'tools/call',
+            params: { name, arguments: args, ...(meta !== undefined ? { _meta: meta } : {}) },
+          }),
+        }).then((r) => r.json()),
+      )
+
+    // 1. Stale root_conversation_id rejected
+    expect(
+      (
+        await callTool(
+          'request_peer_assistance',
+          { target: 'codex', kind: 'review', reason: 'Stale root' },
+          {
+            'antigravity.google/root_conversation_id': 'sid-agy-stale',
+            'antigravity.google/conversation_id': 'sid-agy-stale',
+            progressToken: 'traj-current-2:0',
+          },
+        )
+      ).result.isError,
+    ).toBe(true)
+
+    // 2. Legacy conversation_id without antigravity.google/conversation_id rejected
+    expect(
+      (
+        await callTool(
+          'request_peer_assistance',
+          { target: 'codex', kind: 'review', reason: 'Legacy meta only' },
+          {
+            'antigravity.google/root_conversation_id': 'sid-agy-current',
+            conversation_id: 'sid-agy-current',
+            progressToken: 'traj-current-2:1',
+          },
+        )
+      ).result.isError,
+    ).toBe(true)
+
+    // 3. Unformatted progressToken (missing :<stepIndex>) rejected
+    expect(
+      (
+        await callTool(
+          'request_peer_assistance',
+          { target: 'codex', kind: 'review', reason: 'Unformatted token' },
+          {
+            'antigravity.google/root_conversation_id': 'sid-agy-current',
+            'antigravity.google/conversation_id': 'sid-agy-current',
+            progressToken: 'traj-current-2',
+          },
+        )
+      ).result.isError,
+    ).toBe(true)
+
+    // 4. Valid 4-tuple stages peer proposal, but missing completion token withholds acceptance
+    const stagedPeer = await callTool(
+      'request_peer_assistance',
+      { target: 'codex', kind: 'challenge', reason: 'Check concurrency invariants' },
+      {
+        'antigravity.google/root_conversation_id': 'sid-agy-current',
+        'antigravity.google/conversation_id': 'sid-agy-current',
+        progressToken: 'traj-current-2:5',
+      },
+    )
+    expect(stagedPeer.result.isError).toBe(false)
+    expect(
+      server.acceptCompleted(
+        { target: 'codex', kind: 'challenge', reason: 'Check concurrency invariants' },
+        receipt,
+      ),
+    ).toBe(false)
+    expect(server.confirmAgyToolCallCompleted('traj-current-2:5', receipt)).toBe(true)
+    expect(
+      server.acceptCompleted(
+        { target: 'codex', kind: 'challenge', reason: 'Check concurrency invariants' },
+        receipt,
+      ),
+    ).toBe(true)
+
+    // 5. Once root current() flips false, subsequent calls are rejected immediately
+    current = false
+    expect(
+      (
+        await callTool(
+          'publish_session_title',
+          { title: 'Late title' },
+          {
+            'antigravity.google/root_conversation_id': 'sid-agy-current',
+            'antigravity.google/conversation_id': 'sid-agy-current',
+            progressToken: 'traj-current-2:6',
+          },
+        )
+      ).result.isError,
+    ).toBe(true)
+    server.endTurn(receipt)
+  })
 })

@@ -11,7 +11,7 @@ import {
 } from 'lucide-react'
 import { useEffect, useId, useRef, useState, type KeyboardEvent } from 'react'
 
-import type { ConversationQueueState, RuntimeAgentId } from '@pact/contracts'
+import { agentDisplayName, type ConversationQueueState, type RuntimeAgentId } from '@pact/contracts'
 
 interface QueueMessageBarProps {
   queue: ConversationQueueState
@@ -124,18 +124,13 @@ export function QueueMessageBar({
       </div>
     ) : null
   }
-  const name =
-    entry.recipient === 'all'
-      ? 'All Agents'
-      : entry.recipient === 'claude'
-        ? 'Claude Code'
-        : 'Codex'
+  const name = entry.recipient === 'all' ? 'All Agents' : agentDisplayName(entry.recipient)
   const agentMismatchReason =
     respondingAgentId &&
     entry.recipient !== 'all' &&
     entry.recipient !== respondingAgentId &&
     !entry.workflowCommand
-      ? `${respondingAgentId === 'claude' ? 'Claude Code' : 'Codex'} is replying right now, so this message for ${name} can’t be steered.`
+      ? `${agentDisplayName(respondingAgentId)} is replying right now, so this message for ${name} can’t be steered.`
       : undefined
   const steerInfoId = `queue-steer-info-${id}`
   const stoppingBackground = backgroundStatus === 'stopping'
@@ -285,7 +280,7 @@ export function QueueMessageBar({
           <span>
             {replacementWait ? (
               <>
-                {`Waiting for ${replacementWait.actor === 'claude' ? 'Claude Code' : 'Codex'}'s current response.`}
+                {`Waiting for ${agentDisplayName(replacementWait.actor)}'s current response.`}
                 <br />
                 {`Then start this task instead of continuing /${replacementWait.kind}.`}
               </>

@@ -34,6 +34,9 @@ import {
   initialTaskRoleCandidates,
   initialTaskRoleCandidateSchema,
   initialTaskRoleCandidateIdSchema,
+  pactEntryPrimary,
+  pactSessionEntryPrimary,
+  resolveLegacyCompatibleTaskStageRoles,
   taskStageRolesSchema,
   collaborationInitialStage,
   collaborationViewSchema,
@@ -1618,5 +1621,184 @@ describe('explicit initial stage roles', () => {
     expect(collaborationInitialStage('plan')).toBe('plan')
     expect(collaborationInitialStage('build')).toBe('implement')
     expect(collaborationInitialStage('review')).toBe('code_review')
+  })
+})
+
+describe('2-of-3 active agent pair invariants', () => {
+  const allPairs = [
+    ['claude', 'codex'],
+    ['codex', 'claude'],
+    ['claude', 'agy'],
+    ['agy', 'claude'],
+    ['codex', 'agy'],
+    ['agy', 'codex'],
+  ] as const
+
+  it.each(allPairs)(
+    'restricts roles, entry primary, and initial role candidates strictly to (%s, %s)',
+    (primary, secondary) => {
+      const inactive = (['claude', 'codex', 'agy'] as const).find(
+        (id) => id !== primary && id !== secondary,
+      )!
+      const defaultRoles = defaultTaskStageRoles(primary, secondary)
+      expect(taskStageRolesSchema.parse(defaultRoles)).toEqual(defaultRoles)
+      expect(
+        new Set([
+          defaultRoles.planAuthor,
+          defaultRoles.planReviewer,
+          defaultRoles.codeAuthor,
+          defaultRoles.codeReviewer,
+        ]),
+      ).toEqual(new Set([primary, secondary]))
+
+      for (const kind of ['plan', 'build', 'review'] as const) {
+        const pair = [primary, secondary] as const
+        expect(pactSessionEntryPrimary(kind, pair)).toBe(primary)
+        expect(pactSessionEntryPrimary(kind, pair, primary)).toBe(
+          kind === 'build' ? secondary : primary,
+        )
+        expect(pactSessionEntryPrimary(kind, pair, secondary)).toBe(
+          kind === 'build' ? primary : secondary,
+        )
+        expect(pactSessionEntryPrimary(kind, pair, primary)).toBe(
+          pactEntryPrimary(kind, primary, primary, secondary),
+        )
+        expect(pactSessionEntryPrimary(kind, pair, secondary)).toBe(
+          pactEntryPrimary(kind, primary, secondary, secondary),
+        )
+        expect(() => pactSessionEntryPrimary(kind, pair, inactive)).toThrow(/not a member/)
+
+        const candidates = initialTaskRoleCandidates(kind, primary, secondary)
+        expect(candidates.length).toBe(kind === 'plan' ? 3 : 1)
+        for (const candidate of candidates) {
+          expect(initialTaskRoleCandidateSchema.parse(candidate)).toEqual(candidate)
+          const members = [
+            candidate.roles.planAuthor,
+            candidate.roles.planReviewer,
+            candidate.roles.codeAuthor,
+            candidate.roles.codeReviewer,
+          ]
+          expect(members).not.toContain(inactive)
+          expect(new Set(members)).toEqual(new Set([primary, secondary]))
+        }
+      }
+
+      const assigned = task({
+        owner: primary,
+        reviewer: secondary,
+        actor: defaultRoles.planAuthor,
+        rolePolicy: 'split-stages-v1',
+        stageRoles: defaultRoles,
+      })
+      expect(collaborationTaskSchema.parse(assigned)).toEqual(assigned)
+
+      // Reject 3-agent span in stageRoles or auxiliary task actors
+      expect(
+        taskStageRolesSchema.safeParse({
+          ...defaultRoles,
+          codeAuthor: inactive,
+          codeReviewer: primary,
+        }).success,
+      ).toBe(false)
+      expect(
+        collaborationTaskSchema.safeParse({
+          ...assigned,
+          stageRoles: {
+            ...defaultRoles,
+            codeAuthor: primary,
+            codeReviewer: inactive,
+          },
+        }).success,
+      ).toBe(false)
+      expect(
+        collaborationTaskSchema.safeParse({
+          ...assigned,
+          actor: inactive,
+        }).success,
+      ).toBe(false)
+      expect(
+        collaborationTaskSchema.safeParse({
+          ...assigned,
+          lastCodeActor: inactive,
+        }).success,
+      ).toBe(false)
+
+      const customRoles = {
+        ...defaultRoles,
+        revision: 2,
+        codeAuthor: primary,
+        codeReviewer: secondary,
+      }
+      expect(
+        resolveLegacyCompatibleTaskStageRoles({
+          owner: primary,
+          reviewer: secondary,
+          stageRoles: customRoles,
+        }),
+      ).toEqual(customRoles)
+      expect(
+        resolveLegacyCompatibleTaskStageRoles({
+          owner: primary,
+          reviewer: secondary,
+        }),
+      ).toEqual(defaultRoles)
+    },
+  )
+
+  it('resolves legacy pre-stageRoles tasks where owner === reviewer for claude/codex while defaultTaskStageRoles rejects identical pairs', () => {
+    expect(resolveLegacyCompatibleTaskStageRoles({ owner: 'claude', reviewer: 'claude' })).toEqual({
+      version: 'task-stage-roles-v1',
+      revision: 0,
+      planAuthor: 'claude',
+      planReviewer: 'codex',
+      codeAuthor: 'codex',
+      codeReviewer: 'claude',
+    })
+    expect(resolveLegacyCompatibleTaskStageRoles({ owner: 'codex', reviewer: 'codex' })).toEqual({
+      version: 'task-stage-roles-v1',
+      revision: 0,
+      planAuthor: 'codex',
+      planReviewer: 'claude',
+      codeAuthor: 'claude',
+      codeReviewer: 'codex',
+    })
+    expect(() => resolveLegacyCompatibleTaskStageRoles({ owner: 'agy', reviewer: 'agy' })).toThrow(
+      /explicit 2-member Agent pair/,
+    )
+    expect(() => defaultTaskStageRoles('claude', 'claude')).toThrow(/must be distinct/)
+    expect(() => defaultTaskStageRoles('codex', 'codex')).toThrow(/must be distinct/)
+    expect(() => defaultTaskStageRoles('agy', 'agy')).toThrow(/must be distinct/)
+  })
+
+  it('advances workflow and open-mode collaboration cleanly for (claude, agy) and (codex, agy) pairs', () => {
+    for (const [owner, reviewer] of [
+      ['claude', 'agy'],
+      ['agy', 'codex'],
+    ] as const) {
+      const roles = defaultTaskStageRoles(owner, reviewer)
+      const baseReady = accepted()
+      const ready = collaborationTaskSchema.parse({
+        ...baseReady,
+        owner,
+        reviewer,
+        actor: roles.planReviewer,
+        rolePolicy: 'split-stages-v1',
+        stageRoles: roles,
+        review: {
+          ...baseReady.review!,
+          actor: roles.planReviewer,
+        },
+      })
+      const implementing = advanceCollaboration(ready, 'execute', limits)
+      expect(implementing.actor).toBe(roles.codeAuthor)
+      expect(implementing.openMode).toBe(true)
+      const settledImpl = settleCollaborationStage(implementing, {
+        kind: 'work',
+        authorization: turnAuthorization(implementing, 'implement', { runId: implementing.runId }),
+      })
+      const reviewing = advanceCollaboration(settledImpl, 'review_code', limits)
+      expect(reviewing.actor).toBe(roles.codeReviewer)
+      expect(reviewing.stage).toBe('code_review')
+    }
   })
 })

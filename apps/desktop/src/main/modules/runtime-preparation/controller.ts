@@ -1,6 +1,11 @@
 import { dialog, type BrowserWindow, type Dialog, type OpenDialogOptions } from 'electron'
 
-import type { RpcResult, RuntimeAgentId, RuntimePreparation } from '@pact/contracts'
+import {
+  agentDisplayName,
+  type RpcResult,
+  type RuntimeAgentId,
+  type RuntimePreparation,
+} from '@pact/contracts'
 
 import type { UtilityProcessClient } from '../../utility-process/client'
 
@@ -39,7 +44,7 @@ class ElectronRuntimePreparationController implements RuntimePreparationControll
 
   private executableDialogOptions(agentId: RuntimeAgentId): OpenDialogOptions {
     return {
-      title: `Choose ${agentId === 'claude' ? 'Claude Code' : 'Codex'} executable`,
+      title: `Choose ${agentDisplayName(agentId)} executable`,
       properties: ['openFile'],
       ...(this.platform === 'win32'
         ? { filters: [{ name: 'Executable', extensions: ['exe', 'cmd'] }] }

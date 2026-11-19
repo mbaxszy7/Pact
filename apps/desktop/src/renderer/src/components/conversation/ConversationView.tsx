@@ -57,10 +57,12 @@ import type { SkillSelection } from '@pact/contracts'
 import type { ConversationImage } from '@pact/contracts/images'
 
 import {
+  agentDisplayName,
   compareConversationDisplayOrder,
   conversationMessageOrder,
   isConversationBackgroundReport,
   otherAgent,
+  resolveActiveAgentPair,
   CONVERSATION_MARKDOWN_BYTES,
   parseComposerCommandPrefix,
   CONVERSATION_WINDOW_MESSAGES,
@@ -71,7 +73,8 @@ import {
   collaborationInputProcessing,
   defaultTaskStageRoles,
   isCollaborationOpenMode,
-  pactEntryPrimary,
+  pactSessionEntryPrimary,
+  resolveLegacyCompatibleTaskStageRoles,
   validateSideChatMainSyncContent,
 } from '@pact/contracts'
 
@@ -222,6 +225,8 @@ interface ConversationViewProps {
   sending: boolean
   stopping: boolean
   agentActionsEnabled: boolean
+  mainSyncEnabled?: boolean | undefined
+  sideChatSettingsState?: 'loading' | 'error' | undefined
   error?: string | undefined
   onSend: ConversationFlow['send']
   onSaveCommentDraft: ConversationFlow['saveCommentDraft']
@@ -277,7 +282,9 @@ const messageDateTimeFormatter = new Intl.DateTimeFormat(undefined, {
 const TRANSCRIPT_OVERSCAN = 4
 const CONVERSATION_WIDTH = 'w-full max-w-[clamp(56rem,82cqw,80rem)]'
 const OLDER_HISTORY_SCROLL_THRESHOLD = 160
-const agentName = (id: 'claude' | 'codex'): string => (id === 'claude' ? 'Claude Code' : 'Codex')
+const agentName = (id: RuntimeAgentId): string => agentDisplayName(id)
+const speakerBgClass = (id: RuntimeAgentId | undefined): string =>
+  id === 'claude' ? 'bg-speaker-claude' : id === 'agy' ? 'bg-speaker-agy' : 'bg-speaker-codex'
 
 function hasVisibleChanges(run: AgentRun | undefined): boolean {
   return Boolean(
@@ -295,60 +302,63 @@ interface MentionQuery {
   end: number
   query: string
 }
-const mentionOptions = [
-  {
-    token: '@codex' as const,
-    label: 'Codex',
-    description: 'Send only to Codex',
-    route: { type: 'agent', agentId: 'codex' } as const,
-    icon: Bot,
-  },
-  {
-    token: '@claude' as const,
-    label: 'Claude Code',
-    description: 'Send only to Claude Code',
-    route: { type: 'agent', agentId: 'claude' } as const,
-    icon: Bot,
-  },
-  {
-    token: '@all' as const,
-    label: 'All',
-    description: 'Primary, then Secondary',
-    route: { type: 'all' } as const,
-    icon: Users,
-  },
-]
+interface MentionOption {
+  token: '@claude' | '@codex' | '@agy' | '@all' | '@Main'
+  label: string
+  description: string
+  route: ConversationComposerMention['route']
+  icon: typeof Bot
+}
 
-const sideChatMentionOptions = [
-  {
-    token: '@codex' as const,
-    label: 'Codex',
-    description: 'Send only to Codex',
-    route: { type: 'agent', agentId: 'codex' } as const,
+function agentMentionOption(agentId: RuntimeAgentId): MentionOption {
+  const label = agentDisplayName(agentId)
+  const token = agentId === 'claude' ? '@claude' : agentId === 'codex' ? '@codex' : '@agy'
+  return {
+    token,
+    label,
+    description: `Send only to ${label}`,
+    route: { type: 'agent', agentId },
     icon: Bot,
-  },
-  {
-    token: '@claude' as const,
-    label: 'Claude Code',
-    description: 'Send only to Claude Code',
-    route: { type: 'agent', agentId: 'claude' } as const,
-    icon: Bot,
-  },
-  {
-    token: '@Main' as const,
-    label: 'Main chat',
-    description: 'Send to the main chat',
-    route: { type: 'main' } as const,
-    icon: CornerUpLeft,
-  },
-  {
-    token: '@all' as const,
-    label: 'All Agents',
-    description: 'Primary, then Secondary',
-    route: { type: 'all' } as const,
-    icon: Users,
-  },
-]
+  }
+}
+
+function buildMentionOptions(
+  pair: readonly [RuntimeAgentId, RuntimeAgentId],
+  isSideChat: boolean,
+): MentionOption[] {
+  const [first, second] = pair
+  if (isSideChat) {
+    return [
+      agentMentionOption(first),
+      agentMentionOption(second),
+      {
+        token: '@all',
+        label: 'All Agents',
+        description: 'Primary, then Secondary',
+        route: { type: 'all' },
+        icon: Users,
+      },
+      {
+        token: '@Main',
+        label: 'Main chat',
+        description: 'Send to the main chat',
+        route: { type: 'main' },
+        icon: CornerUpLeft,
+      },
+    ]
+  }
+  return [
+    agentMentionOption(first),
+    agentMentionOption(second),
+    {
+      token: '@all',
+      label: 'All',
+      description: 'Primary, then Secondary',
+      route: { type: 'all' },
+      icon: Users,
+    },
+  ]
+}
 
 function mentionQueryAt(value: string, cursor: number): MentionQuery | undefined {
   const prefix = value.slice(0, cursor)
@@ -412,6 +422,8 @@ export function ConversationView({
   sending,
   stopping: stopRequested,
   agentActionsEnabled,
+  mainSyncEnabled,
+  sideChatSettingsState,
   error,
   onSend,
   onSaveCommentDraft,
@@ -1165,7 +1177,7 @@ export function ConversationView({
   const stopLabel = stopping
     ? 'Stopping…'
     : respondingAgentId
-      ? `Stop ${respondingAgentId === 'claude' ? 'Claude Code' : 'Codex'} response`
+      ? `Stop ${agentName(respondingAgentId)} response`
       : 'Stop background work'
   const requestStop = (): Promise<boolean> => onStop(respondingAgentId ? undefined : backgroundStop)
   const continuationBlocked =
@@ -1190,8 +1202,29 @@ export function ConversationView({
   const [lastMainSync, setLastMainSync] = useState<
     { sideChatId: string; receipt: SideChatSyncMainReceipt } | undefined
   >()
-  const composerDisabled = !agentActionsEnabled || recoveryLocked || Boolean(history.restoringInput)
+  const effectiveMainSyncEnabled = mainSyncEnabled ?? agentActionsEnabled
+  const anyComposerActionEnabled =
+    agentActionsEnabled || (isSideChat && effectiveMainSyncEnabled && Boolean(onSyncToMain))
+  const composerDisabled =
+    !anyComposerActionEnabled || recoveryLocked || Boolean(history.restoringInput)
   const composerContentReady = useMemo(() => composerHasContent(composer), [composer])
+  const composerPrefix = parseComposerCommandPrefix(composer, composerSkills)
+  const isBtwReady = !isSideChat && Boolean(composerPrefix.btw && !composerPrefix.error)
+  const activePair = useMemo(() => resolveActiveAgentPair(session.settings), [session.settings])
+  const resolvedComposerRoute = resolveComposerRoute(
+    {
+      text: composer,
+      skills: composerSkills,
+      mention: composerMention,
+      route: composerRoute,
+      returnedInputOperationId: composerReturnedInputOperationId,
+    },
+    activePair[0],
+    { allowMainRoute: isSideChat, secondaryAgentId: activePair[1] },
+  ).route
+  const isMainRoute = isSideChat && resolvedComposerRoute.type === 'main'
+  const skillComposerDisabled =
+    composerDisabled || inputTakeover || (!agentActionsEnabled && !isMainRoute)
   const skillComposer = useSkillComposer({
     session,
     text: composer,
@@ -1200,13 +1233,12 @@ export function ConversationView({
     mention: composerMention,
     returnedInputOperationId: composerReturnedInputOperationId,
     mainTargetAgentId,
-    disabled: composerDisabled || inputTakeover,
+    disabled: skillComposerDisabled,
   })
   const activeSkillId = skillComposer.query
     ? skillComposer.options[skillComposer.active]?.id
     : undefined
-  const skillMenuOpen =
-    Boolean(skillComposer.query) && visible && !composerDisabled && !inputTakeover
+  const skillMenuOpen = Boolean(skillComposer.query) && visible && !skillComposerDisabled
   const returnedInput = history.window?.view.rebuildInputRecovery
   const queue = snapshot?.queue
   const queueEnabled = queue?.enabled ?? true
@@ -1226,14 +1258,17 @@ export function ConversationView({
     : queuedInput?.recipient === 'all'
       ? 'Messages for all Agents stay queued.'
       : 'Steer is available only for the Agent currently responding.'
-  const commonComposerBlocked =
+  const sharedComposerBlocked =
+    recoveryLocked ||
+    Boolean(history.restoringInput) ||
     choosingImages ||
     composerImages.some((image) => image.status !== 'ready') ||
     Boolean(skillComposer.warning) ||
     skillComposer.checking ||
-    composerDisabled ||
     sending ||
     history.draftsLoading
+  const mainSyncComposerBlocked = !effectiveMainSyncEnabled || sharedComposerBlocked
+  const commonComposerBlocked = !agentActionsEnabled || sharedComposerBlocked
   const disabled =
     commonComposerBlocked ||
     stopping ||
@@ -1251,6 +1286,7 @@ export function ConversationView({
           ['not_dispatched', 'settled'].includes(previousDecisionRun.nativeEffectsState ?? ''))),
     )
   const questionDisabled =
+    !agentActionsEnabled ||
     composerDisabled ||
     sending ||
     stopping ||
@@ -1295,20 +1331,6 @@ export function ConversationView({
       commentEditor?.body.trim()),
   )
   const commentDraftId = commentEditor?.draftId
-  const composerPrefix = parseComposerCommandPrefix(composer, composerSkills)
-  const isBtwReady = !isSideChat && Boolean(composerPrefix.btw && !composerPrefix.error)
-  const resolvedComposerRoute = resolveComposerRoute(
-    {
-      text: composer,
-      skills: composerSkills,
-      mention: composerMention,
-      route: composerRoute,
-      returnedInputOperationId: composerReturnedInputOperationId,
-    },
-    session.settings.primaryAgentId,
-    { allowMainRoute: isSideChat },
-  ).route
-  const isMainRoute = isSideChat && resolvedComposerRoute.type === 'main'
   const isHandoffArriving =
     handoffArriveKey !== undefined && handoffArriveKey !== dismissedArriveKey
   useEffect(() => {
@@ -1339,11 +1361,15 @@ export function ConversationView({
     unfinishedTask && !composerPrefix.pact
       ? collaborationActor(unfinishedTask, 'reply')
       : session.settings.primaryAgentId
-  const primaryName = session.settings.primaryAgentId === 'claude' ? 'Claude Code' : 'Codex'
-  const secondaryName = session.settings.primaryAgentId === 'claude' ? 'Codex' : 'Claude Code'
-  const availableMentionOptions = isSideChat ? sideChatMentionOptions : mentionOptions
+  const primaryName = agentName(activePair[0])
+  const secondaryName = agentName(activePair[1])
+  const availableMentionOptions = useMemo(
+    () => buildMentionOptions(activePair, isSideChat),
+    [activePair, isSideChat],
+  )
   const filteredMentionOptions = availableMentionOptions.filter(
     (option) =>
+      (option.token === '@Main' ? effectiveMainSyncEnabled : agentActionsEnabled) &&
       option.token
         .slice(1)
         .toLowerCase()
@@ -2550,18 +2576,25 @@ export function ConversationView({
           : composerRoute?.type === 'agent'
             ? composerRoute.agentId
             : undefined
+      const taskRoles = resolveLegacyCompatibleTaskStageRoles(unfinishedTask)
+      const taskPair: readonly [RuntimeAgentId, RuntimeAgentId] =
+        unfinishedTask.owner !== unfinishedTask.reviewer
+          ? [unfinishedTask.owner, unfinishedTask.reviewer]
+          : [taskRoles.planAuthor, taskRoles.planReviewer]
       const fallbackReviewer = otherAgent(
         unfinishedTask.unreviewedCodeActor ??
           unfinishedTask.lastCodeActor ??
           collaborationActor(unfinishedTask, 'implement'),
+        taskPair,
       )
       return `${agentName(explicit ?? fallbackReviewer)} reviews code.`
     }
-    const { route } = resolveComposerRoute(editorValue, session.settings.primaryAgentId)
-    if (route.type !== 'agent') return undefined
-    const roles = defaultTaskStageRoles(
-      pactEntryPrimary(composerPrefix.pact, session.settings.primaryAgentId, route.agentId),
-    )
+    const { route } = resolveComposerRoute(editorValue, activePair[0], {
+      secondaryAgentId: activePair[1],
+    })
+    if (route.type !== 'agent' || !activePair.includes(route.agentId)) return undefined
+    const entryPrimary = pactSessionEntryPrimary(composerPrefix.pact, activePair, route.agentId)
+    const roles = defaultTaskStageRoles(entryPrimary, otherAgent(entryPrimary, activePair))
     return composerPrefix.pact === 'plan'
       ? `${agentName(roles.planAuthor)} drafts plan · ${agentName(roles.planReviewer)} reviews plan.`
       : composerPrefix.pact === 'build'
@@ -2668,7 +2701,7 @@ export function ConversationView({
     }
   }
 
-  const chooseMention = (option: (typeof sideChatMentionOptions)[number]): void => {
+  const chooseMention = (option: MentionOption): void => {
     if (!mentionQuery) return
     const current = composerRef.current?.document() ?? editorValue
     const selectedMention = current.mention
@@ -2729,6 +2762,7 @@ export function ConversationView({
     }
     const { route: effectiveRoute, sendRoute } = resolveComposerRoute(document, defaultRecipient, {
       allowMainRoute: isSideChat,
+      secondaryAgentId: activePair[1],
     })
     if (!isSideChat && prefix.btw && !prefix.error) {
       if (btwSubmitting || commonComposerBlocked || !onOpenBtwSideChat) return
@@ -2768,7 +2802,7 @@ export function ConversationView({
       return
     }
     if (isSideChat && effectiveRoute.type === 'main') {
-      if (commonComposerBlocked || !onSyncToMain) return
+      if (mainSyncComposerBlocked || !onSyncToMain) return
       const syncDraft = extractMainSyncDraft(document)
       const trimmedLead = syncDraft.text.length - syncDraft.text.trimStart().length
       const syncContent = syncDraft.text.trim()
@@ -2897,7 +2931,9 @@ export function ConversationView({
       // uncertain acknowledgement instead of silently re-authorizing a newer task state.
       replacementAttempt.current ??= { taskId: task.id, revision: task.revision }
       const removed = document.text.length - document.text.trimStart().length
-      const { sendRoute } = resolveComposerRoute(document, defaultRecipient)
+      const { sendRoute } = resolveComposerRoute(document, defaultRecipient, {
+        secondaryAgentId: activePair[1],
+      })
       const sent = await onSend(
         document.text,
         draftComments.map((comment) => comment.id),
@@ -3324,9 +3360,19 @@ export function ConversationView({
       onOpenFile={(id, path) => onOpenWorkspaceChanges(id, path, undefined, changeSet.revision)}
     />
   )
+  const handoffSourceLabel = (run: AgentRun): string | undefined => {
+    const peerIds = [...new Set(run.handoffSourceAgents ?? [])]
+    if (peerIds.length === 1) return agentName(peerIds[0]!)
+    if (peerIds.length === 2) return `${agentName(peerIds[0]!)} and ${agentName(peerIds[1]!)}`
+    if (peerIds.length > 2) {
+      const names = peerIds.map((id) => agentName(id))
+      return `${names.slice(0, -1).join(', ')}, and ${names.at(-1)!}`
+    }
+    return undefined
+  }
   const renderChangeMetadata = (run: AgentRun): React.JSX.Element => (
     <p className="mb-1 px-1 text-caption text-secondary">
-      {run.agentId === 'claude' ? 'Claude Code' : 'Codex'} ·{' '}
+      {agentName(run.agentId)} ·{' '}
       <time dateTime={run.createdAt}>
         {messageDateTimeFormatter.format(new Date(run.createdAt))}
       </time>{' '}
@@ -3473,19 +3519,15 @@ export function ConversationView({
       const run = row.run
       return (
         <article className="w-fit max-w-[92%] min-w-0 self-start" data-pact-run-context-id={run.id}>
-          <div
-            className={`rounded-message ${run.agentId === 'claude' ? 'bg-speaker-claude' : 'bg-speaker-codex'} px-4 py-3`}
-          >
+          <div className={`rounded-message ${speakerBgClass(run.agentId)} px-4 py-3`}>
             <p className="flex min-w-0 items-baseline gap-1.5 text-caption text-secondary">
-              <span className="shrink-0 font-medium">
-                {run.agentId === 'claude' ? 'Claude Code' : 'Codex'}
-              </span>
+              <span className="shrink-0 font-medium">{agentName(run.agentId)}</span>
               <RunConfiguration run={run} />
             </p>
             {run.handoffMessageCount ? (
               <ContextReceipt
                 count={run.handoffMessageCount}
-                target={run.agentId}
+                source={handoffSourceLabel(run)}
                 accepted={Boolean(run.nativeTurnId)}
               />
             ) : null}
@@ -3551,19 +3593,17 @@ export function ConversationView({
         >
           <div className="w-fit max-w-[92%] self-start">
             <div
-              className={`rounded-message ${placeholderRun.agentId === 'claude' ? 'bg-speaker-claude' : 'bg-speaker-codex'} px-4 py-3`}
+              className={`rounded-message ${speakerBgClass(placeholderRun.agentId)} px-4 py-3`}
               data-pact-message-bubble
             >
               <p className="flex min-w-0 items-baseline gap-1.5 text-caption text-secondary">
-                <span className="shrink-0 font-medium">
-                  {placeholderRun.agentId === 'claude' ? 'Claude Code' : 'Codex'}
-                </span>
+                <span className="shrink-0 font-medium">{agentName(placeholderRun.agentId)}</span>
                 <RunConfiguration run={placeholderRun} />
               </p>
               {placeholderRun.handoffMessageCount ? (
                 <ContextReceipt
                   count={placeholderRun.handoffMessageCount}
-                  target={placeholderRun.agentId}
+                  source={handoffSourceLabel(placeholderRun)}
                   accepted={Boolean(placeholderRun.nativeTurnId)}
                 />
               ) : null}
@@ -3639,13 +3679,8 @@ export function ConversationView({
     }
     const backgroundReport = isConversationBackgroundReport(message)
     const speaker =
-      message.role === 'user' ? 'You' : message.agentId === 'claude' ? 'Claude Code' : 'Codex'
-    const background =
-      message.role === 'user'
-        ? 'bg-speaker-user'
-        : message.agentId === 'claude'
-          ? 'bg-speaker-claude'
-          : 'bg-speaker-codex'
+      message.role === 'user' ? 'You' : message.agentId ? agentName(message.agentId) : 'Codex'
+    const background = message.role === 'user' ? 'bg-speaker-user' : speakerBgClass(message.agentId)
     const retryInThisSlot =
       activeRun &&
       message.outputSnapshot?.canonical !== false &&
@@ -3729,7 +3764,7 @@ export function ConversationView({
                 {replyRecipient ? (
                   <span
                     className="font-medium text-primary"
-                    aria-label={`Reply to ${replyRecipient === 'codex' ? 'Codex' : 'Claude Code'}`}
+                    aria-label={`Reply to ${agentName(replyRecipient)}`}
                   >
                     @{replyRecipient}
                   </span>
@@ -3770,7 +3805,7 @@ export function ConversationView({
               {ownsRunActivity && messageRun?.handoffMessageCount ? (
                 <ContextReceipt
                   count={messageRun.handoffMessageCount}
-                  target={messageRun.agentId}
+                  source={handoffSourceLabel(messageRun)}
                   accepted={Boolean(messageRun.nativeTurnId)}
                 />
               ) : null}
@@ -4433,7 +4468,13 @@ export function ConversationView({
                 strokeWidth={1.5}
               />
               <h2 className="mt-section text-subtitle font-medium text-primary">
-                {isSideChat ? `Ask ${primaryName}` : `Start with ${primaryName}`}
+                {isSideChat
+                  ? sideChatSettingsState === 'loading'
+                    ? 'Loading side chat settings…'
+                    : sideChatSettingsState === 'error'
+                      ? 'Ask in this side chat'
+                      : `Ask ${primaryName}`
+                  : `Start with ${primaryName}`}
               </h2>
               <p className="mx-auto mt-1 max-w-[46ch] text-caption leading-relaxed text-secondary">
                 {isSideChat
@@ -4843,10 +4884,8 @@ export function ConversationView({
                         <span>
                           ·{' '}
                           {returnedInput.route.type === 'all'
-                            ? `${returnedInput.route.firstAgentId === 'codex' ? 'Codex' : 'Claude Code'} → ${returnedInput.route.secondAgentId === 'codex' ? 'Codex' : 'Claude Code'}`
-                            : returnedInput.route.agentId === 'codex'
-                              ? 'Codex'
-                              : 'Claude Code'}
+                            ? `${agentName(returnedInput.route.firstAgentId)} → ${agentName(returnedInput.route.secondAgentId)}`
+                            : agentName(returnedInput.route.agentId)}
                         </span>
                         {returnedInput.state === 'pending' ||
                         (!composer &&
@@ -4929,9 +4968,13 @@ export function ConversationView({
                           : activeMentionId
                       }
                       placeholder={
-                        agentActionsEnabled
-                          ? 'What should we tackle next?'
-                          : 'Agent actions are paused'
+                        isSideChat && sideChatSettingsState === 'loading'
+                          ? 'Loading side chat settings…'
+                          : agentActionsEnabled
+                            ? 'What should we tackle next?'
+                            : isSideChat && effectiveMainSyncEnabled
+                              ? 'Mention @Main to send to main chat'
+                              : 'Agent actions are paused'
                       }
                       disabled={composerDisabled || inputTakeover}
                       onKeyDown={(event) => {
@@ -5109,7 +5152,7 @@ export function ConversationView({
                       {skillComposer.agents.map((agent) => (
                         <Fragment key={agent}>
                           <p className="px-2.5 pt-2 pb-1 text-caption font-medium text-tertiary">
-                            {agent === 'claude' ? 'Claude Code' : 'Codex'}
+                            {agentName(agent)}
                           </p>
                           {skillComposer.visibleOptions
                             .filter((entry) => entry.agentId === agent)
@@ -5171,7 +5214,7 @@ export function ConversationView({
                                 <button
                                   type="button"
                                   className="min-h-8 rounded-control px-2 text-caption text-secondary hover:bg-surface-muted disabled:opacity-50"
-                                  aria-label={`Previous ${agent === 'claude' ? 'Claude Code' : 'Codex'} Skills`}
+                                  aria-label={`Previous ${agentName(agent)} Skills`}
                                   disabled={skillComposer.loading}
                                   onMouseDown={(event) => event.preventDefault()}
                                   onClick={() => {
@@ -5191,7 +5234,7 @@ export function ConversationView({
                                 <button
                                   type="button"
                                   className="min-h-8 rounded-control px-2 text-caption text-secondary hover:bg-surface-muted disabled:opacity-50"
-                                  aria-label={`More ${agent === 'claude' ? 'Claude Code' : 'Codex'} Skills`}
+                                  aria-label={`More ${agentName(agent)} Skills`}
                                   disabled={skillComposer.loading}
                                   onMouseDown={(event) => event.preventDefault()}
                                   onClick={() => {
@@ -5325,7 +5368,7 @@ export function ConversationView({
                             isBtwReady
                               ? commonComposerBlocked || btwSubmitting || !onOpenBtwSideChat
                               : isMainRoute
-                                ? commonComposerBlocked || !onSyncToMain
+                                ? mainSyncComposerBlocked || !onSyncToMain
                                 : disabled ||
                                   !hasDraft ||
                                   Boolean(replacement) ||
@@ -5361,11 +5404,11 @@ export function ConversationView({
                   <div className="pact-composer-controls flex min-w-0 items-center gap-2">
                     {onSaveSessionPermission ? (
                       <>
-                        {(['claude', 'codex'] as const).map((agent) => (
+                        {activePair.map((agent) => (
                           <div
                             key={`${session.id}-${agent}`}
                             role="group"
-                            aria-label={`${agent === 'claude' ? 'Claude Code' : 'Codex'} settings`}
+                            aria-label={`${agentName(agent)} settings`}
                             className="pact-agent-controls text-caption"
                           >
                             <PermissionMenu
@@ -5479,28 +5522,29 @@ export function ConversationView({
 
 function ContextReceipt({
   count,
-  target,
+  source,
   accepted,
 }: {
   count: number
-  target: AgentRun['agentId']
+  source?: string | undefined
   accepted: boolean
 }): React.JSX.Element {
-  const source = target === 'claude' ? 'Codex' : 'Claude Code'
+  const unit = count === 1 ? 'message' : 'messages'
   return (
     <p className="mt-1 text-caption text-tertiary">
-      {accepted ? 'Shared' : 'Prepared'} {count} earlier {count === 1 ? 'message' : 'messages'} from{' '}
-      {source}
+      {source
+        ? `${accepted ? 'Shared' : 'Prepared'} ${count} earlier ${unit} from ${source}`
+        : `Included ${count} earlier ${unit}`}
     </p>
   )
 }
 
 function MessageResponseIndicator({ agentId }: { agentId: RuntimeAgentId }): React.JSX.Element {
-  const name = agentId === 'claude' ? 'Claude Code' : 'Codex'
+  const name = agentName(agentId)
   return (
     <div className="mt-1.5 flex justify-center">
       <span
-        className={`inline-flex h-5 items-center gap-1 rounded-pill px-2 text-secondary ${agentId === 'claude' ? 'bg-speaker-claude' : 'bg-speaker-codex'}`}
+        className={`inline-flex h-5 items-center gap-1 rounded-pill px-2 text-secondary ${speakerBgClass(agentId)}`}
         role="status"
         aria-label={`${name} is responding`}
       >
@@ -5531,8 +5575,8 @@ function PeerProposalAction({
   onDismiss: (proposalId: string) => Promise<boolean>
 }): React.JSX.Element {
   const [working, setWorking] = useState<'accept' | 'dismiss' | undefined>()
-  const requesterName = requester === 'claude' ? 'Claude Code' : 'Codex'
-  const targetName = proposal.targetAgentId === 'claude' ? 'Claude Code' : 'Codex'
+  const requesterName = agentName(requester)
+  const targetName = agentName(proposal.targetAgentId)
   const action =
     proposal.kind === 'fact_check'
       ? 'fact-check'

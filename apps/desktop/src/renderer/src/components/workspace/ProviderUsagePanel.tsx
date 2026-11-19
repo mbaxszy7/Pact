@@ -14,6 +14,7 @@ import { isUsageSnapshotStale, useProviderUsage } from './useProviderUsage'
 const PROVIDERS: readonly { id: ProviderUsageProvider; label: string }[] = [
   { id: 'codex', label: 'Codex' },
   { id: 'claude', label: 'Claude Code' },
+  { id: 'agy', label: 'Antigravity' },
 ]
 
 type PopoverMode = 'closed' | 'compact' | 'detailed'
@@ -31,9 +32,16 @@ function effectiveStatus(snapshot: ProviderUsageSnapshot, nowMs: number): Provid
   return isUsageSnapshotStale(snapshot, nowMs) ? 'stale' : snapshot.status
 }
 
+function snapshotWindows(snapshot: ProviderUsageSnapshot): Array<ProviderUsageWindow | null> {
+  if (snapshot.pools?.length) {
+    return snapshot.pools.flatMap((pool) => [pool.fiveHour, pool.sevenDay])
+  }
+  return [snapshot.fiveHour, snapshot.sevenDay]
+}
+
 function shouldShowWindows(snapshot: ProviderUsageSnapshot, status: ProviderUsageStatus): boolean {
   return (
-    (hasUsageWindow(snapshot.fiveHour) || hasUsageWindow(snapshot.sevenDay)) &&
+    snapshotWindows(snapshot).some((window) => hasUsageWindow(window)) &&
     status !== 'unauthenticated' &&
     status !== 'not_applicable' &&
     status !== 'unsupported' &&
@@ -61,11 +69,23 @@ function formatResetTime(timestamp: string, nowMs: number): string {
     const minutes = totalMinutes % 60
     return hours < 6 && minutes > 0 ? `Resets in ${hours}h ${minutes}m` : `Resets in ${hours}h`
   }
-  const formatted = new Intl.DateTimeFormat(undefined, {
+  const parts = new Intl.DateTimeFormat('en-US', {
     weekday: 'short',
     hour: '2-digit',
     minute: '2-digit',
-    hour12: false,
+    hourCycle: 'h23',
+  }).formatToParts(new Date(targetMs))
+  const weekday = parts.find((part) => part.type === 'weekday')?.value
+  const hour = parts.find((part) => part.type === 'hour')?.value
+  const minute = parts.find((part) => part.type === 'minute')?.value
+  if (weekday && hour && minute) {
+    return `Resets ${weekday} ${hour}:${minute}`
+  }
+  const formatted = new Intl.DateTimeFormat('en-US', {
+    weekday: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
   }).format(new Date(targetMs))
   return `Resets ${formatted}`
 }
@@ -122,7 +142,7 @@ function badgeDotTone(
     const snapshot = snapshots[id]
     const status = effectiveStatus(snapshot, nowMs)
     if (status === 'stale' || !shouldShowWindows(snapshot, status)) continue
-    for (const window of [snapshot.fiveHour, snapshot.sevenDay]) {
+    for (const window of snapshotWindows(snapshot)) {
       if (hasUsageWindow(window)) {
         lowestRemaining = Math.min(lowestRemaining, toRemainingPercent(window.usedPercent))
       }
@@ -243,28 +263,61 @@ function ProviderUsageSection({
       </div>
 
       {showWindows ? (
-        <div className={detailed ? 'mt-1.5 space-y-1.5' : 'mt-1 space-y-1'}>
-          {hasUsageWindow(snapshot.fiveHour) ? (
-            <UsageWindowBar
-              providerLabel={label}
-              windowLabel="5h"
-              window={snapshot.fiveHour}
-              stale={stale}
-              showResetTime={detailed}
-              nowMs={nowMs}
-            />
-          ) : null}
-          {hasUsageWindow(snapshot.sevenDay) ? (
-            <UsageWindowBar
-              providerLabel={label}
-              windowLabel="7d"
-              window={snapshot.sevenDay}
-              stale={stale}
-              showResetTime={detailed}
-              nowMs={nowMs}
-            />
-          ) : null}
-        </div>
+        snapshot.pools && snapshot.pools.length > 1 ? (
+          <div className={detailed ? 'mt-1.5 space-y-2' : 'mt-1 space-y-1.5'}>
+            {snapshot.pools.map((pool) => (
+              <div key={pool.id} className="space-y-1">
+                <p className="truncate text-caption leading-snug text-tertiary">{pool.label}</p>
+                {hasUsageWindow(pool.fiveHour) ? (
+                  <UsageWindowBar
+                    providerLabel={`${label} ${pool.label}`}
+                    windowLabel="5h"
+                    window={pool.fiveHour}
+                    stale={stale}
+                    showResetTime={detailed}
+                    nowMs={nowMs}
+                  />
+                ) : null}
+                {hasUsageWindow(pool.sevenDay) ? (
+                  <UsageWindowBar
+                    providerLabel={`${label} ${pool.label}`}
+                    windowLabel="7d"
+                    window={pool.sevenDay}
+                    stale={stale}
+                    showResetTime={detailed}
+                    nowMs={nowMs}
+                  />
+                ) : null}
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className={detailed ? 'mt-1.5 space-y-1.5' : 'mt-1 space-y-1'}>
+            {snapshot.message ? (
+              <p className="truncate text-caption leading-snug text-tertiary">{snapshot.message}</p>
+            ) : null}
+            {hasUsageWindow(snapshot.fiveHour) ? (
+              <UsageWindowBar
+                providerLabel={label}
+                windowLabel="5h"
+                window={snapshot.fiveHour}
+                stale={stale}
+                showResetTime={detailed}
+                nowMs={nowMs}
+              />
+            ) : null}
+            {hasUsageWindow(snapshot.sevenDay) ? (
+              <UsageWindowBar
+                providerLabel={label}
+                windowLabel="7d"
+                window={snapshot.sevenDay}
+                stale={stale}
+                showResetTime={detailed}
+                nowMs={nowMs}
+              />
+            ) : null}
+          </div>
+        )
       ) : silentLoading ? (
         <output className="mt-1.5 block" aria-busy="true" aria-label={`${label} usage loading`}>
           <span
@@ -516,7 +569,7 @@ export function ProviderUsagePanel({
               }}
             >
               <div
-                className={`rounded-panel border border-border bg-surface-raised text-primary shadow-popover ${
+                className={`max-h-[calc(100vh-2rem)] overflow-y-auto rounded-panel border border-border bg-surface-raised text-primary shadow-popover ${
                   mode === 'detailed' ? 'space-y-2.5 p-3' : 'space-y-2 p-2.5'
                 }`}
               >

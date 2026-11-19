@@ -55,6 +55,7 @@
   --color-speaker-user: var(--pact-speaker-user);
   --color-speaker-claude: var(--pact-speaker-claude);
   --color-speaker-codex: var(--pact-speaker-codex);
+  --color-speaker-agy: var(--pact-speaker-agy);
   --color-diff-added: var(--pact-diff-added);
   --color-diff-added-foreground: var(--pact-diff-added-foreground);
   --color-diff-removed: var(--pact-diff-removed);

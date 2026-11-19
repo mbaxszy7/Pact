@@ -196,6 +196,19 @@ export type HandoffGuidanceV2 = z.infer<typeof handoffGuidanceV2Schema>
 export const handoffGuidanceSchema = z.union([planRevisionGuidanceSchema, handoffGuidanceV2Schema])
 export type HandoffGuidance = z.infer<typeof handoffGuidanceSchema>
 
+export const routeCandidateIdSchema = z.enum(['route_codex', 'route_claude', 'route_agy'])
+export type RouteCandidateId = z.infer<typeof routeCandidateIdSchema>
+
+export function routeCandidateIdForAgent(agentId: 'claude' | 'codex' | 'agy'): RouteCandidateId {
+  return agentId === 'claude' ? 'route_claude' : agentId === 'codex' ? 'route_codex' : 'route_agy'
+}
+
+export function agentIdForRouteCandidate(
+  candidateId: RouteCandidateId,
+): 'claude' | 'codex' | 'agy' {
+  return candidateId === 'route_claude' ? 'claude' : candidateId === 'route_codex' ? 'codex' : 'agy'
+}
+
 /** Ordinary routing retains only the selected recipient's receipt, never unadopted model prose. */
 export const inputRoutingProposalSchema = z.strictObject({
   version: z.literal('input-routing-v1'),
@@ -203,7 +216,7 @@ export const inputRoutingProposalSchema = z.strictObject({
   handoffId: digest,
   inputSha256: digest,
   sourceFingerprint: digest,
-  candidateId: z.enum(['route_codex', 'route_claude']),
+  candidateId: routeCandidateIdSchema,
   configurationGeneration: z.number().int().nonnegative(),
   configurationFingerprint: digest,
   deadlineAt: z.number().int().nonnegative(),
@@ -218,33 +231,71 @@ export const initialTaskRolesProposalSchema = inputRoutingProposalSchema.extend(
 export type InitialTaskRolesProposal = z.infer<typeof initialTaskRolesProposalSchema>
 
 /** Durable ordinary-Send receipt metadata; no model prose or native credentials. */
-export const preparedInputMetadataSchema = z.strictObject({
-  version: z.literal('prepared-input-v1'),
-  ownerId: z.string().uuid(),
-  requestFingerprint: digest,
-  inputId: z.string().uuid().nullable(),
-  routeSpecified: z.boolean(),
-  defaultAgentId: z.enum(['claude', 'codex']),
-  allowedAgentIds: z
-    .array(z.enum(['claude', 'codex']))
-    .min(1)
-    .max(2),
-  routeIntent: z.literal('implicit'),
-  composerRevision: z.number().int().nonnegative(),
-  settingsRevision: z.number().int().nonnegative(),
-  taskRoles: z
-    .strictObject({
-      kind: pactSkillSchema,
-      primaryAgentId: z.enum(['claude', 'codex']),
-      defaults: taskStageRolesSchema.refine((roles) => roles.revision === 0, {
-        message: 'Prepared role defaults always start at revision 0.',
-      }),
-      candidates: z.array(initialTaskRoleCandidateSchema).min(1).max(3),
-    })
-    .optional(),
-  sourceFingerprint: digest,
-  cancellationReason: z.enum(['cancelled', 'preparation_failed', 'restarted']).optional(),
-})
+export const preparedInputMetadataSchema = z
+  .strictObject({
+    version: z.literal('prepared-input-v1'),
+    ownerId: z.string().uuid(),
+    requestFingerprint: digest,
+    inputId: z.string().uuid().nullable(),
+    routeSpecified: z.boolean(),
+    defaultAgentId: z.enum(['claude', 'codex', 'agy']),
+    allowedAgentIds: z
+      .array(z.enum(['claude', 'codex', 'agy']))
+      .min(1)
+      .max(2)
+      .refine((ids) => new Set(ids).size === ids.length, 'Allowed Agents must be unique.'),
+    routeIntent: z.literal('implicit'),
+    composerRevision: z.number().int().nonnegative(),
+    settingsRevision: z.number().int().nonnegative(),
+    taskRoles: z
+      .strictObject({
+        kind: pactSkillSchema,
+        primaryAgentId: z.enum(['claude', 'codex', 'agy']),
+        secondaryAgentId: z.enum(['claude', 'codex', 'agy']).optional(),
+        defaults: taskStageRolesSchema.refine((roles) => roles.revision === 0, {
+          message: 'Prepared role defaults always start at revision 0.',
+        }),
+        candidates: z.array(initialTaskRoleCandidateSchema).min(1).max(3),
+      })
+      .refine(
+        (taskRoles) => {
+          const secondary = taskRoles.secondaryAgentId ?? taskRoles.defaults.planReviewer
+          if (taskRoles.primaryAgentId === secondary) return false
+          const pair = new Set([taskRoles.primaryAgentId, secondary])
+          const rolesInPair = (roles: z.infer<typeof taskStageRolesSchema>) =>
+            pair.has(roles.planAuthor) &&
+            pair.has(roles.planReviewer) &&
+            pair.has(roles.codeAuthor) &&
+            pair.has(roles.codeReviewer)
+          if (!rolesInPair(taskRoles.defaults)) return false
+          const ids = new Set<string>()
+          for (const candidate of taskRoles.candidates) {
+            if (ids.has(candidate.id)) return false
+            ids.add(candidate.id)
+            if (!rolesInPair(candidate.roles)) return false
+            if (
+              candidate.id !== `roles_${candidate.roles.planAuthor}_${candidate.roles.codeAuthor}`
+            )
+              return false
+          }
+          return true
+        },
+        { message: 'Prepared task role candidates must belong to the active 2-member Agent pair.' },
+      )
+      .optional(),
+    sourceFingerprint: digest,
+    cancellationReason: z.enum(['cancelled', 'preparation_failed', 'restarted']).optional(),
+  })
+  .refine(
+    (metadata) => {
+      if (!metadata.taskRoles || metadata.allowedAgentIds.length < 2) return true
+      const secondary =
+        metadata.taskRoles.secondaryAgentId ?? metadata.taskRoles.defaults.planReviewer
+      const allowed = new Set(metadata.allowedAgentIds)
+      return allowed.has(metadata.taskRoles.primaryAgentId) && allowed.has(secondary)
+    },
+    { message: 'Prepared task roles must match the allowed active Agent pair.' },
+  )
 export type PreparedInputMetadata = z.infer<typeof preparedInputMetadataSchema>
 
 export type RelayDecisionMaterial = {

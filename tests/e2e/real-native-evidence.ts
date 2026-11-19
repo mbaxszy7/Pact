@@ -97,7 +97,7 @@ export type NativeSourceEvidence = Omit<
 
 export async function findNativeSourceRecord(
   ctx: RealWorkspace,
-  agentId: 'claude' | 'codex',
+  agentId: 'claude' | 'codex' | 'agy',
   nativeSessionId: string,
 ): Promise<NativeSourceEvidence> {
   return findNativeRecordWith(ctx, agentId, nativeSessionId, readNativeSourceEvidence)
@@ -105,7 +105,7 @@ export async function findNativeSourceRecord(
 
 export async function findNativeRecord(
   ctx: RealWorkspace,
-  agentId: 'claude' | 'codex',
+  agentId: 'claude' | 'codex' | 'agy',
   nativeSessionId: string,
 ): Promise<NativeEvidence> {
   return findNativeRecordWith(ctx, agentId, nativeSessionId, readNativeEvidence)
@@ -114,10 +114,13 @@ export async function findNativeRecord(
 /** This observer owns one bounded scan of this fixture's Native files; no symlinks are followed. */
 async function findNativeRecordWith<T extends { nativeIds: Set<string> }>(
   ctx: RealWorkspace,
-  agentId: 'claude' | 'codex',
+  agentId: 'claude' | 'codex' | 'agy',
   nativeSessionId: string,
   read: (path: string) => Promise<T>,
 ): Promise<T> {
+  if (agentId === 'agy') {
+    throw new Error('Antigravity native evidence uses SQLite trajectory inspection.')
+  }
   if (!/^[A-Za-z0-9_-]{1,128}$/u.test(nativeSessionId))
     throw new Error('Unexpected Native file identity')
   const storageRoot = await realpath(

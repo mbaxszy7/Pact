@@ -42,12 +42,21 @@ export const windowsOwnerNativeCases = Object.freeze(
     'keeps cleanup unconfirmed when the bridge crashes before its empty receipt even after independent handles show kernel cleanup',
   ].map((title) => `Windows product OwnedProcessGroup ${title}`),
 )
+export const agyNativeFiles = Object.freeze(['tests/native/agy-native.test.ts'])
+export const agyNativeCases = Object.freeze([
+  'completes ACP initialize (clientInfo), zero-Turn session/new + session/load + session/close, and non-empty TrajectorySummary SQLite creation without model calls',
+  'verifies production AgyAgentAdapter zero-Turn Rebuild seed and cold-load verification receipt (negative and positive)',
+  'prepares and executes an execution_id-closed SQLite Fork boundary with cold session/load verification and post-cut exclusion',
+  'enforces explicit PACT_E2E_AGY_AUTH_DIR isolation without reading host HOME and rejects unsafe Windows .cmd paths',
+])
 
 export function nativeProfileSupports(profile, platform = process.platform, arch = process.arch) {
   if (profile.name === 'legacy') return true
   if (profile.name === 'execution-codex') return platform === 'darwin' && arch === 'arm64'
   if (profile.name === 'windows-owner')
     return platform === 'win32' && ['x64', 'arm64'].includes(arch)
+  if (profile.name === 'agy')
+    return ['darwin', 'win32', 'linux'].includes(platform) && ['x64', 'arm64'].includes(arch)
   return false
 }
 
@@ -90,6 +99,16 @@ export function nativeProfile(name = 'legacy') {
       directory: 'pact-windows-owner-native',
       files: windowsOwnerNativeFiles,
       cases: [...windowsOwnerHostCases, ...windowsOwnerNativeCases],
+    }
+  if (name === 'agy')
+    return {
+      name,
+      command: 'test:native:agy',
+      codexVersion: null,
+      claudeVersion: null,
+      directory: 'pact-agy-native-cli',
+      files: agyNativeFiles,
+      cases: agyNativeCases,
     }
   throw new Error('Unknown fixed native profile')
 }

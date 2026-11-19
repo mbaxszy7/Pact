@@ -1,18 +1,37 @@
 import { ArrowLeft, SlidersHorizontal, Sparkles } from 'lucide-react'
 import { useState } from 'react'
 
-import type {
-  DefaultSessionSettings,
-  DefaultSessionSettingsEditorState,
-  Project,
-  RuntimeAgentId,
+import {
+  agentDisplayName,
+  resolveActiveAgentPair,
+  type ActiveAgentPairInput,
+  type AgentModelCatalog,
+  type DefaultSessionSettings,
+  type DefaultSessionSettingsEditorState,
+  type Project,
+  type RuntimeAgentId,
+  type RuntimePreparation,
 } from '@pact/contracts'
 
-import { SessionSettingsFields } from '../settings/session/SessionSettingsFields'
+import {
+  deriveAgentAvailability,
+  preferredReadyPair,
+  resolveMergedDefaultModelCatalogs,
+  SessionSettingsFields,
+  useActivePairCatalogs,
+} from '../settings/session/SessionSettingsFields'
+
+const unavailableCatalog = (agentId: RuntimeAgentId): AgentModelCatalog => ({
+  agentId,
+  status: 'unavailable',
+  models: [],
+  checkedAt: new Date(0).toISOString(),
+})
 
 interface SessionCreationViewProps {
   project: Project
   editorState?: DefaultSessionSettingsEditorState | undefined
+  runtimePreparation?: RuntimePreparation | undefined
   loading: boolean
   creating: boolean
   error?: string | undefined
@@ -25,6 +44,7 @@ interface SessionCreationViewProps {
 export function SessionCreationView({
   project,
   editorState,
+  runtimePreparation,
   loading,
   creating,
   error,
@@ -38,12 +58,42 @@ export function SessionCreationView({
     editorState?.current?.settings,
   )
   const effectiveSettings = settings ?? editorState?.current?.settings
-  const settingsAvailable = Boolean(
-    effectiveSettings &&
-    editorState &&
-    selectionIsAvailable(effectiveSettings.agents.claude, editorState.modelCatalogs.claude) &&
-    selectionIsAvailable(effectiveSettings.agents.codex, editorState.modelCatalogs.codex),
+  const agentAvailability = deriveAgentAvailability(runtimePreparation)
+  const activePair = effectiveSettings ? resolveActiveAgentPair(effectiveSettings) : undefined
+  const bridgeLoader =
+    typeof window !== 'undefined' && typeof window.pact?.prepareSessionCreation === 'function'
+      ? (pair: ActiveAgentPairInput) => window.pact.prepareSessionCreation(project.id, pair)
+      : undefined
+  const { fetchedCatalogs, sameSource, pairCatalogLoading, refreshCatalogs } =
+    useActivePairCatalogs({
+      editorState,
+      baseCatalogs: editorState?.modelCatalogs,
+      activePair,
+      agentAvailability,
+      enabled: Boolean(editorState && effectiveSettings),
+      loadForPair: bridgeLoader,
+      onFallbackRefresh: onRetry,
+    })
+  const mergedCatalogs = editorState
+    ? resolveMergedDefaultModelCatalogs(editorState.modelCatalogs, fetchedCatalogs, sameSource)
+    : undefined
+  const pairCliReady = Boolean(
+    activePair &&
+    (!agentAvailability ||
+      activePair.every((agentId) => agentAvailability[agentId]?.available ?? true)),
   )
+  const pairModelsAvailable = Boolean(
+    effectiveSettings &&
+    mergedCatalogs &&
+    activePair &&
+    activePair.every((agentId) =>
+      selectionIsAvailable(
+        effectiveSettings.agents[agentId],
+        mergedCatalogs[agentId] ?? unavailableCatalog(agentId),
+      ),
+    ),
+  )
+  const settingsAvailable = pairCliReady && pairModelsAvailable
 
   return (
     <main className="min-h-full bg-surface">
@@ -94,7 +144,7 @@ export function SessionCreationView({
             </div>
           ) : null}
 
-          {editorState?.current && effectiveSettings ? (
+          {editorState?.current && effectiveSettings && mergedCatalogs ? (
             <>
               <section className="py-section" aria-labelledby="session-scope-title">
                 <h2
@@ -121,7 +171,22 @@ export function SessionCreationView({
                     title="Customize this Session"
                     description="Adjust agents, models, or limits for this session"
                     selected={scope === 'custom'}
-                    onSelect={() => setScope('custom')}
+                    onSelect={() => {
+                      setScope('custom')
+                      if (
+                        effectiveSettings &&
+                        agentAvailability &&
+                        resolveActiveAgentPair(effectiveSettings).some(
+                          (agentId) => !(agentAvailability[agentId]?.available ?? true),
+                        )
+                      ) {
+                        const [primaryAgentId, secondaryAgentId] = preferredReadyPair(
+                          runtimePreparation,
+                          resolveActiveAgentPair(effectiveSettings),
+                        )
+                        setSettings({ ...effectiveSettings, primaryAgentId, secondaryAgentId })
+                      }
+                    }}
                   />
                 </div>
               </section>
@@ -129,22 +194,27 @@ export function SessionCreationView({
               {scope === 'defaults' ? (
                 <DefaultSettingsSummary
                   settings={effectiveSettings}
-                  modelCatalogs={editorState.modelCatalogs}
+                  modelCatalogs={mergedCatalogs}
                   onOpenAppDefaults={onOpenAppDefaults}
                 />
               ) : (
                 <SessionSettingsFields
                   idPrefix="new-session"
                   settings={effectiveSettings}
-                  modelCatalogs={editorState.modelCatalogs}
+                  modelCatalogs={mergedCatalogs}
+                  agentAvailability={agentAvailability}
                   disabled={creating}
+                  refreshing={loading || pairCatalogLoading}
+                  showRefresh
                   onChange={setSettings}
+                  onRefresh={refreshCatalogs}
                 />
               )}
-              {!settingsAvailable ? (
+              {!settingsAvailable && (!pairCatalogLoading || !pairCliReady) ? (
                 <output className="mb-section rounded-control bg-status-warning-muted px-group py-2 text-caption text-status-warning-foreground">
-                  A saved model or effort isn’t available in this project. Customize this session
-                  before creating it.
+                  {!pairCliReady
+                    ? 'One of the selected agents isn’t ready on this device. Customize this session or review agent setup before creating it.'
+                    : 'A saved model or effort isn’t available in this project. Customize this session before creating it.'}
                 </output>
               ) : null}
             </>
@@ -164,7 +234,13 @@ export function SessionCreationView({
             <button
               className="primary-action-button"
               type="submit"
-              disabled={!effectiveSettings || !settingsAvailable || loading || creating}
+              disabled={
+                !effectiveSettings ||
+                !settingsAvailable ||
+                loading ||
+                pairCatalogLoading ||
+                creating
+              }
               data-busy={creating}
               aria-busy={creating}
             >
@@ -217,10 +293,7 @@ function DefaultSettingsSummary({
   modelCatalogs: DefaultSessionSettingsEditorState['modelCatalogs']
   onOpenAppDefaults: () => void
 }): React.JSX.Element {
-  const agentOrder: RuntimeAgentId[] = [
-    settings.primaryAgentId,
-    settings.primaryAgentId === 'claude' ? 'codex' : 'claude',
-  ]
+  const agentOrder = resolveActiveAgentPair(settings)
   return (
     <section className="border-t border-border py-section" aria-labelledby="defaults-summary-title">
       <div className="flex flex-wrap items-start justify-between gap-group">
@@ -245,9 +318,9 @@ function DefaultSettingsSummary({
             {agentOrder.map((agentId, index) => (
               <AgentSummaryItem
                 key={agentId}
-                label={agentId === 'claude' ? 'Claude Code' : 'Codex'}
+                label={agentDisplayName(agentId)}
                 role={index === 0 ? 'Primary' : 'Secondary'}
-                value={`${modelDisplayName(settings.agents[agentId].model, modelCatalogs[agentId])} · ${settingValue(settings.agents[agentId].effort)}`}
+                value={`${modelDisplayName(settings.agents[agentId].model, modelCatalogs[agentId] ?? unavailableCatalog(agentId))} · ${settingValue(settings.agents[agentId].effort)}`}
               />
             ))}
           </div>

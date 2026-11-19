@@ -143,6 +143,15 @@ export const diagnosticNativeMethodSchema = z.enum([
   'turn/start',
   'turn/interrupt',
   'turn/steer',
+  'session/new',
+  'session/load',
+  'session/prompt',
+  'session/cancel',
+  'session/close',
+  'session/set_mode',
+  'session/set_config_option',
+  'session/request_permission',
+  'elicitation/create',
   'unrecognized',
 ])
 export const diagnosticFailureSourceSchema = z.enum([
@@ -224,6 +233,7 @@ export const diagnosticEventSchema = z.strictObject({
       'clarify_prepared_input',
       'route_codex',
       'route_claude',
+      'route_agy',
       'no_advice',
       'other_candidate',
       'disabled',
@@ -272,7 +282,7 @@ export const diagnosticEventSchema = z.strictObject({
         'history_operation_duplicate',
         'plan_capture_failed',
       ]),
-      tool: z.enum(['Write', 'Edit', 'ExitPlanMode']),
+      tool: z.enum(['Write', 'Edit', 'ExitPlanMode', 'write_file', 'edit_file']),
       phase: z.enum(['begin', 'success', 'failure']),
     })
     .optional(),
@@ -283,6 +293,7 @@ export const diagnosticEventSchema = z.strictObject({
       'catalogs',
       'claude_close',
       'codex_close',
+      'agy_close',
       'post_catalog',
       'repository_read',
     ])
@@ -354,6 +365,7 @@ export const diagnosticEventSchema = z.strictObject({
     'stop',
     'native_check',
     'claude_plan',
+    'agy_plan',
     'native_rebuild',
     'fork',
     'undo',
@@ -380,7 +392,7 @@ export const diagnosticEventSchema = z.strictObject({
   sessionId: z.uuid().optional(),
   runId: z.uuid().optional(),
   operationId: z.uuid().optional(),
-  agentId: z.enum(['claude', 'codex']).optional(),
+  agentId: z.enum(['claude', 'codex', 'agy']).optional(),
   cliVersion: z
     .string()
     .regex(/^\d{1,5}\.\d{1,5}\.\d{1,5}(?:\.\d{1,5})?$/u)

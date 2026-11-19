@@ -9,12 +9,13 @@ import {
 } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 
-import type {
-  AgentRun,
-  CollaborationSession,
-  RuntimeAgentId,
-  SessionPermissionMode,
-  SessionPermissionSaveInput,
+import {
+  agentDisplayName,
+  type AgentRun,
+  type CollaborationSession,
+  type RuntimeAgentId,
+  type SessionPermissionMode,
+  type SessionPermissionSaveInput,
 } from '@pact/contracts'
 
 const modes = {
@@ -91,16 +92,16 @@ export function PermissionMenu({
       trigger.current?.focus({ preventScroll: true })
     }
   }, [visible])
-  const selected =
-    session.settings.permissionModes?.[agent] ?? (agent === 'claude' ? 'ask' : 'native')
+  const fullName = agentDisplayName(agent)
+  const shortName = agent === 'claude' ? 'Claude' : agent === 'codex' ? 'Codex' : 'Antigravity'
+  const fallbackMode: SessionPermissionMode = agent === 'codex' ? 'native' : 'ask'
+  const selected = session.settings.permissionModes?.[agent] ?? fallbackMode
   const { label, Icon } = modes[selected]
   const current =
     run?.agentId === agent && (busy || ['starting', 'running', 'recovering'].includes(run.status))
       ? run
       : undefined
-  const currentMode = current
-    ? modes[current.permissionMode ?? (agent === 'claude' ? 'ask' : 'native')].label
-    : undefined
+  const currentMode = current ? modes[current.permissionMode ?? fallbackMode].label : undefined
   const readOnly =
     current?.collaboration && !['implement', 'repair'].includes(current.collaboration.stage)
   const currentScope = currentMode
@@ -109,7 +110,7 @@ export function PermissionMenu({
   const pending =
     run?.agentId === agent &&
     (busy || ['starting', 'running', 'recovering'].includes(run.status)) &&
-    (run.permissionMode ?? (agent === 'claude' ? 'ask' : 'native')) !== selected
+    (run.permissionMode ?? fallbackMode) !== selected
   const choose = async (
     mode: SessionPermissionMode,
     confirmedFullAccess = false,
@@ -156,7 +157,7 @@ export function PermissionMenu({
         popoverTarget={id}
         disabled={disabled || saving}
         title={`Permissions for the next task: ${label}.${currentScope ? ` ${currentScope}` : ''}`}
-        aria-label={`${agent === 'claude' ? 'Claude Code' : 'Codex'} permissions for the next task: ${label}`}
+        aria-label={`${fullName} permissions for the next task: ${label}`}
         aria-haspopup="menu"
         aria-expanded={expanded}
         style={{ anchorName: anchor }}
@@ -168,7 +169,7 @@ export function PermissionMenu({
           strokeWidth={1.75}
         />
         <span className={`truncate ${selected === 'full' ? 'text-status-warning-foreground' : ''}`}>
-          {agent === 'claude' ? 'Claude' : 'Codex'} · {label}
+          {shortName} · {label}
         </span>
         <ChevronDown aria-hidden="true" className="pact-agent-chevron size-3 shrink-0" />
       </button>
@@ -196,11 +197,9 @@ export function PermissionMenu({
           maxHeight: 'calc(100dvh - 64px)',
         }}
         className="pact-agent-popover pact-composer-popover"
-        aria-label={`${agent === 'claude' ? 'Claude Code' : 'Codex'} permissions`}
+        aria-label={`${fullName} permissions`}
       >
-        <p className="pact-composer-menu-heading">
-          {agent === 'claude' ? 'Claude Code' : 'Codex'} permissions
-        </p>
+        <p className="pact-composer-menu-heading">{fullName} permissions</p>
         {!confirming &&
           (['native', 'ask', 'auto', 'full'] as const).map((mode) => {
             const option = modes[mode]
@@ -229,14 +228,14 @@ export function PermissionMenu({
         {confirming ? (
           <section id={`${id}-confirmation`} className="mt-1 px-3 pt-1 pb-1">
             <p className="font-medium text-status-warning-foreground">
-              Enable Full access for {agent === 'claude' ? 'Claude Code' : 'Codex'}?
+              Enable Full access for {fullName}?
             </p>
             <p className="mt-1.5 leading-relaxed text-secondary">
               Allow file edits and network access beyond this project without asking first. Built-in
               safety limits and plan or question prompts still apply.
             </p>
             <p className="mt-1.5 leading-relaxed text-secondary">
-              Applies only to {agent === 'claude' ? 'Claude Code' : 'Codex'} in this session.
+              Applies only to {fullName} in this session.
             </p>
             <div className="mt-2.5 flex justify-end gap-1.5">
               <button

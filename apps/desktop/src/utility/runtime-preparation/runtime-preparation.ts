@@ -1,7 +1,6 @@
-import { spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { constants } from 'node:fs'
-import { access, opendir, realpath } from 'node:fs/promises'
+import { access, opendir, realpath, rm } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { delimiter, isAbsolute, join } from 'node:path'
 
@@ -18,6 +17,12 @@ import { RUNTIME_MINIMUM_VERSIONS } from '@pact/contracts'
 
 import { recordDiagnostic } from '../../diagnostics/utility-log'
 import { OwnedProcessGroup } from '../owned-process-group'
+import {
+  AgyProbeError,
+  isAgyProbeSettled,
+  isUnsafeWindowsCmdPath,
+  runAgyAcpProbe,
+} from './agy-acp-probe'
 
 const PROBE_TIMEOUT_MS = 4_000
 const MAX_CAPTURE_BYTES = 64 * 1024
@@ -27,12 +32,57 @@ const INSTALLATION_DISCOVERY_BYTES = 64 * 1024
 const SHELL_EXECUTION_MS = 2_000
 const SHELL_TOTAL_MS = 3_000
 const MAX_PATH_ENTRIES = 128
+const MAX_ACTIVE_AGY_PROBES = 4
+const MAX_ACTIVE_CLI_PROBES_PER_AGENT = 4
+
+type FixedCliProbeCommand = 'version' | 'claude_auth' | 'codex_auth'
+type FixedLookupCommand =
+  | 'where_claude'
+  | 'where_codex'
+  | 'where_agy'
+  | 'zsh_claude'
+  | 'zsh_codex'
+  | 'zsh_agy'
 
 interface ProbeCommandResult {
   exitCode: number | null
   output: string
   timedOut: boolean
   failedToStart: boolean
+  closeUnconfirmed?: boolean
+}
+
+interface UnconfirmedAgyProbe {
+  readonly probeCwd: string
+}
+
+export function runtimeAgentDisplayName(agentId: RuntimeAgentId): string {
+  if (agentId === 'claude') return 'Claude Code'
+  if (agentId === 'codex') return 'Codex'
+  return 'Antigravity'
+}
+
+function fixedCliProbeArgs(command: FixedCliProbeCommand): {
+  readonly argv: readonly string[]
+  readonly windowsCmdSuffix: string
+} {
+  if (command === 'version') return { argv: ['--version'], windowsCmdSuffix: '--version' }
+  if (command === 'claude_auth')
+    return { argv: ['auth', 'status'], windowsCmdSuffix: 'auth status' }
+  return { argv: ['login', 'status'], windowsCmdSuffix: 'login status' }
+}
+
+function fixedLookupArgs(command: FixedLookupCommand): {
+  readonly executable: string
+  readonly argv: readonly string[]
+} {
+  if (command === 'where_claude') return { executable: 'where.exe', argv: ['claude'] }
+  if (command === 'where_codex') return { executable: 'where.exe', argv: ['codex'] }
+  if (command === 'where_agy') return { executable: 'where.exe', argv: ['agy'] }
+  if (command === 'zsh_claude')
+    return { executable: '/bin/zsh', argv: ['-lc', 'command -v claude'] }
+  if (command === 'zsh_codex') return { executable: '/bin/zsh', argv: ['-lc', 'command -v codex'] }
+  return { executable: '/bin/zsh', argv: ['-lc', 'command -v agy'] }
 }
 
 export class RuntimePreparation {
@@ -40,13 +90,67 @@ export class RuntimePreparation {
   private environmentTask: Promise<void> | undefined
   private environmentOwner: OwnedProcessGroup | undefined
   private readonly environmentAbort = new AbortController()
+  private readonly agyProbes = new Set<OwnedProcessGroup>()
+  private readonly unconfirmedAgyProbes = new Map<OwnedProcessGroup, UnconfirmedAgyProbe>()
+  private readonly cliProbes = new Map<RuntimeAgentId, Set<OwnedProcessGroup>>([
+    ['claude', new Set()],
+    ['codex', new Set()],
+    ['agy', new Set()],
+  ])
+  private readonly unconfirmedCliProbes = new Map<RuntimeAgentId, Set<OwnedProcessGroup>>([
+    ['claude', new Set()],
+    ['codex', new Set()],
+    ['agy', new Set()],
+  ])
+  private lastAcpAgentInfoVersion: string | undefined
   private disposed = false
   private disposal: Promise<void> | undefined
 
   constructor(
     private readonly repository: RuntimePreparationRepository,
-    private readonly options: { discoverShellPath?: boolean } = {},
+    private readonly options: { discoverShellPath?: boolean; env?: NodeJS.ProcessEnv } = {},
   ) {}
+
+  static canCompleteOnboarding(preparation: Pick<RuntimePreparationSnapshot, 'agents'>): boolean {
+    return preparation.agents.filter((agent) => agent.state === 'ready').length >= 2
+  }
+
+  static validateActivePairReadiness(
+    preparation: Pick<RuntimePreparationSnapshot, 'agents'>,
+    primaryAgentId: RuntimeAgentId,
+    secondaryAgentId: RuntimeAgentId,
+  ): { ok: true } | { ok: false; code: 'VALIDATION' | 'RUNTIME_UNAVAILABLE'; message: string } {
+    if (primaryAgentId === secondaryAgentId) {
+      return {
+        ok: false,
+        code: 'VALIDATION',
+        message: 'Primary and secondary Agents must be different.',
+      }
+    }
+    if (!RuntimePreparation.canCompleteOnboarding(preparation)) {
+      return {
+        ok: false,
+        code: 'RUNTIME_UNAVAILABLE',
+        message: 'At least two Agents must be ready before completing setup.',
+      }
+    }
+    const byId = new Map(preparation.agents.map((agent) => [agent.agentId, agent]))
+    if (
+      byId.get(primaryAgentId)?.state !== 'ready' ||
+      byId.get(secondaryAgentId)?.state !== 'ready'
+    ) {
+      return {
+        ok: false,
+        code: 'RUNTIME_UNAVAILABLE',
+        message: 'Both selected Agents must be ready before saving.',
+      }
+    }
+    return { ok: true }
+  }
+
+  readLastAcpAgentVersion(): string | undefined {
+    return this.lastAcpAgentInfoVersion
+  }
 
   /** One Utility-lifetime PATH snapshot; authentication and readiness are always checked afresh. */
   async prepareEnvironment(signal?: AbortSignal): Promise<void> {
@@ -80,7 +184,35 @@ export class RuntimePreparation {
     // The in-flight owner retains its original absolute cleanup deadline, including on Quit.
     this.disposal ??= (async () => {
       await this.environmentTask
+      const allCliProbes: OwnedProcessGroup[] = []
+      for (const set of this.cliProbes.values()) {
+        allCliProbes.push(...set)
+      }
+      const closeResults = await Promise.allSettled([
+        ...[...this.agyProbes].map((probe) => probe.close()),
+        ...allCliProbes.map((probe) => probe.close()),
+      ])
+      await this.reconcileUnconfirmedAgyProbes()
+      for (const probe of this.agyProbes) {
+        if (isAgyProbeSettled(probe)) this.agyProbes.delete(probe)
+      }
+      for (const agentId of ['claude', 'codex', 'agy'] as const) {
+        this.pruneSettledCliProbes(agentId)
+      }
+      const hasRemainingCliProbes = (['claude', 'codex', 'agy'] as const).some(
+        (agentId) =>
+          (this.cliProbes.get(agentId)?.size ?? 0) > 0 ||
+          (this.unconfirmedCliProbes.get(agentId)?.size ?? 0) > 0,
+      )
       if (this.environmentOwner) throw new Error('The shell process was not released.')
+      if (
+        closeResults.some((result) => result.status === 'rejected') ||
+        this.agyProbes.size > 0 ||
+        this.unconfirmedAgyProbes.size > 0 ||
+        hasRemainingCliProbes
+      ) {
+        throw new Error('Runtime preparation probes were not released.')
+      }
     })()
     return this.disposal
   }
@@ -184,33 +316,80 @@ export class RuntimePreparation {
     process.env.PATH = effectivePath
   }
 
-  catalogIdentity(workingDirectory?: string): string {
+  private effectiveEnv(): NodeJS.ProcessEnv {
+    return this.options.env ?? process.env
+  }
+
+  catalogIdentity(workingDirectory?: string, activePairKey?: string): string {
+    const env = this.effectiveEnv()
     return createHash('sha256')
       .update(
         JSON.stringify([
           workingDirectory,
+          ...(activePairKey ? [activePairKey] : []),
           this.configurationGeneration,
           this.repository.readSelectedExecutablePath('claude'),
           this.repository.readSelectedExecutablePath('codex'),
-          process.env.PATH,
-          process.env.LOCALAPPDATA,
+          this.repository.readSelectedExecutablePath('agy'),
+          env.PATH,
+          env.LOCALAPPDATA,
+          env.ANTIGRAVITY_GEMINI_DIR,
         ]),
       )
       .digest('hex')
   }
 
   providerConfigurationKey(agentId: RuntimeAgentId): string {
+    const env = this.effectiveEnv()
     return createHash('sha256')
       .update(
         JSON.stringify([
           agentId,
           this.configurationGeneration,
           this.repository.readSelectedExecutablePath(agentId),
-          process.env.PATH,
-          process.env.LOCALAPPDATA,
+          env.PATH,
+          env.LOCALAPPDATA,
+          ...(agentId === 'agy' ? [env.ANTIGRAVITY_GEMINI_DIR] : []),
         ]),
       )
       .digest('hex')
+  }
+
+  private pruneSettledCliProbes(provider: RuntimeAgentId): void {
+    const unconfirmedSet = this.unconfirmedCliProbes.get(provider)
+    const activeSet = this.cliProbes.get(provider)
+    if (unconfirmedSet) {
+      for (const probe of unconfirmedSet) {
+        if (isAgyProbeSettled(probe)) {
+          unconfirmedSet.delete(probe)
+          activeSet?.delete(probe)
+        }
+      }
+    }
+    if (activeSet) {
+      for (const probe of activeSet) {
+        if (isAgyProbeSettled(probe) && !unconfirmedSet?.has(probe)) {
+          activeSet.delete(probe)
+        }
+      }
+    }
+  }
+
+  unconfirmedProviderProbes(provider: RuntimeAgentId): readonly OwnedProcessGroup[] {
+    this.pruneSettledCliProbes(provider)
+    const unresolved: OwnedProcessGroup[] = [...(this.unconfirmedCliProbes.get(provider) ?? [])]
+    if (provider === 'agy') {
+      for (const [probe, metadata] of this.unconfirmedAgyProbes.entries()) {
+        if (isAgyProbeSettled(probe)) {
+          this.unconfirmedAgyProbes.delete(probe)
+          this.agyProbes.delete(probe)
+          void rm(metadata.probeCwd, { recursive: true, force: true }).catch(() => undefined)
+        } else {
+          unresolved.push(probe)
+        }
+      }
+    }
+    return unresolved
   }
 
   async findRecoveryExecutable(
@@ -235,6 +414,35 @@ export class RuntimePreparation {
       await this.prepareEnvironment(signal)
       signal?.throwIfAborted()
       return { ok: true, value: await this.collectReadinessSnapshot(signal) }
+    } catch {
+      return {
+        ok: false,
+        error: { code: 'INTERNAL', message: 'Runtime preparation could not be completed.' },
+      }
+    }
+  }
+
+  async inspectProviderReadiness(
+    provider: RuntimeAgentId,
+    signal?: AbortSignal,
+  ): Promise<RpcResult<RuntimeAgentReadiness>> {
+    try {
+      await this.prepareEnvironment(signal)
+      signal?.throwIfAborted()
+      const agent = await this.probeAgent(
+        provider,
+        this.repository.readSelectedExecutablePath(provider),
+        signal,
+      )
+      signal?.throwIfAborted()
+      const cliVersion = agent.version?.match(/\b\d{1,5}\.\d{1,5}\.\d{1,5}\b/u)?.[0]
+      recordDiagnostic({
+        operation: 'readiness',
+        phase: agent.state === 'ready' ? 'ready' : 'blocked',
+        agentId: agent.agentId,
+        ...(cliVersion ? { cliVersion } : {}),
+      })
+      return { ok: true, value: agent }
     } catch {
       return {
         ok: false,
@@ -270,14 +478,15 @@ export class RuntimePreparation {
   private async collectReadinessSnapshot(
     signal?: AbortSignal,
   ): Promise<RuntimePreparationSnapshot> {
-    // The probes are independent and bounded, so startup latency is the slower probe rather than
-    // the sum of both CLIs.
-    const [claude, codex] = await Promise.all([
+    // The probes are independent and bounded, so startup latency is the slowest probe rather than
+    // the sum of all three CLIs.
+    const [claude, codex, agy] = await Promise.all([
       this.probeAgent('claude', this.repository.readSelectedExecutablePath('claude'), signal),
       this.probeAgent('codex', this.repository.readSelectedExecutablePath('codex'), signal),
+      this.probeAgent('agy', this.repository.readSelectedExecutablePath('agy'), signal),
     ])
     signal?.throwIfAborted()
-    for (const agent of [claude, codex]) {
+    for (const agent of [claude, codex, agy]) {
       const cliVersion = agent.version?.match(/\b\d{1,5}\.\d{1,5}\.\d{1,5}\b/u)?.[0]
       recordDiagnostic({
         operation: 'readiness',
@@ -286,7 +495,7 @@ export class RuntimePreparation {
         ...(cliVersion ? { cliVersion } : {}),
       })
     }
-    return { firstUse: !this.repository.hasCompletedFirstUseSetup(), agents: [claude, codex] }
+    return { firstUse: !this.repository.hasCompletedFirstUseSetup(), agents: [claude, codex, agy] }
   }
 
   private async probeAgent(
@@ -295,95 +504,315 @@ export class RuntimePreparation {
     signal?: AbortSignal,
   ): Promise<RuntimeAgentReadiness> {
     const checkedAt = new Date().toISOString()
-    signal?.throwIfAborted()
-    const executablePath = await this.findExecutable(agentId, selectedPath, signal)
-    signal?.throwIfAborted()
-    if (!executablePath) {
-      return {
-        agentId,
-        state: 'missing',
-        detail: selectedPath
-          ? 'Saved executable path was not found. Choose a valid path or reinstall.'
-          : 'No executable was found.',
-        checkedAt,
+    let executablePath: string | undefined
+    try {
+      signal?.throwIfAborted()
+      if (this.unconfirmedProviderProbes(agentId).length > 0) {
+        return {
+          agentId,
+          state: 'cannot_verify',
+          ...(selectedPath ? { executablePath: selectedPath } : {}),
+          detail: `${runtimeAgentDisplayName(agentId)} check could not be confirmed.`,
+          checkedAt,
+        }
       }
-    }
+      executablePath = await this.findExecutable(agentId, selectedPath, signal)
+      signal?.throwIfAborted()
+      if (!executablePath) {
+        return {
+          agentId,
+          state: 'missing',
+          detail: selectedPath
+            ? 'Saved executable path was not found. Choose a valid path or reinstall.'
+            : 'No executable was found.',
+          checkedAt,
+        }
+      }
 
-    // --version is both the version source and the bounded "can this executable start?" probe. It
-    // deliberately avoids a model request, network quota, or workspace access.
-    const version = await this.runProbeCommand(executablePath, ['--version'], signal)
-    signal?.throwIfAborted()
-    if (version.failedToStart || version.timedOut || version.exitCode !== 0) {
-      return {
+      // --version is both the version source and the bounded "can this executable start?" probe. It
+      // deliberately avoids a model request, network quota, or workspace access.
+      const version = await this.runCliProbeCommand(agentId, executablePath, 'version', signal)
+      signal?.throwIfAborted()
+      if (version.closeUnconfirmed) {
+        return {
+          agentId,
+          state: 'cannot_verify',
+          executablePath,
+          detail: `${runtimeAgentDisplayName(agentId)} version check cleanup could not be confirmed.`,
+          checkedAt,
+        }
+      }
+      if (version.failedToStart || version.timedOut || version.exitCode !== 0) {
+        return {
+          agentId,
+          state: 'startup_failed',
+          executablePath,
+          detail: version.timedOut ? 'Version check timed out.' : 'The executable could not start.',
+          checkedAt,
+        }
+      }
+
+      const versionText = this.parseVersionLine(version.output)
+      const minimumVersion = RUNTIME_MINIMUM_VERSIONS[agentId]
+      const agentName = runtimeAgentDisplayName(agentId)
+      const compatibility = this.versionCompatibility(versionText, minimumVersion)
+      if (compatibility !== 'supported') {
+        return {
+          agentId,
+          state: compatibility === 'outdated' ? 'unsupported_version' : 'cannot_verify',
+          executablePath,
+          ...(versionText ? { version: versionText } : {}),
+          detail:
+            compatibility === 'outdated'
+              ? `Requires ${agentName} ${minimumVersion} or later. Upgrade ${agentName}, then check again.`
+              : `Could not read the ${agentName} version. Version ${minimumVersion} or later is required. Upgrade or select a supported installation, then check again.`,
+          checkedAt,
+        }
+      }
+
+      if (agentId === 'agy') {
+        return await this.probeAgyAuthentication(executablePath, versionText, checkedAt, signal)
+      }
+
+      // Each CLI owns its authentication truth. Exit 0 means the CLI accepted an effective login or
+      // API configuration; Pact does not inspect credential files itself.
+      const auth = await this.runCliProbeCommand(
         agentId,
-        state: 'startup_failed',
         executablePath,
-        detail: version.timedOut ? 'Version check timed out.' : 'The executable could not start.',
-        checkedAt,
+        agentId === 'claude' ? 'claude_auth' : 'codex_auth',
+        signal,
+      )
+      signal?.throwIfAborted()
+      if (auth.closeUnconfirmed) {
+        return {
+          agentId,
+          state: 'cannot_verify',
+          executablePath,
+          ...(versionText ? { version: versionText } : {}),
+          detail: `${agentName} authentication check cleanup could not be confirmed.`,
+          checkedAt,
+        }
       }
-    }
+      if (auth.exitCode === 0 && !auth.timedOut && !auth.failedToStart) {
+        return {
+          agentId,
+          state: 'ready',
+          executablePath,
+          ...(versionText ? { version: versionText } : {}),
+          checkedAt,
+        }
+      }
 
-    const versionText = this.parseVersionLine(version.output)
-    const minimumVersion = RUNTIME_MINIMUM_VERSIONS[agentId]
-    const agentName = agentId === 'claude' ? 'Claude Code' : 'Codex'
-    const compatibility = this.versionCompatibility(versionText, minimumVersion)
-    if (compatibility !== 'supported') {
+      if (auth.exitCode === 1 && !auth.timedOut && !auth.failedToStart) {
+        return {
+          agentId,
+          state: 'authentication_required',
+          executablePath,
+          ...(versionText ? { version: versionText } : {}),
+          detail:
+            agentId === 'claude'
+              ? 'Run claude auth login in your terminal, or set up a login or compatible API configuration.'
+              : 'Run codex login in your terminal, then check again.',
+          checkedAt,
+        }
+      }
+
       return {
         agentId,
-        state: compatibility === 'outdated' ? 'unsupported_version' : 'cannot_verify',
+        state: auth.failedToStart || auth.timedOut ? 'startup_failed' : 'cannot_verify',
         executablePath,
         ...(versionText ? { version: versionText } : {}),
-        detail:
-          compatibility === 'outdated'
-            ? `Requires ${agentName} ${minimumVersion} or later. Upgrade ${agentName}, then check again.`
-            : `Could not read the ${agentName} version. Version ${minimumVersion} or later is required. Upgrade or select a supported installation, then check again.`,
+        detail: auth.timedOut
+          ? 'Authentication check timed out.'
+          : auth.failedToStart
+            ? 'Authentication check could not start.'
+            : 'This CLI version did not return a recognized authentication status.',
+        checkedAt,
+      }
+    } catch (error) {
+      signal?.throwIfAborted()
+      if (this.disposed) {
+        throw new Error('Runtime preparation is shutting down.', { cause: error })
+      }
+      return {
+        agentId,
+        state: 'cannot_verify',
+        ...(executablePath ? { executablePath } : {}),
+        detail: `Could not verify ${runtimeAgentDisplayName(agentId)} installation.`,
+        checkedAt,
+      }
+    }
+  }
+
+  private async reconcileUnconfirmedAgyProbes(): Promise<boolean> {
+    const settledEntries: Array<[OwnedProcessGroup, UnconfirmedAgyProbe]> = []
+    for (const entry of this.unconfirmedAgyProbes.entries()) {
+      if (isAgyProbeSettled(entry[0])) settledEntries.push(entry)
+    }
+    await Promise.allSettled(
+      settledEntries.map(async ([probe, metadata]) => {
+        this.unconfirmedAgyProbes.delete(probe)
+        this.agyProbes.delete(probe)
+        await rm(metadata.probeCwd, { recursive: true, force: true }).catch(() => undefined)
+      }),
+    )
+    return this.unconfirmedAgyProbes.size > 0
+  }
+
+  private ownAgyProbe(
+    signal: AbortSignal,
+    onCloseInput: () => void | Promise<void>,
+  ): OwnedProcessGroup {
+    signal.throwIfAborted()
+    for (const candidate of this.agyProbes) {
+      if (isAgyProbeSettled(candidate) && !this.unconfirmedAgyProbes.has(candidate)) {
+        this.agyProbes.delete(candidate)
+      }
+    }
+    if (this.disposed || this.agyProbes.size >= MAX_ACTIVE_AGY_PROBES) {
+      throw new AgyProbeError('close_unconfirmed', 'Antigravity probe capacity is unavailable.')
+    }
+    const probe = new OwnedProcessGroup({ signal, onCloseInput })
+    this.agyProbes.add(probe)
+    return probe
+  }
+
+  private async probeAgyAuthentication(
+    executablePath: string,
+    cliVersion: string | undefined,
+    checkedAt: string,
+    signal?: AbortSignal,
+  ): Promise<RuntimeAgentReadiness> {
+    if (await this.reconcileUnconfirmedAgyProbes()) {
+      return {
+        agentId: 'agy',
+        state: 'cannot_verify',
+        executablePath,
+        ...(cliVersion ? { version: cliVersion } : {}),
+        detail: 'Antigravity authentication check could not be confirmed.',
         checkedAt,
       }
     }
 
-    // Each CLI owns its authentication truth. Exit 0 means the CLI accepted an effective login or
-    // API configuration; Pact does not inspect credential files itself.
-    const auth = await this.runProbeCommand(
-      executablePath,
-      agentId === 'claude' ? ['auth', 'status'] : ['login', 'status'],
-      signal,
-    )
-    signal?.throwIfAborted()
-    if (auth.exitCode === 0 && !auth.timedOut && !auth.failedToStart) {
+    const combinedAbort = new AbortController()
+    const onAbort = (): void => combinedAbort.abort(signal?.reason)
+    this.environmentAbort.signal.addEventListener('abort', onAbort, { once: true })
+    signal?.addEventListener('abort', onAbort, { once: true })
+    if (this.environmentAbort.signal.aborted || signal?.aborted) {
+      combinedAbort.abort(signal?.reason ?? this.environmentAbort.signal.reason)
+    }
+
+    let discoveredAgentInfoVersion: string | undefined
+    let sessionCleanupNote: string | undefined
+    try {
+      await runAgyAcpProbe<void>({
+        executablePath,
+        ...(this.options.env ? { env: this.options.env } : {}),
+        signal: combinedAbort.signal,
+        timeoutMs: PROBE_TIMEOUT_MS,
+        maxFrameBytes: MAX_CAPTURE_BYTES,
+        maxTotalBytes: MAX_CAPTURE_BYTES,
+        deleteProbeSessionDb: true,
+        ownProbe: (probeSignal, onCloseInput) => this.ownAgyProbe(probeSignal, onCloseInput),
+        onAgentInfoVersion: (agentInfoVersion) => {
+          // Record ACP server version separately; RuntimeAgentReadiness.version always reflects CLI --version.
+          discoveredAgentInfoVersion = agentInfoVersion
+          this.lastAcpAgentInfoVersion = agentInfoVersion
+        },
+        inspectSession: async () => undefined,
+        onCloseError: (_error, probe, probeCwd) => {
+          if (!isAgyProbeSettled(probe)) {
+            this.unconfirmedAgyProbes.set(probe, { probeCwd })
+          }
+        },
+        onProbeSettled: (probe) => {
+          if (isAgyProbeSettled(probe)) {
+            this.unconfirmedAgyProbes.delete(probe)
+            this.agyProbes.delete(probe)
+          }
+        },
+        onSessionCleanupNote: (note) => {
+          sessionCleanupNote = note
+          recordDiagnostic({
+            operation: 'readiness',
+            phase: 'ready',
+            level: 'warn',
+            agentId: 'agy',
+          })
+        },
+      })
+      signal?.throwIfAborted()
       return {
-        agentId,
+        agentId: 'agy',
         state: 'ready',
         executablePath,
-        ...(versionText ? { version: versionText } : {}),
+        ...(cliVersion ? { version: cliVersion } : {}),
+        ...(discoveredAgentInfoVersion ? { agentInfoVersion: discoveredAgentInfoVersion } : {}),
+        ...(sessionCleanupNote ? { detail: sessionCleanupNote } : {}),
         checkedAt,
       }
-    }
-
-    if (auth.exitCode === 1 && !auth.timedOut && !auth.failedToStart) {
+    } catch (error) {
+      signal?.throwIfAborted()
+      if (this.disposed) {
+        throw new Error('Runtime preparation is shutting down.', { cause: error })
+      }
+      const versionFields = {
+        ...(cliVersion ? { version: cliVersion } : {}),
+        ...(discoveredAgentInfoVersion ? { agentInfoVersion: discoveredAgentInfoVersion } : {}),
+      }
+      if (error instanceof AgyProbeError) {
+        if (error.kind === 'unauthenticated') {
+          return {
+            agentId: 'agy',
+            state: 'authentication_required',
+            executablePath,
+            ...versionFields,
+            detail: 'Run agy to sign in in your terminal, then check again.',
+            checkedAt,
+          }
+        }
+        if (error.kind === 'start_failed') {
+          return {
+            agentId: 'agy',
+            state: 'startup_failed',
+            executablePath,
+            ...versionFields,
+            detail: 'Authentication check could not start.',
+            checkedAt,
+          }
+        }
+        if (error.kind === 'timeout') {
+          return {
+            agentId: 'agy',
+            state: 'startup_failed',
+            executablePath,
+            ...versionFields,
+            detail: 'Authentication check timed out.',
+            checkedAt,
+          }
+        }
+        if (error.kind === 'close_unconfirmed') {
+          return {
+            agentId: 'agy',
+            state: 'cannot_verify',
+            executablePath,
+            ...versionFields,
+            detail: 'Antigravity authentication check could not be confirmed.',
+            checkedAt,
+          }
+        }
+      }
       return {
-        agentId,
-        state: 'authentication_required',
+        agentId: 'agy',
+        state: 'cannot_verify',
         executablePath,
-        ...(versionText ? { version: versionText } : {}),
-        detail:
-          agentId === 'claude'
-            ? 'Run claude auth login in your terminal, or set up a login or compatible API configuration.'
-            : 'Run codex login in your terminal, then check again.',
+        ...versionFields,
+        detail: 'This CLI version did not return a recognized authentication status.',
         checkedAt,
       }
-    }
-
-    return {
-      agentId,
-      state: auth.failedToStart || auth.timedOut ? 'startup_failed' : 'cannot_verify',
-      executablePath,
-      ...(versionText ? { version: versionText } : {}),
-      detail: auth.timedOut
-        ? 'Authentication check timed out.'
-        : auth.failedToStart
-          ? 'Authentication check could not start.'
-          : 'This CLI version did not return a recognized authentication status.',
-      checkedAt,
+    } finally {
+      this.environmentAbort.signal.removeEventListener('abort', onAbort)
+      signal?.removeEventListener('abort', onAbort)
     }
   }
 
@@ -405,7 +834,7 @@ export class RuntimePreparation {
 
   /** Desktop updates its native CLI separately from PATH installations. Never replace an explicit choice. */
   private async findWindowsDesktopClaude(signal?: AbortSignal): Promise<string | undefined> {
-    const localAppData = process.env.LOCALAPPDATA
+    const localAppData = this.effectiveEnv().LOCALAPPDATA
     if (process.platform !== 'win32' || !localAppData || !isAbsolute(localAppData)) return undefined
     const deadline = Date.now() + INSTALLATION_DISCOVERY_MS
     let entries = 0,
@@ -480,7 +909,7 @@ export class RuntimePreparation {
     agentId: RuntimeAgentId,
     directoryLimit?: number,
   ): Promise<string | undefined> {
-    const candidates = (process.env.PATH ?? '')
+    const candidates = (this.effectiveEnv().PATH ?? '')
       .split(delimiter)
       .filter(Boolean)
       .slice(0, directoryLimit)
@@ -501,9 +930,13 @@ export class RuntimePreparation {
     agentId: RuntimeAgentId,
     signal?: AbortSignal,
   ): Promise<string | undefined> {
-    const base = agentId === 'claude' ? 'claude' : 'codex'
     if (process.platform === 'win32') {
-      const result = await this.runProbeCommand('where.exe', [base], signal)
+      const lookupCommand: FixedLookupCommand =
+        agentId === 'claude' ? 'where_claude' : agentId === 'codex' ? 'where_codex' : 'where_agy'
+      const result = await this.runLookupCommand(agentId, lookupCommand, signal)
+      if (result.closeUnconfirmed) {
+        throw new Error('Platform executable lookup cleanup could not be confirmed.')
+      }
       const candidates = result.output
         .split(/\r?\n/u)
         .map((line) => line.trim())
@@ -517,8 +950,12 @@ export class RuntimePreparation {
     }
     if (process.platform === 'darwin') {
       if (this.options.discoverShellPath) return undefined
-      const command = agentId === 'claude' ? 'command -v claude' : 'command -v codex'
-      const result = await this.runProbeCommand('/bin/zsh', ['-lc', command], signal)
+      const lookupCommand: FixedLookupCommand =
+        agentId === 'claude' ? 'zsh_claude' : agentId === 'codex' ? 'zsh_codex' : 'zsh_agy'
+      const result = await this.runLookupCommand(agentId, lookupCommand, signal)
+      if (result.closeUnconfirmed) {
+        throw new Error('Platform executable lookup cleanup could not be confirmed.')
+      }
       const candidate = result.output.split(/\r?\n/u).find(Boolean)?.trim()
       return candidate && (await this.isExecutable(candidate)) ? candidate : undefined
     }
@@ -526,8 +963,7 @@ export class RuntimePreparation {
   }
 
   private candidateExecutableNames(agentId: RuntimeAgentId): string[] {
-    const base = agentId === 'claude' ? 'claude' : 'codex'
-    return process.platform === 'win32' ? [`${base}.exe`, `${base}.cmd`] : [base]
+    return process.platform === 'win32' ? [`${agentId}.exe`, `${agentId}.cmd`] : [agentId]
   }
 
   private async isExecutable(filePath: string): Promise<boolean> {
@@ -549,7 +985,7 @@ export class RuntimePreparation {
     version: string | undefined,
     minimumVersion: string,
   ): 'supported' | 'outdated' | 'unknown' {
-    // Match a complete version token from either CLI's first output line, never a partial or
+    // Match a complete version token from any CLI's first output line, never a partial or
     // malformed number. Build metadata does not affect ordering; prereleases precede a release.
     const match = version?.match(
       /(?:^|\s)(\d{1,5})\.(\d{1,5})\.(\d{1,5})(-[\da-z]+(?:[.-][\da-z]+)*)?(?:\+[\da-z]+(?:[.-][\da-z]+)*)?(?=$|\s|\()/iu,
@@ -563,85 +999,161 @@ export class RuntimePreparation {
     return match[4] ? 'outdated' : 'supported'
   }
 
-  // Run only fixed CLI probes. User-controlled values are passed as arguments, never through a
-  // general-purpose shell, and output is bounded because CLI output is untrusted input.
-  private runProbeCommand(
+  private runCliProbeCommand(
+    agentId: RuntimeAgentId,
     executablePath: string,
-    args: string[],
+    command: FixedCliProbeCommand,
     signal?: AbortSignal,
   ): Promise<ProbeCommandResult> {
-    return new Promise((resolve) => {
-      let output = ''
-      let outputBytes = 0
-      let failedToStart = false
-      let timedOut = false
-      let settled = false
-      if (signal?.aborted) {
-        resolve({ exitCode: null, output, timedOut: true, failedToStart: false })
-        return
-      }
-      const isWindowsCommand = process.platform === 'win32' && /\.cmd$/iu.test(executablePath)
-      if (isWindowsCommand && /[&|<>^%!"\r\n]/u.test(executablePath)) {
-        resolve({ exitCode: null, output, timedOut: false, failedToStart: true })
-        return
-      }
-      const child = spawn(
-        isWindowsCommand ? (process.env.ComSpec ?? 'cmd.exe') : executablePath,
-        isWindowsCommand ? ['/d', '/s', '/c', `""${executablePath}" ${args.join(' ')}"`] : args,
-        {
-          shell: false,
-          stdio: ['ignore', 'pipe', 'pipe'],
-          windowsHide: true,
-          windowsVerbatimArguments: isWindowsCommand,
-        },
-      )
-      let killTimer: ReturnType<typeof setTimeout> | undefined
-      let closeTimer: ReturnType<typeof setTimeout> | undefined
-      const capture = (chunk: Buffer, stdout: boolean): void => {
-        const length = Math.min(chunk.length, MAX_CAPTURE_BYTES - outputBytes)
-        if (length > 0) {
-          if (stdout) output += chunk.subarray(0, length).toString('utf8')
-          outputBytes += length
-        }
-      }
-      // Diagnostics are drained under the same byte budget, never parsed as machine results.
-      const stdout = (chunk: Buffer): void => capture(chunk, true)
-      const stderr = (chunk: Buffer): void => capture(chunk, false)
-      const finish = (exitCode: number | null): void => {
-        if (settled) return
-        settled = true
-        clearTimeout(timeout)
-        clearTimeout(killTimer)
-        clearTimeout(closeTimer)
-        signal?.removeEventListener('abort', stop)
-        child.stdout.off('data', stdout)
-        child.stderr.off('data', stderr)
-        child.stdout.destroy()
-        child.stderr.destroy()
-        resolve({ exitCode, output, timedOut, failedToStart })
-      }
-      const stop = (): void => {
-        if (settled || closeTimer) return
-        timedOut = true
-        child.kill()
-        killTimer = setTimeout(() => child.kill('SIGKILL'), 250)
-        // A descendant retaining stdio must not keep a probe waiter alive.
-        closeTimer = setTimeout(() => {
-          child.kill('SIGKILL')
-          child.unref()
-          finish(null)
-        }, 750)
-      }
-      const timeout = setTimeout(stop, PROBE_TIMEOUT_MS)
-      child.stdout.on('data', stdout)
-      child.stderr.on('data', stderr)
-      child.once('error', () => {
-        failedToStart = true
-        finish(null)
+    const spec = fixedCliProbeArgs(command)
+    const isWindowsCommand = process.platform === 'win32' && /\.cmd$/iu.test(executablePath)
+    if (isWindowsCommand && isUnsafeWindowsCmdPath(executablePath)) {
+      return Promise.resolve({
+        exitCode: null,
+        output: '',
+        timedOut: false,
+        failedToStart: true,
       })
-      child.once('close', finish)
-      signal?.addEventListener('abort', stop, { once: true })
-      if (signal?.aborted) stop()
-    })
+    }
+    return this.spawnBoundedProbe(
+      agentId,
+      isWindowsCommand ? (this.effectiveEnv().ComSpec ?? 'cmd.exe') : executablePath,
+      isWindowsCommand
+        ? ['/d', '/s', '/c', `""${executablePath}" ${spec.windowsCmdSuffix}"`]
+        : spec.argv,
+      isWindowsCommand,
+      signal,
+    )
+  }
+
+  private runLookupCommand(
+    agentId: RuntimeAgentId,
+    command: FixedLookupCommand,
+    signal?: AbortSignal,
+  ): Promise<ProbeCommandResult> {
+    const spec = fixedLookupArgs(command)
+    return this.spawnBoundedProbe(agentId, spec.executable, spec.argv, false, signal)
+  }
+
+  // Run only fixed CLI probes inside OwnedProcessGroup so timed-out/cancelled children never
+  // unref and leak past caller concurrency permits while still alive.
+  private async spawnBoundedProbe(
+    agentId: RuntimeAgentId,
+    targetExecutable: string,
+    args: readonly string[],
+    windowsVerbatimArguments: boolean,
+    signal?: AbortSignal,
+  ): Promise<ProbeCommandResult> {
+    if (signal?.aborted || this.disposed || this.environmentAbort.signal.aborted) {
+      return { exitCode: null, output: '', timedOut: true, failedToStart: false }
+    }
+    this.pruneSettledCliProbes(agentId)
+    const activeSet = this.cliProbes.get(agentId)!
+    const unconfirmedSet = this.unconfirmedCliProbes.get(agentId)!
+    if (activeSet.size >= MAX_ACTIVE_CLI_PROBES_PER_AGENT || unconfirmedSet.size > 0) {
+      return {
+        exitCode: null,
+        output: '',
+        timedOut: false,
+        failedToStart: true,
+        closeUnconfirmed: true,
+      }
+    }
+
+    let output = ''
+    let outputBytes = 0
+    let failedToStart = false
+    let timedOut = false
+    let closeUnconfirmed = false
+    const probeAbort = new AbortController()
+    const probe = new OwnedProcessGroup({ signal: probeAbort.signal })
+    activeSet.add(probe)
+
+    const onExternalAbort = (): void => {
+      timedOut = true
+      probeAbort.abort(signal?.reason ?? this.environmentAbort.signal.reason)
+    }
+    signal?.addEventListener('abort', onExternalAbort, { once: true })
+    this.environmentAbort.signal.addEventListener('abort', onExternalAbort, { once: true })
+
+    try {
+      if (signal?.aborted || this.disposed || this.environmentAbort.signal.aborted) {
+        timedOut = true
+        probeAbort.abort()
+        return { exitCode: null, output: '', timedOut: true, failedToStart: false }
+      }
+
+      let child
+      try {
+        child = probe.spawn(targetExecutable, [...args], {
+          ...(this.options.env ? { env: this.options.env } : {}),
+          windowsHide: true,
+          windowsVerbatimArguments,
+        })
+      } catch {
+        failedToStart = true
+        return { exitCode: null, output: '', timedOut: false, failedToStart: true }
+      }
+      if (!child.stdin.destroyed) child.stdin.end()
+
+      const exitCode = await new Promise<number | null>((resolve) => {
+        let settled = false
+        const capture = (chunk: Buffer, isStdout: boolean): void => {
+          const length = Math.min(chunk.length, MAX_CAPTURE_BYTES - outputBytes)
+          if (length > 0) {
+            if (isStdout) output += chunk.subarray(0, length).toString('utf8')
+            outputBytes += length
+          }
+        }
+        const onStdout = (chunk: Buffer): void => capture(chunk, true)
+        const onStderr = (chunk: Buffer): void => capture(chunk, false)
+        const finish = (code: number | null): void => {
+          if (settled) return
+          settled = true
+          clearTimeout(timeout)
+          probeAbort.signal.removeEventListener('abort', onProbeAborted)
+          child.stdout.off('data', onStdout)
+          child.stderr.off('data', onStderr)
+          resolve(code)
+        }
+        const onProbeAborted = (): void => {
+          timedOut = true
+          finish(null)
+        }
+        const timeout = setTimeout(() => {
+          timedOut = true
+          probeAbort.abort()
+          finish(null)
+        }, PROBE_TIMEOUT_MS)
+        child.stdout.on('data', onStdout)
+        child.stderr.on('data', onStderr)
+        child.once('error', () => {
+          failedToStart = true
+          finish(null)
+        })
+        child.once('close', (code) => finish(code))
+        probeAbort.signal.addEventListener('abort', onProbeAborted, { once: true })
+        if (probeAbort.signal.aborted) onProbeAborted()
+      })
+
+      return {
+        exitCode,
+        output,
+        timedOut,
+        failedToStart,
+      }
+    } finally {
+      signal?.removeEventListener('abort', onExternalAbort)
+      this.environmentAbort.signal.removeEventListener('abort', onExternalAbort)
+      await probe.close().catch(() => {
+        closeUnconfirmed = true
+      })
+      if (closeUnconfirmed || !isAgyProbeSettled(probe)) {
+        closeUnconfirmed = true
+        unconfirmedSet.add(probe)
+      } else {
+        activeSet.delete(probe)
+      }
+    }
   }
 }

@@ -670,7 +670,7 @@ describe('Plan revision advice persistence', () => {
     const boundary = (
       agentId: 'claude' | 'codex',
     ): import('@pact/contracts').AgentNativeForkBoundary => {
-      const run = selection.runs[agentId],
+      const run = selection.runs[agentId]!,
         response = f.repo.forkResponse(run.id, selection.prepared.sequence)
       return {
         nativeSessionId: run.nativeSessionId!,

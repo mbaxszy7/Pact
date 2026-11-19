@@ -1,7 +1,7 @@
 import { BookOpen, ChevronLeft, Maximize2, Minimize2, RotateCcw, X } from 'lucide-react'
 import { Component, lazy, Suspense, type ReactNode } from 'react'
 
-import type { SkillDocument, SkillSelection } from '@pact/contracts'
+import { agentDisplayName, type SkillDocument, type SkillSelection } from '@pact/contracts'
 
 const CodeViewer = lazy(async () => {
   const module = await import('../project-file/ProjectCodeViewer')
@@ -56,7 +56,7 @@ export function SkillDocumentPanel({
   onBackToSideChat?: (() => void) | undefined
   onRetry: () => void
 }): React.JSX.Element {
-  const label = state.skill.agentId === 'codex' ? 'Codex' : 'Claude Code'
+  const label = agentDisplayName(state.skill.agentId)
   const document = state.document
   return (
     <section className="flex h-full min-h-0 flex-col" aria-label="Skill document">

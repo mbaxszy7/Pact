@@ -11,8 +11,38 @@ import { schedulingHandoffSchema } from './scheduling.js'
 export * from './collaboration-documents.js'
 export * from './scheduling.js'
 
-const agent = z.enum(['claude', 'codex'])
+export const AGENTS = ['claude', 'codex', 'agy'] as const
+const agent = z.enum(AGENTS)
 type AgentId = z.infer<typeof agent>
+
+export const AGENT_DISPLAY_NAMES = {
+  claude: 'Claude Code',
+  codex: 'Codex',
+  agy: 'Antigravity',
+} as const satisfies Record<AgentId, string>
+
+export function agentDisplayName(agentId: AgentId): string {
+  return AGENT_DISPLAY_NAMES[agentId]
+}
+
+export function defaultSecondaryAgent(primary: AgentId): AgentId {
+  return primary === 'claude' ? 'codex' : 'claude'
+}
+
+export function isAgentInPair(agentId: AgentId, pair: readonly [AgentId, AgentId]): boolean {
+  return pair[0] === agentId || pair[1] === agentId
+}
+
+export function resolveActiveAgentPair(settings: {
+  primaryAgentId: AgentId
+  secondaryAgentId?: AgentId | undefined
+}): [AgentId, AgentId] {
+  const secondary = settings.secondaryAgentId ?? defaultSecondaryAgent(settings.primaryAgentId)
+  if (settings.primaryAgentId === secondary) {
+    throw new Error('Primary and Secondary Agents must be distinct.')
+  }
+  return [settings.primaryAgentId, secondary]
+}
 export const PACT_SKILLS = ['plan', 'build', 'review'] as const
 export type PactSkill = (typeof PACT_SKILLS)[number]
 export const pactSkillSchema = z.enum(PACT_SKILLS)
@@ -67,13 +97,24 @@ export const taskStageRolesSchema = z
     (roles) => roles.planAuthor !== roles.planReviewer && roles.codeAuthor !== roles.codeReviewer,
     'Each author requires a distinct reviewer.',
   )
+  .refine(
+    (roles) =>
+      new Set([roles.planAuthor, roles.planReviewer, roles.codeAuthor, roles.codeReviewer]).size ===
+      2,
+    'All stage roles must belong to a single 2-member Agent pair.',
+  )
 export type TaskStageRoles = z.infer<typeof taskStageRolesSchema>
 
 export const initialTaskRoleCandidateIdSchema = z.enum([
   'roles_codex_codex',
   'roles_codex_claude',
+  'roles_codex_agy',
   'roles_claude_codex',
   'roles_claude_claude',
+  'roles_claude_agy',
+  'roles_agy_codex',
+  'roles_agy_claude',
+  'roles_agy_agy',
 ])
 export type InitialTaskRoleCandidateId = z.infer<typeof initialTaskRoleCandidateIdSchema>
 export const initialTaskRoleCandidateSchema = z.strictObject({
@@ -84,8 +125,27 @@ export const initialTaskRoleCandidateSchema = z.strictObject({
 })
 export type InitialTaskRoleCandidate = z.infer<typeof initialTaskRoleCandidateSchema>
 
-export function defaultTaskStageRoles(primary: AgentId): TaskStageRoles {
-  const secondary = primary === 'codex' ? 'claude' : 'codex'
+export function otherAgent(id: AgentId, pair?: readonly [AgentId, AgentId]): AgentId {
+  if (pair) {
+    if (pair[0] === pair[1]) {
+      throw new Error('Active Agent pair must contain two distinct Agents.')
+    }
+    if (id === pair[0]) return pair[1]
+    if (id === pair[1]) return pair[0]
+    throw new Error(`Agent ${id} is not a member of active pair [${pair[0]}, ${pair[1]}].`)
+  }
+  if (id === 'claude') return 'codex'
+  if (id === 'codex') return 'claude'
+  throw new Error('Cannot resolve peer of Antigravity without an explicit 2-member Agent pair.')
+}
+
+export function defaultTaskStageRoles(
+  primary: AgentId,
+  secondary: AgentId = defaultSecondaryAgent(primary),
+): TaskStageRoles {
+  if (primary === secondary) {
+    throw new Error('Primary and Secondary Agents must be distinct.')
+  }
   return {
     version: 'task-stage-roles-v1',
     revision: 0,
@@ -95,9 +155,49 @@ export function defaultTaskStageRoles(primary: AgentId): TaskStageRoles {
     codeReviewer: primary,
   }
 }
-export function pactEntryPrimary(kind: PactSkill, primary: AgentId, entryActor?: AgentId): AgentId {
+
+export function resolveLegacyCompatibleTaskStageRoles(task: {
+  owner: AgentId
+  reviewer: AgentId
+  stageRoles?: TaskStageRoles | undefined
+}): TaskStageRoles {
+  if (task.stageRoles !== undefined) {
+    return task.stageRoles
+  }
+  if (task.owner !== task.reviewer) {
+    return defaultTaskStageRoles(task.owner, task.reviewer)
+  }
+  const peer = otherAgent(task.owner)
+  return {
+    version: 'task-stage-roles-v1',
+    revision: 0,
+    planAuthor: task.owner,
+    planReviewer: peer,
+    codeAuthor: peer,
+    codeReviewer: task.owner,
+  }
+}
+
+export function pactEntryPrimary(
+  kind: PactSkill,
+  primary: AgentId,
+  entryActor?: AgentId,
+  secondary?: AgentId,
+): AgentId {
+  const pair = resolveActiveAgentPair({ primaryAgentId: primary, secondaryAgentId: secondary })
   if (!entryActor) return primary
-  return kind === 'build' ? (entryActor === 'codex' ? 'claude' : 'codex') : entryActor
+  if (!isAgentInPair(entryActor, pair)) {
+    throw new Error(`Agent ${entryActor} is not a member of active pair [${pair[0]}, ${pair[1]}].`)
+  }
+  return kind === 'build' ? otherAgent(entryActor, pair) : entryActor
+}
+
+export function pactSessionEntryPrimary(
+  kind: PactSkill,
+  pair: readonly [AgentId, AgentId],
+  entryActor?: AgentId,
+): AgentId {
+  return pactEntryPrimary(kind, pair[0], entryActor, pair[1])
 }
 type PactEntryRoute = { type: 'agent'; agentId: AgentId } | { type: 'primary' } | { type: 'all' }
 export function pactCommandRouteAllowed(
@@ -113,15 +213,20 @@ export function pactCommandRouteAllowed(
       route.agentId === prefixRoute.agentId)
   )
 }
+const CANONICAL_CANDIDATE_AGENT_ORDER: readonly AgentId[] = ['codex', 'claude', 'agy']
+
 export function initialTaskRoleCandidates(
   kind: PactSkill,
   primary: AgentId,
+  secondary: AgentId = defaultSecondaryAgent(primary),
 ): InitialTaskRoleCandidate[] {
-  const defaults = defaultTaskStageRoles(primary)
-  const planAuthors: AgentId[] = kind === 'plan' ? ['codex', 'claude'] : [defaults.planAuthor]
+  const pair = resolveActiveAgentPair({ primaryAgentId: primary, secondaryAgentId: secondary })
+  const defaults = defaultTaskStageRoles(primary, secondary)
+  const pairMembers = CANONICAL_CANDIDATE_AGENT_ORDER.filter((id) => isAgentInPair(id, pair))
+  const planAuthors: AgentId[] = kind === 'plan' ? pairMembers : [defaults.planAuthor]
   const candidates: InitialTaskRoleCandidate[] = []
   for (const planAuthor of planAuthors) {
-    for (const codeAuthor of ['codex', 'claude'] as const) {
+    for (const codeAuthor of pairMembers) {
       if (planAuthor === defaults.planAuthor && codeAuthor === defaults.codeAuthor) continue
       candidates.push({
         id: `roles_${planAuthor}_${codeAuthor}`,
@@ -129,9 +234,9 @@ export function initialTaskRoleCandidates(
           version: 'task-stage-roles-v1',
           revision: 0,
           planAuthor,
-          planReviewer: planAuthor === 'codex' ? 'claude' : 'codex',
+          planReviewer: otherAgent(planAuthor, pair),
           codeAuthor,
-          codeReviewer: codeAuthor === 'codex' ? 'claude' : 'codex',
+          codeReviewer: otherAgent(codeAuthor, pair),
         },
       })
     }
@@ -581,6 +686,59 @@ export const collaborationTaskSchema = z
   .refine((task) => !task.stageRoles || task.rolePolicy === 'split-stages-v1', {
     message: 'Explicit stage roles require frozen Primary and Secondary identities.',
   })
+  .refine(
+    (task) => {
+      const participants: AgentId[] = [task.owner, task.reviewer, task.actor]
+      const pushOptional = (id: AgentId | undefined) => {
+        if (id) participants.push(id)
+      }
+      const pushRoles = (roles: TaskStageRoles | undefined) => {
+        if (!roles) return
+        participants.push(
+          roles.planAuthor,
+          roles.planReviewer,
+          roles.codeAuthor,
+          roles.codeReviewer,
+        )
+      }
+      pushRoles(task.stageRoles)
+      pushOptional(task.planAuthor)
+      pushOptional(task.unreviewedCodeActor)
+      pushOptional(task.unreviewedPlanActor)
+      pushOptional(task.lastCodeActor)
+      pushOptional(task.planReference?.author)
+      pushOptional(task.review?.actor)
+      pushOptional(task.review?.planReference?.author)
+      pushOptional(task.pendingWork?.planReference?.author)
+      pushOptional(task.planRevision?.planReference?.author)
+      pushOptional(task.planAcceptanceCoverage?.planReference.author)
+      pushOptional(task.inputProcessing?.decision?.actor)
+      if (task.authorization) {
+        participants.push(task.authorization.actor)
+        pushRoles(task.authorization.stageRoles)
+        pushOptional(task.authorization.planReference?.author)
+        pushOptional(task.authorization.userAuthority?.returnActor)
+        pushOptional(task.authorization.inputProcessing?.decision?.actor)
+        pushOptional(task.authorization.replyIntentBasis?.askCheckpoint?.actor)
+        pushOptional(task.authorization.replyIntentBasis?.review?.actor)
+        pushOptional(task.authorization.replyIntentBasis?.review?.planReference?.author)
+        pushOptional(task.authorization.replyIntentBasis?.planReference?.author)
+        pushRoles(task.authorization.replyIntentBasis?.stageRoles)
+      }
+      if (task.owner !== task.reviewer) {
+        const pair: readonly [AgentId, AgentId] = [task.owner, task.reviewer]
+        return participants.every((id) => isAgentInPair(id, pair))
+      }
+      const distinct = new Set(participants)
+      if (distinct.size > 2) return false
+      if (distinct.has('agy') && distinct.size > 1) return false
+      return true
+    },
+    {
+      message:
+        'All collaboration task roles and participants must belong to its frozen 2-member Agent pair.',
+    },
+  )
 export type CollaborationTask = z.infer<typeof collaborationTaskSchema>
 
 /** Compact notification boundary projected from the current collaboration facts. */
@@ -732,9 +890,6 @@ export interface CollaborationLimits {
   maxReviewCycles: number
   maxRepairAttempts: number
 }
-
-export const otherAgent = (id: 'claude' | 'codex'): 'claude' | 'codex' =>
-  id === 'claude' ? 'codex' : 'claude'
 
 export function collaborationRequiresPlan(task: CollaborationTask): boolean {
   if (task.planRevision) return true
@@ -1041,6 +1196,8 @@ export function collaborationActor(
   stage: CollaborationStage,
 ) {
   const roles = task.stageRoles
+  const taskPair: readonly [AgentId, AgentId] | undefined =
+    task.owner !== task.reviewer ? [task.owner, task.reviewer] : undefined
   const defaultCodeAuthor = roles
     ? roles.codeAuthor
     : task.rolePolicy === 'split-stages-v1'
@@ -1061,15 +1218,15 @@ export function collaborationActor(
         : (task.lastCodeActor ?? defaultCodeAuthor)
     if (stage === 'code_review')
       return task.unreviewedCodeActor
-        ? otherAgent(task.unreviewedCodeActor)
+        ? otherAgent(task.unreviewedCodeActor, taskPair)
         : task.lastCodeActor
-          ? otherAgent(task.lastCodeActor)
+          ? otherAgent(task.lastCodeActor, taskPair)
           : defaultCodeReviewer
     if (stage === 'plan_review')
       return task.unreviewedPlanActor
-        ? otherAgent(task.unreviewedPlanActor)
+        ? otherAgent(task.unreviewedPlanActor, taskPair)
         : task.planAuthor
-          ? otherAgent(task.planAuthor)
+          ? otherAgent(task.planAuthor, taskPair)
           : defaultPlanReviewer
     if (stage === 'implement')
       return task.status === 'running'
@@ -1077,7 +1234,7 @@ export function collaborationActor(
         : task.review?.stage === 'plan_review' &&
             task.review.verdict === 'accepted' &&
             (!task.runId || task.review.runId === task.runId)
-          ? otherAgent(task.review.actor)
+          ? otherAgent(task.review.actor, taskPair)
           : (task.lastCodeActor ?? defaultCodeAuthor)
     return task.planAuthor ?? defaultPlanAuthor
   }
@@ -1201,7 +1358,7 @@ function collaborationStageLimit(
 export interface CollaborationDecision {
   inputGate: ReturnType<typeof collaborationInputGate>
   nextStage: CollaborationStage | undefined
-  nextActor: 'codex' | 'claude' | undefined
+  nextActor: AgentId | undefined
   availableActions: CollaborationAction[]
   continuationLimit: CollaborationStageLimit | undefined
 }
@@ -1440,6 +1597,8 @@ export function advanceCollaboration(
 
   let stage: CollaborationStage | undefined
   let actor: AgentId | undefined
+  const nextPair: readonly [AgentId, AgentId] | undefined =
+    next.owner !== next.reviewer ? [next.owner, next.reviewer] : undefined
 
   if (action === 'resume') {
     if (task.automation !== 'paused' || open || decision.nextStage !== 'plan')
@@ -1467,7 +1626,7 @@ export function advanceCollaboration(
         { kind: 'plan_not_accepted' },
         'The current plan is not ready for implementation.',
       )
-    actor = open ? otherAgent(next.review!.actor) : collaborationActor(next, 'implement')
+    actor = open ? otherAgent(next.review!.actor, nextPair) : collaborationActor(next, 'implement')
     stage = 'implement'
     next.openMode = true
     next.lastCodeActor = actor
@@ -1487,7 +1646,7 @@ export function advanceCollaboration(
           { kind: 'unavailable_action' },
           'The current plan revision does not need review.',
         )
-      actor = otherAgent(next.unreviewedPlanActor!)
+      actor = otherAgent(next.unreviewedPlanActor!, nextPair)
       next.automation = 'active'
       next.pauseReason = undefined
     } else {
@@ -1509,7 +1668,7 @@ export function advanceCollaboration(
         { kind: 'review_not_current' },
         'There are no unreviewed code changes.',
       )
-    actor = otherAgent(next.unreviewedCodeActor)
+    actor = otherAgent(next.unreviewedCodeActor, nextPair)
     stage = 'code_review'
     next.openMode = true
     next.reviewCycles++
@@ -1522,7 +1681,7 @@ export function advanceCollaboration(
         { kind: 'review_not_current' },
         'There is no review requesting changes.',
       )
-    actor = otherAgent(latestReview.actor)
+    actor = otherAgent(latestReview.actor, nextPair)
     stage = 'collaborate'
     next.openMode = true
     if (latestReview.stage === 'code_review') {

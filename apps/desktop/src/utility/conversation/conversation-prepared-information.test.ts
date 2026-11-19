@@ -368,6 +368,7 @@ it('a stale default publishes restored Comment revision and drafts resync to the
     f.db.sessionRepository.saveSettings(f.sessionId, {
       ...current.settings,
       primaryAgentId: 'claude',
+      secondaryAgentId: 'codex',
     })
     expect(
       await f.flow.saveSchedulingSettings({

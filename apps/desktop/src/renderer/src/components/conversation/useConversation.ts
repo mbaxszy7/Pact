@@ -2213,13 +2213,26 @@ export function useConversation(
         const change = unwrapRpcResult(
           await window.pact.markSessionRead({ sessionId, throughSequence: sequence }),
         )
+        const currentWindow = windowRef.current
+        if (
+          currentWindow?.view.sessionId === change.session.id &&
+          currentWindow.view.session.hasUnread !== change.session.hasUnread
+        ) {
+          commitWindow({
+            ...currentWindow,
+            view: {
+              ...currentWindow.view,
+              session: { ...currentWindow.view.session, hasUnread: change.session.hasUnread },
+            },
+          })
+        }
         acceptSessionCatalogChange(queryClient, change)
         onSessionReadRef.current?.(change.session)
       } catch {
         if (markedReadRef.current === request) markedReadRef.current = undefined
       }
     },
-    [queryClient, sessionId, visible],
+    [commitWindow, queryClient, sessionId, visible],
   )
 
   useLayoutEffect(() => {
@@ -4189,10 +4202,12 @@ export function useConversation(
               ? '@all'
               : restoredRoute.agentId === 'codex'
                 ? '@codex'
-                : '@claude'
+                : restoredRoute.agentId === 'agy'
+                  ? '@agy'
+                  : '@claude'
           let candidate: RegExpExecArray | undefined,
             ambiguous = false
-          for (const entry of text.matchAll(/(?:^|\s)(@(claude|codex|all))(?=\s|$)/gu)) {
+          for (const entry of text.matchAll(/(?:^|\s)(@(claude|codex|agy|all))(?=\s|$)/gu)) {
             if (entry[1] !== token) continue
             if (candidate) {
               ambiguous = true

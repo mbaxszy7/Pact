@@ -50,7 +50,12 @@ const migrationsFolder = resolve(import.meta.dirname, '../drizzle')
 const createdAt = '2026-10-14T00:00:00.000Z'
 const settings: DefaultSessionSettings = {
   primaryAgentId: 'codex',
-  agents: { claude: { model: null, effort: null }, codex: { model: null, effort: null } },
+  secondaryAgentId: 'claude',
+  agents: {
+    claude: { model: null, effort: null },
+    codex: { model: null, effort: null },
+    agy: { model: null, effort: null },
+  },
   maxDiscussionRounds: 6,
 
   maxReviewCycles: 3,

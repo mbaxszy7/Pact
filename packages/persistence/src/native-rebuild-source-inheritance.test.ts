@@ -37,7 +37,12 @@ async function rebuiltSourceFixture(agentId: RuntimeAgentId) {
       { id: sessionId, projectId, title: 'Rebuild sources', createdAt },
       {
         primaryAgentId: agentId,
-        agents: { codex: { model: null, effort: null }, claude: { model: null, effort: null } },
+        secondaryAgentId: agentId === 'codex' ? 'claude' : 'codex',
+        agents: {
+          codex: { model: null, effort: null },
+          claude: { model: null, effort: null },
+          agy: { model: null, effort: null },
+        },
         maxDiscussionRounds: 6,
         maxReviewCycles: 3,
         maxRepairAttempts: 3,

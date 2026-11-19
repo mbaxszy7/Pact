@@ -304,4 +304,26 @@ describe('host-declared ordinary information admission', () => {
       ])
     },
   )
+
+  it('restricts send routing candidates strictly to activePair (including route_agy) while admitting historical 3rd-agent sources', () => {
+    const facts = send()
+    facts.primary = 'agy'
+    facts.activePair = ['agy', 'codex']
+    // 'review' is authored by 'codex' and 'response' is authored by 'claude' (historical 3rd agent)!
+    facts.materials = {
+      ...facts.materials,
+      sources: [...facts.materials.sources, source('agy-exec', ['execution'], 'agy')],
+      inputBytes: facts.materials.inputBytes + 200,
+    }
+    facts.referencedSourceIds = ['review', 'response', 'agy-exec']
+    facts.legalActions = [
+      legal('route_send', 'codex'),
+      legal('route_send', 'claude'),
+      legal('route_send', 'agy'),
+    ]
+
+    const result = selected(evaluateRelayPolicy(facts))
+    expect(result.candidates.map((c) => c.id)).toEqual(['route_codex', 'route_agy'])
+    expect(result.candidates.map((c) => c.id)).not.toContain('route_claude')
+  })
 })

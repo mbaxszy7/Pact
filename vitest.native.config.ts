@@ -1,6 +1,10 @@
 import { defineConfig } from 'vitest/config'
 
-import { codexExecutionNativeFiles, windowsOwnerNativeFiles } from './scripts/native-profiles.mjs'
+import {
+  agyNativeFiles,
+  codexExecutionNativeFiles,
+  windowsOwnerNativeFiles,
+} from './scripts/native-profiles.mjs'
 
 export default defineConfig({
   test: {
@@ -8,7 +12,7 @@ export default defineConfig({
     isolate: true,
     setupFiles: ['tests/native/windows-process-owner-setup.ts'],
     include: ['tests/native/**/*.test.ts'],
-    exclude: [...codexExecutionNativeFiles, ...windowsOwnerNativeFiles],
+    exclude: [...codexExecutionNativeFiles, ...windowsOwnerNativeFiles, ...agyNativeFiles],
     reporters: ['verbose'],
     fileParallelism: false,
     maxWorkers: 1,

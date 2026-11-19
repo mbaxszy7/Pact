@@ -227,4 +227,40 @@ describe('routing current and returned drafts', () => {
       route: { type: 'main' },
     })
   })
+
+  it('resolves @agy, /btw @agy /skill handoff, and @all against an explicit secondaryAgentId', () => {
+    expect(
+      resolveComposerRoute(document('@agy inspect trajectory'), 'claude', {
+        secondaryAgentId: 'agy',
+      }),
+    ).toEqual({
+      route: { type: 'agent', agentId: 'agy' },
+      targets: ['agy'],
+      sendRoute: { type: 'agent', agentId: 'agy' },
+    })
+
+    expect(
+      resolveComposerRoute(document('@all compare approaches'), 'claude', {
+        secondaryAgentId: 'agy',
+      }),
+    ).toEqual({
+      route: { type: 'all' },
+      targets: ['claude', 'agy'],
+      sendRoute: { type: 'all' },
+    })
+
+    const btwAgy = extractBtwSideChatDraft({
+      text: '/btw @agy /trace check latency',
+      mention: { route: { type: 'agent', agentId: 'agy' }, token: '@agy', start: 5, end: 9 },
+      route: { type: 'agent', agentId: 'agy' },
+      skills: [{ id: 'c'.repeat(64), agentId: 'agy', name: 'trace', start: 10, end: 16 }],
+    })
+    expect(btwAgy).toEqual({
+      text: '@agy /trace check latency',
+      mention: { route: { type: 'agent', agentId: 'agy' }, token: '@agy', start: 0, end: 4 },
+      route: { type: 'agent', agentId: 'agy' },
+      skills: [{ id: 'c'.repeat(64), agentId: 'agy', name: 'trace', start: 5, end: 11 }],
+      returnedInputOperationId: undefined,
+    })
+  })
 })

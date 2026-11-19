@@ -253,7 +253,7 @@ the default directory is `<repository>/.pact-data/dev/logs/development` (on Wind
 source of truth. Custom database locations also relocate the log directory.
 
 Share the relevant `pact-*.jsonl` files with the approximate failure time and platform.
-Claude plan capture and submission events use `operation: "claude_plan"`, with Session/Run
+Claude and Antigravity plan capture and submission events use `operation: "claude_plan"` or `operation: "agy_plan"`, with Session/Run
 identifiers, a phase and finite reason codes. Capture failures and submission rejections
 are warnings, and successful capture/submission are informational; neither requires Debug
 logging. `planCapture` is the latest capture failure hint, when present, and is not proof
@@ -517,11 +517,11 @@ Each test copies their bytes into its private provider homes. Source files are n
 their hashes are verified after execution. Missing configuration, authentication, placeholders, or
 configuration escaping isolation fails before launch. Tests do not fall back to daily CLI auth files.
 Set `PACT_E2E_ENV_DIR` for another configuration directory and `PACT_E2E_CLAUDE_EXECUTABLE` /
-`PACT_E2E_CODEX_EXECUTABLE` to select absolute CLI paths; otherwise discovery uses PATH. Model and
+`PACT_E2E_CODEX_EXECUTABLE` / `PACT_E2E_AGY_EXECUTABLE` to select absolute CLI paths; otherwise discovery uses PATH. Optional Antigravity (`agy`) real-provider checks require explicit `PACT_E2E_AGY_AUTH_DIR`, copy private Antigravity state into an isolated fixture `ANTIGRAVITY_GEMINI_DIR` under the fixture home, and never scan, read, symlink, or mutate daily `.gemini/antigravity-cli`, `.gemini/antigravity`, or host keychain files. Model and
 endpoint choices come from the native configuration. Do not put actual values in documentation,
 issue attachments, environment dumps, traces, or committed example files.
 
-Each fixture owns its project, Git configuration, HOME/XDG/AppData, Claude/Codex history, database,
+Each fixture owns its project, Git configuration, HOME/XDG/AppData, Claude/Codex/Antigravity history, database,
 Electron userData/sessionData, temporary directory, and diagnostics. Run only on those identities.
 Close owned resources and verify source integrity before cleanup. Never delete daily native history,
 locks, existing projects, or user databases. Real-provider traces/screenshots remain disabled; bounded
@@ -630,10 +630,9 @@ JSON in place. Diagnostics preserve the actual failing boundary before fixture d
 
 ### Native protocol regression
 
-`pnpm test:native` fails on absent/unrecognized actual CLIs; it never substitutes the Electron fake.
-Selection uses PATH or `PACT_NATIVE_CODEX_EXECUTABLE` / `PACT_NATIVE_CLAUDE_EXECUTABLE`. The CI seam uses
-Codex 0.159.2, Claude Code 2.1.272, and the pinned desktop SDK; other versions/platforms need their own
-results. It builds actual production Adapters/Workers into a temporary fixture.
+`pnpm test:native` and `pnpm test:native:agy` fail on absent or unrecognized actual CLIs; neither substitutes the Electron fake.
+`pnpm test:native` runs the npm-pinned `legacy` CI profile (Codex 0.159.2, Claude Code 2.1.272, and the pinned desktop SDK) via PATH or `PACT_NATIVE_CODEX_EXECUTABLE` / `PACT_NATIVE_CLAUDE_EXECUTABLE`. `pnpm test:native:agy` runs the dedicated `agy` profile (`node scripts/ci.mjs native agy`), requiring real Antigravity (`agy >= 1.5.9`, non-prerelease) via PATH or `PACT_NATIVE_AGY_EXECUTABLE` to verify ACP handshake, non-empty zero-Turn Rebuild witness, and `execution_id`-closed SQLite Fork checks inside isolated allowlist environments and fixture `ANTIGRAVITY_GEMINI_DIR` roots without paid model calls; other versions/platforms need their own
+results. Each suite builds actual production Adapters/Workers into a temporary fixture.
 
 The generated Codex loopback configuration disables optional plugins, so protocol fixtures do not
 start external marketplace downloads or leave their Git children behind after native EOF. The writer

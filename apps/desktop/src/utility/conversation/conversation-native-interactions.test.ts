@@ -127,7 +127,12 @@ afterEach(() => {
 const migrationsFolder = resolve(import.meta.dirname, '../../../../../packages/persistence/drizzle')
 const settings: DefaultSessionSettings = {
   primaryAgentId: 'codex',
-  agents: { codex: { model: null, effort: null }, claude: { model: null, effort: null } },
+  secondaryAgentId: 'claude',
+  agents: {
+    codex: { model: null, effort: null },
+    claude: { model: null, effort: null },
+    agy: { model: null, effort: null },
+  },
   maxDiscussionRounds: 3,
 
   maxReviewCycles: 3,
@@ -151,7 +156,11 @@ async function fixture(agentId: RuntimeAgentId, kind: typeof native.kind) {
   })
   db.sessionRepository.create(
     { id: sessionId, projectId, title: 'Fixture', createdAt: timestamp },
-    { ...settings, primaryAgentId: agentId },
+    {
+      ...settings,
+      primaryAgentId: agentId,
+      secondaryAgentId: agentId === 'claude' ? 'codex' : 'claude',
+    },
   )
   const createFlow = () => {
     const preparation = new RuntimePreparation(db.runtimePreparationRepository)

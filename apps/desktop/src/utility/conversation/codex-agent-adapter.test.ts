@@ -5601,3 +5601,238 @@ it.each([
     }
   },
 )
+
+it('replaces an idle loaded-thread connection when the Session active peer swaps from claude to agy so tools/list reloads target=[agy] while preserving nativeSessionId', async () => {
+  const {
+    collaboration: _workflow,
+    collaborationAuthorization: _authorization,
+    ...prompt
+  } = planRunInput('codex').promptEnvelope
+
+  let currentPeer: 'claude' | 'agy' = 'claude'
+  const spawnedProcessIds: number[] = []
+  const observedServerNames: string[] = []
+  const cachedTargetEnumsByProcess: Array<string[]> = []
+  let nextProcessId = 0
+
+  const adapter = new CodexAgentAdapter(
+    '/fake/codex',
+    () => {
+      const processId = ++nextProcessId
+      spawnedProcessIds.push(processId)
+      // Simulate real Codex App Server behavior: once a thread is loaded in this process,
+      // subsequent thread/resume calls in the SAME process keep the initial MCP tools/list schema!
+      const loadedThreadEnums = new Map<string, string[]>()
+      let loadedServerName = ''
+      let loadedUrl = ''
+
+      const handleThreadOpen = (
+        request: object,
+        respond: (payload: object) => void,
+        isResume: boolean,
+      ): void => {
+        const id = Reflect.get(request, 'id')
+        const params = (Reflect.get(request, 'params') ?? {}) as Record<string, unknown>
+        const threadId = isResume ? String(params['threadId']) : 'peer-swap-thread'
+        const config = (params['config'] ?? {}) as Record<string, unknown>
+        const [mcpKey, mcpVal] = Object.entries(config).find(([k]) => k.startsWith('mcp_servers.'))!
+        const serverName = mcpKey.slice('mcp_servers.'.length)
+        const url = String((mcpVal as Record<string, unknown>)['url'])
+        observedServerNames.push(serverName)
+
+        void (async () => {
+          if (!loadedThreadEnums.has(threadId)) {
+            loadedServerName = serverName
+            loadedUrl = url
+            const listRpc = (await fetch(url, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json', connection: 'close' },
+              body: JSON.stringify({
+                jsonrpc: '2.0',
+                id: 1,
+                method: 'tools/list',
+                params: {},
+              }),
+            }).then((r) => r.json())) as Record<string, unknown>
+            const tools = ((listRpc['result'] as Record<string, unknown>)['tools'] ?? []) as Array<
+              Record<string, unknown>
+            >
+            const peerTool = tools.find((t) => t['name'] === 'request_peer_assistance')!
+            const inputSchema = peerTool['inputSchema'] as Record<string, unknown>
+            const props = inputSchema['properties'] as Record<string, Record<string, unknown>>
+            const targetEnum = (props['target']?.['enum'] ?? []) as string[]
+            loadedThreadEnums.set(threadId, targetEnum)
+            cachedTargetEnumsByProcess.push(targetEnum)
+          }
+          respond({
+            id,
+            result: {
+              model: 'gpt-5.4',
+              reasoningEffort: 'high',
+              thread: { id: threadId },
+            },
+          })
+        })()
+      }
+
+      const child = fakeCodexProcess(
+        (request, respond, notify) => {
+          const id = Reflect.get(request, 'id')
+          const method = String(Reflect.get(request, 'method'))
+          const params = (Reflect.get(request, 'params') ?? {}) as Record<string, unknown>
+          if (method === 'initialize') {
+            respond({ id, result: { userAgent: 'codex_cli_rs/0.163.0' } })
+          } else if (method === 'thread/start') {
+            handleThreadOpen(request, respond, false)
+          } else if (method === 'turn/start') {
+            const threadId = String(params['threadId'])
+            const turnId = `turn-${processId}-${randomUUID().slice(0, 8)}`
+            respond({ id, result: { turn: { id: turnId } } })
+            void (async () => {
+              const targetEnum = loadedThreadEnums.get(threadId) ?? []
+              const target = targetEnum[0]
+              const callRpc = (await fetch(loadedUrl, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json', connection: 'close' },
+                body: JSON.stringify({
+                  jsonrpc: '2.0',
+                  id: 2,
+                  method: 'tools/call',
+                  params: {
+                    name: 'request_peer_assistance',
+                    arguments: {
+                      target,
+                      kind: 'review',
+                      reason: `Consult ${target}`,
+                    },
+                  },
+                }),
+              }).then((r) => r.json())) as Record<string, unknown>
+              const toolResult = callRpc['result'] as Record<string, unknown>
+              notify({
+                method: 'item/completed',
+                params: {
+                  threadId,
+                  turnId,
+                  item: {
+                    id: `peer-call-${processId}`,
+                    type: 'mcpToolCall',
+                    server: loadedServerName,
+                    tool: 'request_peer_assistance',
+                    status: 'completed',
+                    error: null,
+                    arguments: {
+                      target,
+                      kind: 'review',
+                      reason: `Consult ${target}`,
+                    },
+                    result: toolResult,
+                  },
+                },
+              })
+              notify({
+                method: 'turn/completed',
+                params: { threadId, turn: { id: turnId, status: 'completed' } },
+              })
+            })()
+          }
+        },
+        (request, respond) => {
+          if (Reflect.get(request, 'method') === 'thread/resume') {
+            handleThreadOpen(request, respond, true)
+            return true
+          }
+          return false
+        },
+      )
+      return {
+        child,
+        close: async () => {
+          child.emit('exit', 0, null)
+          child.emit('close', 0, null)
+        },
+      }
+    },
+    {},
+    undefined,
+    () => currentPeer,
+  )
+
+  const runEvents = async (runInput: AgentRunInput): Promise<NormalizedAgentEvent[]> => {
+    const events: NormalizedAgentEvent[] = []
+    for await (const event of adapter.run(runInput, new AbortController().signal)) {
+      events.push(event)
+    }
+    return events
+  }
+
+  try {
+    // Turn 1: Session pair is (codex, claude) -> starts thread-1 with target=['claude']
+    const turn1Events = await runEvents({
+      runId: randomUUID(),
+      sessionId: prompt.sessionId,
+      cwd: '/project',
+      model: 'gpt-5.4',
+      effort: 'high',
+      peerAssistanceAllowed: true,
+      promptEnvelope: { ...prompt },
+    })
+    expect(spawnedProcessIds).toEqual([1])
+    expect(cachedTargetEnumsByProcess).toEqual([['claude']])
+    expect(turn1Events).toContainEqual(
+      expect.objectContaining({
+        type: 'peer.assistance.requested',
+        targetAgentId: 'claude',
+      }),
+    )
+
+    // Turn 2: Same pair (codex, claude) on existing thread -> reuses Process 1 without restarting!
+    const turn2Events = await runEvents({
+      runId: randomUUID(),
+      sessionId: prompt.sessionId,
+      nativeSessionId: 'peer-swap-thread',
+      cwd: '/project',
+      model: 'gpt-5.4',
+      effort: 'high',
+      peerAssistanceAllowed: true,
+      promptEnvelope: { ...prompt },
+    })
+    expect(spawnedProcessIds).toEqual([1])
+    expect(turn2Events).toContainEqual(
+      expect.objectContaining({
+        type: 'peer.assistance.requested',
+        targetAgentId: 'claude',
+      }),
+    )
+
+    // Turn 3: Session replaces claude with agy -> replaces idle Process 1 with Process 2,
+    // rotates peerServerName, resumes 'peer-swap-thread' with preserved history, and reloads tools/list with target=['agy']!
+    currentPeer = 'agy'
+    const turn3Events = await runEvents({
+      runId: randomUUID(),
+      sessionId: prompt.sessionId,
+      nativeSessionId: 'peer-swap-thread',
+      cwd: '/project',
+      model: 'gpt-5.4',
+      effort: 'high',
+      peerAssistanceAllowed: true,
+      promptEnvelope: { ...prompt },
+    })
+    expect(spawnedProcessIds).toEqual([1, 2])
+    expect(observedServerNames[2]).not.toBe(observedServerNames[0])
+    expect(cachedTargetEnumsByProcess).toEqual([['claude'], ['agy']])
+    expect(turn3Events).toContainEqual({
+      agentId: 'codex',
+      type: 'session.started',
+      nativeSessionId: 'peer-swap-thread',
+    })
+    expect(turn3Events).toContainEqual(
+      expect.objectContaining({
+        type: 'peer.assistance.requested',
+        targetAgentId: 'agy',
+      }),
+    )
+  } finally {
+    await adapter.dispose()
+  }
+})

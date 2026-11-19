@@ -4,6 +4,7 @@ import { realpathSync } from 'node:fs'
 import { dirname, isAbsolute, join } from 'node:path'
 
 import type {
+  ActiveAgentPairInput,
   WorkspaceArchivePrepareInput,
   WorkspaceArchiveOperationInput,
   WorkspaceArchivePreview,
@@ -255,7 +256,9 @@ export interface UtilityProcessClient {
   updateRuntimeExecutablePath(
     input: RuntimeExecutablePathUpdate,
   ): Promise<RpcResult<RuntimePreparation>>
-  getDefaultSessionSettingsEditorState(): Promise<RpcResult<DefaultSessionSettingsEditorState>>
+  getDefaultSessionSettingsEditorState(
+    activePair?: ActiveAgentPairInput,
+  ): Promise<RpcResult<DefaultSessionSettingsEditorState>>
   saveDefaultSessionSettings(
     input: DefaultSessionSettingsSaveInput,
   ): Promise<RpcResult<DefaultSessionSettingsState>>
@@ -946,12 +949,15 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
     )
   }
 
-  async getDefaultSessionSettingsEditorState(): Promise<
-    RpcResult<DefaultSessionSettingsEditorState>
-  > {
+  async getDefaultSessionSettingsEditorState(
+    activePair?: ActiveAgentPairInput,
+  ): Promise<RpcResult<DefaultSessionSettingsEditorState>> {
     return ElectronUtilityProcessClient.toDefaultSessionSettingsEditorStateResult(
       await this.request(
-        { type: 'default-session-settings.get.request' },
+        {
+          type: 'default-session-settings.get.request',
+          ...(activePair ? { input: { activePair } } : {}),
+        },
         'default-session-settings.get.response',
         DEFAULT_SESSION_SETTINGS_TIMEOUT_MS,
       ),

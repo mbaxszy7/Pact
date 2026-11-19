@@ -402,7 +402,10 @@ const bridge: DesktopBridge = {
       await invoke(IPC_CHANNELS.schedulingActivityRead, schedulingActivityReadSchema.parse(input)),
     ),
   onSchedulingChanged: (listener) => onSchedulingChanged(() => listener()),
-  getDefaultSessionSettingsEditorState: () => invoke(IPC_CHANNELS.defaultSessionSettingsGet),
+  getDefaultSessionSettingsEditorState: (activePair) =>
+    activePair !== undefined
+      ? invoke(IPC_CHANNELS.defaultSessionSettingsGet, activePair)
+      : invoke(IPC_CHANNELS.defaultSessionSettingsGet),
   saveDefaultSessionSettings: (input) => invoke(IPC_CHANNELS.defaultSessionSettingsSave, input),
   getProjectCatalog: () => invoke(IPC_CHANNELS.projectCatalogGet),
   readProjectContext: async (input) => {
@@ -447,7 +450,10 @@ const bridge: DesktopBridge = {
   moveSessionGroup: (input) => invoke(IPC_CHANNELS.sessionGroupMove, input),
   dissolveSessionGroup: (input) => invoke(IPC_CHANNELS.sessionGroupDissolve, input),
   setSessionGroup: (input) => invoke(IPC_CHANNELS.sessionGroupSet, input),
-  prepareSessionCreation: (projectId) => invoke(IPC_CHANNELS.sessionCreationPrepare, projectId),
+  prepareSessionCreation: (projectId, activePair) =>
+    activePair !== undefined
+      ? invoke(IPC_CHANNELS.sessionCreationPrepare, projectId, activePair)
+      : invoke(IPC_CHANNELS.sessionCreationPrepare, projectId),
   createSession: (input) => invoke(IPC_CHANNELS.sessionCreate, input),
   renameSession: (input) => invoke(IPC_CHANNELS.sessionRename, input),
   markSessionRead: (input) => invoke(IPC_CHANNELS.sessionMarkRead, input),
@@ -455,7 +461,10 @@ const bridge: DesktopBridge = {
     invoke(IPC_CHANNELS.sessionArchive, sessionId, operationId),
   restoreSession: (sessionId) => invoke(IPC_CHANNELS.sessionRestore, sessionId),
   setSessionSidebarHidden: (input) => invoke(IPC_CHANNELS.sessionSidebarHiddenSet, input),
-  getSessionSettings: (sessionId) => invoke(IPC_CHANNELS.sessionSettingsGet, sessionId),
+  getSessionSettings: (sessionId, activePair) =>
+    activePair !== undefined
+      ? invoke(IPC_CHANNELS.sessionSettingsGet, sessionId, activePair)
+      : invoke(IPC_CHANNELS.sessionSettingsGet, sessionId),
   saveSessionSettings: (input) => invoke(IPC_CHANNELS.sessionSettingsSave, input),
   saveSessionPermission: (input) => invoke(IPC_CHANNELS.sessionPermissionSave, input),
   saveSessionSpeed: (input) => invoke(IPC_CHANNELS.sessionSpeedSave, input),
