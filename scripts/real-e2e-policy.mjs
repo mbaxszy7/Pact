@@ -12,6 +12,66 @@ import { isScriptEntry } from './script-entry.mjs'
 
 // Exact business cases, independent of a candidate's mutable tags or test outcome.
 export const realCases = [
+  ...['codex', 'claude'].map((primary) => ({
+    path: 'tests/e2e/collaboration-stage-roles-real.spec.ts',
+    title: `real Primary ${primary} plans and reviews code while Secondary reviews the plan and implements`,
+    tier: 'extended',
+    scenario: 'collaboration',
+  })),
+  ...['codex', 'claude'].map((owner) => ({
+    path: 'tests/e2e/collaboration-result-real.spec.ts',
+    title: `real ${owner} retains an unchanged plan and settles its reply without implementation authority`,
+    tier: 'extended',
+    scenario: 'collaboration',
+  })),
+  {
+    path: 'tests/e2e/skill-composer.spec.ts',
+    title:
+      'real Skill menu stays outside the Composer, dismisses, and preserves Pact command badges',
+    tier: 'extended',
+    scenario: 'additional-regression',
+  },
+  {
+    path: 'tests/e2e/skill-composer.spec.ts',
+    title: 'real Skill menu keeps Plan at its original click position while native catalogs load',
+    tier: 'extended',
+    scenario: 'additional-regression',
+  },
+  {
+    path: 'tests/e2e/relay-information-real.spec.ts',
+    title:
+      'real Claude completes a confirmed user value and an already-answered release note without repeated questions',
+    tier: 'extended',
+    platforms: ['darwin'],
+    scenario: 'additional-regression',
+  },
+  ...['codex_luna', 'claude_haiku_5_5'].map((target) => ({
+    path: 'tests/e2e/relay-information-real.spec.ts',
+    title: `real Relay ${target} preserves necessary information through Cancel and a fresh Send without inventing user questions`,
+    tier: 'extended',
+    platforms: ['darwin'],
+    scenario: 'additional-regression',
+  })),
+  ...['codex_luna', 'claude_haiku_5_5'].map((target) => ({
+    path: 'tests/e2e/relay-routing-benefit-real.spec.ts',
+    title: `real Relay ${target} saves one source-author route correction against the legal default`,
+    tier: 'extended',
+    platforms: ['darwin'],
+    scenario: 'routing',
+  })),
+  ...['codex_luna', 'claude_haiku_5_5'].map((target) => ({
+    path: 'tests/e2e/relay-real-handoff.spec.ts',
+    title: `real Relay ${target} compares Off and On through the fixed native reviewer`,
+    tier: 'extended',
+    platforms: ['darwin'],
+    scenario: 'collaboration',
+  })),
+  {
+    path: 'tests/e2e/relay-native-comparison.spec.ts',
+    title: 'real ordinary Pact Session completes one exact Codex Luna task',
+    tier: 'extended',
+    scenario: 'additional-regression',
+  },
   {
     path: 'tests/e2e/real-stop.spec.ts',
     title:
@@ -414,24 +474,34 @@ export const realCases = [
     tier: 'extended',
     scenario: 'additional-regression',
   },
+  {
+    path: 'tests/e2e/agy-real-provider.spec.ts',
+    title:
+      'opt-in local real Antigravity CLI smoke completes readiness, @agy prompt, cold SQLite verification, and Fork in isolated HOME',
+    tier: 'extended',
+    optIn: 'PACT_E2E_REAL_AGY',
+    scenario: 'additional-regression',
+  },
 ]
 
 export const realPolicyHash = createHash('sha256').update(JSON.stringify(realCases)).digest('hex')
 const caseKey = (path, title) => JSON.stringify([path, title])
 const registered = new Map(realCases.map((item) => [caseKey(item.path, item.title), item]))
+const isOptInEnabled = (item, env = process.env) => !item.optIn || env?.[item.optIn] === '1'
 
 export function requireRealScope(scope) {
   if (!['core', 'full'].includes(scope)) throw new Error('Real E2E scope must be core or full')
   return scope
 }
 
-export function realCaseRequired(target, scope, platform = process.platform) {
+export function realCaseRequired(target, scope, platform = process.platform, env = process.env) {
   requireRealScope(scope)
   if (target.project !== 'real') return true
   const item = registered.get(caseKey(target.path, target.title))
   if (!item) throw new Error('Real E2E case has no reviewed core/extended classification')
   return (
     (!item.platforms || item.platforms.includes(platform)) &&
+    isOptInEnabled(item, env) &&
     (scope === 'full' || item.tier === 'core')
   )
 }
@@ -486,6 +556,7 @@ export function evaluateRealReport(
     identity = null,
     execution = 'completed',
     platform = process.platform,
+    env = process.env,
   } = {},
 ) {
   requireRealScope(suite)
@@ -511,6 +582,7 @@ export function evaluateRealReport(
   const cases = realCases.map((item) => {
     const test = observed.get(caseKey(item.path, item.title))
     const applicable = !item.platforms || item.platforms.includes(platform)
+    const optedIn = isOptInEnabled(item, env)
     let status = 'not-run',
       durationMs = 0,
       failureCategory = item.tier === 'extended' && suite === 'core' ? 'deferred' : 'missing-result'
@@ -549,14 +621,25 @@ export function evaluateRealReport(
         failureCategory = 'invalid-evidence'
       }
     }
+    const skippedByOptIn =
+      Boolean(test) &&
+      Array.isArray(test.results) &&
+      test.results.length === 1 &&
+      test.results[0].status === 'skipped'
+    const activeOptIn = optedIn || (Boolean(test) && !skippedByOptIn)
     if (!applicable && ['not-run', 'skipped'].includes(status)) {
       status = 'not-applicable'
       failureCategory = 'other-platform'
       reason = 'This native case is required on its declared target platform, not this runner.'
+    } else if (!activeOptIn && ['not-run', 'skipped'].includes(status)) {
+      status = 'not-run'
+      durationMs = 0
+      failureCategory = 'deferred'
+      reason = 'Deferred to explicitly opted-in provider regression.'
     }
     return Object.assign({}, item, {
       applicable,
-      required: applicable && (gate === 'full' || item.tier === 'core'),
+      required: applicable && activeOptIn && (gate === 'full' || item.tier === 'core'),
       status,
       durationMs,
       failureCategory,

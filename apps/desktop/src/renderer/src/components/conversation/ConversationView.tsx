@@ -38,11 +38,10 @@ import type {
   AnchoredComment,
   CollaborationSession,
   CollaborationTask,
-  CollaborationTodo,
-  CollaborationTodoPage,
+  RelayDecisionAnswer,
+  ConversationPage,
   CommentAnchor,
   MessageCommentAnchor,
-  ConversationSendInput,
   PeerRequestProposal,
   RuntimeAgentId,
   WorkspaceChangeSet,
@@ -51,25 +50,37 @@ import type {
   SessionCatalogChange,
   ConversationRunContext,
   ConversationDisplayOrder,
+  SideChatSyncMainReceipt,
+  UserInformationDeclaration,
 } from '@pact/contracts'
 import type { SkillSelection } from '@pact/contracts'
 import type { ConversationImage } from '@pact/contracts/images'
 
 import {
+  agentDisplayName,
   compareConversationDisplayOrder,
   conversationMessageOrder,
-  CONVERSATION_MARKDOWN_BYTES,
-  collaborationRequiresPlan,
-  collaborationPendingPhase,
+  isConversationBackgroundReport,
   otherAgent,
+  resolveActiveAgentPair,
+  CONVERSATION_MARKDOWN_BYTES,
   parseComposerCommandPrefix,
   CONVERSATION_WINDOW_MESSAGES,
   WORKSPACE_CHANGE_FILES,
   WORKSPACE_OPERATION_TIMEOUT_MS,
+  collaborationInputGate,
+  collaborationActor,
+  collaborationInputProcessing,
+  defaultTaskStageRoles,
+  isCollaborationOpenMode,
+  pactSessionEntryPrimary,
+  resolveLegacyCompatibleTaskStageRoles,
+  validateSideChatMainSyncContent,
 } from '@pact/contracts'
 
 import type { ConversationViewProjection } from './conversation-window'
 import type { DraftImage } from './image-client'
+import type { MessageTextSelection } from './MessageSelectionSurface'
 import type {
   ConversationComposerMention,
   ConversationHistoryControls,
@@ -77,16 +88,22 @@ import type {
 } from './useConversation'
 
 import { MESSAGE_ANCHOR_TEXT_BASIS } from '../../../../shared/message-anchor-text'
+import { PreparedInputCard } from '../scheduling/PreparedInputCard'
+import { RelayDecisionCard, type RelayDecisionPresentation } from '../scheduling/RelayDecisionCard'
+import { RelayActivityIndicator } from '../settings/scheduling/RelayActivityIndicator'
+import { InputReplacement } from '../ui/InputReplacement'
 import { AgentActivityList } from './AgentActivityList'
+import { CollaborationQuestionCard } from './CollaborationQuestionCard'
 import {
   CollaborationReview,
   type PlanTextSelection,
   type ReportTextSelection,
 } from './CollaborationReview'
-import { CollaborationTodos, type TodoCommentDraft } from './CollaborationTodos'
 import {
   composerDifference,
   composerHasContent,
+  extractBtwSideChatDraft,
+  extractMainSyncDraft,
   replaceComposerDocument,
   resolveComposerRoute,
   type ComposerDocument,
@@ -105,6 +122,7 @@ import {
   clearProjectionHighlight,
   focusProjectionRange,
   isProjectionHighlightOwned,
+  pulseMessageTarget,
   selectedTextRange,
   planSelectionSource,
   reportSelectionSource,
@@ -120,7 +138,9 @@ import { SentComments } from './SentComments'
 import { NativeForkRecovery, SessionForkDialog, type SessionForkOpening } from './SessionFork'
 import { SessionWarningCard } from './SessionWarningCard'
 import { SpeedMenu } from './SpeedMenu'
-import { commentDraftSaveSucceeded, type CommentDraftSaveOutcome } from './useConversation'
+import { TaskReplacementConfirmation } from './TaskReplacementConfirmation'
+import { sameDecision, hasDecisionAnswers, type DecisionReplyContext } from './useConversation'
+import { commentDraftSaveSucceeded } from './useConversation'
 import { useSkillComposer, type ComposerEdit } from './useSkillComposer'
 import { WorkspaceChangesCard, type WorkspaceChangesList } from './WorkspaceChangesCard'
 
@@ -128,31 +148,31 @@ const EMPTY_SKILLS: SkillSelection[] = []
 const EMPTY_IMAGES: readonly DraftImage[] = []
 const EMPTY_COMMENTS: AnchoredComment[] = []
 const ignoreSkillChanges = (_value: SkillSelection[]): void => undefined
-const commentSourceLabel = (anchor: CommentAnchor): string =>
-  anchor.type === 'file'
-    ? anchor.path
-    : anchor.type === 'todo'
-      ? anchor.question
-        ? 'Answer'
-        : 'Todo comment'
-      : anchor.plan
-        ? `Plan v${anchor.plan.version}`
-        : anchor.report
-          ? 'Review'
-          : 'Message'
+const commentSourceLabel = (
+  anchor: CommentAnchor,
+  currentSession?: Pick<CollaborationSession, 'id' | 'parentSessionId'>,
+): string =>
+  anchor.type === 'unavailable'
+    ? 'Source unavailable'
+    : anchor.type === 'file'
+      ? anchor.path
+      : anchor.type === 'cutoff_message'
+        ? (currentSession?.parentSessionId &&
+            anchor.sourceSessionId === currentSession.parentSessionId) ||
+          anchor.sourceSessionId === currentSession?.id
+          ? 'Main chat'
+          : 'Side chat'
+        : anchor.plan
+          ? `Plan v${anchor.plan.version}`
+          : anchor.report
+            ? 'Review'
+            : 'Message'
 
 interface ConversationViewProps {
-  todoNavigation?:
-    | {
-        taskId: string
-        todoId: string
-        todoRevision: number
-        navigationId: string
-        selection?: import('@pact/contracts').TodoCommentAnchor['selection']
-      }
-    | undefined
   planPanelHost?: HTMLElement | null | undefined
   planPanelOpen?: boolean | undefined
+  planPanelExpanded?: boolean | undefined
+  onPlanPanelExpandedChange?: ((expanded: boolean) => void) | undefined
   planAvailable?: boolean | undefined
   planRestoreFocusRef?: React.RefObject<HTMLButtonElement | null> | undefined
   onPlanAvailable?: ((sessionId: string, taskId?: string) => void) | undefined
@@ -167,6 +187,10 @@ interface ConversationViewProps {
   sessionSettingsSaving?: boolean | undefined
   onSaveSessionPermission?: ((input: SessionPermissionSaveInput) => Promise<boolean>) | undefined
   onSaveSessionSpeed?: ((input: SessionSpeedSaveInput) => Promise<boolean>) | undefined
+  schedulingState?: import('@pact/contracts').SchedulingState | undefined
+  relayDecision?: RelayDecisionPresentation | undefined
+  onOpenRelaySettings?: (() => void) | undefined
+  onOpenSessionSettings?: (() => void) | undefined
   visible: boolean
   session: CollaborationSession
   snapshot?: ConversationViewProjection | undefined
@@ -185,22 +209,29 @@ interface ConversationViewProps {
   composerMention?: ConversationComposerMention | undefined
   composerRoute?: ComposerDocument['route']
   composerReturnedInputOperationId?: string | undefined
+  composerUserInformation?: UserInformationDeclaration | undefined
+  composerRevision?: number | undefined
+  onClearSubmittedDraft?: ((expectedRevision: number) => void) | undefined
+  handoffArriveKey?: string | number | undefined
+  mainTargetAgentId?: RuntimeAgentId | undefined
+  onOpenBtwSideChat?: ((draft: ComposerDocument) => Promise<boolean>) | undefined
+  onAskInSideChat?: ((selection: MessageTextSelection) => void) | undefined
+  onOpenSideChat?: ((sideChatId: string) => void) | undefined
+  resolveSideChatTitle?: ((sideChatId: string, fallbackTitle: string) => string) | undefined
+  onSyncToMain?: ConversationFlow['syncToMain'] | undefined
+  onViewMainMessage?: ((receipt: SideChatSyncMainReceipt) => void) | undefined
   onComposerMentionChange: (value: ConversationComposerMention | undefined) => void
   loading: boolean
   sending: boolean
   stopping: boolean
   agentActionsEnabled: boolean
+  mainSyncEnabled?: boolean | undefined
+  sideChatSettingsState?: 'loading' | 'error' | undefined
   error?: string | undefined
-  onSend: (
-    content: string,
-    commentIds: string[],
-    route?: NonNullable<ConversationSendInput['route']>,
-    skills?: SkillSelection[],
-    planningAction?: ConversationSendInput['planningAction'],
-  ) => Promise<boolean>
+  onSend: ConversationFlow['send']
   onSaveCommentDraft: ConversationFlow['saveCommentDraft']
   onRemoveCommentDraft: (commentId: string) => Promise<boolean>
-  onStop: () => Promise<boolean>
+  onStop: ConversationFlow['stop']
   onRebuildNativeContext: ConversationFlow['rebuildNativeContext']
   onCheckNativeContext: ConversationFlow['checkNativeContext']
   onAcceptPeerProposal: (proposalId: string) => Promise<boolean>
@@ -228,6 +259,7 @@ interface ConversationViewProps {
     | {
         navigationId?: string
         messageId: string
+        queuedOperationId?: string | undefined
         startOffset: number
         endOffset: number
         textBasis?: MessageCommentAnchor['textBasis']
@@ -250,6 +282,9 @@ const messageDateTimeFormatter = new Intl.DateTimeFormat(undefined, {
 const TRANSCRIPT_OVERSCAN = 4
 const CONVERSATION_WIDTH = 'w-full max-w-[clamp(56rem,82cqw,80rem)]'
 const OLDER_HISTORY_SCROLL_THRESHOLD = 160
+const agentName = (id: RuntimeAgentId): string => agentDisplayName(id)
+const speakerBgClass = (id: RuntimeAgentId | undefined): string =>
+  id === 'claude' ? 'bg-speaker-claude' : id === 'agy' ? 'bg-speaker-agy' : 'bg-speaker-codex'
 
 function hasVisibleChanges(run: AgentRun | undefined): boolean {
   return Boolean(
@@ -267,29 +302,63 @@ interface MentionQuery {
   end: number
   query: string
 }
-const mentionOptions = [
-  {
-    token: '@codex' as const,
-    label: 'Codex',
-    description: 'Send only to Codex',
-    route: { type: 'agent', agentId: 'codex' } as const,
+interface MentionOption {
+  token: '@claude' | '@codex' | '@agy' | '@all' | '@Main'
+  label: string
+  description: string
+  route: ConversationComposerMention['route']
+  icon: typeof Bot
+}
+
+function agentMentionOption(agentId: RuntimeAgentId): MentionOption {
+  const label = agentDisplayName(agentId)
+  const token = agentId === 'claude' ? '@claude' : agentId === 'codex' ? '@codex' : '@agy'
+  return {
+    token,
+    label,
+    description: `Send only to ${label}`,
+    route: { type: 'agent', agentId },
     icon: Bot,
-  },
-  {
-    token: '@claude' as const,
-    label: 'Claude Code',
-    description: 'Send only to Claude Code',
-    route: { type: 'agent', agentId: 'claude' } as const,
-    icon: Bot,
-  },
-  {
-    token: '@all' as const,
-    label: 'All',
-    description: 'Primary, then Secondary',
-    route: { type: 'all' } as const,
-    icon: Users,
-  },
-]
+  }
+}
+
+function buildMentionOptions(
+  pair: readonly [RuntimeAgentId, RuntimeAgentId],
+  isSideChat: boolean,
+): MentionOption[] {
+  const [first, second] = pair
+  if (isSideChat) {
+    return [
+      agentMentionOption(first),
+      agentMentionOption(second),
+      {
+        token: '@all',
+        label: 'All Agents',
+        description: 'Primary, then Secondary',
+        route: { type: 'all' },
+        icon: Users,
+      },
+      {
+        token: '@Main',
+        label: 'Main chat',
+        description: 'Send to the main chat',
+        route: { type: 'main' },
+        icon: CornerUpLeft,
+      },
+    ]
+  }
+  return [
+    agentMentionOption(first),
+    agentMentionOption(second),
+    {
+      token: '@all',
+      label: 'All',
+      description: 'Primary, then Secondary',
+      route: { type: 'all' },
+      icon: Users,
+    },
+  ]
+}
 
 function mentionQueryAt(value: string, cursor: number): MentionQuery | undefined {
   const prefix = value.slice(0, cursor)
@@ -301,10 +370,10 @@ function mentionQueryAt(value: string, cursor: number): MentionQuery | undefined
 
 export function ConversationView({
   planPanelHost,
-  planPanelOpen,
+  planPanelExpanded = false,
+  onPlanPanelExpandedChange,
   planAvailable,
   planRestoreFocusRef,
-  todoNavigation,
   onPlanAvailable,
   onOpenPlan,
   onClosePlan,
@@ -316,6 +385,10 @@ export function ConversationView({
   onSaveSessionPermission,
   onSaveSessionSpeed,
   visible,
+  schedulingState,
+  relayDecision,
+  onOpenRelaySettings,
+  onOpenSessionSettings,
   session,
   snapshot,
   history,
@@ -333,11 +406,24 @@ export function ConversationView({
   composerMention,
   composerRoute,
   composerReturnedInputOperationId,
+  composerUserInformation,
+  composerRevision = 0,
+  onClearSubmittedDraft,
+  handoffArriveKey,
+  mainTargetAgentId,
+  onOpenBtwSideChat,
+  onAskInSideChat,
+  onOpenSideChat,
+  resolveSideChatTitle,
+  onSyncToMain,
+  onViewMainMessage,
   onComposerMentionChange,
   loading,
   sending,
-  stopping,
+  stopping: stopRequested,
   agentActionsEnabled,
+  mainSyncEnabled,
+  sideChatSettingsState,
   error,
   onSend,
   onSaveCommentDraft,
@@ -455,7 +541,7 @@ export function ConversationView({
         installWorkspaceFiles({
           ...initial,
           loading: false,
-          error: 'Loading saved files took too long. Try again.',
+          error: 'Loading changed files took too long. Try again.',
         })
       }, WORKSPACE_OPERATION_TIMEOUT_MS)
       try {
@@ -474,18 +560,18 @@ export function ConversationView({
           result.value.changeSet.id !== changeSetId ||
           result.value.changeSet.sessionId !== session.id
         )
-          throw new Error('These changes do not belong to this Session.')
+          throw new Error('These file changes do not belong to this session.')
         if ((result.value.changeSet.revision ?? 0) !== revision)
-          throw new Error('The recorded changes changed while loading. Try again.')
+          throw new Error('Changed files were updated while loading. Try again.')
         const files = [...initial.files, ...result.value.files]
         if (files.length > WORKSPACE_CHANGE_FILES)
-          throw new Error('The saved file list exceeded its supported size.')
+          throw new Error('Too many changed files to display at once.')
         if (new Set(files.map((file) => file.path)).size !== files.length)
-          throw new Error('The saved file list contains duplicate paths.')
+          throw new Error('Changed file list contained duplicate paths.')
         if (!result.value.nextPath && files.length !== result.value.changeSet.fileCount)
-          throw new Error('The saved file list is incomplete. Try again.')
+          throw new Error('Changed file list is incomplete. Try again.')
         if (result.value.nextPath && result.value.nextPath === current?.nextPath)
-          throw new Error('The saved file list did not advance.')
+          throw new Error('Couldn’t load the next page of changed files.')
         installWorkspaceFiles({
           ...initial,
           revision: result.value.changeSet.revision ?? 0,
@@ -502,13 +588,12 @@ export function ConversationView({
               contextGeneration,
               result.value.changeSet.revision,
             )
-          else onNotice('No saved files are available for this round.')
+          else onNotice('No changed files were recorded for this turn.')
         }
       } catch (failure) {
         if (!workspaceOwnerActiveRef.current || generation !== workspaceFilesGenerationRef.current)
           return
-        const message =
-          failure instanceof Error ? failure.message : 'Pact could not load saved files.'
+        const message = failure instanceof Error ? failure.message : 'Couldn’t load changed files.'
         installWorkspaceFiles({ ...initial, loading: false, error: message })
         if (open) onNotice(message)
       } finally {
@@ -574,6 +659,12 @@ export function ConversationView({
       initialId: image.id,
     })
   const skillMenuRef = useRef<HTMLDivElement>(null)
+  const skillPopoverOpen = useRef(false)
+  const mentionMenuRef = useRef<HTMLDivElement>(null)
+  const mentionPopoverOpen = useRef(false)
+  const dismissedMention = useRef<MentionQuery | undefined>(undefined)
+  const composerBoxRef = useRef<HTMLDivElement>(null)
+  const composerMenuAnchor = `--pact-composer-menu-${useId().replaceAll(':', '')}`
   const [mentionQuery, setMentionQuery] = useState<MentionQuery | undefined>()
   const [activeMentionIndex, setActiveMentionIndex] = useState(0)
   const copyRequestGenerationRef = useRef(0)
@@ -599,6 +690,7 @@ export function ConversationView({
   >(undefined)
   const focusAfterPageRef = useRef<'latest' | undefined>(undefined)
   const commentTextareaRef = useRef<HTMLTextAreaElement>(null)
+  const commentFocusRef = useRef<{ visible: boolean; cancel?: () => void }>({ visible })
   const messageRefs = useRef(new Map<string, HTMLElement>())
   const messagesRef = useRef(snapshot?.messages)
   // Completed Markdown can skip Composer/stream renders; its stable event
@@ -633,7 +725,6 @@ export function ConversationView({
       endOffset: 0,
       plan: { runId: source.runId, version: source.version },
     })
-    setContextTab('plan')
     onOpenPlan?.()
   }
   const planSourceNavigationRef = useRef(planSourceNavigation)
@@ -641,6 +732,7 @@ export function ConversationView({
   const openPlanCallback = useRef(onOpenPlan)
   openPlanCallback.current = onOpenPlan
   const appliedNavigationRef = useRef<typeof messageNavigation>(undefined)
+  const queueDockRef = useRef<HTMLDivElement>(null)
   const appliedGapResyncRef = useRef(0)
   const gapRestoreRef = useRef<
     | {
@@ -691,10 +783,26 @@ export function ConversationView({
   const [currentPlan, setCurrentPlan] = useState<{
     sessionId: string
     task?: CollaborationTask | undefined
+    replacement?:
+      | Extract<ConversationPage, { scope: 'collaboration' }>['view']['replacement']
+      | undefined
+    planSync?: Extract<ConversationPage, { scope: 'collaboration' }>['view']['planSync'] | undefined
     source?: { runId: string; messageId: string } | undefined
     error?: string | undefined
   }>()
   const [planRefresh, setPlanRefresh] = useState(0)
+  const [answeredDecisionKey, setAnsweredDecisionKey] = useState<string>()
+  const [replacement, setReplacement] = useState<{
+    sessionId: string
+    taskId: string
+    command: 'plan' | 'build' | 'review'
+    draftToken: object
+  }>()
+  const [replacementBusy, setReplacementBusy] = useState(false)
+  const [replacementFailed, setReplacementFailed] = useState(false)
+  // One frozen replacement reference per confirmation; uncertain acknowledgments retry the same proof.
+  const replacementAttempt = useRef<{ taskId: string; revision: number } | undefined>(undefined)
+  const replacementRestoreFocus = useRef(false)
   const planReadOwner = useRef<{
     active: boolean
     pending: boolean
@@ -702,7 +810,7 @@ export function ConversationView({
   }>({ active: true, pending: false })
   const planAvailableCallback = useRef(onPlanAvailable)
   planAvailableCallback.current = onPlanAvailable
-  const planReadKey = `${latestRun?.id ?? ''}:${latestRun?.status ?? ''}:${latestRun && !['starting', 'running', 'recovering'].includes(latestRun.status) ? latestRun.updatedAt : ''}:${planRefresh}`
+  const planReadKey = `${latestRun?.id ?? ''}:${latestRun?.status ?? ''}:${latestRun && !['starting', 'running', 'recovering'].includes(latestRun.status) ? latestRun.updatedAt : ''}:${snapshot?.queue?.revision ?? ''}:${planRefresh}`
   useEffect(() => {
     const owner = planReadOwner.current
     owner.active = true
@@ -735,16 +843,17 @@ export function ConversationView({
         }
         const view = response.value.view
         const task = view.task ?? undefined
-        setCurrentPlan({ sessionId: requested.sessionId, task, source: view.planSource })
+        setCurrentPlan({
+          sessionId: requested.sessionId,
+          task,
+          replacement: view.replacement,
+          source: view.planSource,
+          planSync: view.planSync,
+        })
         if (!planSourceNavigationRef.current)
           planAvailableCallback.current?.(
             requested.sessionId,
-            task &&
-              (((task.plan || task.planDocument) && view.planSource) ||
-                (task.kind !== 'plan' &&
-                  task.ledgerOpenCount + task.ledgerAwaitingCount + task.doneTodoCount > 0))
-              ? task.id
-              : undefined,
+            task?.planReference && view.planSource ? task.id : undefined,
           )
       } catch {
         if (owner.active && owner.desired === requested)
@@ -761,273 +870,246 @@ export function ConversationView({
     void read()
   }, [session.id, planReadKey, visible])
   const currentTask = currentPlan?.sessionId === session.id ? currentPlan.task : undefined
-  const planningTask = currentTask?.kind === 'plan' ? currentTask : undefined
-  const [contextTab, setContextTab] = useState<'plan' | 'todos'>('plan')
-  const [todoTarget, setTodoTarget] =
-    useState<NonNullable<ConversationViewProps['todoNavigation']>>()
-  const [todoTaskId, setTodoTaskId] = useState<string>()
-  const [todoEditing, setTodoEditing] = useState(false)
-  const [todoPage, setTodoPage] = useState<CollaborationTodoPage>()
-  const [todoSource, setTodoSource] = useState<{
-    navigationId: string
-    todo: CollaborationTodo
-    current: Pick<CollaborationTodo, 'revision' | 'status'> | null
+  const planningTask =
+    currentTask && (currentTask.kind === 'plan' || Boolean(currentTask.planReference))
+      ? currentTask
+      : undefined
+  const unfinishedTask = currentTask?.status === 'complete' ? undefined : currentTask
+  const inputGateState = unfinishedTask ? collaborationInputGate(unfinishedTask) : undefined
+  const planRecovery =
+    currentPlan?.sessionId === session.id && currentPlan.planSync?.runId === unfinishedTask?.runId
+      ? currentPlan?.planSync
+      : undefined
+  const decisionSource = unfinishedTask
+    ? collaborationInputProcessing(unfinishedTask).decision
+    : undefined
+  const decisionKey =
+    unfinishedTask && decisionSource
+      ? `${unfinishedTask.id}:${decisionSource.runId}:${unfinishedTask.inputSequence}`
+      : undefined
+  // A successful Send dismisses this notice immediately, including while the
+  // current-task projection is refreshing. A new reply or withdrawn input has
+  // a different identity/version and can ask for a decision again.
+  const decisionTakeover = Boolean(decisionSource)
+  const nativeRequests = nativeInputRequests(snapshot)
+  const nativeQuestions = nativeRequests.filter(
+    ({ request }) => request.kind && request.kind !== 'approval',
+  )
+  const relayRequest =
+    snapshot?.relaySchedulingDecision?.sessionId === session.id &&
+    snapshot.relaySchedulingDecision.decisionId !== history.cancelledInformationDecisionId
+      ? snapshot.relaySchedulingDecision
+      : undefined
+  const relayIdentity = relayRequest
+    ? `${relayRequest.sessionId}:${relayRequest.decisionId}:${relayRequest.revision}`
+    : undefined
+  const [relayUi, setRelayUi] = useState<{
+    identity: string
+    value: string
+    status: RelayDecisionPresentation['status']
+    error?: string | undefined
   }>()
-  const [todoOffset, setTodoOffset] = useState(0)
-  const [doneTodos, setDoneTodos] = useState(false)
-  const [todoLoading, setTodoLoading] = useState(false)
-  const [todoError, setTodoError] = useState('')
-  const [todoRefresh, setTodoRefresh] = useState(0)
-  const todoInteraction = useRef({ editing: false, onNotice })
-  useLayoutEffect(() => {
-    todoInteraction.current = { editing: todoEditing, onNotice }
-  }, [todoEditing, onNotice])
-  const todoPageCache = useRef(new Map<string, CollaborationTodoPage>())
-  const todoPageBasis = useRef<{ key: string; revision: number } | undefined>(undefined)
-  const todoReadOwner = useRef<{
-    active: boolean
-    pending: boolean
-    desired?:
-      | {
-          sessionId: string
-          taskId: string
-          offset: number
-          done: boolean
-          key: string
-          basisKey: string
-          target?: NonNullable<ConversationViewProps['todoNavigation']>
-        }
-      | undefined
-  }>({ active: true, pending: false })
-  const openTodo = useCallback(
-    (target: { taskId: string; todoId: string; todoRevision: number }): void => {
-      if (todoInteraction.current.editing) {
-        todoInteraction.current.onNotice(
-          'Add this Comment to the draft or cancel before opening another Todo.',
+  const relayAnswerOwner = useRef<
+    { identity: string; input: RelayDecisionAnswer; pending: boolean } | undefined
+  >(undefined)
+  const relayUiRef = useRef(relayIdentity)
+  relayUiRef.current = relayIdentity
+  const readRelayReceipt = async (): Promise<void> => {
+    const owner = relayAnswerOwner.current
+    if (!owner || owner.pending || owner.identity !== relayUiRef.current) return
+    owner.pending = true
+    setRelayUi((current) =>
+      current?.identity === owner.identity ? { ...current, status: 'checking_receipt' } : current,
+    )
+    try {
+      const { reference, clientOperationId } = owner.input
+      const result = await window.pact.getRelayDecisionReceipt({
+        sessionId: reference.sessionId,
+        decisionId: reference.decisionId,
+        clientOperationId,
+      })
+      if (relayUiRef.current !== owner.identity) return
+      if (result.ok) {
+        history.retryRead()
+      } else
+        setRelayUi((current) =>
+          current?.identity === owner.identity
+            ? { ...current, status: 'receipt_unconfirmed', error: result.error.message }
+            : current,
         )
-        return
-      }
-      setTodoTarget({ ...target, navigationId: crypto.randomUUID() })
-      setTodoTaskId(target.taskId)
-      setTodoSource(undefined)
-      setTodoPage(undefined)
-      setTodoOffset(0)
-      while (todoPageCache.current.size > 2)
-        todoPageCache.current.delete(todoPageCache.current.keys().next().value!)
-      setContextTab('todos')
-      planAvailableCallback.current?.(session.id, target.taskId)
-      openPlanCallback.current?.()
-      stickToBottomRef.current = false
-      scrollIntentRef.current = undefined
-    },
-    [session.id],
-  )
-  useEffect(() => {
-    setTodoPage(undefined)
-    setTodoTarget(undefined)
-    setTodoSource(undefined)
-    setTodoTaskId(undefined)
-    setTodoOffset(0)
-    setDoneTodos(false)
-    setTodoEditing(false)
-    setContextTab('plan')
-    todoPageCache.current.clear()
-  }, [session.id])
-  useEffect(() => {
-    if (todoNavigation) openTodo(todoNavigation)
-  }, [todoNavigation, openTodo])
-  const contextHasPlan = Boolean(currentTask?.plan || currentTask?.planDocument)
-  useEffect(() => {
-    if (currentTask?.id && !contextHasPlan) setContextTab('todos')
-  }, [currentTask?.id, contextHasPlan])
-  useEffect(() => {
-    const owner = todoReadOwner.current
-    const cache = todoPageCache.current
-    owner.active = true
-    return () => {
-      owner.active = false
-      owner.desired = undefined
-      cache.clear()
+    } catch {
+      if (relayUiRef.current === owner.identity)
+        setRelayUi((current) =>
+          current?.identity === owner.identity
+            ? {
+                ...current,
+                status: 'receipt_unconfirmed',
+                error:
+                  'The scheduling decision is not confirmed. Check its receipt before another action.',
+              }
+            : current,
+        )
+    } finally {
+      owner.pending = false
     }
-  }, [])
-  useEffect(() => {
-    const owner = todoReadOwner.current
-    const taskId = todoTaskId ?? currentTask?.id
-    const group = todoTarget ? 'source' : doneTodos ? 'done' : 'active'
-    const basisKey = `${session.id}:${taskId ?? ''}:${planReadKey}:${group}:${todoTarget?.navigationId ?? ''}:${todoRefresh}`
-    const key = `${basisKey}:${todoTarget ? 0 : todoOffset}`
-    owner.desired =
-      visible && planPanelHost && planPanelOpen && contextTab === 'todos' && taskId
-        ? {
-            sessionId: session.id,
-            taskId,
-            offset: todoOffset,
-            done: doneTodos,
-            key,
-            basisKey,
-            ...(todoTarget ? { target: todoTarget } : {}),
-          }
-        : undefined
-    const read = async (): Promise<void> => {
-      if (!owner.active || owner.pending || !owner.desired) return
-      const requested = owner.desired
-      const cached = todoPageCache.current.get(requested.key)
-      if (cached) {
-        if (requested.target) setDoneTodos(cached.group === 'done')
-        setTodoPage(cached)
-        return
-      }
-      owner.pending = true
-      setTodoLoading(true)
-      setTodoError('')
-      try {
-        const response = await window.pact.getConversation({
-          scope: 'collaboration',
-          sessionId: requested.sessionId,
-          projection: 'todos',
-          taskId: requested.taskId,
-          todoStatus: requested.target ? 'source' : requested.done ? 'done' : 'active',
-          todoOffset: requested.offset,
-          ...(todoPageBasis.current?.key === requested.basisKey
-            ? { ledgerRevision: todoPageBasis.current.revision }
-            : {}),
-          ...(requested.target
-            ? { todoId: requested.target.todoId, todoRevision: requested.target.todoRevision }
-            : {}),
-        })
-        if (!owner.active || owner.desired !== requested) return
-        if (
-          !response.ok ||
-          response.value.scope !== 'collaboration' ||
-          !response.value.view.todos
-        ) {
-          setTodoError(response.ok ? 'Todos could not be loaded.' : response.error.message)
-          return
-        }
-        const page = response.value.view.todos
-        if (page.group === 'all') {
-          setTodoError('Todos could not be loaded in the requested group.')
-          return
-        }
-        if (requested.target) {
-          const exact = response.value.view.todo
-          if (
-            !exact ||
-            exact.taskId !== requested.target.taskId ||
-            exact.id !== requested.target.todoId ||
-            exact.revision !== requested.target.todoRevision
-          ) {
-            setTodoError('This exact Todo source could not be loaded.')
-            return
-          }
-          setTodoSource({
-            navigationId: requested.target.navigationId,
-            todo: exact,
-            current: response.value.view.todoCurrent ?? null,
-          })
-          setDoneTodos(page.group === 'done')
-        }
-        todoPageBasis.current = { key: requested.basisKey, revision: page.ledgerRevision }
-        const resident = [...todoPageCache.current.values()].at(-1)
-        if (
-          resident &&
-          (resident.taskId !== page.taskId || resident.ledgerRevision !== page.ledgerRevision)
-        )
-          todoPageCache.current.clear()
-        todoPageCache.current.set(requested.key, page)
-        while (
-          todoPageCache.current.size >
-          (requested.target && todoEditing ? 1 : requested.target || todoEditing ? 2 : 3)
-        )
-          todoPageCache.current.delete(todoPageCache.current.keys().next().value!)
-        setTodoPage(page)
-      } catch {
-        if (owner.active && owner.desired === requested)
-          setTodoError('Todos could not be loaded. Try again.')
-      } finally {
+  }
+  const submitRelayAnswer = async (answer: RelayDecisionAnswer['answer']): Promise<void> => {
+    if (
+      answer.kind === 'cancel' &&
+      relayRequest?.request.category === 'necessary_information' &&
+      history.cancelPreparedInformation
+    ) {
+      await history.cancelPreparedInformation(relayRequest)
+      return
+    }
+    if (!relayRequest || !relayIdentity || relayAnswerOwner.current?.identity === relayIdentity)
+      return
+    const owner = {
+      identity: relayIdentity,
+      pending: true,
+      input: {
+        reference: {
+          sessionId: relayRequest.sessionId,
+          decisionId: relayRequest.decisionId,
+          revision: relayRequest.revision,
+        },
+        clientOperationId: crypto.randomUUID(),
+        answer,
+      },
+    }
+    relayAnswerOwner.current = owner
+    setRelayUi((current) => ({
+      identity: relayIdentity,
+      value: current?.identity === relayIdentity ? current.value : '',
+      status: 'submitting',
+    }))
+    try {
+      const result = await window.pact.answerRelayDecision(owner.input)
+      if (relayUiRef.current !== owner.identity) return
+      if (result.ok) history.retryRead()
+      else if (result.error.code === 'TIMEOUT' || result.error.code === 'UNCERTAIN') {
         owner.pending = false
-        if (owner.active && owner.desired && owner.desired !== requested) void read()
-        else if (owner.active) setTodoLoading(false)
+        await readRelayReceipt()
+      } else {
+        relayAnswerOwner.current = undefined
+        setRelayUi((current) =>
+          current?.identity === owner.identity
+            ? { ...current, status: 'awaiting_confirmation', error: result.error.message }
+            : current,
+        )
       }
+    } catch {
+      if (relayUiRef.current === owner.identity) {
+        owner.pending = false
+        await readRelayReceipt()
+      }
+    } finally {
+      owner.pending = false
     }
-    void read()
-  }, [
-    session.id,
-    currentTask?.id,
-    planPanelHost,
-    planPanelOpen,
-    visible,
-    contextTab,
-    todoOffset,
-    doneTodos,
-    todoTarget,
-    todoTaskId,
-    planReadKey,
-    todoRefresh,
-    todoEditing,
-  ])
-  const readTodoDetail = useCallback(
-    async (todo: CollaborationTodo) => {
-      const response = await window.pact.getConversation({
-        scope: 'collaboration',
-        sessionId: session.id,
-        projection: 'todos',
-        taskId: todo.taskId,
-        todoId: todo.id,
-        todoRevision: todo.revision,
-      })
-      if (!response.ok || response.value.scope !== 'collaboration' || !response.value.view.todo)
-        return undefined
-      const detail = response.value.view.todo
-      return {
-        todo: detail,
-        runId: detail.sourceRunId,
-        messageId: detail.sourceMessageId,
-        document: detail.document,
+  }
+  const activeRelayUi = relayUi?.identity === relayIdentity ? relayUi : undefined
+  const productionRelayDecision: RelayDecisionPresentation | undefined = relayRequest
+    ? {
+        request: relayRequest,
+        status: activeRelayUi?.status ?? 'awaiting_confirmation',
+        answerValue: activeRelayUi?.value ?? '',
+        error: activeRelayUi?.error,
+        onChangeAnswer: (value) => {
+          if (relayIdentity)
+            setRelayUi({ identity: relayIdentity, value, status: 'awaiting_confirmation' })
+        },
+        onConfirm: (answer) => {
+          void submitRelayAnswer(answer)
+        },
+        onCheckReceipt: () => {
+          void readRelayReceipt()
+        },
+        onCancel: () => {
+          void submitRelayAnswer({ kind: 'cancel' })
+        },
       }
-    },
-    [session.id],
+    : undefined
+  const cancellation = history.informationCancellation
+  const currentRelayDecision =
+    cancellation?.request.sessionId === session.id
+      ? {
+          ...cancellation,
+          cancelling: true,
+          answerValue: '',
+          onChangeAnswer: () => undefined,
+          onConfirm: () => undefined,
+          onCancel: () => undefined,
+          onCheckReceipt: () => {
+            void history.checkInformationCancellation?.()
+          },
+        }
+      : relayDecision?.request.sessionId === session.id
+        ? relayDecision
+        : productionRelayDecision
+  const inputTakeover =
+    decisionTakeover || nativeQuestions.length > 0 || Boolean(currentRelayDecision)
+  // Identity of the current draft contents; any edit invalidates the open confirmation.
+  const replacementDraftToken = useMemo(
+    () => ({}),
+    // oxlint-disable-next-line react-hooks/exhaustive-deps -- Deliberate identity token over the draft inputs.
+    [
+      composer,
+      composerSkills,
+      composerMention,
+      composerRoute,
+      composerReturnedInputOperationId,
+      composerImages,
+      snapshot?.commentsRevision,
+    ],
   )
-  const addTodoComment = useCallback(
-    async (draft: TodoCommentDraft): Promise<CommentDraftSaveOutcome> => {
-      const anchor: import('@pact/contracts').TodoCommentAnchor = {
-        type: 'todo',
-        taskId: draft.todo.taskId,
-        todoId: draft.todo.id,
-        todoRevision: draft.todo.revision,
-        quote: draft.quote ?? draft.todo.title,
-        ...(draft.selection ? { selection: draft.selection } : {}),
-        ...(draft.answer
-          ? {
-              question: {
-                id: draft.answer.questionId,
-                revision: draft.answer.questionRevision,
-                ...(draft.answer.optionIndex === undefined
-                  ? {}
-                  : { optionIndex: draft.answer.optionIndex }),
-              },
-            }
-          : {}),
-      }
-      if (draft.commentId)
-        return onSaveCommentDraft({
-          mode: 'edit',
-          requestId: draft.requestId,
-          sessionId: session.id,
-          commentId: draft.commentId,
-          body: draft.body,
-          anchor,
-        })
-      return onSaveCommentDraft({
-        mode: 'create',
-        requestId: draft.requestId,
-        sessionId: session.id,
-        commentId: draft.requestId,
-        body: draft.body,
-        anchor,
-      })
-    },
-    [session.id, onSaveCommentDraft],
+  // The confirmation yields to every native/question/Relay takeover above it.
+  const replacementTask =
+    replacement && replacement.sessionId === session.id && unfinishedTask?.id === replacement.taskId
+      ? unfinishedTask
+      : undefined
+  const replacementDetails =
+    replacementTask && currentPlan?.sessionId === session.id ? currentPlan.replacement : undefined
+  useEffect(() => {
+    if (
+      replacement &&
+      (replacement.sessionId !== session.id ||
+        replacement.taskId !== unfinishedTask?.id ||
+        replacement.draftToken !== replacementDraftToken)
+    ) {
+      replacementAttempt.current = undefined
+      setReplacement(undefined)
+    }
+  }, [replacement, session.id, unfinishedTask?.id, replacementDraftToken])
+  useEffect(() => {
+    if (replacement || !replacementRestoreFocus.current) return
+    replacementRestoreFocus.current = false
+    composerRef.current?.focus()
+  }, [replacement])
+  const showDecisionNotice = Boolean(
+    decisionSource &&
+    !planRecovery &&
+    decisionKey !== answeredDecisionKey &&
+    (inputGateState === 'needs_reply' || inputGateState === 'incomplete'),
+  )
+  const decisionMessageId =
+    decisionSource?.messageId ??
+    (decisionSource ? runsById.get(decisionSource.runId)?.responseMessageId : undefined)
+  const decisionReply: DecisionReplyContext | undefined =
+    showDecisionNotice && decisionSource && unfinishedTask
+      ? {
+          reference: {
+            taskId: unfinishedTask.id,
+            runId: decisionSource.runId,
+            decisionInputSequence: decisionSource.inputSequence,
+            expectedInputSequence: unfinishedTask.inputSequence,
+          },
+          questions: decisionSource.questions ?? [],
+        }
+      : undefined
+  const decisionAnswersReady = Boolean(
+    decisionReply &&
+    sameDecision(history.decisionDraft?.reference, decisionReply.reference) &&
+    hasDecisionAnswers(history.decisionDraft),
   )
   const activeRun =
     latestRun &&
@@ -1043,6 +1125,30 @@ export function ConversationView({
       : undefined
 
   const sessionIssues = snapshot?.sessionIssues
+  const relayRebuild =
+    currentRelayDecision?.request.request.category === 'arrangement_change' &&
+    currentRelayDecision.request.request.operation.kind === 'rebuild_native_context' &&
+    !decisionTakeover &&
+    !nativeRequests.length &&
+    !planRecovery
+      ? currentRelayDecision.request.request.operation
+      : undefined
+  const visibleSessionIssues =
+    sessionIssues && relayRebuild
+      ? {
+          ...sessionIssues,
+          agents: sessionIssues.agents.filter(
+            (issue) =>
+              !(
+                issue.agentId === relayRebuild.agentId &&
+                issue.generation === relayRebuild.expectedGeneration &&
+                (issue.nativeSessionId ?? null) === relayRebuild.expectedNativeSessionId &&
+                (issue.runId ?? null) === relayRebuild.expectedRunId &&
+                (issue.rebuildId ?? null) === relayRebuild.expectedRebuildId
+              ),
+          ),
+        }
+      : sessionIssues
   const inputGate = sessionIssues?.inputGate ?? 'read_only'
   const recoveryLocked = inputGate === 'read_only'
 
@@ -1057,12 +1163,25 @@ export function ConversationView({
     )?.agentId ??
     activeRun?.agentId ??
     (!recoveryLocked ? pendingRoutedAgentId : undefined)
+  const backgroundIssues = visibleSessionIssues?.agents ?? []
+  const backgroundWorking = backgroundIssues.some((issue) => issue.phase === 'background_working')
+  const backgroundStopping = backgroundIssues.some((issue) => issue.phase === 'background_stopping')
+  const backgroundCheckNeeded = backgroundIssues.some(
+    (issue) => issue.phase === 'background_check' || issue.phase === 'background_checking',
+  )
+  const backgroundStopIssue = backgroundIssues.find((issue) => issue.backgroundStop)
+  const backgroundStop = backgroundStopIssue?.backgroundStop
+  const stopping = stopRequested || backgroundStopping
   const responseInProgress = Boolean(respondingAgentId) || stopping
-  const composerActionLabel = stopping
-    ? 'Stopping response'
+  const showStop = stopping || (!recoveryLocked && Boolean(respondingAgentId || backgroundStop))
+  const stopLabel = stopping
+    ? 'Stopping…'
     : respondingAgentId
-      ? `Stop ${respondingAgentId === 'claude' ? 'Claude Code' : 'Codex'} response`
-      : 'Send message'
+      ? `Stop ${agentName(respondingAgentId)} response`
+      : 'Stop background work'
+  const requestStop = (): Promise<boolean> => onStop(respondingAgentId ? undefined : backgroundStop)
+  const continuationBlocked =
+    inputGate !== 'open' || backgroundWorking || backgroundCheckNeeded || stopping
   const activeRunHasMessage = Boolean(
     activeRun &&
     snapshot?.messages.some(
@@ -1076,8 +1195,36 @@ export function ConversationView({
         (message.content.trim() || history.window?.messageMeta[message.id]?.oversized),
     ),
   )
-  const composerDisabled = !agentActionsEnabled || recoveryLocked || Boolean(history.restoringInput)
+  const isSideChat = Boolean(session.parentSessionId)
+  const [btwSubmitting, setBtwSubmitting] = useState(false)
+  const [dismissedArriveKey, setDismissedArriveKey] = useState<string | number | undefined>()
+  const focusedArriveKeyRef = useRef<string | number | undefined>(undefined)
+  const [lastMainSync, setLastMainSync] = useState<
+    { sideChatId: string; receipt: SideChatSyncMainReceipt } | undefined
+  >()
+  const effectiveMainSyncEnabled = mainSyncEnabled ?? agentActionsEnabled
+  const anyComposerActionEnabled =
+    agentActionsEnabled || (isSideChat && effectiveMainSyncEnabled && Boolean(onSyncToMain))
+  const composerDisabled =
+    !anyComposerActionEnabled || recoveryLocked || Boolean(history.restoringInput)
   const composerContentReady = useMemo(() => composerHasContent(composer), [composer])
+  const composerPrefix = parseComposerCommandPrefix(composer, composerSkills)
+  const isBtwReady = !isSideChat && Boolean(composerPrefix.btw && !composerPrefix.error)
+  const activePair = useMemo(() => resolveActiveAgentPair(session.settings), [session.settings])
+  const resolvedComposerRoute = resolveComposerRoute(
+    {
+      text: composer,
+      skills: composerSkills,
+      mention: composerMention,
+      route: composerRoute,
+      returnedInputOperationId: composerReturnedInputOperationId,
+    },
+    activePair[0],
+    { allowMainRoute: isSideChat, secondaryAgentId: activePair[1] },
+  ).route
+  const isMainRoute = isSideChat && resolvedComposerRoute.type === 'main'
+  const skillComposerDisabled =
+    composerDisabled || inputTakeover || (!agentActionsEnabled && !isMainRoute)
   const skillComposer = useSkillComposer({
     session,
     text: composer,
@@ -1085,18 +1232,13 @@ export function ConversationView({
     route: composerRoute,
     mention: composerMention,
     returnedInputOperationId: composerReturnedInputOperationId,
-    disabled: composerDisabled,
+    mainTargetAgentId,
+    disabled: skillComposerDisabled,
   })
   const activeSkillId = skillComposer.query
     ? skillComposer.options[skillComposer.active]?.id
     : undefined
-  useLayoutEffect(() => {
-    if (activeSkillId && skillComposer.revealActive)
-      skillMenuRef.current?.querySelector<HTMLElement>(`#skill-${activeSkillId}`)?.scrollIntoView({
-        block: 'nearest',
-        behavior: 'instant',
-      })
-  }, [activeSkillId, skillComposer.revealActive])
+  const skillMenuOpen = Boolean(skillComposer.query) && visible && !skillComposerDisabled
   const returnedInput = history.window?.view.rebuildInputRecovery
   const queue = snapshot?.queue
   const queueEnabled = queue?.enabled ?? true
@@ -1108,6 +1250,7 @@ export function ConversationView({
     queuedInput.recipient === activeRun?.agentId &&
     activeRun.status === 'running' &&
     activeRun.dispatchPhase === 'accepted' &&
+    !activeRun.collaboration &&
     !queuedInput.workflowCommand,
   )
   const steerUnavailableReason = queuedInput?.workflowCommand
@@ -1115,82 +1258,172 @@ export function ConversationView({
     : queuedInput?.recipient === 'all'
       ? 'Messages for all Agents stay queued.'
       : 'Steer is available only for the Agent currently responding.'
-  const disabled =
+  const sharedComposerBlocked =
+    recoveryLocked ||
+    Boolean(history.restoringInput) ||
     choosingImages ||
     composerImages.some((image) => image.status !== 'ready') ||
     Boolean(skillComposer.warning) ||
     skillComposer.checking ||
+    sending ||
+    history.draftsLoading
+  const mainSyncComposerBlocked = !effectiveMainSyncEnabled || sharedComposerBlocked
+  const commonComposerBlocked = !agentActionsEnabled || sharedComposerBlocked
+  const disabled =
+    commonComposerBlocked ||
+    stopping ||
+    (inputGate === 'send_blocked' && (!activeRun?.collaboration || backgroundCheckNeeded))
+  const previousDecisionRun = unfinishedTask ? runsById.get(unfinishedTask.runId) : undefined
+  const incompleteCanAnswer =
+    inputGateState !== 'incomplete' ||
+    Boolean(
+      previousDecisionRun &&
+      ((previousDecisionRun.dispatchPhase === 'ended' &&
+        previousDecisionRun.nativeEffectsState === 'settled') ||
+        (!previousDecisionRun.nativeTurnId &&
+          !previousDecisionRun.nativeOutcome &&
+          ['not_sent', 'rejected'].includes(previousDecisionRun.dispatchPhase ?? '') &&
+          ['not_dispatched', 'settled'].includes(previousDecisionRun.nativeEffectsState ?? ''))),
+    )
+  const questionDisabled =
+    !agentActionsEnabled ||
     composerDisabled ||
-    (inputGate === 'send_blocked' && !activeRun?.collaboration) ||
     sending ||
     stopping ||
-    history.draftsLoading
+    Boolean(activeRun) ||
+    inputGate !== 'open' ||
+    Boolean(history.restoringInput) ||
+    !incompleteCanAnswer
   const draftComments = snapshot?.draftComments ?? EMPTY_COMMENTS
-  const todoDraftKeys = useMemo(
-    () =>
-      new Set(
-        draftComments.flatMap((comment) =>
-          comment.anchor.type === 'todo'
-            ? [`${comment.anchor.todoId}:${comment.anchor.todoRevision}`]
-            : [],
-        ),
-      ),
-    [draftComments],
+  const hasDraft =
+    composerContentReady ||
+    draftComments.length > 0 ||
+    Boolean(history.draftPage?.hasMore || history.draftPage?.hasEarlier) ||
+    composerImages.length > 0
+  const showSend = !showStop || hasDraft
+  const workingIssues = backgroundIssues.filter((issue) => issue.phase === 'background_working')
+  const waitingBackgroundIssue =
+    queueEnabled &&
+    queuedInput?.state === 'queued' &&
+    workingIssues.length === 1 &&
+    workingIssues[0]?.action === 'none'
+      ? workingIssues[0]
+      : undefined
+  const stoppingBackgroundAgent =
+    !respondingAgentId && stopping
+      ? (backgroundIssues.find((issue) => issue.phase === 'background_stopping')?.agentId ??
+        backgroundStopIssue?.agentId)
+      : undefined
+  const stoppingBackgroundInQueue = Boolean(
+    queuedInput &&
+    queuedInput.state !== 'unknown' &&
+    queuedInput.state !== 'dispatching' &&
+    stoppingBackgroundAgent,
   )
-  const todoAnswerDrafts = useMemo(
-    () =>
-      new Map(
-        draftComments.flatMap((comment) =>
-          comment.anchor.type === 'todo' && comment.anchor.question
-            ? [
-                [
-                  `${comment.anchor.taskId}:${comment.anchor.todoId}:${comment.anchor.todoRevision}`,
-                  comment,
-                ] as const,
-              ]
-            : [],
-        ),
-      ),
-    [draftComments],
-  )
+  const queuedBackgroundAgent = stoppingBackgroundInQueue
+    ? stoppingBackgroundAgent
+    : waitingBackgroundIssue?.agentId
   const feedbackDraft = Boolean(
-    currentTask &&
+    unfinishedTask &&
     (composerContentReady ||
       draftComments.length ||
       composerImages.length ||
-      todoEditing ||
       commentEditor?.body.trim()),
   )
-  const focusComposer = useCallback(() => composerRef.current?.focus(), [])
-  const activeCommentAnchor = commentEditor?.anchor
-  const currentDuty = currentTask ? collaborationPendingPhase(currentTask) : undefined
+  const commentDraftId = commentEditor?.draftId
+  const isHandoffArriving =
+    handoffArriveKey !== undefined && handoffArriveKey !== dismissedArriveKey
+  useEffect(() => {
+    if (handoffArriveKey === undefined || handoffArriveKey === dismissedArriveKey) {
+      return undefined
+    }
+    const timer = window.setTimeout(() => setDismissedArriveKey(handoffArriveKey), 220)
+    return () => window.clearTimeout(timer)
+  }, [dismissedArriveKey, handoffArriveKey])
+  useLayoutEffect(() => {
+    if (
+      handoffArriveKey === undefined ||
+      !visible ||
+      composerDisabled ||
+      inputTakeover ||
+      focusedArriveKeyRef.current === handoffArriveKey
+    ) {
+      return
+    }
+    focusedArriveKeyRef.current = handoffArriveKey
+    const editor = composerRef.current
+    if (!editor) return
+    const end = editor.document().text.length
+    editor.focus()
+    editor.select(end, end)
+  }, [composerDisabled, handoffArriveKey, inputTakeover, visible])
   const defaultRecipient =
-    currentTask && !parseComposerCommandPrefix(composer, composerSkills).pact
-      ? currentTask.kind === 'plan' && currentTask.approvedPlanVersion === undefined
-        ? currentTask.primary
-        : currentDuty?.stage === 'review'
-          ? currentTask.reviewer
-          : currentTask.implementer
+    unfinishedTask && !composerPrefix.pact
+      ? collaborationActor(unfinishedTask, 'reply')
       : session.settings.primaryAgentId
-  const primaryName = session.settings.primaryAgentId === 'claude' ? 'Claude Code' : 'Codex'
-  const filteredMentionOptions = mentionOptions.filter(
+  const primaryName = agentName(activePair[0])
+  const secondaryName = agentName(activePair[1])
+  const availableMentionOptions = useMemo(
+    () => buildMentionOptions(activePair, isSideChat),
+    [activePair, isSideChat],
+  )
+  const filteredMentionOptions = availableMentionOptions.filter(
     (option) =>
-      option.token.slice(1).startsWith(mentionQuery?.query ?? '') &&
-      (!currentTask || option.token !== '@all'),
+      (option.token === '@Main' ? effectiveMainSyncEnabled : agentActionsEnabled) &&
+      option.token
+        .slice(1)
+        .toLowerCase()
+        .startsWith((mentionQuery?.query ?? '').toLowerCase()) &&
+      (!unfinishedTask || isBtwReady || option.token !== '@all'),
   )
   const mentionListOpen = Boolean(
-    mentionQuery && filteredMentionOptions.length > 0 && !composerDisabled,
+    mentionQuery &&
+    filteredMentionOptions.length > 0 &&
+    visible &&
+    !composerDisabled &&
+    !inputTakeover,
   )
   const mentionListId = `message-recipients-${session.id}`
   const activeMentionId = mentionListOpen
     ? `${mentionListId}-${filteredMentionOptions[activeMentionIndex]?.token.slice(1) ?? 'none'}`
     : undefined
+  const composerMenuKind = skillMenuOpen ? 'skill' : mentionListOpen ? 'mention' : undefined
+  useLayoutEffect(() => {
+    const menu = composerMenuKind === 'skill' ? skillMenuRef.current : mentionMenuRef.current
+    const open = composerMenuKind === 'skill' ? skillPopoverOpen : mentionPopoverOpen
+    const box = composerBoxRef.current
+    if (!composerMenuKind || !menu || !box) return undefined
+    const fit = (): void => {
+      menu.style.setProperty(
+        '--pact-composer-menu-available-height',
+        `${Math.max(0, box.getBoundingClientRect().top - 16)}px`,
+      )
+    }
+    fit()
+    menu.showPopover()
+    const observer = new ResizeObserver(fit)
+    observer.observe(box)
+    window.addEventListener('resize', fit)
+    return () => {
+      observer.disconnect()
+      window.removeEventListener('resize', fit)
+      if (open.current && menu.isConnected) menu.hidePopover()
+    }
+  }, [composerMenuKind, session.id])
+  useLayoutEffect(() => {
+    if (activeSkillId && skillComposer.revealActive)
+      skillMenuRef.current?.querySelector<HTMLElement>(`#skill-${activeSkillId}`)?.scrollIntoView({
+        block: 'nearest',
+        behavior: 'instant',
+      })
+  }, [activeSkillId, skillComposer.revealActive])
   const scrollVersion = `${snapshot?.messages.at(-1)?.id ?? ''}:${snapshot?.messages.length ?? 0}:${snapshot?.activities.length ?? 0}:${snapshot?.runs.length ?? 0}:${loading}`
   const residentMessages = snapshot?.messages
   const navigationMessage = messageNavigation
     ? residentMessages?.find((message) => message.id === messageNavigation.messageId)
     : undefined
   useEffect(() => {
+    dismissedMention.current = undefined
     setMentionQuery(undefined)
     setActiveMentionIndex(0)
   }, [session.id])
@@ -1562,7 +1795,6 @@ export function ConversationView({
     runsById,
   ])
   // TanStack owns mutable measurements; React Compiler must not memoize its methods.
-  // oxlint-disable-next-line react/incompatible-library
   const virtualizer = useVirtualizer({
     count: rows.length,
     getScrollElement: () => transcriptRef.current,
@@ -2037,6 +2269,20 @@ export function ConversationView({
     setRestorationMessageIds([])
     setRestorationPlan(undefined)
     setRestorationReport(undefined)
+    if (
+      messageNavigation.queuedOperationId &&
+      queuedInput?.id === messageNavigation.queuedOperationId
+    ) {
+      const dock = queueDockRef.current
+      if (!dock) return undefined
+      const focusDock = (): void => {
+        dock.scrollIntoView({ behavior: 'smooth', block: 'center' })
+        pulseMessageTarget(dock)
+        appliedNavigationRef.current = messageNavigation
+      }
+      const frame = requestAnimationFrame(focusDock)
+      return () => cancelAnimationFrame(frame)
+    }
     void ensureMessage(messageNavigation.messageId)
     // A resident source marker can change the row key. Focus only after that
     // render has committed, never on a DOM node about to be replaced.
@@ -2045,6 +2291,11 @@ export function ConversationView({
     const message = navigationMessage
       ? messageRefs.current.get(messageNavigation.messageId)
       : undefined
+    if (!message && navigationMessage) {
+      const index = rows.findIndex((row) => row.message?.id === messageNavigation.messageId)
+      if (index >= 0) virtualizer.scrollToIndex(index, { align: 'center' })
+      return undefined
+    }
     if (message) {
       stickToBottomRef.current = false
       const focus = (): boolean => {
@@ -2075,6 +2326,23 @@ export function ConversationView({
           appliedNavigationRef.current = messageNavigation
           return true
         }
+        if (messageNavigation.textBasis === 'plain-visible-v1') {
+          const transcript = transcriptRef.current
+          const rect = message.getBoundingClientRect()
+          if (transcript && rect.height > 0) {
+            virtualizer.scrollToOffset(
+              transcript.scrollTop +
+                rect.top -
+                transcript.getBoundingClientRect().top -
+                transcript.clientHeight / 2 +
+                rect.height / 2,
+              { behavior: 'smooth' },
+            )
+          }
+          pulseMessageTarget(message)
+          appliedNavigationRef.current = messageNavigation
+          return true
+        }
         return false
       }
       const frame = focus() ? undefined : requestAnimationFrame(() => void focus())
@@ -2088,10 +2356,12 @@ export function ConversationView({
     dismissedNavigation,
     hasProtectedSelection,
     messageNavigation,
+    queuedInput?.id,
     history.window?.sourceMessageId,
     visible,
     navigationMessage,
     mountedRowKeys,
+    rows,
     virtualizer,
     cancelPrepend,
   ])
@@ -2107,15 +2377,63 @@ export function ConversationView({
     setRequestedResponseId(undefined)
     setRestorationMessageIds([])
   }, [requestedResponseId, visible, rows, mountedRowKeys, virtualizer])
-  useEffect(() => {
-    if (!activeCommentAnchor) return undefined
-    const frame = requestAnimationFrame(() => {
-      const textarea = commentTextareaRef.current
-      textarea?.focus()
-      textarea?.setSelectionRange(textarea.value.length, textarea.value.length)
+  useLayoutEffect(() => {
+    commentFocusRef.current.visible = visible
+    if (!visible) commentFocusRef.current.cancel?.()
+  }, [visible])
+  useLayoutEffect(() => {
+    const textarea = commentTextareaRef.current
+    if (
+      !commentDraftId ||
+      !commentFocusRef.current.visible ||
+      !textarea ||
+      document.activeElement === textarea
+    )
+      return undefined
+    const origin = document.activeElement
+    let active = true
+    let frame: number | undefined
+    const detach = (): void => {
+      document.removeEventListener('focusin', cancel, true)
+      window.removeEventListener('blur', cancel)
+      if (commentFocusRef.current.cancel === cancel) delete commentFocusRef.current.cancel
+    }
+    const cancel = (): void => {
+      active = false
+      detach()
+      if (frame !== undefined) cancelAnimationFrame(frame)
+      frame = undefined
+    }
+    // Capture ownership before paint. Any later focus transfer supersedes this request,
+    // including a transfer away and back to the original element.
+    commentFocusRef.current.cancel = cancel
+    document.addEventListener('focusin', cancel, true)
+    window.addEventListener('blur', cancel)
+    frame = requestAnimationFrame(() => {
+      if (!active) return
+      active = false
+      frame = undefined
+      detach()
+      if (
+        commentTextareaRef.current !== textarea ||
+        !commentFocusRef.current.visible ||
+        !textarea.isConnected ||
+        textarea.disabled ||
+        textarea.readOnly ||
+        document.activeElement !== origin ||
+        textarea.closest('[inert], [hidden], [aria-hidden="true"]')
+      )
+        return
+      for (let element: HTMLElement | null = textarea; element; element = element.parentElement) {
+        const style = getComputedStyle(element)
+        if (style.display === 'none' || style.visibility === 'hidden') return
+      }
+      textarea.focus()
+      if (document.activeElement === textarea)
+        textarea.setSelectionRange(textarea.value.length, textarea.value.length)
     })
-    return () => cancelAnimationFrame(frame)
-  }, [activeCommentAnchor])
+    return cancel
+  }, [commentDraftId, planPanelExpanded])
   useEffect(() => {
     copyActiveRef.current = true
     return () => {
@@ -2243,6 +2561,64 @@ export function ConversationView({
     }),
     [composer, composerSkills, composerMention, composerRoute, composerReturnedInputOperationId],
   )
+  const pactCommandHint = (() => {
+    if (isSideChat || !composerPrefix.pact || composerPrefix.error) return undefined
+    const inTaskReviewHint =
+      composerPrefix.pact === 'review' &&
+      unfinishedTask &&
+      !unfinishedTask.ending &&
+      isCollaborationOpenMode(unfinishedTask) &&
+      (unfinishedTask.kind === 'plan' || unfinishedTask.kind === 'build')
+    if (inTaskReviewHint) {
+      const explicit =
+        composerPrefix.route?.type === 'agent'
+          ? composerPrefix.route.agentId
+          : composerRoute?.type === 'agent'
+            ? composerRoute.agentId
+            : undefined
+      const taskRoles = resolveLegacyCompatibleTaskStageRoles(unfinishedTask)
+      const taskPair: readonly [RuntimeAgentId, RuntimeAgentId] =
+        unfinishedTask.owner !== unfinishedTask.reviewer
+          ? [unfinishedTask.owner, unfinishedTask.reviewer]
+          : [taskRoles.planAuthor, taskRoles.planReviewer]
+      const fallbackReviewer = otherAgent(
+        unfinishedTask.unreviewedCodeActor ??
+          unfinishedTask.lastCodeActor ??
+          collaborationActor(unfinishedTask, 'implement'),
+        taskPair,
+      )
+      return `${agentName(explicit ?? fallbackReviewer)} reviews code.`
+    }
+    const { route } = resolveComposerRoute(editorValue, activePair[0], {
+      secondaryAgentId: activePair[1],
+    })
+    if (route.type !== 'agent' || !activePair.includes(route.agentId)) return undefined
+    const entryPrimary = pactSessionEntryPrimary(composerPrefix.pact, activePair, route.agentId)
+    const roles = defaultTaskStageRoles(entryPrimary, otherAgent(entryPrimary, activePair))
+    return composerPrefix.pact === 'plan'
+      ? `${agentName(roles.planAuthor)} drafts plan · ${agentName(roles.planReviewer)} reviews plan.`
+      : composerPrefix.pact === 'build'
+        ? `${agentName(roles.codeAuthor)} implements.`
+        : `${agentName(roles.codeReviewer)} reviews code.`
+  })()
+  const dismissMentionMenu = (): void => {
+    dismissedMention.current = mentionQuery
+    setMentionQuery(undefined)
+  }
+  const updateMentionQuery = (text: string, cursor: number): void => {
+    const next = mentionQueryAt(text, cursor)
+    const dismissed = dismissedMention.current
+    if (
+      next &&
+      dismissed &&
+      next.start === dismissed.start &&
+      next.end === dismissed.end &&
+      next.query === dismissed.query
+    )
+      return
+    dismissedMention.current = undefined
+    setMentionQuery(next)
+  }
   const acceptComposerDocument = (
     document: ComposerDocument,
     cursor: number,
@@ -2261,14 +2637,14 @@ export function ConversationView({
       return true
     }
     skillComposer.update(document.text, cursor, document.skills)
-    setMentionQuery(mentionQueryAt(document.text, cursor))
+    updateMentionQuery(document.text, cursor)
     setActiveMentionIndex(0)
     return true
   }
   const cursorChanged = (cursor: number): void => {
     const current = composerRef.current?.document() ?? editorValue
     skillComposer.update(current.text, cursor, current.skills)
-    setMentionQuery(mentionQueryAt(current.text, cursor))
+    updateMentionQuery(current.text, cursor)
     setActiveMentionIndex(0)
   }
   const documentAfterEdits = (edits: ComposerEdit[]): ComposerDocument | undefined => {
@@ -2291,35 +2667,41 @@ export function ConversationView({
       composerRef.current?.apply(next, { start: cursor, end: cursor }, replacements)
     } catch (editError) {
       composerRef.current?.refuseEdit(
-        editError instanceof Error ? editError.message : 'Your draft was kept.',
+        editError instanceof Error
+          ? editError.message
+          : 'Couldn’t apply that edit. Your draft was kept.',
       )
     }
   }
   const chooseSkill = (entry: import('./useSkillComposer').ComposerSkillOption): void => {
-    const replacement = skillComposer.choose(entry)
-    if (!replacement) return
+    const skillReplacement = skillComposer.choose(entry)
+    if (!skillReplacement) return
     const current = composerRef.current?.document() ?? editorValue
     if (
       history.admitComposerEdit?.(
-        current.text.length - (replacement.end - replacement.start) + replacement.text.length,
+        current.text.length -
+          (skillReplacement.end - skillReplacement.start) +
+          skillReplacement.text.length,
       ) === false
     )
       return
     try {
-      const next = replaceComposerDocument(current, replacement)
-      if (replacement.skill)
-        next.skills = [...next.skills, replacement.skill].toSorted((a, b) => a.start - b.start)
-      const cursor = replacement.start + replacement.text.length
+      const next = replaceComposerDocument(current, skillReplacement)
+      if (skillReplacement.skill)
+        next.skills = [...next.skills, skillReplacement.skill].toSorted((a, b) => a.start - b.start)
+      const cursor = skillReplacement.start + skillReplacement.text.length
       composerRef.current?.focus()
-      composerRef.current?.apply(next, { start: cursor, end: cursor }, [replacement])
+      composerRef.current?.apply(next, { start: cursor, end: cursor }, [skillReplacement])
     } catch (editError) {
       composerRef.current?.refuseEdit(
-        editError instanceof Error ? editError.message : 'Your draft was kept.',
+        editError instanceof Error
+          ? editError.message
+          : 'Couldn’t apply that skill. Your draft was kept.',
       )
     }
   }
 
-  const chooseMention = (option: (typeof mentionOptions)[number]): void => {
+  const chooseMention = (option: MentionOption): void => {
     if (!mentionQuery) return
     const current = composerRef.current?.document() ?? editorValue
     const selectedMention = current.mention
@@ -2352,7 +2734,9 @@ export function ConversationView({
       composerRef.current?.apply(nextDocument, { start: cursor, end: cursor }, edits)
     } catch (editError) {
       composerRef.current?.refuseEdit(
-        editError instanceof Error ? editError.message : 'Your draft was kept.',
+        editError instanceof Error
+          ? editError.message
+          : 'Couldn’t insert that mention. Your draft was kept.',
       )
       return
     }
@@ -2360,54 +2744,146 @@ export function ConversationView({
     setActiveMentionIndex(0)
   }
 
-  const submit = async (purpose?: ConversationSendInput['planningAction']): Promise<void> => {
-    if (responseInProgress && !queueEnabled) return
+  const submitAnswers = async (): Promise<void> => {
+    if (!decisionReply || questionDisabled || !decisionAnswersReady) return
+    const submittedKey = decisionKey
+    const sent = await onSend('', [], undefined, undefined, decisionReply)
+    if (sent) setAnsweredDecisionKey(submittedKey)
+    setPlanRefresh((value) => value + 1)
+  }
+
+  const submit = async (): Promise<void> => {
+    if (inputTakeover) return
+    const document = composerRef.current?.document() ?? editorValue
+    const prefix = parseComposerCommandPrefix(document.text, document.skills)
+    if (isSideChat && (prefix.pact || prefix.btw)) {
+      onNotice('Pact commands (/plan, /build, /review, /btw) can only be used in the main chat.')
+      return
+    }
+    const { route: effectiveRoute, sendRoute } = resolveComposerRoute(document, defaultRecipient, {
+      allowMainRoute: isSideChat,
+      secondaryAgentId: activePair[1],
+    })
+    if (!isSideChat && prefix.btw && !prefix.error) {
+      if (btwSubmitting || commonComposerBlocked || !onOpenBtwSideChat) return
+      if (decisionReply) {
+        onNotice('Reply to the active questions before starting a /btw side chat.')
+        return
+      }
+      if (
+        composerReturnedInputOperationId ||
+        returnedInput?.state === 'installed' ||
+        queue?.returnedInput?.operationId ||
+        composerUserInformation
+      ) {
+        onNotice('Send or clear the saved message before starting a /btw side chat.')
+        return
+      }
+      if (composerImages.length > 0 || draftComments.length > 0) {
+        onNotice('Remove attached images or draft comments before starting a /btw side chat.')
+        return
+      }
+      const btwDraft = extractBtwSideChatDraft(document)
+      if (!btwDraft) return
+      const submittedRevision = composerRevision
+      setBtwSubmitting(true)
+      try {
+        const opened = await onOpenBtwSideChat(btwDraft)
+        if (opened) {
+          if (onClearSubmittedDraft) onClearSubmittedDraft(submittedRevision)
+          else if (onComposerDocumentChange) onComposerDocumentChange({ text: '', skills: [] })
+          else onComposerChange('')
+          skillComposer.close()
+          setMentionQuery(undefined)
+        }
+      } finally {
+        setBtwSubmitting(false)
+      }
+      return
+    }
+    if (isSideChat && effectiveRoute.type === 'main') {
+      if (mainSyncComposerBlocked || !onSyncToMain) return
+      const syncDraft = extractMainSyncDraft(document)
+      const trimmedLead = syncDraft.text.length - syncDraft.text.trimStart().length
+      const syncContent = syncDraft.text.trim()
+      if (
+        syncContent.length === 0 &&
+        composerImages.length === 0 &&
+        draftComments.length === 0 &&
+        !history.draftPage?.hasMore &&
+        !history.draftPage?.hasEarlier
+      ) {
+        onNotice('Write a message before sending to the main chat.')
+        return
+      }
+      const shiftedSkills = syncDraft.skills.map((entry) =>
+        Object.assign({}, entry, {
+          start: entry.start - trimmedLead,
+          end: entry.end - trimmedLead,
+        }),
+      )
+      const syncValidation = validateSideChatMainSyncContent(syncContent, shiftedSkills)
+      if (!syncValidation.ok) {
+        onNotice(syncValidation.message)
+        return
+      }
+      const receipt = await onSyncToMain(
+        syncContent,
+        draftComments.map((comment) => comment.id),
+        shiftedSkills,
+      )
+      if (receipt) {
+        setLastMainSync({ sideChatId: session.id, receipt })
+        skillComposer.close()
+        setMentionQuery(undefined)
+      }
+      return
+    }
+    if (responseInProgress && !queueEnabled && !unfinishedTask) return
     if (responseInProgress && queuedInput) {
       onNotice('One message is already queued. Edit or remove it before queuing another.')
       return
     }
     if (
-      (!composerHasContent(composerRef.current?.document().text ?? composer) &&
+      (!composerHasContent(document.text) &&
         draftComments.length === 0 &&
-        composerImages.length === 0) ||
+        composerImages.length === 0 &&
+        !decisionAnswersReady) ||
       disabled
     )
       return
     stickToBottomRef.current = true
     cancelPrepend()
     scrollIntentRef.current = undefined
-    const document = composerRef.current?.document() ?? editorValue
     const removed = document.text.length - document.text.trimStart().length
-    const { sendRoute } = resolveComposerRoute(document, defaultRecipient)
-    if (currentTask && sendRoute?.type === 'all') {
+    if (unfinishedTask && sendRoute?.type === 'all') {
       onNotice('Choose one Agent for this feedback batch.')
       return
     }
-    const prefix = parseComposerCommandPrefix(document.text, document.skills)
-    const planning =
-      (planningTask?.plan || planningTask?.planDocument) &&
-      collaborationRequiresPlan(planningTask) &&
-      planningTask.approvedPlanVersion === undefined &&
-      !prefix.pact &&
-      !prefix.skills.length
-    const selectedActor = sendRoute?.type === 'agent' ? sendRoute.agentId : planningTask?.primary
-    const planningAction =
-      purpose ??
-      (planning && sendRoute?.type !== 'all'
-        ? selectedActor === planningTask.primary
-          ? 'maintain_plan'
-          : 'review_plan'
-        : undefined)
-    const targetRoute =
-      purpose && planningTask
-        ? {
-            type: 'agent' as const,
-            agentId:
-              purpose === 'maintain_plan' ? planningTask.primary : otherAgent(planningTask.primary),
-          }
-        : currentTask && sendRoute?.type === 'primary' && !prefix.pact
-          ? { type: 'agent' as const, agentId: defaultRecipient }
-          : sendRoute
+    if (decisionReply && prefix.pact) {
+      onNotice('Send your answers as a reply before starting another Pact command.')
+      return
+    }
+    if (replacement) return
+    const inTaskReview = Boolean(
+      prefix.pact === 'review' &&
+      unfinishedTask &&
+      !unfinishedTask.ending &&
+      isCollaborationOpenMode(unfinishedTask) &&
+      (unfinishedTask.kind === 'plan' || unfinishedTask.kind === 'build'),
+    )
+    if (prefix.pact && unfinishedTask && !inTaskReview) {
+      setReplacementFailed(false)
+      setReplacement({
+        sessionId: session.id,
+        taskId: unfinishedTask.id,
+        command: prefix.pact,
+        draftToken: replacementDraftToken,
+      })
+      return
+    }
+    const submittedDecisionKey = decisionKey
+    const targetRoute = sendRoute
     const sent = await onSend(
       document.text,
       draftComments.map((comment) => comment.id),
@@ -2415,11 +2891,74 @@ export function ConversationView({
       document.skills.map((entry) => {
         return Object.assign({}, entry, { start: entry.start - removed, end: entry.end - removed })
       }),
-      planningAction,
     )
     if (sent) {
+      setAnsweredDecisionKey(submittedDecisionKey)
+      setPlanRefresh((value) => value + 1)
       skillComposer.close()
       setMentionQuery(undefined)
+    } else if (decisionReply) setPlanRefresh((value) => value + 1)
+  }
+
+  const cancelReplacement = (): void => {
+    replacementAttempt.current = undefined
+    replacementRestoreFocus.current = true
+    setReplacementFailed(false)
+    setReplacement(undefined)
+  }
+  const confirmReplacement = async (): Promise<void> => {
+    const task = replacementTask
+    if (
+      !replacement ||
+      !task ||
+      replacementBusy ||
+      disabled ||
+      inputTakeover ||
+      queuedInput ||
+      sending
+    )
+      return
+    setReplacementBusy(true)
+    setReplacementFailed(false)
+    try {
+      const document = composerRef.current?.document() ?? editorValue
+      const prefix = parseComposerCommandPrefix(document.text, document.skills)
+      if (prefix.pact !== replacement.command || replacement.draftToken !== replacementDraftToken) {
+        cancelReplacement()
+        return
+      }
+      // First confirm freezes the displayed revision; retries reuse the same proof after an
+      // uncertain acknowledgement instead of silently re-authorizing a newer task state.
+      replacementAttempt.current ??= { taskId: task.id, revision: task.revision }
+      const removed = document.text.length - document.text.trimStart().length
+      const { sendRoute } = resolveComposerRoute(document, defaultRecipient, {
+        secondaryAgentId: activePair[1],
+      })
+      const sent = await onSend(
+        document.text,
+        draftComments.map((comment) => comment.id),
+        sendRoute,
+        document.skills.map((entry) =>
+          Object.assign({}, entry, { start: entry.start - removed, end: entry.end - removed }),
+        ),
+        undefined,
+        // The server rechecks this exact current task identity and revision at receipt.
+        replacementAttempt.current,
+      )
+      if (sent) {
+        replacementAttempt.current = undefined
+        setReplacement(undefined)
+        setPlanRefresh((value) => value + 1)
+        skillComposer.close()
+        setMentionQuery(undefined)
+      } else {
+        setReplacementFailed(true)
+        // Refresh the current projection so a stale revision does not trap the confirmation.
+        setPlanRefresh((value) => value + 1)
+      }
+      // A rejected or uncertain receipt keeps the draft and its pending nonce for an explicit retry.
+    } finally {
+      setReplacementBusy(false)
     }
   }
 
@@ -2517,13 +3056,7 @@ export function ConversationView({
           if (source.plan) return source.plan.runId === host.dataset.pactPlanRunId
           if (source.report) {
             const actual = reportSelectionSource(host)
-            return (
-              actual?.runId === source.report.runId &&
-              actual.target.type === source.report.target.type &&
-              (actual.target.type === 'summary' ||
-                (source.report.target.type === 'feedback' &&
-                  actual.target.id === source.report.target.id))
-            )
+            return actual?.runId === source.report.runId
           }
           return false
         }
@@ -2622,6 +3155,7 @@ export function ConversationView({
       : `restore:${gapRecoveryPending ?? ''}:${gapRestoreRef.current?.messageId ?? ''}`
   const [planSourcePreview, setPlanSourcePreview] = useState<{
     key: string
+    taskId?: string | undefined
     plan?: CurrentPlanDocument | undefined
     error?: string | undefined
   }>()
@@ -2671,7 +3205,7 @@ export function ConversationView({
         const source = view?.planSource
         const task = view?.task
         if (
-          !(task?.plan || task?.planDocument) ||
+          !task?.planReference ||
           task.planVersion !== requested.version ||
           source?.runId !== requested.runId
         ) {
@@ -2680,15 +3214,18 @@ export function ConversationView({
         }
         setPlanSourcePreview({
           key: requested.key,
+          taskId: task.id,
           plan: {
             runId: requested.runId,
             messageId: source.messageId,
             version: requested.version,
-            author: task.planAuthor ?? task.drafter,
-            content: task.plan ?? '',
-            document: task.planDocument,
+            author:
+              task.planReference.author ?? task.planAuthor ?? collaborationActor(task, 'plan'),
+            content: '',
+            document: task.planReference.document,
             sessionId: requested.sessionId,
             aroundOffset: planSourceNavigationRef.current?.startOffset,
+            endOffset: planSourceNavigationRef.current?.endOffset,
             navigationId: planSourceNavigationRef.current?.navigationId,
             basis:
               planSourceNavigationRef.current?.textBasis === 'plain-visible-v1'
@@ -2743,20 +3280,6 @@ export function ConversationView({
     stickToBottomRef.current = false
     scrollIntentRef.current = undefined
   }, [])
-  const focusedTodo =
-    todoTarget && todoSource?.navigationId === todoTarget.navigationId ? todoSource.todo : undefined
-  const visibleTodos = useMemo(
-    () => (todoPage?.items ?? []).filter((todo) => (todo.status === 'done') === doneTodos),
-    [todoPage, doneTodos],
-  )
-  const separateTodoSource =
-    focusedTodo &&
-    !visibleTodos.some(
-      (todo) => todo.id === focusedTodo.id && todo.revision === focusedTodo.revision,
-    )
-      ? focusedTodo
-      : undefined
-
   const saveComment = async (): Promise<void> => {
     if (!commentEditor?.body.trim() || disabled || savingComment) return
     const submitted =
@@ -2767,25 +3290,26 @@ export function ConversationView({
     const requestedSessionId = session.id
     setSavingComment(true)
     try {
-      const saved = await onSaveCommentDraft(
-        submitted.commentId
-          ? {
-              mode: 'edit',
-              requestId: submitted.draftId,
-              sessionId: session.id,
-              commentId: submitted.commentId,
-              body: submitted.body,
-              ...(submitted.anchor.type === 'todo' ? { anchor: submitted.anchor } : {}),
-            }
+      const saveInput = submitted.commentId
+        ? {
+            mode: 'edit' as const,
+            requestId: submitted.draftId,
+            sessionId: session.id,
+            commentId: submitted.commentId,
+            body: submitted.body,
+          }
+        : submitted.anchor.type === 'unavailable' || submitted.anchor.type === 'cutoff_message'
+          ? undefined
           : {
-              mode: 'create',
+              mode: 'create' as const,
               requestId: submitted.draftId,
               sessionId: session.id,
               commentId: submitted.draftId,
               body: submitted.body,
               anchor: submitted.anchor,
-            },
-      )
+            }
+      if (!saveInput) return
+      const saved = await onSaveCommentDraft(saveInput)
       if (
         typeof saved === 'object' &&
         requestedSessionId === messageInteractionRef.current.snapshot?.session.id
@@ -2836,20 +3360,32 @@ export function ConversationView({
       onOpenFile={(id, path) => onOpenWorkspaceChanges(id, path, undefined, changeSet.revision)}
     />
   )
+  const handoffSourceLabel = (run: AgentRun): string | undefined => {
+    const peerIds = [...new Set(run.handoffSourceAgents ?? [])]
+    if (peerIds.length === 1) return agentName(peerIds[0]!)
+    if (peerIds.length === 2) return `${agentName(peerIds[0]!)} and ${agentName(peerIds[1]!)}`
+    if (peerIds.length > 2) {
+      const names = peerIds.map((id) => agentName(id))
+      return `${names.slice(0, -1).join(', ')}, and ${names.at(-1)!}`
+    }
+    return undefined
+  }
   const renderChangeMetadata = (run: AgentRun): React.JSX.Element => (
     <p className="mb-1 px-1 text-caption text-secondary">
-      {run.agentId === 'claude' ? 'Claude Code' : 'Codex'} ·{' '}
+      {agentName(run.agentId)} ·{' '}
       <time dateTime={run.createdAt}>
         {messageDateTimeFormatter.format(new Date(run.createdAt))}
       </time>{' '}
       ·{' '}
       {run.controlDisposition === 'abandoned'
-        ? 'Abandoned'
+        ? 'Cancelled'
         : run.status === 'interrupted'
           ? 'Stopped'
           : run.status === 'failed'
             ? 'Failed'
-            : 'Completed'}
+            : run.nativeEffectsState === 'pending' || run.nativeEffectsState === 'unknown'
+              ? 'Reply finished'
+              : 'Completed'}
     </p>
   )
   const renderRecordingWarning = (run: AgentRun): React.JSX.Element | null =>
@@ -2863,12 +3399,13 @@ export function ConversationView({
         <span>{run.workspaceRecordingUnavailableReason}</span>
       </p>
     ) : null
-  const renderSavedRunResult = (run: AgentRun): React.JSX.Element | null =>
-    run.responseMessageId ? (
+  const renderSavedRunResult = (run: AgentRun): React.JSX.Element | null => {
+    const id = run.responseMessageId
+    if (!id || rows.some((row) => row.message?.id === id)) return null
+    return (
       <button
         type="button"
         onClick={() => {
-          const id = run.responseMessageId!
           cancelPrepend()
           stickToBottomRef.current = false
           scrollIntentRef.current = undefined
@@ -2880,7 +3417,8 @@ export function ConversationView({
       >
         View response
       </button>
-    ) : null
+    )
+  }
   const renderChangeGroup = (run: AgentRun): React.JSX.Element => {
     const group = history.window?.runArtifacts?.find((item) => item.latestRunId === run.id)
     const previousCount = Math.max(0, (group?.totalCount ?? 1) - 1)
@@ -2923,7 +3461,7 @@ export function ConversationView({
               }
               className="inline-flex min-h-8 cursor-pointer items-center gap-1.5 rounded-control px-2 text-caption text-secondary hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-focus disabled:cursor-default disabled:opacity-45"
             >
-              Previous {previousCount} {previousCount === 1 ? 'record' : 'records'}
+              Previous {previousCount} {previousCount === 1 ? 'attempt' : 'attempts'}
               <ChevronDown
                 className={`size-3.5 transition-transform ${expanded ? 'rotate-180' : ''}`}
                 aria-hidden="true"
@@ -2943,7 +3481,7 @@ export function ConversationView({
                 ))}
                 {loadingGroup ? (
                   <p className="px-2 text-caption text-secondary" aria-busy="true">
-                    Loading earlier records…
+                    Loading earlier attempts…
                   </p>
                 ) : null}
                 {failure ? (
@@ -2964,7 +3502,7 @@ export function ConversationView({
                     }
                     className="min-h-8 w-fit cursor-pointer rounded-control px-2 text-caption font-medium text-primary hover:bg-surface-muted focus-visible:outline-2 focus-visible:outline-focus disabled:cursor-default disabled:opacity-45"
                   >
-                    {failure ? 'Try again' : 'Load earlier records'}
+                    {failure ? 'Try again' : 'Load earlier attempts'}
                   </button>
                 ) : null}
               </div>
@@ -2981,19 +3519,15 @@ export function ConversationView({
       const run = row.run
       return (
         <article className="w-fit max-w-[92%] min-w-0 self-start" data-pact-run-context-id={run.id}>
-          <div
-            className={`rounded-message ${run.agentId === 'claude' ? 'bg-speaker-claude' : 'bg-speaker-codex'} px-4 py-3`}
-          >
+          <div className={`rounded-message ${speakerBgClass(run.agentId)} px-4 py-3`}>
             <p className="flex min-w-0 items-baseline gap-1.5 text-caption text-secondary">
-              <span className="shrink-0 font-medium">
-                {run.agentId === 'claude' ? 'Claude Code' : 'Codex'}
-              </span>
+              <span className="shrink-0 font-medium">{agentName(run.agentId)}</span>
               <RunConfiguration run={run} />
             </p>
             {run.handoffMessageCount ? (
               <ContextReceipt
                 count={run.handoffMessageCount}
-                target={run.agentId}
+                source={handoffSourceLabel(run)}
                 accepted={Boolean(run.nativeTurnId)}
               />
             ) : null}
@@ -3023,12 +3557,21 @@ export function ConversationView({
               run={row.run}
               latestRunId={latestRun?.id}
               disabled={disabled || responseInProgress}
-              onIterate={focusComposer}
-              onOpenTodo={openTodo}
+              continuationBlocked={continuationBlocked}
               onOpenPlan={openRecordedPlan}
+              onOpenSessionSettings={isSideChat ? undefined : onOpenSessionSettings}
+              nativePresentationSuspended={
+                nativePresentationSuspended ||
+                nativeQuestions.length > 0 ||
+                Boolean(currentRelayDecision) ||
+                !visible
+              }
               onOpenProjectFile={openProjectFile}
-              onCreateReportComment={recoveryLocked ? undefined : handleCreatePlanComment}
+              onCreateReportComment={
+                recoveryLocked || inputTakeover ? undefined : handleCreatePlanComment
+              }
               feedbackDraft={feedbackDraft}
+              onTaskChange={() => setPlanRefresh((value) => value + 1)}
               revealReport={revealReport}
               revealReportRequestId={revealReportRequestId}
               revealReportBasis={
@@ -3038,7 +3581,6 @@ export function ConversationView({
                 gapRestoreRef.current?.selection?.startOffset ?? messageNavigation?.startOffset
               }
               onReportReady={handlePlanReady}
-              onDetailRead={beginDetailRead}
             />
           ) : null}
         </article>
@@ -3051,19 +3593,17 @@ export function ConversationView({
         >
           <div className="w-fit max-w-[92%] self-start">
             <div
-              className={`rounded-message ${placeholderRun.agentId === 'claude' ? 'bg-speaker-claude' : 'bg-speaker-codex'} px-4 py-3`}
+              className={`rounded-message ${speakerBgClass(placeholderRun.agentId)} px-4 py-3`}
               data-pact-message-bubble
             >
               <p className="flex min-w-0 items-baseline gap-1.5 text-caption text-secondary">
-                <span className="shrink-0 font-medium">
-                  {placeholderRun.agentId === 'claude' ? 'Claude Code' : 'Codex'}
-                </span>
+                <span className="shrink-0 font-medium">{agentName(placeholderRun.agentId)}</span>
                 <RunConfiguration run={placeholderRun} />
               </p>
               {placeholderRun.handoffMessageCount ? (
                 <ContextReceipt
                   count={placeholderRun.handoffMessageCount}
-                  target={placeholderRun.agentId}
+                  source={handoffSourceLabel(placeholderRun)}
                   accepted={Boolean(placeholderRun.nativeTurnId)}
                 />
               ) : null}
@@ -3087,12 +3627,21 @@ export function ConversationView({
               run={placeholderRun}
               latestRunId={latestRun?.id}
               disabled={disabled || responseInProgress}
-              onIterate={focusComposer}
-              onOpenTodo={openTodo}
+              continuationBlocked={continuationBlocked}
               onOpenPlan={openRecordedPlan}
+              onOpenSessionSettings={isSideChat ? undefined : onOpenSessionSettings}
+              nativePresentationSuspended={
+                nativePresentationSuspended ||
+                nativeQuestions.length > 0 ||
+                Boolean(currentRelayDecision) ||
+                !visible
+              }
               onOpenProjectFile={openProjectFile}
-              onCreateReportComment={recoveryLocked ? undefined : handleCreatePlanComment}
+              onCreateReportComment={
+                recoveryLocked || inputTakeover ? undefined : handleCreatePlanComment
+              }
               feedbackDraft={feedbackDraft}
+              onTaskChange={() => setPlanRefresh((value) => value + 1)}
               revealReport={revealReport}
               revealReportRequestId={revealReportRequestId}
               revealReportBasis={
@@ -3102,7 +3651,6 @@ export function ConversationView({
                 gapRestoreRef.current?.selection?.startOffset ?? messageNavigation?.startOffset
               }
               onReportReady={handlePlanReady}
-              onDetailRead={beginDetailRead}
             />
           ) : null}
         </article>
@@ -3129,14 +3677,10 @@ export function ConversationView({
         </div>
       )
     }
+    const backgroundReport = isConversationBackgroundReport(message)
     const speaker =
-      message.role === 'user' ? 'You' : message.agentId === 'claude' ? 'Claude Code' : 'Codex'
-    const background =
-      message.role === 'user'
-        ? 'bg-speaker-user'
-        : message.agentId === 'claude'
-          ? 'bg-speaker-claude'
-          : 'bg-speaker-codex'
+      message.role === 'user' ? 'You' : message.agentId ? agentName(message.agentId) : 'Codex'
+    const background = message.role === 'user' ? 'bg-speaker-user' : speakerBgClass(message.agentId)
     const retryInThisSlot =
       activeRun &&
       message.outputSnapshot?.canonical !== false &&
@@ -3147,6 +3691,12 @@ export function ConversationView({
       ? activeRun
       : message.runId
         ? runsById.get(message.runId)
+        : undefined
+    const replyRecipient =
+      message.role === 'user' && messageRun?.collaboration?.stage === 'reply'
+        ? message.route?.type === 'agent'
+          ? message.route.agentId
+          : messageRun.agentId
         : undefined
     const activityRunId = messageRun?.id ?? message.runId
     const visibleContent = message.content
@@ -3179,6 +3729,7 @@ export function ConversationView({
       !activeRun &&
       !recoveryLocked &&
       message.role === 'assistant' &&
+      !backgroundReport &&
       message.outputSnapshot?.canonical !== false &&
       message.replyToMessageId === pendingRoutedMessage?.id &&
       message.agentId !== pendingRoutedAgentId
@@ -3210,14 +3761,51 @@ export function ConversationView({
             <div data-pact-message-bubble className={`rounded-message ${background} px-4 py-3`}>
               <p className="flex min-w-0 items-baseline gap-1.5 text-caption text-secondary">
                 <span className="shrink-0 font-medium">{speaker}</span>
-                {message.role === 'assistant' && messageRun ? (
+                {replyRecipient ? (
+                  <span
+                    className="font-medium text-primary"
+                    aria-label={`Reply to ${agentName(replyRecipient)}`}
+                  >
+                    @{replyRecipient}
+                  </span>
+                ) : null}
+                {backgroundReport ? (
+                  <span>
+                    · Background update{message.historicalBackgroundReport ? ' · Earlier task' : ''}
+                  </span>
+                ) : message.role === 'assistant' && messageRun ? (
                   <RunConfiguration run={messageRun} />
+                ) : null}
+                {!isSideChat &&
+                message.role === 'user' &&
+                message.originSideChat &&
+                onOpenSideChat ? (
+                  <button
+                    type="button"
+                    className="pact-side-chat-from-badge ml-1 inline-flex items-center gap-1 rounded-pill border border-border bg-surface-raised/90 px-2 py-0.5 text-caption font-medium leading-none text-secondary transition-colors hover:border-border-strong hover:text-primary focus-visible:outline-2 focus-visible:outline-focus"
+                    title={`Open side chat: ${
+                      resolveSideChatTitle
+                        ? resolveSideChatTitle(
+                            message.originSideChat.sideChatId,
+                            message.originSideChat.sideChatTitle,
+                          )
+                        : message.originSideChat.sideChatTitle
+                    }`}
+                    onClick={() => onOpenSideChat(message.originSideChat!.sideChatId)}
+                  >
+                    <CornerUpLeft
+                      aria-hidden="true"
+                      className="size-3 shrink-0"
+                      strokeWidth={1.75}
+                    />
+                    From side chat
+                  </button>
                 ) : null}
               </p>
               {ownsRunActivity && messageRun?.handoffMessageCount ? (
                 <ContextReceipt
                   count={messageRun.handoffMessageCount}
-                  target={messageRun.agentId}
+                  source={handoffSourceLabel(messageRun)}
                   accepted={Boolean(messageRun.nativeTurnId)}
                 />
               ) : null}
@@ -3241,15 +3829,30 @@ export function ConversationView({
                     : 'mt-1'
                 }
               >
-                {messageMeta?.oversized ? (
+                {backgroundReport && message.state === 'incomplete' ? (
+                  <p className="text-caption text-secondary">
+                    The background update could not be saved.
+                  </p>
+                ) : messageMeta?.oversized ? (
                   <LargeMessagePreview preview={messageMeta.oversized.preview} />
                 ) : !commentOnly ? (
                   <MessageMarkdown
                     content={visibleContent}
-                    skills={message.role === 'user' ? message.skills : undefined}
+                    skills={message.role === 'user' ? (message.skills ?? []) : undefined}
                     onOpenProjectFile={openProjectFile}
                     messageId={message.id}
-                    onCreateComment={recoveryLocked ? undefined : handleCreateMessageComment}
+                    onCreateComment={
+                      recoveryLocked || inputTakeover ? undefined : handleCreateMessageComment
+                    }
+                    onAskInSideChat={
+                      !isSideChat &&
+                      !backgroundReport &&
+                      !messageMeta?.oversized &&
+                      message.state !== 'streaming' &&
+                      (message.role === 'user' || message.role === 'assistant')
+                        ? onAskInSideChat
+                        : undefined
+                    }
                   />
                 ) : null}
                 {message.images?.length ? (
@@ -3294,7 +3897,9 @@ export function ConversationView({
               copyResult={copyFeedback?.messageId === message.id ? copyFeedback.result : undefined}
               onCopy={copyMessage}
               onFork={
+                !isSideChat &&
                 message.role === 'assistant' &&
+                !backgroundReport &&
                 message.outputSnapshot?.canonical !== false &&
                 message.state === 'complete' &&
                 onForkSessionCreated
@@ -3330,12 +3935,21 @@ export function ConversationView({
             run={messageRun}
             latestRunId={latestRun?.id}
             disabled={disabled || responseInProgress}
-            onIterate={focusComposer}
-            onOpenTodo={openTodo}
+            continuationBlocked={continuationBlocked}
             onOpenPlan={openRecordedPlan}
+            onOpenSessionSettings={onOpenSessionSettings}
+            nativePresentationSuspended={
+              nativePresentationSuspended ||
+              nativeQuestions.length > 0 ||
+              Boolean(currentRelayDecision) ||
+              !visible
+            }
             onOpenProjectFile={openProjectFile}
-            onCreateReportComment={recoveryLocked ? undefined : handleCreatePlanComment}
+            onCreateReportComment={
+              recoveryLocked || inputTakeover ? undefined : handleCreatePlanComment
+            }
             feedbackDraft={feedbackDraft}
+            onTaskChange={() => setPlanRefresh((value) => value + 1)}
             revealReport={revealReport}
             revealReportRequestId={revealReportRequestId}
             revealReportBasis={
@@ -3345,8 +3959,8 @@ export function ConversationView({
               gapRestoreRef.current?.selection?.startOffset ?? messageNavigation?.startOffset
             }
             onReportReady={handlePlanReady}
-            onDetailRead={beginDetailRead}
             renderedMessageId={message.id}
+            replyBodyComplete={message.state === 'complete'}
           />
         ) : null}
         {message.role === 'assistant' &&
@@ -3366,97 +3980,221 @@ export function ConversationView({
     )
   }
 
+  const commentEditorView = commentEditor ? (
+    <section
+      className="rounded-card border border-border bg-surface-raised p-3"
+      aria-labelledby="comment-editor-title"
+      data-pact-comment-editor
+    >
+      <header className="flex items-start justify-between gap-group">
+        <div className="flex min-w-0 items-start gap-2.5">
+          <span className="grid size-7 shrink-0 place-items-center rounded-control bg-status-info-muted text-status-info-foreground">
+            <MessageSquarePlus aria-hidden="true" className="size-4" strokeWidth={1.75} />
+          </span>
+          <div className="min-w-0">
+            <h2 id="comment-editor-title" className="text-caption font-medium text-primary">
+              {commentEditor.commentId ? 'Edit comment' : 'New comment'}
+            </h2>
+            <p
+              className="mt-0.5 line-clamp-2 text-caption leading-relaxed text-secondary"
+              title={commentEditor.quote}
+            >
+              {commentSourceLabel(commentEditor.anchor, session)} · “{commentEditor.quote}”
+            </p>
+            {commentEditor.anchor.type === 'unavailable' ? (
+              <p className="mt-1 text-caption text-secondary">{commentEditor.anchor.reason}</p>
+            ) : null}
+          </div>
+        </div>
+        <button
+          className="grid size-7 shrink-0 place-items-center rounded-control text-secondary hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus"
+          type="button"
+          aria-label="Close Comment editor"
+          title="Close"
+          disabled={recoveryLocked}
+          onClick={() => setCommentEditor(undefined)}
+        >
+          <X aria-hidden="true" className="size-3.5" strokeWidth={1.75} />
+        </button>
+      </header>
+      <div className="mt-2 flex items-end gap-2 rounded-control bg-surface-muted p-2 focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-focus">
+        <textarea
+          ref={commentTextareaRef}
+          className="field-sizing-content min-h-12 max-h-40 min-w-0 flex-1 resize-none bg-transparent px-1 py-1 text-body leading-relaxed text-primary outline-none placeholder:text-tertiary"
+          value={commentEditor.body}
+          placeholder="What should the Agent notice?"
+          aria-label="Comment"
+          disabled={recoveryLocked}
+          onChange={(event) => setCommentEditor({ ...commentEditor, body: event.target.value })}
+          onKeyDown={(event) => {
+            if (event.key === 'Escape') setCommentEditor(undefined)
+            if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
+              event.preventDefault()
+              void saveComment()
+            }
+          }}
+        />
+        <button
+          className="h-8 shrink-0 rounded-control bg-surface-inverse px-3 text-caption font-medium text-inverse disabled:cursor-default disabled:opacity-40"
+          type="button"
+          disabled={!commentEditor.body.trim() || disabled || savingComment}
+          onClick={() => void saveComment()}
+        >
+          {commentEditor.commentId
+            ? savingComment
+              ? 'Saving…'
+              : 'Save comment'
+            : savingComment
+              ? 'Adding…'
+              : 'Add comment'}
+        </button>
+      </div>
+      <p className="mt-2.5 px-1 text-caption text-tertiary">
+        {commentEditor.commentId
+          ? 'Enter to save · Shift+Enter for a new line'
+          : 'Enter to add · Shift+Enter for a new line'}
+      </p>
+    </section>
+  ) : null
+  const commentDraftsView = (
+    <>
+      {draftComments.length > 0 ? (
+        <div
+          className="flex max-h-20 w-full flex-wrap gap-1.5 overflow-y-auto px-2 pt-1"
+          aria-label="Attached Comment drafts"
+        >
+          {draftComments.map((comment) => {
+            const collapsedQuote = comment.anchor.quote.replace(/\s+/gu, ' ').trim()
+            const draftLabel =
+              comment.body.trim() || (collapsedQuote ? `“${collapsedQuote}”` : 'Quoted selection')
+            return (
+              <span
+                key={comment.id}
+                className={`inline-flex max-w-64 items-center gap-1 rounded-pill bg-status-info-muted px-2.5 py-1 text-caption text-status-info-foreground ${recoveryLocked ? 'opacity-55' : ''}`}
+              >
+                <button
+                  className="truncate text-left"
+                  type="button"
+                  title={
+                    comment.anchor.type === 'unavailable'
+                      ? `${comment.anchor.reason}${comment.body ? `\n${comment.body}` : ''}`
+                      : comment.body.trim() || comment.anchor.quote
+                  }
+                  disabled={recoveryLocked}
+                  onClick={() =>
+                    setCommentEditor({
+                      commentId: comment.id,
+                      draftId: crypto.randomUUID(),
+                      anchor: comment.anchor,
+                      quote: comment.anchor.quote,
+                      body: comment.body,
+                    })
+                  }
+                >
+                  {commentSourceLabel(comment.anchor, session)} · {draftLabel}
+                </button>
+                {comment.anchor.type !== 'unavailable' ? (
+                  <button
+                    type="button"
+                    aria-label="Return to Comment source"
+                    title="Return to source"
+                    disabled={recoveryLocked}
+                    onClick={() => onOpenComment(comment)}
+                    className="grid size-6 shrink-0 place-items-center rounded-control hover:bg-status-info/15 focus-visible:outline-2 focus-visible:outline-focus"
+                  >
+                    <CornerUpLeft aria-hidden="true" className="size-3.5" strokeWidth={1.75} />
+                  </button>
+                ) : null}
+                <button
+                  className="grid size-4 shrink-0 place-items-center rounded-full hover:bg-status-info/15"
+                  type="button"
+                  aria-label="Remove Comment draft"
+                  disabled={disabled}
+                  onClick={() => void onRemoveCommentDraft(comment.id)}
+                >
+                  <X aria-hidden="true" className="size-3" />
+                </button>
+              </span>
+            )
+          })}
+        </div>
+      ) : null}
+      {history.draftPage?.hasMore || history.draftPage?.hasEarlier ? (
+        <div
+          aria-label="Comment draft pages"
+          className="flex gap-2 px-2 text-caption text-secondary"
+        >
+          {history.draftPage.hasEarlier ? (
+            <button
+              type="button"
+              disabled={history.draftsLoading}
+              onClick={history.firstDraftPage}
+              className="min-h-7 rounded-control px-1.5 hover:bg-surface-muted focus-visible:outline-2 focus-visible:outline-focus disabled:opacity-45"
+            >
+              First drafts
+            </button>
+          ) : null}
+          {history.draftPage.hasMore ? (
+            <button
+              type="button"
+              disabled={history.draftsLoading}
+              onClick={history.loadMoreDrafts}
+              className="min-h-7 rounded-control px-1.5 hover:bg-surface-muted focus-visible:outline-2 focus-visible:outline-focus disabled:opacity-45"
+            >
+              More drafts
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+    </>
+  )
+
+  const sourcePreview =
+    planSourceKey && planSourcePreview?.key === planSourceKey ? planSourcePreview : undefined
+  const latestPlanVersion =
+    sourcePreview?.plan &&
+    planningTask?.planReference &&
+    currentPlan?.source &&
+    planningTask.id === sourcePreview.taskId &&
+    planningTask.planVersion > sourcePreview.plan.version
+      ? planningTask.planVersion
+      : undefined
+  const showCurrentPlan = (): void => {
+    if (planSourceNavigation) {
+      planSourceRead.current.desired = undefined
+      setPlanSourcePreview(undefined)
+      setCardPlanNavigation(undefined)
+      setDismissedNavigation(messageNavigation)
+      planAvailableCallback.current?.(
+        session.id,
+        planningTask?.planReference && currentPlan?.source ? planningTask.id : undefined,
+      )
+    }
+    onOpenPlan?.()
+  }
+
   return (
     <main className="@container/conversation flex h-full min-h-0 flex-col">
       {planPanelHost
         ? createPortal(
             <CurrentPlanPanel
-              activeTab={planningTask?.plan || planningTask?.planDocument ? contextTab : 'todos'}
-              onTabChange={(tab) => {
-                setContextTab(tab)
-                if (tab === 'todos' && !todoEditing) {
-                  setTodoTarget(undefined)
-                  setTodoSource(undefined)
-                  setTodoTaskId(undefined)
-                  setDoneTodos(false)
-                  setTodoOffset(0)
-                  setTodoPage(undefined)
-                }
-              }}
-              taskLabel={currentTask?.kind === 'build' ? 'Build review' : 'Review'}
-              todoSource={Boolean(
-                (todoTaskId && todoTaskId !== currentTask?.id) ||
-                (todoTarget &&
-                  focusedTodo &&
-                  !todoPage?.items.some(
-                    (item) => item.id === focusedTodo.id && item.revision === focusedTodo.revision,
-                  )),
-              )}
-              todoCount={
-                currentTask && (!todoTaskId || todoTaskId === currentTask.id)
-                  ? currentTask.ledgerOpenCount + currentTask.ledgerAwaitingCount
-                  : todoPage?.activeCount
-              }
-              todos={
-                currentTask || todoTaskId ? (
-                  <CollaborationTodos
-                    key={`${session.id}:${todoTaskId ?? currentTask!.id}`}
-                    active={Boolean(visible && planPanelOpen && contextTab === 'todos')}
-                    sessionId={session.id}
-                    taskId={todoTaskId ?? currentTask!.id}
-                    ledgerRevision={todoPage?.ledgerRevision ?? 0}
-                    items={visibleTodos}
-                    sourceTodo={separateTodoSource}
-                    sourceCurrent={focusedTodo ? todoSource?.current : undefined}
-                    activeCount={todoPage?.activeCount ?? 0}
-                    doneCount={todoPage?.doneCount ?? 0}
-                    showDone={doneTodos}
-                    loading={todoLoading || !todoPage}
-                    error={todoError}
-                    hasPrevious={
-                      todoPage?.previousOffset !== null && todoPage?.previousOffset !== undefined
-                    }
-                    hasNext={todoPage?.nextOffset !== null && todoPage?.nextOffset !== undefined}
-                    disabled={disabled}
-                    reveal={
-                      todoTarget
-                        ? {
-                            todoId: todoTarget.todoId,
-                            revision: todoTarget.todoRevision,
-                            navigationId: todoTarget.navigationId,
-                            ...(todoTarget.selection ? { selection: todoTarget.selection } : {}),
-                          }
-                        : undefined
-                    }
-                    addedDrafts={todoDraftKeys}
-                    answerDrafts={todoAnswerDrafts}
-                    onShowDone={(value) => {
-                      setDoneTodos(value)
-                      setTodoOffset(0)
-                      setTodoTarget(undefined)
-                      setTodoSource(undefined)
-                      setTodoPage(undefined)
-                    }}
-                    onPrevious={() => {
-                      setTodoTarget(undefined)
-                      setTodoSource(undefined)
-                      setTodoOffset(todoPage?.previousOffset ?? 0)
-                    }}
-                    onNext={() => {
-                      setTodoTarget(undefined)
-                      setTodoSource(undefined)
-                      setTodoOffset(todoPage?.nextOffset ?? 0)
-                    }}
-                    onRetry={() => {
-                      todoPageCache.current.clear()
-                      setTodoRefresh((value) => value + 1)
-                    }}
-                    onReadDetail={readTodoDetail}
-                    onAddComment={addTodoComment}
-                    onEditorChange={setTodoEditing}
-                    onNotice={onNotice}
-                    onOpenProjectFile={openProjectFile}
-                  />
+              expanded={planPanelExpanded}
+              onExpandedChange={onPlanPanelExpandedChange}
+              comments={
+                planPanelExpanded &&
+                (commentEditor ||
+                  draftComments.length ||
+                  history.draftPage?.hasMore ||
+                  history.draftPage?.hasEarlier) ? (
+                  <div className="flex flex-col gap-group">
+                    {commentEditorView}
+                    {commentDraftsView}
+                    {error ? (
+                      <p role="alert" className="text-caption text-danger">
+                        {error}
+                      </p>
+                    ) : null}
+                  </div>
                 ) : undefined
               }
               plan={
@@ -3464,31 +4202,57 @@ export function ConversationView({
                   ? planSourcePreview?.key === planSourceKey
                     ? planSourcePreview.plan
                     : undefined
-                  : (planningTask?.plan || planningTask?.planDocument) && currentPlan?.source
+                  : planningTask?.planReference && currentPlan?.source
                     ? {
                         taskId: planningTask.id,
                         runId: currentPlan.source.runId,
                         messageId: currentPlan.source.messageId,
                         version: planningTask.planVersion,
-                        author: planningTask.planAuthor ?? planningTask.drafter,
-                        content: planningTask.plan ?? '',
-                        document: planningTask.planDocument,
+                        author:
+                          planningTask.planReference.author ??
+                          planningTask.planAuthor ??
+                          collaborationActor(planningTask, 'plan'),
+                        content: '',
+                        document: planningTask.planReference.document,
                         sessionId: session.id,
-                        status:
-                          planningTask.status === 'running'
-                            ? 'Working'
-                            : planningTask.status === 'ready'
-                              ? 'Ready to implement'
-                              : planningTask.status === 'complete'
-                                ? 'Completed'
-                                : planningTask.actor === planningTask.primary
-                                  ? 'Awaiting review'
-                                  : 'Awaiting revision',
+                        status: currentPlan.planSync
+                          ? 'Needs restore'
+                          : planningTask.status === 'running' && planningTask.stage === 'plan'
+                            ? 'Drafting'
+                            : planningTask.status === 'running' &&
+                                planningTask.stage === 'plan_review'
+                              ? 'In review'
+                              : planningTask.review?.stage === 'plan_review' &&
+                                  planningTask.review.planReference?.version ===
+                                    planningTask.planVersion &&
+                                  planningTask.review.planReference?.document.sha256 ===
+                                    planningTask.planReference.document.sha256
+                                ? planningTask.review.verdict === 'accepted'
+                                  ? 'Accepted'
+                                  : planningTask.review.verdict === 'changes_requested'
+                                    ? 'Changes requested'
+                                    : isCollaborationOpenMode(planningTask)
+                                      ? 'Unreviewed'
+                                      : 'In review'
+                                : planningTask.unreviewedPlanActor
+                                  ? 'Unreviewed'
+                                  : isCollaborationOpenMode(planningTask)
+                                    ? 'Accepted'
+                                    : planningTask.stage === 'plan_review'
+                                      ? 'In review'
+                                      : 'Drafting',
                       }
                     : undefined
               }
               source={Boolean(planSourceKey)}
+              latestVersion={latestPlanVersion}
+              onOpenLatest={showCurrentPlan}
               onPlanReady={handlePanelPlanReady}
+              onRevealApplied={(id) => {
+                const navigation = planSourceNavigationRef.current
+                if (navigation?.navigationId === id && navigation.plan)
+                  appliedNavigationRef.current = navigation
+              }}
               loading={
                 planSourceKey
                   ? planSourcePreview?.key !== planSourceKey
@@ -3504,7 +4268,6 @@ export function ConversationView({
                     : undefined
               }
               onClose={() => {
-                todoReadOwner.current.desired = undefined
                 if (planSourceNavigation) {
                   planSourceRead.current.desired = undefined
                   setPlanSourcePreview(undefined)
@@ -3515,7 +4278,9 @@ export function ConversationView({
               }}
               onRetry={() => setPlanRefresh((value) => value + 1)}
               onOpenProjectFile={openProjectFile}
-              onCreatePlanComment={recoveryLocked ? undefined : handleCreatePlanComment}
+              onCreatePlanComment={
+                recoveryLocked || inputTakeover ? undefined : handleCreatePlanComment
+              }
             />,
             planPanelHost,
           )
@@ -3525,26 +4290,22 @@ export function ConversationView({
           <button
             ref={planRestoreFocusRef}
             type="button"
-            onClick={() => {
-              if (planSourceNavigation) {
-                planSourceRead.current.desired = undefined
-                setPlanSourcePreview(undefined)
-                setCardPlanNavigation(undefined)
-                setDismissedNavigation(messageNavigation)
-                planAvailableCallback.current?.(
-                  session.id,
-                  (planningTask?.plan || planningTask?.planDocument) && currentPlan?.source
-                    ? planningTask.id
-                    : undefined,
-                )
-              }
-              onOpenPlan?.()
-            }}
+            onClick={showCurrentPlan}
             className="inline-flex min-h-8 items-center gap-2 rounded-control px-2 text-caption font-medium text-secondary hover:bg-surface-muted focus-visible:outline-2 focus-visible:outline-focus"
           >
-            <BookOpen aria-hidden="true" className="size-4" strokeWidth={1.75} />{' '}
-            {planningTask ? 'Plan' : 'Todos'}
+            <BookOpen aria-hidden="true" className="size-4" strokeWidth={1.75} /> Plan
           </button>
+        </div>
+      ) : null}
+      {isSideChat && session.sideChatOrigin === 'btw' && session.sideChatHasContext ? (
+        <div
+          key={`origin:${session.id}`}
+          className="pact-side-chat-origin-enter shrink-0 px-section pt-2.5"
+        >
+          <div className="mx-auto flex w-full max-w-[78ch] items-center gap-1.5 text-caption text-tertiary">
+            <Info aria-hidden="true" className="size-3.5 shrink-0" strokeWidth={1.75} />
+            <span>Context from main chat</span>
+          </div>
         </div>
       ) : null}
       {/* oxlint-disable-next-line jsx-a11y/no-noninteractive-element-interactions -- The focusable Transcript region uses native wheel and keyboard scrolling. */}
@@ -3625,30 +4386,28 @@ export function ConversationView({
                 ? 'Scroll up for earlier messages.'
                 : 'Beginning of conversation.'}
           </output>
-          {history.pageError ? (
+          {history.pageError && !hasNewerHistory ? (
             <div
               className="mb-group flex items-center justify-center gap-2 text-caption text-danger"
               role="alert"
             >
               <span>{history.pageError}</span>
-              {history.pageError ? (
-                <button
-                  className="font-medium text-primary hover:underline focus-visible:outline-2 focus-visible:outline-focus"
-                  type="button"
-                  onClick={() => {
-                    if (!history.gapRecoveryPending) {
-                      if (historyReadDirectionRef.current === 'latest') void loadLatest()
-                      else void loadOlder()
-                      return
-                    }
-                    const retry = gapRetryRef.current
-                    if (retry.mode === 'around') void history.recoverFromGap(retry.messageId)
-                    else void loadLatestForGap()
-                  }}
-                >
-                  Retry
-                </button>
-              ) : null}
+              <button
+                className="font-medium text-primary hover:underline focus-visible:outline-2 focus-visible:outline-focus"
+                type="button"
+                onClick={() => {
+                  if (!history.gapRecoveryPending) {
+                    if (historyReadDirectionRef.current === 'latest') void loadLatest()
+                    else void loadOlder()
+                    return
+                  }
+                  const retry = gapRetryRef.current
+                  if (retry.mode === 'around') void history.recoverFromGap(retry.messageId)
+                  else void loadLatestForGap()
+                }}
+              >
+                Retry
+              </button>
             </div>
           ) : null}
           {loading && !snapshot ? (
@@ -3709,10 +4468,18 @@ export function ConversationView({
                 strokeWidth={1.5}
               />
               <h2 className="mt-section text-subtitle font-medium text-primary">
-                Start with {primaryName}
+                {isSideChat
+                  ? sideChatSettingsState === 'loading'
+                    ? 'Loading side chat settings…'
+                    : sideChatSettingsState === 'error'
+                      ? 'Ask in this side chat'
+                      : `Ask ${primaryName}`
+                  : `Start with ${primaryName}`}
               </h2>
               <p className="mx-auto mt-1 max-w-[46ch] text-caption leading-relaxed text-secondary">
-                Work with your Agent in this Project. This conversation will be saved.
+                {isSideChat
+                  ? 'Ask about the main chat, or type @Main to send a takeaway back.'
+                  : 'Ask a question, describe a change, or type @ to mention an agent.'}
               </p>
             </div>
           )}
@@ -3720,17 +4487,9 @@ export function ConversationView({
           {snapshot?.forkOperation && !snapshot.forkOperation.ready ? (
             <NativeForkRecovery operation={snapshot.forkOperation} />
           ) : null}
-          {nativeInputRequests(snapshot).map(({ agentId, request }) =>
-            request.kind && request.kind !== 'approval' ? (
-              <NativeInputCard
-                key={request.id}
-                request={request}
-                agentId={agentId}
-                onRespond={onRespondNativeInput}
-                draft={nativeInputDrafts[request.id]}
-                onDraftChange={onNativeInputDraftChange}
-              />
-            ) : (
+          {nativeRequests
+            .filter(({ request }) => !request.kind || request.kind === 'approval')
+            .map(({ agentId, request }) => (
               <NativePermissionCard
                 key={request.id}
                 request={request}
@@ -3738,8 +4497,7 @@ export function ConversationView({
                 agentId={agentId}
                 onRespond={onRespondNativePermission}
               />
-            ),
-          )}
+            ))}
 
           {hasNewerHistory ? (
             <div className="mx-auto mt-group">
@@ -3754,9 +4512,19 @@ export function ConversationView({
             </div>
           ) : null}
           {hasNewerHistory && history.pageError ? (
-            <p className="mt-1 text-center text-caption text-danger" role="alert">
-              {history.pageError}
-            </p>
+            <div
+              className="mt-1 flex items-center justify-center gap-2 text-caption text-danger"
+              role="alert"
+            >
+              <span>{history.pageError}</span>
+              <button
+                className="font-medium text-primary hover:underline focus-visible:outline-2 focus-visible:outline-focus"
+                type="button"
+                onClick={() => void loadLatest()}
+              >
+                Retry
+              </button>
+            </div>
           ) : null}
 
           {history.readError ? (
@@ -3781,12 +4549,14 @@ export function ConversationView({
         </div>
       </section>
 
-      <div className="shrink-0 px-section py-group">
-        <div className={`mx-auto flex ${CONVERSATION_WIDTH} flex-col gap-2`}>
-          {sessionIssues && sessionIssues.agents.length > 0 ? (
+      <div className="pact-conversation-input-dock shrink-0 px-section py-group">
+        <div className={`pact-input-dock-inner mx-auto flex ${CONVERSATION_WIDTH} flex-col gap-2`}>
+          {visibleSessionIssues && visibleSessionIssues.agents.length > 0 ? (
             <SessionWarningCard
-              value={sessionIssues}
+              value={visibleSessionIssues}
               enabled={agentActionsEnabled}
+              queuedBackgroundAgent={queuedBackgroundAgent}
+              stoppingAgent={stoppingBackgroundAgent}
               onRetry={(issue) =>
                 issue.action === 'inspect_rebuild'
                   ? onRebuildNativeContext(issue.agentId, {
@@ -3794,7 +4564,7 @@ export function ConversationView({
                       clientOperationId: issue.rebuildId,
                       expectedGeneration: issue.generation,
                     })
-                  : onCheckNativeContext(issue.agentId)
+                  : onCheckNativeContext(issue.agentId, issue.runId)
               }
               onRebuild={(issue, operationId) =>
                 onRebuildNativeContext(issue.agentId, {
@@ -3811,767 +4581,917 @@ export function ConversationView({
               }
             />
           ) : null}
-          {commentEditor ? (
-            <section
-              className="rounded-card border border-border bg-surface-raised p-3"
-              aria-labelledby="comment-editor-title"
+          <div className="relay-indicator-slot">
+            {onOpenRelaySettings ? (
+              <RelayActivityIndicator
+                state={schedulingState}
+                sessionId={session.id}
+                visible={visible && !nativePresentationSuspended}
+                waitingForUser={inputTakeover || nativeRequests.length > 0}
+                onOpenSettings={onOpenRelaySettings}
+              />
+            ) : null}
+          </div>
+          <div ref={queueDockRef} className="pact-queued-input flex min-h-0 flex-col">
+            {queue && queueActions ? (
+              <QueueMessageBar
+                queue={queue}
+                pending={queueActions.pending}
+                disabled={composerDisabled || sending}
+                canResume={!continuationBlocked}
+                backgroundStatus={
+                  stoppingBackgroundInQueue
+                    ? 'stopping'
+                    : waitingBackgroundIssue?.resultDisposition === 'incomplete'
+                      ? 'waiting_incomplete'
+                      : waitingBackgroundIssue
+                        ? 'waiting'
+                        : undefined
+                }
+                showSteer={
+                  activeRun?.status === 'running' &&
+                  !activeRun.collaboration &&
+                  !unfinishedTask &&
+                  !queuedInput?.workflowCommand
+                }
+                canSteer={!inputTakeover && !stopping && canSteerQueuedInput}
+                steerUnavailableReason={
+                  inputTakeover ? 'Resolve the current interaction first.' : steerUnavailableReason
+                }
+                respondingAgentId={respondingAgentId}
+                onSteer={queueActions.steer}
+                onRemove={queueActions.remove}
+                onEdit={inputTakeover ? undefined : () => returnQueueMessageToComposer(false)}
+                onResume={queueActions.resume}
+                onSetEnabled={queueActions.setEnabled}
+                onCheckStatus={
+                  queuedInput?.state === 'unknown' && queuedInput.delivery
+                    ? queueActions.checkStatus
+                    : undefined
+                }
+              />
+            ) : null}
+            <InputReplacement
+              key={session.id}
+              replacement={
+                nativeQuestions.length
+                  ? {
+                      key: `native:${nativeQuestions.map(({ request }) => `${request.operationId}:${request.id}`).join(':')}`,
+                      content: (
+                        <div className="max-h-[min(60vh,36rem)] space-y-2 overflow-auto">
+                          {nativeQuestions.map(({ agentId, request }) => (
+                            <NativeInputCard
+                              key={`${request.operationId}:${request.id}`}
+                              request={request}
+                              agentId={agentId}
+                              onRespond={onRespondNativeInput}
+                              draft={nativeInputDrafts[request.id]}
+                              onDraftChange={onNativeInputDraftChange}
+                            />
+                          ))}
+                        </div>
+                      ),
+                    }
+                  : decisionTakeover && decisionSource
+                    ? {
+                        key: planRecovery
+                          ? `recovery:${planRecovery.runId}`
+                          : decisionReply
+                            ? `question:${decisionKey}`
+                            : `processing:${decisionKey}`,
+                        content: planRecovery ? (
+                          <section
+                            aria-label="Plan recovery required"
+                            className="rounded-control border border-border bg-surface-muted px-group py-panel text-caption"
+                          >
+                            <p className="font-medium text-primary">Plan recovery required</p>
+                            <p className="mt-1 text-secondary">
+                              Restore the saved plan using the recovery action above. Your previous
+                              answers and message draft are kept.
+                            </p>
+                          </section>
+                        ) : decisionReply ? (
+                          <div className="space-y-2">
+                            {inputGateState === 'incomplete' ? (
+                              <p role="status" className="px-group text-caption text-secondary">
+                                {incompleteCanAnswer
+                                  ? 'Your previous reply was not confirmed. You can send a follow-up answer.'
+                                  : 'Your previous reply needs recovery before another answer can be sent.'}
+                              </p>
+                            ) : null}
+                            <CollaborationQuestionCard
+                              key={decisionKey}
+                              sessionId={session.id}
+                              runId={decisionSource.runId}
+                              messageId={decisionMessageId}
+                              actor={
+                                decisionSource.actor ?? runsById.get(decisionSource.runId)?.agentId
+                              }
+                              decision={decisionReply}
+                              draft={history.decisionDraft}
+                              onDraftChange={history.setDecisionDraft}
+                              onClearDraft={history.clearDecisionDraft}
+                              onSubmit={() => void submitAnswers()}
+                              canSubmit={decisionAnswersReady}
+                              disabled={questionDisabled}
+                              onOpenProjectFile={openProjectFile}
+                            />
+                          </div>
+                        ) : (
+                          <section
+                            aria-label="Answer progress"
+                            className="flex items-center gap-group rounded-control border border-border bg-surface-muted px-group py-panel text-caption"
+                          >
+                            <LoaderCircle
+                              aria-hidden="true"
+                              className="size-4 shrink-0 animate-spin text-secondary motion-reduce:animate-none"
+                            />
+                            <div className="min-w-0 flex-1">
+                              <p className="font-medium text-primary">
+                                {inputGateState === 'queued'
+                                  ? 'Answers queued'
+                                  : responseInProgress
+                                    ? 'Processing your answers'
+                                    : 'Answers sent'}
+                              </p>
+                              <p className="mt-1 text-secondary">
+                                Your message draft is kept until these questions are resolved.
+                              </p>
+                            </div>
+                            {showStop ? (
+                              <button
+                                type="button"
+                                disabled={stopping}
+                                onClick={() => void requestStop()}
+                                className="min-h-8 rounded-control px-3 font-medium text-primary hover:bg-surface-raised focus-visible:outline-2 focus-visible:outline-focus"
+                              >
+                                {stopping ? 'Stopping…' : 'Stop'}
+                              </button>
+                            ) : null}
+                          </section>
+                        ),
+                      }
+                    : currentRelayDecision && !planRecovery && nativeRequests.length === 0
+                      ? {
+                          key: `relay:${currentRelayDecision.request.decisionId}`,
+                          content: (
+                            <RelayDecisionCard
+                              decision={currentRelayDecision}
+                              visible={visible && !nativePresentationSuspended}
+                            />
+                          ),
+                        }
+                      : undefined
+              }
             >
-              <header className="flex items-start justify-between gap-group">
-                <div className="flex min-w-0 items-start gap-2.5">
-                  <span className="grid size-7 shrink-0 place-items-center rounded-control bg-status-info-muted text-status-info-foreground">
-                    <MessageSquarePlus aria-hidden="true" className="size-4" strokeWidth={1.75} />
-                  </span>
-                  <div className="min-w-0">
-                    <h2 id="comment-editor-title" className="text-caption font-medium text-primary">
-                      {commentEditor.commentId ? 'Edit comment' : 'New comment'}
-                    </h2>
-                    <p
-                      className="mt-0.5 line-clamp-2 text-caption leading-relaxed text-secondary"
-                      title={commentEditor.quote}
-                    >
-                      {commentSourceLabel(commentEditor.anchor)} · “{commentEditor.quote}”
-                    </p>
+              <div className="pact-ordinary-input-stack flex flex-col gap-2">
+                {snapshot?.preparedInputContinuation ? (
+                  <PreparedInputCard
+                    key={`${session.id}:${snapshot.preparedInputContinuation.batchId}`}
+                    sessionId={session.id}
+                    input={snapshot.preparedInputContinuation}
+                    disabled={
+                      sending || stopping || nativeRequests.length > 0 || Boolean(planRecovery)
+                    }
+                    onChanged={() => history.retryRead()}
+                  />
+                ) : null}
+                {!planPanelExpanded ? commentEditorView : null}
+                {skillComposer.warning ? (
+                  <div
+                    id={`skill-warning-${session.id}`}
+                    role="alert"
+                    className="flex items-start gap-2 rounded-control border border-status-danger/30 bg-status-danger-muted px-3 py-2 text-caption text-status-danger-foreground"
+                  >
+                    <TriangleAlert
+                      aria-hidden="true"
+                      className="mt-0.5 size-3.5 shrink-0"
+                      strokeWidth={1.75}
+                    />
+                    <span>{skillComposer.warning}</span>
                   </div>
-                </div>
-                <button
-                  className="grid size-7 shrink-0 place-items-center rounded-control text-secondary hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus"
-                  type="button"
-                  aria-label="Close Comment editor"
-                  title="Close"
-                  disabled={recoveryLocked}
-                  onClick={() => setCommentEditor(undefined)}
-                >
-                  <X aria-hidden="true" className="size-3.5" strokeWidth={1.75} />
-                </button>
-              </header>
-              <div className="mt-2 flex items-end gap-2 rounded-control bg-surface-muted p-2 focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-focus">
-                <textarea
-                  ref={commentTextareaRef}
-                  className="field-sizing-content min-h-12 max-h-40 min-w-0 flex-1 resize-none bg-transparent px-1 py-1 text-body leading-relaxed text-primary outline-none placeholder:text-tertiary"
-                  value={commentEditor.body}
-                  placeholder="What should the Agent notice?"
-                  aria-label="Comment"
-                  disabled={recoveryLocked}
-                  onChange={(event) =>
-                    setCommentEditor({ ...commentEditor, body: event.target.value })
-                  }
-                  onKeyDown={(event) => {
-                    if (event.key === 'Escape') setCommentEditor(undefined)
+                ) : null}
+                {queue?.returnedInput &&
+                queueActions &&
+                composerReturnedInputOperationId !== queue.returnedInput.operationId ? (
+                  <button
+                    type="button"
+                    className="min-h-7 cursor-pointer self-start rounded-control px-2 text-caption font-medium text-secondary hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-focus disabled:cursor-default disabled:opacity-45"
+                    disabled={composerDisabled || sending || stopping || queueActions.pending}
+                    title="Replace the current draft with the returned message"
+                    onClick={() => void returnQueueMessageToComposer(true)}
+                  >
+                    {history.restoringInput ? 'Restoring…' : 'Restore returned message'}
+                  </button>
+                ) : null}
+                {isSideChat && lastMainSync?.sideChatId === session.id ? (
+                  <div
+                    role="status"
+                    className="pact-side-chat-sync-bar flex items-center justify-between gap-2 rounded-control border border-border bg-surface px-3 py-1.5 text-caption"
+                  >
+                    <span className="flex min-w-0 items-center gap-1.5 text-secondary">
+                      <Check
+                        aria-hidden="true"
+                        className="size-3.5 shrink-0 text-status-ready"
+                        strokeWidth={1.75}
+                      />
+                      <span className="truncate">
+                        Sent to main chat
+                        {lastMainSync.receipt.disposition === 'queued' ? ' (queued)' : ''}
+                      </span>
+                    </span>
+                    <div className="flex shrink-0 items-center gap-2">
+                      {onViewMainMessage ? (
+                        <button
+                          type="button"
+                          className="font-medium text-focus hover:underline focus-visible:outline-2 focus-visible:outline-focus"
+                          onClick={() => onViewMainMessage(lastMainSync.receipt)}
+                        >
+                          View
+                        </button>
+                      ) : null}
+                      <button
+                        type="button"
+                        aria-label="Dismiss main chat notification"
+                        className="grid size-5 place-items-center rounded-control text-tertiary hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-focus"
+                        onClick={() => setLastMainSync(undefined)}
+                      >
+                        <X aria-hidden="true" className="size-3" strokeWidth={1.75} />
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
+                <div
+                  ref={composerBoxRef}
+                  style={{ anchorName: composerMenuAnchor }}
+                  className={`pact-composer-box relative flex flex-col gap-1.5 rounded-card border border-border bg-surface-raised p-2 focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-focus ${isHandoffArriving ? 'pact-composer-handoff-arrive' : ''} ${recoveryLocked ? 'opacity-60' : ''} ${imageDropActive ? 'outline-2 outline-focus outline-offset-4' : ''}`}
+                  onDragEnter={(event) => {
                     if (
-                      event.key === 'Enter' &&
-                      !event.shiftKey &&
-                      !event.nativeEvent.isComposing
+                      !composerDisabled &&
+                      !inputTakeover &&
+                      event.dataTransfer.types.includes('Files')
                     ) {
                       event.preventDefault()
-                      void saveComment()
+                      setImageDropActive(true)
                     }
                   }}
-                />
-                <button
-                  className="h-8 shrink-0 rounded-control bg-surface-inverse px-3 text-caption font-medium text-inverse disabled:cursor-default disabled:opacity-40"
-                  type="button"
-                  disabled={!commentEditor.body.trim() || disabled || savingComment}
-                  onClick={() => void saveComment()}
-                >
-                  {savingComment ? 'Adding…' : 'Add to comment'}
-                </button>
-              </div>
-              <p className="mt-2.5 px-1 text-caption text-tertiary">
-                Enter to add · Shift+Enter for a new line
-              </p>
-            </section>
-          ) : null}
-          {todoEditing && (!planPanelOpen || contextTab !== 'todos') ? (
-            <p className="flex items-center gap-2 px-1 text-caption text-secondary">
-              A Todo Comment is being edited.
-              <button
-                type="button"
-                onClick={() => {
-                  setContextTab('todos')
-                  openPlanCallback.current?.()
-                }}
-                className="min-h-7 rounded-control px-1.5 text-primary hover:bg-surface-muted focus-visible:outline-2 focus-visible:outline-focus"
-              >
-                Continue editing
-              </button>
-            </p>
-          ) : null}
-          {skillComposer.warning ? (
-            <div
-              id={`skill-warning-${session.id}`}
-              role="alert"
-              className="flex items-start gap-2 rounded-control border border-status-danger/30 bg-status-danger-muted px-3 py-2 text-caption text-status-danger-foreground"
-            >
-              <TriangleAlert
-                aria-hidden="true"
-                className="mt-0.5 size-3.5 shrink-0"
-                strokeWidth={1.75}
-              />
-              <span>{skillComposer.warning}</span>
-            </div>
-          ) : null}
-          {queue && queueActions ? (
-            <QueueMessageBar
-              queue={queue}
-              pending={queueActions.pending}
-              disabled={composerDisabled || sending || stopping}
-              canSteer={canSteerQueuedInput}
-              steerUnavailableReason={steerUnavailableReason}
-              respondingAgentId={respondingAgentId}
-              onSteer={queueActions.steer}
-              onRemove={queueActions.remove}
-              onEdit={() => returnQueueMessageToComposer(false)}
-              onResume={queueActions.resume}
-              onSetEnabled={queueActions.setEnabled}
-              onCheckStatus={
-                queuedInput?.state === 'unknown' && queuedInput.delivery
-                  ? queueActions.checkStatus
-                  : undefined
-              }
-            />
-          ) : null}
-          {queue?.returnedInput &&
-          queueActions &&
-          (composerReturnedInputOperationId !== queue.returnedInput.operationId ||
-            (!composer && !composerImages.length && !draftComments.length)) ? (
-            <div
-              className="flex min-h-8 flex-wrap items-center gap-2 px-2 text-caption text-secondary"
-              role="status"
-            >
-              <span>Returned message available</span>
-              <button
-                type="button"
-                className="min-h-7 rounded-control px-2 font-medium text-primary hover:bg-surface-muted disabled:opacity-40"
-                disabled={composerDisabled || sending || stopping || queueActions.pending}
-                title="Replace the current draft with the returned message"
-                onClick={() => void returnQueueMessageToComposer(true)}
-              >
-                {history.restoringInput ? 'Restoring message…' : 'Restore returned message'}
-              </button>
-            </div>
-          ) : null}
-          <div
-            className={`relative flex flex-col gap-1.5 rounded-card border border-border bg-surface-raised p-2 focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-focus ${recoveryLocked ? 'opacity-60' : ''} ${imageDropActive ? 'outline-2 outline-focus outline-offset-4' : ''}`}
-            onDragEnter={(event) => {
-              if (!composerDisabled && event.dataTransfer.types.includes('Files')) {
-                event.preventDefault()
-                setImageDropActive(true)
-              }
-            }}
-            onDragOver={(event) => {
-              if (!composerDisabled && event.dataTransfer.types.includes('Files')) {
-                event.preventDefault()
-                event.dataTransfer.dropEffect = 'copy'
-              }
-            }}
-            onDragLeave={(event) => {
-              if (
-                !event.currentTarget.contains(
-                  event.relatedTarget instanceof Node ? event.relatedTarget : null,
-                )
-              )
-                setImageDropActive(false)
-            }}
-            onDropCapture={(event) => {
-              setImageDropActive(false)
-              if (event.dataTransfer.files.length && onAddComposerImages && !composerDisabled) {
-                event.preventDefault()
-                event.stopPropagation()
-                void onAddComposerImages([...event.dataTransfer.files])
-              }
-            }}
-
-            aria-disabled={recoveryLocked}
-          >
-            <div
-              ref={skillMenuRef}
-              id={`skills-${session.id}`}
-              role="listbox"
-              aria-label="Native Skills"
-              aria-hidden={!skillComposer.query}
-              aria-busy={skillComposer.loading}
-              inert={!skillComposer.query}
-              data-open={Boolean(skillComposer.query)}
-              className="pact-skill-menu absolute right-0 bottom-[calc(100%+8px)] left-0 z-30 min-h-32 max-h-80 overflow-y-auto rounded-panel border border-border bg-surface-raised p-1.5 shadow-lg"
-            >
-              {skillComposer.pactOptions.length > 0 ? (
-                <>
-                  <p className="px-2.5 pt-2 pb-1 text-caption font-medium text-tertiary">Pact</p>
-                  {skillComposer.pactOptions.map((entry) => {
-                    const index = skillComposer.options.indexOf(entry)
-                    return (
-                      <button
-                        key={entry.id}
-                        id={`skill-${entry.id}`}
-                        type="button"
-                        role="option"
-                        aria-selected={index === skillComposer.active}
-                        className={`flex min-h-10 w-full items-center gap-2 rounded-control px-2.5 py-1.5 text-left text-caption ${index === skillComposer.active ? 'bg-surface-muted text-primary' : 'text-secondary hover:bg-surface-muted'}`}
-                        onMouseEnter={() => skillComposer.setActive(index, false)}
-                        onMouseDown={(event) => event.preventDefault()}
-                        onClick={() => chooseSkill(entry)}
-                      >
-                        <BookOpen
-                          aria-hidden="true"
-                          className="size-4 shrink-0"
-                          strokeWidth={1.75}
-                        />
-                        <span className="min-w-0 flex-1">
-                          <span className="block font-medium text-primary">{entry.name}</span>
-                          <span className="block text-tertiary">{entry.description}</span>
-                        </span>
-                        <span className="text-tertiary">Pact</span>
-                      </button>
-                    )
-                  })}
-                </>
-              ) : null}
-              {skillComposer.agents.map((agent) => (
-                <Fragment key={agent}>
-                  <p className="px-2.5 pt-2 pb-1 text-caption font-medium text-tertiary">
-                    {agent === 'claude' ? 'Claude Code' : 'Codex'}
-                  </p>
-                  {skillComposer.visibleOptions
-                    .filter((entry) => entry.agentId === agent)
-                    .map((entry) => {
-                      const index = skillComposer.options.indexOf(entry)
-                      return (
-                        <button
-                          key={entry.id}
-                          id={`skill-${entry.id}`}
-                          type="button"
-                          role="option"
-                          aria-selected={index === skillComposer.active}
-                          className={`flex min-h-10 w-full items-center gap-2 rounded-control px-2.5 py-1.5 text-left text-caption ${index === skillComposer.active ? 'bg-surface-muted text-primary' : 'text-secondary hover:bg-surface-muted'}`}
-                          onMouseEnter={() => skillComposer.setActive(index, false)}
-                          onMouseDown={(event) => event.preventDefault()}
-                          onClick={() => {
-                            chooseSkill(entry)
-                          }}
-                        >
-                          <span className="min-w-0 flex-1">
-                            <span className="block truncate font-medium text-primary">
-                              /{entry.name}
-                              {entry.argumentHint ? (
-                                <span className="ml-2 font-normal text-tertiary">
-                                  {entry.argumentHint}
-                                </span>
-                              ) : null}
-                            </span>
-                            <span
-                              className="block truncate text-tertiary"
-                              title={entry.description}
-                            >
-                              {entry.description}
-                            </span>
-                          </span>
-                          <span className="shrink-0 text-tertiary">
-                            {entry.source === 'native'
-                              ? 'Native'
-                              : entry.source[0]!.toUpperCase() + entry.source.slice(1)}
-                          </span>
-                        </button>
+                  onDragOver={(event) => {
+                    if (
+                      !composerDisabled &&
+                      !inputTakeover &&
+                      event.dataTransfer.types.includes('Files')
+                    ) {
+                      event.preventDefault()
+                      event.dataTransfer.dropEffect = 'copy'
+                    }
+                  }}
+                  onDragLeave={(event) => {
+                    if (
+                      !event.currentTarget.contains(
+                        event.relatedTarget instanceof Node ? event.relatedTarget : null,
                       )
-                    })}
-                  {skillComposer.errors[agent] ? (
-                    <p className="px-2.5 py-2 text-caption text-secondary">
-                      {skillComposer.errors[agent]}
-                    </p>
+                    )
+                      setImageDropActive(false)
+                  }}
+                  onDropCapture={(event) => {
+                    setImageDropActive(false)
+                    if (
+                      event.dataTransfer.files.length &&
+                      onAddComposerImages &&
+                      !composerDisabled &&
+                      !inputTakeover
+                    ) {
+                      event.preventDefault()
+                      event.stopPropagation()
+                      void onAddComposerImages([...event.dataTransfer.files])
+                    }
+                  }}
+
+                  aria-disabled={recoveryLocked}
+                >
+                  <div className="pact-composer-editing flex min-h-16 w-full flex-col gap-1.5">
+                    {!planPanelExpanded ? commentDraftsView : null}
+                    {returnedInput ? (
+                      <div className="mb-2 flex flex-wrap items-center gap-2 px-2 text-caption text-secondary">
+                        <span>
+                          {history.restoringInput
+                            ? 'Restoring unsent message…'
+                            : returnedInput.state === 'installed' &&
+                                (composer || composerImages.length || draftComments.length)
+                              ? 'Unsent message restored'
+                              : 'Previous unsent message is available'}
+                        </span>
+                        <span>
+                          ·{' '}
+                          {returnedInput.route.type === 'all'
+                            ? `${agentName(returnedInput.route.firstAgentId)} → ${agentName(returnedInput.route.secondAgentId)}`
+                            : agentName(returnedInput.route.agentId)}
+                        </span>
+                        {returnedInput.state === 'pending' ||
+                        (!composer &&
+                          !composerImages.length &&
+                          !hasDecisionAnswers(history.decisionDraft)) ? (
+                          <>
+                            <button
+                              type="button"
+                              className="rounded-control px-2 py-1 text-primary hover:bg-surface-muted disabled:opacity-40"
+                              disabled={Boolean(
+                                composer ||
+                                hasDecisionAnswers(history.decisionDraft) ||
+                                composerImages.length ||
+                                composerMention ||
+                                draftComments.some(
+                                  (comment) => !returnedInput.commentIds.includes(comment.id),
+                                ) ||
+                                history.restoringInput ||
+                                history.draftsLoading,
+                              )}
+                              onClick={() => void history.restoreReturnedInput?.()}
+                            >
+                              Restore to input
+                            </button>
+                            {returnedInput.state === 'pending' ? (
+                              <button
+                                type="button"
+                                className="rounded-control px-2 py-1 hover:bg-surface-muted disabled:opacity-40"
+                                disabled={Boolean(history.restoringInput)}
+                                onClick={() => void history.discardReturnedInput?.()}
+                              >
+                                Dismiss
+                              </button>
+                            ) : null}
+                            {returnedInput.state === 'pending' &&
+                            (composer ||
+                              composerImages.length ||
+                              composerMention ||
+                              draftComments.length) ? (
+                              <span>Sending your current draft replaces the returned message.</span>
+                            ) : null}
+                          </>
+                        ) : null}
+                      </div>
+                    ) : null}
+                    <ConversationImages
+                      sessionId={session.id}
+                      images={composerImages}
+                      draft
+                      disabled={composerDisabled}
+                      onOpen={(image) => openImageGallery(composerImages, image)}
+                      onRemove={onRemoveComposerImage}
+                    />
+                    <ComposerEditor
+                      editorRef={composerRef}
+                      value={editorValue}
+                      allowPactCommands={!isSideChat}
+                      onChange={acceptComposerDocument}
+                      admitEdit={history.admitComposerEdit}
+                      onCursor={cursorChanged}
+                      onSkillOpen={(skill) => onOpenSkillDocument?.(skill)}
+                      onNotice={onNotice}
+                      onImages={
+                        onAddComposerImages ? (files) => void onAddComposerImages(files) : undefined
+                      }
+                      expanded={mentionListOpen || Boolean(skillComposer.query)}
+                      controls={
+                        skillComposer.query
+                          ? `skills-${session.id}`
+                          : mentionListOpen
+                            ? mentionListId
+                            : undefined
+                      }
+                      describedBy={
+                        skillComposer.warning ? `skill-warning-${session.id}` : undefined
+                      }
+                      activeDescendant={
+                        skillComposer.query && skillComposer.options[skillComposer.active]
+                          ? `skill-${skillComposer.options[skillComposer.active]!.id}`
+                          : activeMentionId
+                      }
+                      placeholder={
+                        isSideChat && sideChatSettingsState === 'loading'
+                          ? 'Loading side chat settings…'
+                          : agentActionsEnabled
+                            ? 'What should we tackle next?'
+                            : isSideChat && effectiveMainSyncEnabled
+                              ? 'Mention @Main to send to main chat'
+                              : 'Agent actions are paused'
+                      }
+                      disabled={composerDisabled || inputTakeover}
+                      onKeyDown={(event) => {
+                        if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
+                          event.preventDefault()
+                          void submit()
+                          return
+                        }
+                        const editingDocument = composerRef.current?.document() ?? editorValue
+                        const selectedMention = editingDocument.mention
+                        const range = composerRef.current?.selection() ?? { start: 0, end: 0 }
+                        if (skillComposer.query) {
+                          if (event.key === 'Escape') {
+                            event.preventDefault()
+                            skillComposer.close()
+                            return
+                          }
+                          if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+                            event.preventDefault()
+                            const next = skillComposer.active + (event.key === 'ArrowDown' ? 1 : -1)
+                            const current = skillComposer.options[skillComposer.active]
+                            if (
+                              event.key === 'ArrowUp' &&
+                              current &&
+                              current.agentId !== 'pact' &&
+                              (skillComposer.pages[current.agentId]?.startOffset ?? 0) > 0 &&
+                              skillComposer.options[next]?.agentId !== current.agentId
+                            ) {
+                              void skillComposer.more(current.agentId, true)
+                              return
+                            }
+                            if (
+                              event.key === 'ArrowDown' &&
+                              current &&
+                              current.agentId !== 'pact' &&
+                              skillComposer.pages[current.agentId]?.nextOffset != null &&
+                              skillComposer.options[next]?.agentId !== current.agentId
+                            )
+                              void skillComposer.more(current.agentId)
+                            else if (next >= skillComposer.options.length && skillComposer.hasMore)
+                              void skillComposer.more()
+                            else
+                              skillComposer.setActive(
+                                Math.max(0, Math.min(skillComposer.options.length - 1, next)),
+                              )
+                            return
+                          }
+                          if ((event.key === 'Enter' || event.key === 'Tab') && !event.shiftKey) {
+                            // Keep keyboard intent in the Composer while a filtered page is arriving.
+                            event.preventDefault()
+                            const entry = skillComposer.options[skillComposer.active]
+                            if (entry) {
+                              chooseSkill(entry)
+                            }
+                            return
+                          }
+                        }
+                        if (
+                          selectedMention &&
+                          range.start === range.end &&
+                          ((event.key === 'Backspace' && range.start === selectedMention.end) ||
+                            (event.key === 'Delete' && range.start === selectedMention.start))
+                        ) {
+                          event.preventDefault()
+                          const trailingSpace =
+                            editingDocument.text[selectedMention.end] === ' ' ? 1 : 0
+                          const next = `${editingDocument.text.slice(0, selectedMention.start)}${editingDocument.text.slice(selectedMention.end + trailingSpace)}`
+                          const cursor = selectedMention.start
+                          updateComposer(next, cursor, [
+                            {
+                              start: selectedMention.start,
+                              end: selectedMention.end + trailingSpace,
+                              text: '',
+                            },
+                          ])
+                          setMentionQuery(undefined)
+                          return
+                        }
+                        if (mentionQuery && filteredMentionOptions.length > 0) {
+                          if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+                            event.preventDefault()
+                            const direction = event.key === 'ArrowDown' ? 1 : -1
+                            setActiveMentionIndex(
+                              (index) =>
+                                (index + direction + filteredMentionOptions.length) %
+                                filteredMentionOptions.length,
+                            )
+                            return
+                          }
+                          if ((event.key === 'Enter' || event.key === 'Tab') && !event.shiftKey) {
+                            event.preventDefault()
+                            const option = filteredMentionOptions[activeMentionIndex]
+                            if (option) chooseMention(option)
+                            return
+                          }
+                          if (event.key === 'Escape') {
+                            event.preventDefault()
+                            dismissMentionMenu()
+                            return
+                          }
+                        }
+                        if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
+                          if (
+                            !isBtwReady &&
+                            !isMainRoute &&
+                            responseInProgress &&
+                            !queueEnabled &&
+                            !unfinishedTask
+                          )
+                            return
+                          event.preventDefault()
+                          void submit()
+                        }
+                      }}
+                    />
+                  </div>
+                  {pactCommandHint ? (
+                    <p className="px-2 pb-1 text-caption text-tertiary">{pactCommandHint}</p>
                   ) : null}
-                  {!skillComposer.loading &&
-                  !skillComposer.errors[agent] &&
-                  !skillComposer.pages[agent]?.skills.length ? (
-                    <p className="px-2.5 py-2 text-caption text-tertiary">No matching Skills.</p>
-                  ) : null}
-                  {skillComposer.canPrevious(agent) || skillComposer.canMore(agent) ? (
-                    <div className="flex items-center justify-between gap-2 px-2.5 py-1">
-                      {skillComposer.canPrevious(agent) ? (
+                  <div className="pact-composer-send-row relative flex items-center justify-between">
+                    <div
+                      ref={skillMenuRef}
+                      popover="auto"
+                      style={{ positionAnchor: composerMenuAnchor }}
+                      onBeforeToggle={(event) => {
+                        skillPopoverOpen.current = event.newState === 'open'
+                        if (event.newState === 'closed' && skillComposer.query)
+                          skillComposer.close()
+                      }}
+                      id={`skills-${session.id}`}
+                      role="listbox"
+                      aria-label="Native Skills"
+                      aria-hidden={!skillMenuOpen}
+                      aria-busy={skillComposer.loading}
+                      inert={!skillMenuOpen}
+                      data-open={skillMenuOpen}
+                      className="pact-skill-menu overflow-y-auto rounded-panel border border-border bg-surface-raised p-1.5 shadow-lg"
+                    >
+                      {skillComposer.pactOptions.length > 0 ? (
+                        <>
+                          <p className="px-2.5 pt-2 pb-1 text-caption font-medium text-tertiary">
+                            Pact
+                          </p>
+                          {skillComposer.pactOptions.map((entry) => {
+                            const index = skillComposer.options.indexOf(entry)
+                            return (
+                              <button
+                                key={entry.id}
+                                id={`skill-${entry.id}`}
+                                type="button"
+                                role="option"
+                                aria-selected={index === skillComposer.active}
+                                className={`flex min-h-10 w-full items-center gap-2 rounded-control px-2.5 py-1.5 text-left text-caption ${index === skillComposer.active ? 'bg-surface-muted text-primary' : 'text-secondary hover:bg-surface-muted'}`}
+                                onMouseEnter={() => skillComposer.setActive(index, false)}
+                                onMouseDown={(event) => event.preventDefault()}
+                                onClick={() => chooseSkill(entry)}
+                              >
+                                <BookOpen
+                                  aria-hidden="true"
+                                  className="size-4 shrink-0"
+                                  strokeWidth={1.75}
+                                />
+                                <span className="min-w-0 flex-1">
+                                  <span className="block font-medium text-primary">
+                                    {entry.name}
+                                  </span>
+                                  <span className="block text-tertiary">{entry.description}</span>
+                                </span>
+                                <span className="text-tertiary">Pact</span>
+                              </button>
+                            )
+                          })}
+                        </>
+                      ) : null}
+                      {skillComposer.agents.map((agent) => (
+                        <Fragment key={agent}>
+                          <p className="px-2.5 pt-2 pb-1 text-caption font-medium text-tertiary">
+                            {agentName(agent)}
+                          </p>
+                          {skillComposer.visibleOptions
+                            .filter((entry) => entry.agentId === agent)
+                            .map((entry) => {
+                              const index = skillComposer.options.indexOf(entry)
+                              return (
+                                <button
+                                  key={entry.id}
+                                  id={`skill-${entry.id}`}
+                                  type="button"
+                                  role="option"
+                                  aria-selected={index === skillComposer.active}
+                                  className={`flex min-h-10 w-full items-center gap-2 rounded-control px-2.5 py-1.5 text-left text-caption ${index === skillComposer.active ? 'bg-surface-muted text-primary' : 'text-secondary hover:bg-surface-muted'}`}
+                                  onMouseEnter={() => skillComposer.setActive(index, false)}
+                                  onMouseDown={(event) => event.preventDefault()}
+                                  onClick={() => {
+                                    chooseSkill(entry)
+                                  }}
+                                >
+                                  <span className="min-w-0 flex-1">
+                                    <span className="block truncate font-medium text-primary">
+                                      /{entry.name}
+                                      {entry.argumentHint ? (
+                                        <span className="ml-2 font-normal text-tertiary">
+                                          {entry.argumentHint}
+                                        </span>
+                                      ) : null}
+                                    </span>
+                                    <span
+                                      className="block truncate text-tertiary"
+                                      title={entry.description}
+                                    >
+                                      {entry.description}
+                                    </span>
+                                  </span>
+                                  <span className="shrink-0 text-tertiary">
+                                    {entry.source === 'native'
+                                      ? 'Native'
+                                      : entry.source[0]!.toUpperCase() + entry.source.slice(1)}
+                                  </span>
+                                </button>
+                              )
+                            })}
+                          {skillComposer.errors[agent] ? (
+                            <p className="px-2.5 py-2 text-caption text-secondary">
+                              {skillComposer.errors[agent]}
+                            </p>
+                          ) : null}
+                          {!skillComposer.loading &&
+                          !skillComposer.errors[agent] &&
+                          !skillComposer.pages[agent]?.skills.length ? (
+                            <p className="px-2.5 py-2 text-caption text-tertiary">
+                              No matching Skills.
+                            </p>
+                          ) : null}
+                          {skillComposer.canPrevious(agent) || skillComposer.canMore(agent) ? (
+                            <div className="flex items-center justify-between gap-2 px-2.5 py-1">
+                              {skillComposer.canPrevious(agent) ? (
+                                <button
+                                  type="button"
+                                  className="min-h-8 rounded-control px-2 text-caption text-secondary hover:bg-surface-muted disabled:opacity-50"
+                                  aria-label={`Previous ${agentName(agent)} Skills`}
+                                  disabled={skillComposer.loading}
+                                  onMouseDown={(event) => event.preventDefault()}
+                                  onClick={() => {
+                                    composerRef.current?.focus()
+                                    void skillComposer.more(agent, true)
+                                  }}
+                                >
+                                  Previous Skills
+                                </button>
+                              ) : (
+                                <span />
+                              )}
+                              <span role="status" className="text-caption text-tertiary">
+                                {skillComposer.rangeLabel(agent)}
+                              </span>
+                              {skillComposer.canMore(agent) ? (
+                                <button
+                                  type="button"
+                                  className="min-h-8 rounded-control px-2 text-caption text-secondary hover:bg-surface-muted disabled:opacity-50"
+                                  aria-label={`More ${agentName(agent)} Skills`}
+                                  disabled={skillComposer.loading}
+                                  onMouseDown={(event) => event.preventDefault()}
+                                  onClick={() => {
+                                    composerRef.current?.focus()
+                                    void skillComposer.more(agent)
+                                  }}
+                                >
+                                  More Skills
+                                </button>
+                              ) : null}
+                            </div>
+                          ) : null}
+                        </Fragment>
+                      ))}
+                      {skillComposer.loading && skillComposer.options.length === 0 ? (
+                        <p
+                          role="status"
+                          className="flex items-center gap-2 px-2.5 py-2 text-caption text-tertiary"
+                        >
+                          <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
+                          Loading native Skills…
+                        </p>
+                      ) : null}
+                    </div>
+                    <div
+                      ref={mentionMenuRef}
+                      id={mentionListId}
+                      popover="auto"
+                      style={{ positionAnchor: composerMenuAnchor }}
+                      data-open={mentionListOpen}
+                      aria-hidden={!mentionListOpen}
+                      inert={!mentionListOpen}
+                      onBeforeToggle={(event) => {
+                        mentionPopoverOpen.current = event.newState === 'open'
+                        if (event.newState === 'closed' && mentionQuery) dismissMentionMenu()
+                      }}
+                      className="pact-mention-menu overflow-y-auto rounded-panel border border-border bg-surface-raised p-1.5 shadow-lg"
+                      role="listbox"
+                      aria-label="Message recipients"
+                    >
+                      {filteredMentionOptions.map((option, index) => {
+                        const Icon = option.icon
+                        const active = index === activeMentionIndex
+                        return (
+                          <button
+                            id={`${mentionListId}-${option.token.slice(1)}`}
+                            key={option.token}
+                            type="button"
+                            role="option"
+                            aria-selected={active}
+                            className={`flex min-h-9 w-full cursor-pointer items-center gap-2.5 rounded-control px-2.5 text-left text-caption ${active ? 'bg-surface-muted text-primary' : 'text-secondary hover:bg-surface-muted/70 hover:text-primary'}`}
+                            onMouseEnter={() => setActiveMentionIndex(index)}
+                            onMouseDown={(event) => event.preventDefault()}
+                            onClick={() => chooseMention(option)}
+                          >
+                            <Icon
+                              aria-hidden="true"
+                              className="size-3.5 shrink-0"
+                              strokeWidth={1.75}
+                            />
+                            <span className="min-w-0 flex-1">
+                              <span className="font-medium text-primary">{option.label}</span>
+                              <span className="ml-2 text-caption text-tertiary">
+                                {option.token === '@all'
+                                  ? `${primaryName}, then ${secondaryName}`
+                                  : option.description}
+                              </span>
+                            </span>
+                            <span className="font-mono text-caption text-tertiary">
+                              {option.token}
+                            </span>
+                          </button>
+                        )
+                      })}
+                    </div>
+
+                    {onChooseComposerImages ? (
+                      <button
+                        type="button"
+                        className="grid size-8 shrink-0 place-items-center rounded-control text-secondary hover:bg-surface-muted hover:text-primary disabled:opacity-40"
+                        aria-label="Add images"
+                        title="Add images · paste or drop also works"
+                        disabled={composerDisabled || choosingImages}
+                        aria-busy={choosingImages}
+                        onClick={() => void onChooseComposerImages()}
+                      >
+                        {choosingImages ? (
+                          <LoaderCircle
+                            className="size-4 animate-spin"
+                            aria-hidden="true"
+                            strokeWidth={1.75}
+                          />
+                        ) : (
+                          <ImagePlus className="size-4" aria-hidden="true" strokeWidth={1.75} />
+                        )}
+                      </button>
+                    ) : null}
+                    <div className="ml-auto flex shrink-0 items-center gap-1.5">
+                      {showStop ? (
                         <button
                           type="button"
-                          className="min-h-8 rounded-control px-2 text-caption text-secondary hover:bg-surface-muted disabled:opacity-50"
-                          aria-label={`Previous ${agent === 'claude' ? 'Claude Code' : 'Codex'} Skills`}
-                          disabled={skillComposer.loading}
-                          onMouseDown={(event) => event.preventDefault()}
-                          onClick={() => {
-                            composerRef.current?.focus()
-                            void skillComposer.more(agent, true)
-                          }}
+                          aria-label={stopLabel}
+                          title={stopLabel}
+                          disabled={stopping || !agentActionsEnabled}
+                          onClick={() => void requestStop()}
+                          className={`grid size-9 place-items-center rounded-control focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus disabled:cursor-default ${showSend ? 'border border-border bg-surface-muted text-secondary enabled:hover:border-border-strong enabled:hover:text-primary' : 'bg-surface-inverse text-inverse hover:opacity-85'}`}
                         >
-                          Previous Skills
+                          {stopping ? (
+                            <LoaderCircle
+                              aria-hidden="true"
+                              className="size-4 animate-spin motion-reduce:animate-none"
+                              strokeWidth={1.8}
+                            />
+                          ) : (
+                            <Square
+                              aria-hidden="true"
+                              className="size-3.5"
+                              fill="currentColor"
+                              strokeWidth={1.5}
+                            />
+                          )}
                         </button>
-                      ) : (
-                        <span />
-                      )}
-                      <span role="status" className="text-caption text-tertiary">
-                        {skillComposer.rangeLabel(agent)}
-                      </span>
-                      {skillComposer.canMore(agent) ? (
+                      ) : null}
+                      {showSend ? (
                         <button
+                          className="grid size-9 place-items-center rounded-control bg-surface-inverse text-inverse hover:opacity-85 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus disabled:cursor-default disabled:opacity-40"
                           type="button"
-                          className="min-h-8 rounded-control px-2 text-caption text-secondary hover:bg-surface-muted disabled:opacity-50"
-                          aria-label={`More ${agent === 'claude' ? 'Claude Code' : 'Codex'} Skills`}
-                          disabled={skillComposer.loading}
-                          onMouseDown={(event) => event.preventDefault()}
-                          onClick={() => {
-                            composerRef.current?.focus()
-                            void skillComposer.more(agent)
-                          }}
+                          aria-label={isMainRoute ? 'Send to main' : 'Send message'}
+                          title={isMainRoute ? 'Send to main' : 'Send message'}
+                          disabled={
+                            isBtwReady
+                              ? commonComposerBlocked || btwSubmitting || !onOpenBtwSideChat
+                              : isMainRoute
+                                ? mainSyncComposerBlocked || !onSyncToMain
+                                : disabled ||
+                                  !hasDraft ||
+                                  Boolean(replacement) ||
+                                  (responseInProgress && !queueEnabled && !unfinishedTask)
+                          }
+                          onClick={() => void submit()}
                         >
-                          More Skills
+                          {isMainRoute ? (
+                            <span
+                              key="send-main"
+                              className="pact-send-icon inline-flex items-center justify-center"
+                            >
+                              <CornerUpLeft
+                                aria-hidden="true"
+                                className="size-4"
+                                strokeWidth={1.9}
+                              />
+                            </span>
+                          ) : (
+                            <span
+                              key="send-normal"
+                              className="pact-send-icon inline-flex items-center justify-center"
+                            >
+                              <ArrowUp aria-hidden="true" className="size-4" strokeWidth={1.9} />
+                            </span>
+                          )}
                         </button>
                       ) : null}
                     </div>
-                  ) : null}
-                </Fragment>
-              ))}
-              {skillComposer.loading && skillComposer.options.length === 0 ? (
-                <p
-                  role="status"
-                  className="flex items-center gap-2 px-2.5 py-2 text-caption text-tertiary"
-                >
-                  <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
-                  Loading native Skills…
-                </p>
-              ) : null}
-            </div>
-            {mentionListOpen ? (
-              <div
-                id={mentionListId}
-                className="absolute right-0 bottom-[calc(100%+8px)] left-0 z-20 overflow-hidden rounded-panel border border-border bg-surface-raised p-1.5 shadow-lg"
-                role="listbox"
-                aria-label="Message recipients"
-              >
-                {filteredMentionOptions.map((option, index) => {
-                  const Icon = option.icon
-                  const active = index === activeMentionIndex
-                  return (
-                    <button
-                      id={`${mentionListId}-${option.token.slice(1)}`}
-                      key={option.token}
-                      type="button"
-                      role="option"
-                      aria-selected={active}
-                      className={`flex min-h-9 w-full cursor-pointer items-center gap-2.5 rounded-control px-2.5 text-left text-caption ${active ? 'bg-surface-muted text-primary' : 'text-secondary hover:bg-surface-muted/70 hover:text-primary'}`}
-                      onMouseEnter={() => setActiveMentionIndex(index)}
-                      onMouseDown={(event) => event.preventDefault()}
-                      onClick={() => chooseMention(option)}
-                    >
-                      <Icon aria-hidden="true" className="size-3.5 shrink-0" strokeWidth={1.75} />
-                      <span className="min-w-0 flex-1">
-                        <span className="font-medium text-primary">{option.label}</span>
-                        <span className="ml-2 text-caption text-tertiary">
-                          {option.description}
-                        </span>
-                      </span>
-                      <span className="font-mono text-caption text-tertiary">{option.token}</span>
-                    </button>
-                  )
-                })}
-              </div>
-            ) : null}
-            {draftComments.length > 0 ? (
-              <div
-                className="flex max-h-20 w-full flex-wrap gap-1.5 overflow-y-auto px-2 pt-1"
-                aria-label="Attached Comment drafts"
-              >
-                {draftComments.map((comment) => (
-                  <span
-                    key={comment.id}
-                    className={`inline-flex max-w-64 items-center gap-1 rounded-pill bg-status-info-muted px-2.5 py-1 text-caption text-status-info-foreground ${recoveryLocked ? 'opacity-55' : ''}`}
-                  >
-                    <button
-                      className="truncate text-left"
-                      type="button"
-                      title={comment.body}
-                      disabled={recoveryLocked}
-                      onClick={() =>
-                        setCommentEditor({
-                          commentId: comment.id,
-                          draftId: crypto.randomUUID(),
-                          anchor: comment.anchor,
-                          quote: comment.anchor.quote,
-                          body: comment.body,
-                        })
-                      }
-                    >
-                      {commentSourceLabel(comment.anchor)} · {comment.body}
-                    </button>
-                    <button
-                      type="button"
-                      aria-label="Return to Comment source"
-                      title="Return to source"
-                      disabled={recoveryLocked}
-                      onClick={() => onOpenComment(comment)}
-                      className="grid size-6 shrink-0 place-items-center rounded-control hover:bg-status-info/15 focus-visible:outline-2 focus-visible:outline-focus"
-                    >
-                      <CornerUpLeft aria-hidden="true" className="size-3.5" strokeWidth={1.75} />
-                    </button>
-                    <button
-                      className="grid size-4 shrink-0 place-items-center rounded-full hover:bg-status-info/15"
-                      type="button"
-                      aria-label="Remove Comment draft"
-                      disabled={disabled}
-                      onClick={() => void onRemoveCommentDraft(comment.id)}
-                    >
-                      <X aria-hidden="true" className="size-3" />
-                    </button>
-                  </span>
-                ))}
-              </div>
-            ) : null}
-            {history.draftPage?.hasMore || history.draftPage?.hasEarlier ? (
-              <div
-                aria-label="Comment draft pages"
-                className="flex gap-2 px-2 text-caption text-secondary"
-              >
-                {history.draftPage.hasEarlier ? (
-                  <button
-                    type="button"
-                    disabled={history.draftsLoading}
-                    onClick={history.firstDraftPage}
-                    className="min-h-7 rounded-control px-1.5 hover:bg-surface-muted focus-visible:outline-2 focus-visible:outline-focus disabled:opacity-45"
-                  >
-                    First drafts
-                  </button>
-                ) : null}
-                {history.draftPage.hasMore ? (
-                  <button
-                    type="button"
-                    disabled={history.draftsLoading}
-                    onClick={history.loadMoreDrafts}
-                    className="min-h-7 rounded-control px-1.5 hover:bg-surface-muted focus-visible:outline-2 focus-visible:outline-focus disabled:opacity-45"
-                  >
-                    More drafts
-                  </button>
-                ) : null}
-              </div>
-            ) : null}
-            {returnedInput ? (
-              <div className="mb-2 flex flex-wrap items-center gap-2 px-2 text-caption text-secondary">
-                <span>
-                  {history.restoringInput
-                    ? 'Restoring unsent message…'
-                    : returnedInput.state === 'installed' &&
-                        (composer || composerImages.length || draftComments.length)
-                      ? 'Unsent message restored'
-                      : 'Previous unsent message is available'}
-                </span>
-                <span>
-                  ·{' '}
-                  {returnedInput.route.type === 'all'
-                    ? `${returnedInput.route.firstAgentId === 'codex' ? 'Codex' : 'Claude Code'} → ${returnedInput.route.secondAgentId === 'codex' ? 'Codex' : 'Claude Code'}`
-                    : returnedInput.route.agentId === 'codex'
-                      ? 'Codex'
-                      : 'Claude Code'}
-                </span>
-                {returnedInput.state === 'pending' || (!composer && !composerImages.length) ? (
-                  <>
-                    <button
-                      type="button"
-                      className="rounded-control px-2 py-1 text-primary hover:bg-surface-muted disabled:opacity-40"
-                      disabled={Boolean(
-                        composer ||
-                        composerImages.length ||
-                        composerMention ||
-                        draftComments.some(
-                          (comment) => !returnedInput.commentIds.includes(comment.id),
-                        ) ||
-                        history.restoringInput ||
-                        history.draftsLoading,
-                      )}
-                      onClick={() => void history.restoreReturnedInput?.()}
-                    >
-                      Restore to input
-                    </button>
-                    {returnedInput.state === 'pending' ? (
-                      <button
-                        type="button"
-                        className="rounded-control px-2 py-1 hover:bg-surface-muted disabled:opacity-40"
-                        disabled={Boolean(history.restoringInput)}
-                        onClick={() => void history.discardReturnedInput?.()}
-                      >
-                        Dismiss
-                      </button>
-                    ) : null}
-                    {returnedInput.state === 'pending' &&
-                    (composer ||
-                      composerImages.length ||
-                      composerMention ||
-                      draftComments.length) ? (
-                      <span>Keep your current draft. Sending it replaces the previous input.</span>
-                    ) : null}
-                  </>
-                ) : null}
-              </div>
-            ) : null}
-            <ConversationImages
-              sessionId={session.id}
-              images={composerImages}
-              draft
-              disabled={composerDisabled}
-              onOpen={(image) => openImageGallery(composerImages, image)}
-              onRemove={onRemoveComposerImage}
-            />
-            <div className="flex w-full flex-col gap-1">
-              <ComposerEditor
-                editorRef={composerRef}
-                value={editorValue}
-                onChange={acceptComposerDocument}
-                admitEdit={history.admitComposerEdit}
-                onCursor={cursorChanged}
-                onSkillOpen={(skill) => onOpenSkillDocument?.(skill)}
-                onNotice={onNotice}
-                onImages={
-                  onAddComposerImages ? (files) => void onAddComposerImages(files) : undefined
-                }
-                expanded={mentionListOpen || Boolean(skillComposer.query)}
-                controls={
-                  skillComposer.query
-                    ? `skills-${session.id}`
-                    : mentionListOpen
-                      ? mentionListId
-                      : undefined
-                }
-                describedBy={skillComposer.warning ? `skill-warning-${session.id}` : undefined}
-                activeDescendant={
-                  skillComposer.query && skillComposer.options[skillComposer.active]
-                    ? `skill-${skillComposer.options[skillComposer.active]!.id}`
-                    : activeMentionId
-                }
-                placeholder={
-                  history.draftError
-                    ? 'Comments unavailable'
-                    : history.draftsLoading
-                      ? 'Loading saved comments…'
-                      : agentActionsEnabled
-                        ? 'What should we tackle next?'
-                        : 'Agent actions are paused'
-                }
-                disabled={composerDisabled}
-                onKeyDown={(event) => {
-                  if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
-                    event.preventDefault()
-                    void submit()
-                    return
-                  }
-                  const editingDocument = composerRef.current?.document() ?? editorValue
-                  const selectedMention = editingDocument.mention
-                  const range = composerRef.current?.selection() ?? { start: 0, end: 0 }
-                  if (skillComposer.query) {
-                    if (event.key === 'Escape') {
-                      event.preventDefault()
-                      skillComposer.close()
-                      return
-                    }
-                    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
-                      event.preventDefault()
-                      const next = skillComposer.active + (event.key === 'ArrowDown' ? 1 : -1)
-                      const current = skillComposer.options[skillComposer.active]
-                      if (
-                        event.key === 'ArrowUp' &&
-                        current &&
-                        current.agentId !== 'pact' &&
-                        (skillComposer.pages[current.agentId]?.startOffset ?? 0) > 0 &&
-                        skillComposer.options[next]?.agentId !== current.agentId
-                      ) {
-                        void skillComposer.more(current.agentId, true)
-                        return
-                      }
-                      if (
-                        event.key === 'ArrowDown' &&
-                        current &&
-                        current.agentId !== 'pact' &&
-                        skillComposer.pages[current.agentId]?.nextOffset != null &&
-                        skillComposer.options[next]?.agentId !== current.agentId
-                      )
-                        void skillComposer.more(current.agentId)
-                      else if (next >= skillComposer.options.length && skillComposer.hasMore)
-                        void skillComposer.more()
-                      else
-                        skillComposer.setActive(
-                          Math.max(0, Math.min(skillComposer.options.length - 1, next)),
-                        )
-                      return
-                    }
-                    if ((event.key === 'Enter' || event.key === 'Tab') && !event.shiftKey) {
-                      // Keep keyboard intent in the Composer while a filtered page is arriving.
-                      event.preventDefault()
-                      const entry = skillComposer.options[skillComposer.active]
-                      if (entry) {
-                        chooseSkill(entry)
-                      }
-                      return
-                    }
-                  }
-                  if (
-                    selectedMention &&
-                    range.start === range.end &&
-                    ((event.key === 'Backspace' && range.start === selectedMention.end) ||
-                      (event.key === 'Delete' && range.start === selectedMention.start))
-                  ) {
-                    event.preventDefault()
-                    const trailingSpace = editingDocument.text[selectedMention.end] === ' ' ? 1 : 0
-                    const next = `${editingDocument.text.slice(0, selectedMention.start)}${editingDocument.text.slice(selectedMention.end + trailingSpace)}`
-                    const cursor = selectedMention.start
-                    updateComposer(next, cursor, [
-                      {
-                        start: selectedMention.start,
-                        end: selectedMention.end + trailingSpace,
-                        text: '',
-                      },
-                    ])
-                    setMentionQuery(undefined)
-                    return
-                  }
-                  if (mentionQuery && filteredMentionOptions.length > 0) {
-                    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
-                      event.preventDefault()
-                      const direction = event.key === 'ArrowDown' ? 1 : -1
-                      setActiveMentionIndex(
-                        (index) =>
-                          (index + direction + filteredMentionOptions.length) %
-                          filteredMentionOptions.length,
-                      )
-                      return
-                    }
-                    if ((event.key === 'Enter' || event.key === 'Tab') && !event.shiftKey) {
-                      event.preventDefault()
-                      const option = filteredMentionOptions[activeMentionIndex]
-                      if (option) chooseMention(option)
-                      return
-                    }
-                    if (event.key === 'Escape') {
-                      event.preventDefault()
-                      setMentionQuery(undefined)
-                      return
-                    }
-                  }
-                  if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
-                    if (responseInProgress && !queueEnabled) return
-                    event.preventDefault()
-                    void submit()
-                  }
-                }}
-              />
-              <div className="flex items-center justify-between">
-                {onChooseComposerImages ? (
-                  <button
-                    type="button"
-                    className="grid size-8 shrink-0 place-items-center rounded-control text-secondary hover:bg-surface-muted hover:text-primary disabled:opacity-40"
-                    aria-label="Add images"
-                    title="Add images · paste or drop also works"
-                    disabled={composerDisabled || choosingImages}
-                    aria-busy={choosingImages}
-                    onClick={() => void onChooseComposerImages()}
-                  >
-                    {choosingImages ? (
-                      <LoaderCircle
-                        className="size-4 animate-spin"
-                        aria-hidden="true"
-                        strokeWidth={1.75}
-                      />
-                    ) : (
-                      <ImagePlus className="size-4" aria-hidden="true" strokeWidth={1.75} />
-                    )}
-                  </button>
-                ) : null}
-                <button
-                  className="ml-auto grid size-9 shrink-0 cursor-pointer place-items-center rounded-control bg-surface-inverse text-inverse hover:opacity-85 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus disabled:cursor-default disabled:opacity-40"
-                  type="button"
-                  aria-label={composerActionLabel}
-                  title={composerActionLabel}
-                  disabled={
-                    responseInProgress
-                      ? stopping
-                      : disabled ||
-                        (!composerContentReady &&
-                          draftComments.length === 0 &&
-                          composerImages.length === 0)
-                  }
-                  onClick={() => void (responseInProgress ? onStop() : submit())}
-                >
-                  {stopping ? (
-                    <LoaderCircle
-                      aria-hidden="true"
-                      className="size-4 animate-spin"
-                      strokeWidth={1.8}
-                    />
-                  ) : responseInProgress ? (
-                    <Square
-                      aria-hidden="true"
-                      className="size-3.5"
-                      fill="currentColor"
-                      strokeWidth={1.5}
-                    />
-                  ) : (
-                    <ArrowUp aria-hidden="true" className="size-4" strokeWidth={1.9} />
-                  )}
-                </button>
-              </div>
-            </div>
-          </div>
-          <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
-            {onSaveSessionPermission ? (
-              <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-                {(['claude', 'codex'] as const).map((agent) => (
-                  <div
-                    key={`${session.id}-${agent}`}
-                    role="group"
-                    aria-label={`${agent === 'claude' ? 'Claude Code' : 'Codex'} settings`}
-                    className="pact-agent-controls min-w-0 max-w-full text-caption"
-                  >
-                    <PermissionMenu
-                      session={session}
-                      agent={agent}
-                      run={activeRun ?? latestRun}
-                      busy={responseInProgress}
-                      disabled={sessionSettingsSaving}
-                      visible={visible && !nativePresentationSuspended}
-                      onSave={onSaveSessionPermission}
-                      onNotice={onNotice}
-                    />
-                    {onSaveSessionSpeed ? (
+                  </div>
+                </div>
+                {!isSideChat ? (
+                  <div className="pact-composer-controls flex min-w-0 items-center gap-2">
+                    {onSaveSessionPermission ? (
                       <>
-                        <span className="pact-agent-divider" aria-hidden="true" />
-                        <SpeedMenu
-                          session={session}
-                          agent={agent}
-                          run={activeRun ?? latestRun}
-                          busy={responseInProgress}
-                          disabled={sessionSettingsSaving}
-                          visible={visible && !nativePresentationSuspended}
-                          onSave={onSaveSessionSpeed}
-                          onNotice={onNotice}
-                        />
+                        {activePair.map((agent) => (
+                          <div
+                            key={`${session.id}-${agent}`}
+                            role="group"
+                            aria-label={`${agentName(agent)} settings`}
+                            className="pact-agent-controls text-caption"
+                          >
+                            <PermissionMenu
+                              session={session}
+                              agent={agent}
+                              run={activeRun ?? latestRun}
+                              busy={responseInProgress}
+                              disabled={sessionSettingsSaving}
+                              visible={visible && !nativePresentationSuspended && !inputTakeover}
+                              onSave={onSaveSessionPermission}
+                              onNotice={onNotice}
+                            />
+                            {onSaveSessionSpeed ? (
+                              <>
+                                <span className="pact-agent-divider" aria-hidden="true" />
+                                <SpeedMenu
+                                  session={session}
+                                  agent={agent}
+                                  run={activeRun ?? latestRun}
+                                  busy={responseInProgress}
+                                  disabled={sessionSettingsSaving}
+                                  visible={
+                                    visible && !nativePresentationSuspended && !inputTakeover
+                                  }
+                                  onSave={onSaveSessionSpeed}
+                                  onNotice={onNotice}
+                                />
+                              </>
+                            ) : null}
+                          </div>
+                        ))}
                       </>
                     ) : null}
+                    <ProjectContextMenu
+                      key={`${session.id}-${session.projectId}`}
+                      projectId={session.projectId}
+                      platform={platform}
+                      visible={visible && !inputTakeover}
+                      refreshKey={`${latestRun?.id ?? ''}:${latestRun?.status ?? ''}`}
+                      onNotice={onNotice}
+                    />
                   </div>
-                ))}
+                ) : null}
+                {history.draftError && snapshot ? (
+                  <p
+                    className="flex items-center gap-2 px-2 text-caption text-secondary"
+                    role="alert"
+                  >
+                    Couldn’t load comments.
+                    <button
+                      className="min-h-8 font-medium text-primary hover:underline focus-visible:outline-2 focus-visible:outline-focus"
+                      type="button"
+                      onClick={() => history.retryDrafts()}
+                    >
+                      Retry
+                    </button>
+                  </p>
+                ) : null}
               </div>
-            ) : null}
-            <ProjectContextMenu
-              key={`${session.id}-${session.projectId}`}
-              projectId={session.projectId}
-              platform={platform}
-              visible={visible}
-              refreshKey={`${latestRun?.id ?? ''}:${latestRun?.status ?? ''}`}
-              onNotice={onNotice}
-            />
+            </InputReplacement>
           </div>
-          {history.draftError && snapshot ? (
-            <p className="flex items-center gap-2 px-2 text-caption text-secondary" role="alert">
-              Couldn’t load comments.
-              <button
-                className="min-h-8 font-medium text-primary hover:underline focus-visible:outline-2 focus-visible:outline-focus"
-                type="button"
-                onClick={() => history.retryDrafts()}
-              >
-                Retry
-              </button>
-            </p>
-          ) : null}
         </div>
       </div>
+      {replacement && replacementTask ? (
+        <TaskReplacementConfirmation
+          task={replacementTask}
+          command={replacement.command}
+          running={responseInProgress}
+          actor={respondingAgentId ?? collaborationActor(replacementTask, replacementTask.stage)}
+          summary={replacementDetails?.summary}
+          unreviewedChanges={replacementDetails?.unreviewedChanges ?? false}
+          busy={replacementBusy}
+          disabled={disabled || inputTakeover || Boolean(queuedInput) || sending}
+          suspended={nativePresentationSuspended || inputTakeover || !visible}
+          error={
+            replacementFailed
+              ? error || 'The new task could not be started. Your draft is preserved.'
+              : undefined
+          }
+          onCancel={cancelReplacement}
+          onConfirm={() => void confirmReplacement()}
+        />
+      ) : null}
       {forkPoint?.sourceSessionId === session.id && onForkSessionCreated ? (
         <SessionForkDialog
           key={`${forkPoint.sourceSessionId}:${forkPoint.messageId}`}
@@ -4602,28 +5522,29 @@ export function ConversationView({
 
 function ContextReceipt({
   count,
-  target,
+  source,
   accepted,
 }: {
   count: number
-  target: AgentRun['agentId']
+  source?: string | undefined
   accepted: boolean
 }): React.JSX.Element {
-  const source = target === 'claude' ? 'Codex' : 'Claude Code'
+  const unit = count === 1 ? 'message' : 'messages'
   return (
     <p className="mt-1 text-caption text-tertiary">
-      {accepted ? 'Context supplied' : 'Context prepared'} · {count}{' '}
-      {count === 1 ? 'message' : 'messages'} involving {source}
+      {source
+        ? `${accepted ? 'Shared' : 'Prepared'} ${count} earlier ${unit} from ${source}`
+        : `Included ${count} earlier ${unit}`}
     </p>
   )
 }
 
 function MessageResponseIndicator({ agentId }: { agentId: RuntimeAgentId }): React.JSX.Element {
-  const name = agentId === 'claude' ? 'Claude Code' : 'Codex'
+  const name = agentName(agentId)
   return (
     <div className="mt-1.5 flex justify-center">
       <span
-        className={`inline-flex h-5 items-center gap-1 rounded-pill px-2 text-secondary ${agentId === 'claude' ? 'bg-speaker-claude' : 'bg-speaker-codex'}`}
+        className={`inline-flex h-5 items-center gap-1 rounded-pill px-2 text-secondary ${speakerBgClass(agentId)}`}
         role="status"
         aria-label={`${name} is responding`}
       >
@@ -4654,8 +5575,8 @@ function PeerProposalAction({
   onDismiss: (proposalId: string) => Promise<boolean>
 }): React.JSX.Element {
   const [working, setWorking] = useState<'accept' | 'dismiss' | undefined>()
-  const requesterName = requester === 'claude' ? 'Claude Code' : 'Codex'
-  const targetName = proposal.targetAgentId === 'claude' ? 'Claude Code' : 'Codex'
+  const requesterName = agentName(requester)
+  const targetName = agentName(proposal.targetAgentId)
   const action =
     proposal.kind === 'fact_check'
       ? 'fact-check'
@@ -4805,14 +5726,16 @@ const MessageHoverActions = memo(function MessageHoverActions({
   const date = new Date(createdAt)
   const fullDate = messageDateTimeFormatter.format(date)
   const copyLabel = longMessage
-    ? 'Full copy is unavailable for long Messages'
+    ? 'Copy unavailable for long messages'
     : copyResult === 'copying'
       ? 'Copying message'
       : copyResult === 'copied'
         ? 'Message copied'
         : copyResult === 'failed'
-          ? 'Could not copy message'
-          : `Copy ${speaker} message`
+          ? 'Couldn’t copy message'
+          : isUser
+            ? 'Copy your message'
+            : `Copy ${speaker} message`
 
   return (
     <div

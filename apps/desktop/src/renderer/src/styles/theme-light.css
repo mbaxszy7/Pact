@@ -42,6 +42,7 @@
   --pact-speaker-user: #f1e6ff;
   --pact-speaker-claude: #fff2eb;
   --pact-speaker-codex: #d3f6e3;
+  --pact-speaker-agy: #def4fa;
   --pact-diff-added: #e5f8ed;
   --pact-diff-added-foreground: #176637;
   --pact-diff-removed: #fff0ee;
@@ -57,4 +58,5 @@
   --pact-material-user: rgb(241 230 255 / var(--pact-material-message-alpha));
   --pact-material-claude: rgb(255 242 235 / var(--pact-material-message-alpha));
   --pact-material-codex: rgb(211 246 227 / var(--pact-material-message-alpha));
+  --pact-material-agy: rgb(222 244 250 / var(--pact-material-message-alpha));
 }

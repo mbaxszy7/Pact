@@ -32,7 +32,7 @@ export function useNativeInteractionDetails(
         operationId,
         requestId,
         revision,
-        error: 'The native request took too long to load. Try again.',
+        error: 'Timed out loading details. Try again.',
       })
     }, 30000)
     void window.pact
@@ -57,7 +57,7 @@ export function useNativeInteractionDetails(
           operationId,
           requestId,
           revision,
-          error: 'The native request could not load. Try again.',
+          error: 'Couldn’t load details. Try again.',
         })
       })
     return () => {
@@ -76,7 +76,7 @@ export function useNativeInteractionDetails(
       : undefined
   return {
     details: current?.details,
-    error: operationId ? current?.error : 'This native request is no longer active.',
+    error: operationId ? current?.error : 'This request is no longer active.',
     loading: Boolean(operationId && !current),
     retry,
   }

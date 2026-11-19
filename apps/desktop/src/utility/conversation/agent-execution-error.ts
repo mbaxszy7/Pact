@@ -12,6 +12,14 @@ export class AgentExecutionError extends Error {
   }
 }
 
+/** The live workflow admission fence withheld the root input before native I/O. */
+export class NativeInputWithheldError extends AgentExecutionError {
+  constructor(message = 'Collaboration paused before this message was sent. Resume when ready.') {
+    super('user_stopped', message, false)
+    this.name = 'NativeInputWithheldError'
+  }
+}
+
 /** The binding was resumed, but its next-task permissions were not confirmed; no model input was sent. */
 export class PermissionModeRejectedError extends AgentExecutionError {
   constructor(message: string) {
@@ -24,7 +32,7 @@ export class NativeThreadOccupiedError extends AgentExecutionError {
   constructor() {
     super(
       'native_session_occupied',
-      'Another Codex client owns this native session. This request was not submitted. Rebuild to continue in Pact; the other session remains unchanged.',
+      'Another Codex client is using this session. Your message wasn’t sent. Rebuild to continue in Pact without affecting the other session.',
       false,
     )
   }
@@ -70,7 +78,7 @@ export class NativeCapacityError extends AgentExecutionError {
 
 export function classifyAgentError(error: unknown): AgentExecutionError {
   if (error instanceof AgentExecutionError) return error
-  const message = error instanceof Error ? error.message : 'The Agent process failed.'
+  const message = error instanceof Error ? error.message : 'The agent process failed.'
   const normalized = message.toLowerCase()
   if (
     /context(?:\s|-)?(?:window|length|limit)|too many tokens|(?:prompt|input) is too long/u.test(

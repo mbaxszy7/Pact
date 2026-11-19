@@ -90,6 +90,7 @@ export class DatabaseMigrationError extends DatabaseOpenError {
 }
 interface Migration {
   hash: string
+  legacyHash?: string
   createdAt: number
   statements: string[]
 }
@@ -97,10 +98,28 @@ interface HistoryRow {
   hash: string
   createdAt: number
 }
+interface MigrationHistory {
+  applied: number
+  legacyGroupCleanupApplied: boolean
+}
 const MIGRATION_COUNT_LIMIT = 4096
 const MIGRATION_FILE_BYTES = 1024 * 1024
 const MIGRATION_TOTAL_BYTES = 16 * 1024 * 1024
 const OPEN_DEADLINE_MS = 30_000
+const RETIRED_GROUP_CLEANUP = {
+  index: 105,
+  tag: '0105_legacy_sidebar_empty_groups',
+  createdAt: 1794315022661,
+  hash: '0f44dd6853d47ddc3c53dfcd98570866c498bb07ac59f25d58ffed1496cf3378',
+  legacyHash: 'ee38836d26c694b1116ac2fb615be4d8793ad9a39857978240aab25fb05f03f7',
+} as const
+
+function sameMigrationHistory(left: MigrationHistory, right: MigrationHistory): boolean {
+  return (
+    left.applied === right.applied &&
+    left.legacyGroupCleanupApplied === right.legacyGroupCleanupApplied
+  )
+}
 
 const drizzleMigrations = sqliteTable('__drizzle_migrations', {
   id: integer('id').primaryKey(),
@@ -200,6 +219,7 @@ export class PactDatabase {
           options.measurePerformance,
         )
       }
+      let checkedHistory: MigrationHistory
       if (!existsSync(filePath)) {
         stagingFilePath = join(dirname(filePath), `.pact-initialize-${randomUUID()}.sqlite`)
         closeSync(openSync(stagingFilePath, 'wx', 0o600))
@@ -211,7 +231,7 @@ export class PactDatabase {
         } catch (cause) {
           throw new DatabaseMigrationError(filePath, { cause, stagingFilePath })
         }
-        PactDatabase.requireCompatibleHistory(sqlite, migrations, filePath, true)
+        checkedHistory = PactDatabase.requireCompatibleHistory(sqlite, migrations, filePath, true)
         sqlite.close()
         sqlite = undefined
         checkDeadline()
@@ -222,8 +242,8 @@ export class PactDatabase {
       } else {
         PactDatabase.requireRegularFile(filePath)
         sqlite = new Database(filePath, { readonly: true, fileMustExist: true, timeout: 0 })
-        const applied = PactDatabase.requireCompatibleHistory(sqlite, migrations, filePath)
-        if (applied < migrations.length) {
+        checkedHistory = PactDatabase.requireCompatibleHistory(sqlite, migrations, filePath)
+        if (checkedHistory.applied < migrations.length) {
           checkDeadline()
           const reservedBackup = options.backupFilePath
             ? resolve(options.backupFilePath)
@@ -250,7 +270,8 @@ export class PactDatabase {
             })
             const backup = new Database(reservedBackup, { readonly: true, fileMustExist: true })
             try {
-              if (PactDatabase.requireCompatibleHistory(backup, migrations, filePath) !== applied)
+              const history = PactDatabase.requireCompatibleHistory(backup, migrations, filePath)
+              if (!sameMigrationHistory(history, checkedHistory))
                 throw new Error('Backup history differs')
             } finally {
               backup.close()
@@ -269,13 +290,25 @@ export class PactDatabase {
       checkDeadline()
       sqlite = new Database(filePath, { fileMustExist: true, timeout: 0 })
       // The lock remains held over the readonly-to-writable transition and revalidation.
-      const applied = PactDatabase.requireCompatibleHistory(sqlite, migrations, filePath)
+      const openedHistory = PactDatabase.requireCompatibleHistory(sqlite, migrations, filePath)
+      if (!sameMigrationHistory(openedHistory, checkedHistory))
+        throw new DatabaseOpenError(
+          'DATABASE_INCOMPATIBLE',
+          'migration-history-changed-during-open',
+          filePath,
+          backupFilePath ? { backupFilePath } : undefined,
+        )
       sqlite.pragma('foreign_keys = ON')
       sqlite.pragma('journal_mode = WAL')
       const drizzleDatabase = createDrizzleDatabase(sqlite, { schema })
-      if (applied < migrations.length) {
+      if (openedHistory.applied < migrations.length) {
         try {
-          PactDatabase.applyMigrations(drizzleDatabase, migrations, applied, checkDeadline)
+          PactDatabase.applyMigrations(
+            drizzleDatabase,
+            migrations,
+            openedHistory.applied,
+            checkDeadline,
+          )
         } catch (cause) {
           throw new DatabaseMigrationError(filePath, {
             cause,
@@ -389,7 +422,16 @@ export class PactDatabase {
         .filter((statement) => statement.trim())
       if (statements.length === 0 || statements.length > 4096)
         throw new Error('Invalid SQL statement inventory')
-      return { hash: createHash('sha256').update(bytes).digest('hex'), createdAt, statements }
+      const hash = createHash('sha256').update(bytes).digest('hex')
+      if (index !== RETIRED_GROUP_CLEANUP.index) return { hash, createdAt, statements }
+      // Both variants have the same schema. Execute only the pinned replacement.
+      if (
+        tag !== RETIRED_GROUP_CLEANUP.tag ||
+        createdAt !== RETIRED_GROUP_CLEANUP.createdAt ||
+        hash !== RETIRED_GROUP_CLEANUP.hash
+      )
+        throw new Error('Invalid replacement for the retired Session group cleanup migration.')
+      return { hash, createdAt, statements, legacyHash: RETIRED_GROUP_CLEANUP.legacyHash }
     })
   }
 
@@ -398,7 +440,7 @@ export class PactDatabase {
     migrations: Migration[],
     filePath: string,
     exact = false,
-  ): number {
+  ): MigrationHistory {
     const fail = (reason: string): never => {
       throw new DatabaseOpenError('DATABASE_INCOMPATIBLE', reason, filePath)
     }
@@ -468,13 +510,17 @@ export class PactDatabase {
       const expected = migrations[index]!
       if (
         typeof row.hash !== 'string' ||
-        row.hash !== expected.hash ||
+        (row.hash !== expected.hash && (exact || row.hash !== expected.legacyHash)) ||
         row.createdAt !== expected.createdAt
       )
         return fail('divergent-migration-history')
     }
     if (exact && rows.length !== migrations.length) return fail('incomplete-initialization')
-    return rows.length
+    return {
+      applied: rows.length,
+      legacyGroupCleanupApplied:
+        rows[RETIRED_GROUP_CLEANUP.index]?.hash === RETIRED_GROUP_CLEANUP.legacyHash,
+    }
   }
 
   private static applyMigrations(

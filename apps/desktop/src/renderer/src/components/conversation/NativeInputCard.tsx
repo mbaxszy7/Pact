@@ -11,12 +11,13 @@ import {
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 
-import type {
-  NativeInputField,
-  NativeInputRespond,
-  NativeInputValues,
-  NativePermissionRequest,
-  RuntimeAgentId,
+import {
+  agentDisplayName,
+  type NativeInputField,
+  type NativeInputRespond,
+  type NativeInputValues,
+  type NativePermissionRequest,
+  type RuntimeAgentId,
 } from '@pact/contracts'
 
 import type { NativeInputDraft } from './useConversation'
@@ -55,7 +56,7 @@ export function NativeInputCard({
   const [actionError, setError] = useState<string>()
   const error = actionError ?? reader.error
   const identity = { operationId: request.operationId!, requestId: request.id }
-  const agentName = agentId === 'codex' ? 'Codex' : 'Claude Code'
+  const agentName = agentDisplayName(agentId)
   const heading = `${agentName} needs ${request.kind === 'url' ? 'authorization' : 'your input'}`
   const load = (): void => {
     setError(undefined)
@@ -81,10 +82,10 @@ export function NativeInputCard({
     setBusy(true)
     void onRespond({ ...identity, action, ...(action === 'accept' ? { values } : {}) })
       .then((ok) => {
-        if (!ok) setError('Check your answers and the notification, then try again.')
+        if (!ok) setError('Couldn’t submit your response. Check your entries and try again.')
         return undefined
       })
-      .catch(() => setError('The native answer could not be sent. Try again.'))
+      .catch(() => setError('Couldn’t send your response. Try again.'))
       .finally(() => setBusy(false))
   }
   const open = (): void => {
@@ -96,7 +97,7 @@ export function NativeInputCard({
         if (!result.ok) setError(result.error.message)
         return undefined
       })
-      .catch(() => setError('The native authorization page could not open.'))
+      .catch(() => setError('Couldn’t open the sign-in page.'))
       .finally(() => setBusy(false))
   }
   const fieldControl = (field: NativeInputField): React.JSX.Element => {
@@ -288,107 +289,111 @@ export function NativeInputCard({
     request.kind === 'url' ? ShieldCheck : request.kind === 'form' ? ListChecks : MessageSquareText
   return (
     <section
-      className="@container mt-group w-full min-w-0 overflow-hidden rounded-message border border-border bg-surface-raised text-caption"
+      className="@container w-full min-w-0 overflow-hidden rounded-message border border-border bg-surface-raised text-caption"
       aria-label={`${agentName} native input`}
       data-pact-native-input={request.id}
       aria-busy={busy || reader.loading}
     >
-      <header className="flex items-start gap-2.5 px-4 pt-4">
-        <RequestIcon
-          aria-hidden="true"
-          className="mt-0.5 size-4 shrink-0 text-secondary"
-          strokeWidth={1.75}
-        />
-        <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
-            <p className="font-medium text-primary">{heading}</p>
-            {source ? (
-              <span className="max-w-56 truncate text-secondary" title={details?.title}>
-                {source}
-              </span>
-            ) : null}
-          </div>
-          {details ? (
-            <>
-              {!source && details.title !== heading ? (
-                <p className="mt-1 whitespace-pre-wrap break-words text-primary">{details.title}</p>
+      <div className="max-h-[min(40vh,28rem)] overflow-auto">
+        <header className="flex items-start gap-2.5 px-4 pt-4">
+          <RequestIcon
+            aria-hidden="true"
+            className="mt-0.5 size-4 shrink-0 text-secondary"
+            strokeWidth={1.75}
+          />
+          <div className="min-w-0 flex-1">
+            <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
+              <p className="font-medium text-primary">{heading}</p>
+              {source ? (
+                <span className="max-w-56 truncate text-secondary" title={details?.title}>
+                  {source}
+                </span>
               ) : null}
-              {details.message ? (
-                <p className="mt-1.5 max-h-32 overflow-auto whitespace-pre-wrap break-words leading-relaxed text-secondary">
-                  {details.message}
-                </p>
-              ) : null}
-            </>
-          ) : (
-            <p className="mt-1 text-secondary">Loading native request…</p>
-          )}
-        </div>
-      </header>
-      {details?.kind === 'url' ? (
-        <div className="px-4 pb-4 pt-4">
-          <div className="flex items-center gap-2 text-primary">
-            <Globe
-              aria-hidden="true"
-              className="size-4 shrink-0 text-secondary"
-              strokeWidth={1.75}
-            />
-            <p className="min-w-0 break-all font-medium">{authorizationUrl?.origin}</p>
+            </div>
+            {details ? (
+              <>
+                {!source && details.title !== heading ? (
+                  <p className="mt-1 whitespace-pre-wrap break-words text-primary">
+                    {details.title}
+                  </p>
+                ) : null}
+                {details.message ? (
+                  <p className="mt-1.5 max-h-32 overflow-auto whitespace-pre-wrap break-words leading-relaxed text-secondary">
+                    {details.message}
+                  </p>
+                ) : null}
+              </>
+            ) : (
+              <p className="mt-1 text-secondary">Loading native request…</p>
+            )}
           </div>
-          <p className="mt-1.5 text-secondary">Sign-in happens in your browser.</p>
-          <details className="group mt-2 text-secondary">
-            <summary className="flex w-fit cursor-pointer list-none items-center gap-1 rounded-control py-1 hover:text-primary focus-visible:outline-2 focus-visible:outline-focus [&::-webkit-details-marker]:hidden">
-              <ChevronDown
+        </header>
+        {details?.kind === 'url' ? (
+          <div className="px-4 pb-4 pt-4">
+            <div className="flex items-center gap-2 text-primary">
+              <Globe
                 aria-hidden="true"
-                className="size-3.5 transition-transform group-open:rotate-180"
+                className="size-4 shrink-0 text-secondary"
                 strokeWidth={1.75}
               />
-              Full authorization URL
-            </summary>
-            <p className="mt-1 max-h-24 overflow-auto break-all font-mono text-code text-primary">
-              {details.url}
-            </p>
-          </details>
-        </div>
-      ) : details ? (
-        <div
-          className={`grid gap-4 px-4 py-4 ${details.kind === 'form' ? '@min-[30rem]:grid-cols-2' : ''}`}
-        >
-          {details.fields.slice(page * PAGE_FIELDS, (page + 1) * PAGE_FIELDS).map((field) => (
-            <fieldset
-              key={field.id}
-              className={`min-w-0 ${field.type === 'boolean' ? 'flex flex-col justify-center' : ''}`}
-            >
-              {field.type !== 'boolean' ? (
-                <legend className="mb-1.5 w-full whitespace-pre-wrap break-words font-medium text-primary">
-                  {field.label}
-                  {field.required ? ' *' : ''}
-                </legend>
-              ) : null}
-              {field.description && details.kind === 'questions' ? (
-                <p className="mb-2 break-words text-secondary">{field.description}</p>
-              ) : null}
-              {fieldControl(field)}
-              {field.description && details.kind !== 'questions' ? (
-                <p className="mt-1.5 break-words text-secondary">{field.description}</p>
-              ) : null}
-            </fieldset>
-          ))}
-        </div>
-      ) : null}
-      {error ? (
-        <p role="alert" className="px-4 pb-3 text-danger">
-          {error}
-          {!details ? (
-            <button
-              type="button"
-              onClick={load}
-              className="ml-2 cursor-pointer rounded-control px-2 py-1 text-primary hover:bg-surface-muted"
-            >
-              Retry
-            </button>
-          ) : null}
-        </p>
-      ) : null}
+              <p className="min-w-0 break-all font-medium">{authorizationUrl?.origin}</p>
+            </div>
+            <p className="mt-1.5 text-secondary">Sign-in happens in your browser.</p>
+            <details className="group mt-2 text-secondary">
+              <summary className="flex w-fit cursor-pointer list-none items-center gap-1 rounded-control py-1 hover:text-primary focus-visible:outline-2 focus-visible:outline-focus [&::-webkit-details-marker]:hidden">
+                <ChevronDown
+                  aria-hidden="true"
+                  className="size-3.5 transition-transform group-open:rotate-180"
+                  strokeWidth={1.75}
+                />
+                View sign-in URL
+              </summary>
+              <p className="mt-1 max-h-24 overflow-auto break-all font-mono text-code text-primary">
+                {details.url}
+              </p>
+            </details>
+          </div>
+        ) : details ? (
+          <div
+            className={`grid gap-4 px-4 py-4 ${details.kind === 'form' ? '@min-[30rem]:grid-cols-2' : ''}`}
+          >
+            {details.fields.slice(page * PAGE_FIELDS, (page + 1) * PAGE_FIELDS).map((field) => (
+              <fieldset
+                key={field.id}
+                className={`min-w-0 ${field.type === 'boolean' ? 'flex flex-col justify-center' : ''}`}
+              >
+                {field.type !== 'boolean' ? (
+                  <legend className="mb-1.5 w-full whitespace-pre-wrap break-words font-medium text-primary">
+                    {field.label}
+                    {field.required ? ' *' : ''}
+                  </legend>
+                ) : null}
+                {field.description && details.kind === 'questions' ? (
+                  <p className="mb-2 break-words text-secondary">{field.description}</p>
+                ) : null}
+                {fieldControl(field)}
+                {field.description && details.kind !== 'questions' ? (
+                  <p className="mt-1.5 break-words text-secondary">{field.description}</p>
+                ) : null}
+              </fieldset>
+            ))}
+          </div>
+        ) : null}
+        {error ? (
+          <p role="alert" className="px-4 pb-3 text-danger">
+            {error}
+            {!details ? (
+              <button
+                type="button"
+                onClick={load}
+                className="ml-2 cursor-pointer rounded-control px-2 py-1 text-primary hover:bg-surface-muted"
+              >
+                Retry
+              </button>
+            ) : null}
+          </p>
+        ) : null}
+      </div>
       <footer className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2 border-t border-border px-4 py-3">
         {pages > 1 ? (
           <div className="flex items-center gap-1">

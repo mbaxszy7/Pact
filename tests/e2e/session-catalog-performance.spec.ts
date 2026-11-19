@@ -110,8 +110,15 @@ test(
         })
         // oxlint-disable-next-line eslint/no-await-in-loop
         await loadMore.click()
+        // oxlint-disable-next-line eslint/no-await-in-loop
+        await window
+          .getByRole('button', { name: `Session ${840 - index * 50}`, exact: true })
+          .waitFor()
       }
       await expect(loadMore).toHaveCount(0)
+      await navigation.evaluate((element) => {
+        element.scrollTop = element.scrollHeight
+      })
       await expect(window.getByRole('button', { name: 'Session 0', exact: true })).toBeVisible()
       const mounted = await navigation.evaluate((element) => ({
         rows: element.querySelectorAll('li[data-session-menu]').length,
@@ -138,7 +145,6 @@ test(
               primaryAgentId: settings.primaryAgentId,
               agents: settings.agents,
               maxDiscussionRounds: 5,
-              runningMessagePolicy: settings.runningMessagePolicy,
               maxReviewCycles: settings.maxReviewCycles,
               maxRepairAttempts: settings.maxRepairAttempts,
             },
@@ -280,7 +286,11 @@ test(
         window.getByRole('button', { name: 'Rename Project Project 999', exact: true }),
       ).toHaveCount(0)
       await expect(navigation.getByText('Project 999', { exact: true })).toHaveCount(0)
-      await window.getByRole('button', { name: 'Undo', exact: true }).click()
+      const archiveNotice = window.getByRole('region', { name: 'Archive results', exact: true })
+      await archiveNotice.getByRole('button', { name: 'View', exact: true }).click()
+      await archiveNotice
+        .getByRole('button', { name: 'Undo archive of Project 999', exact: true })
+        .click()
       await expect(
         window.getByRole('button', { name: 'Rename Project Project 999', exact: true }),
       ).toBeVisible()

@@ -1,6 +1,7 @@
 appId: com.pact.desktop
 productName: Pact
 asar: true
+beforePack: build/before-pack.mjs
 afterPack: build/after-pack.mjs
 directories:
   buildResources: build
@@ -12,6 +13,7 @@ extraResources:
       - '**/*'
 files:
   - out/**
+  - '!out/native/**'
   - package.json
   - '!**/*.map'
   - '!**/.vscode/**'
@@ -38,6 +40,11 @@ mac:
 win:
   executableName: Pact
   icon: build/icon.ico
+  extraResources:
+    - from: out/native/owned-process-group-win32-${arch}.exe
+      to: native/owned-process-group-win32-${arch}.exe
+    - from: out/native/owned-process-group-win32-${arch}.exe.json
+      to: native/owned-process-group-win32-${arch}.exe.json
   extraFiles:
     - from: build/icon.ico
       to: uninstallerIcon.ico

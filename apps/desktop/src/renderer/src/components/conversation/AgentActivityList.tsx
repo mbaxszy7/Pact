@@ -53,8 +53,8 @@ export function AgentActivityList({
   if (activities.length === 0) return null
 
   const label = active
-    ? `Working · ${activities.length} ${partial ? 'shown' : activities.length === 1 ? 'step' : 'steps'}`
-    : `Work log · ${activities.length} ${partial ? 'shown' : activities.length === 1 ? 'step' : 'steps'}`
+    ? `Working · ${activities.length} ${partial ? 'steps shown' : activities.length === 1 ? 'step' : 'steps'}`
+    : `Work log · ${activities.length} ${partial ? 'steps shown' : activities.length === 1 ? 'step' : 'steps'}`
 
   return (
     <section className="agent-activity" aria-label="Agent activity">

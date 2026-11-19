@@ -19,6 +19,20 @@ import {
 
 export class WorkspaceArchiveConflictError extends Error {}
 
+function sessionArchiveScopeFilter(database: PactDrizzleDatabase, sessionId: string) {
+  const target = database
+    .select({ parentSessionId: sessions.parentSessionId })
+    .from(sessions)
+    .where(eq(sessions.id, sessionId))
+    .get()
+  return or(
+    isNull(operations.sessionId),
+    eq(operations.sessionId, sessionId),
+    ...(target?.parentSessionId ? [eq(operations.sessionId, target.parentSessionId)] : []),
+    sql`${operations.sessionId} IN (SELECT id FROM sessions WHERE parent_session_id = ${sessionId})`,
+  )
+}
+
 export function workspaceArchiveBlocked(
   database: PactDrizzleDatabase,
   projectId: string,
@@ -35,9 +49,7 @@ export function workspaceArchiveBlocked(
           // Match the partial index predicate literally; bound state parameters do not imply it.
           sql`${operations.state} IN ('stopping', 'unresolved')`,
           allowUnresolved ? eq(operations.state, 'stopping') : undefined,
-          sessionId
-            ? or(isNull(operations.sessionId), eq(operations.sessionId, sessionId))
-            : undefined,
+          sessionId ? sessionArchiveScopeFilter(database, sessionId) : undefined,
         ),
       )
       .limit(1)
@@ -77,6 +89,7 @@ export function assertSessionAvailable(
   const session = database
     .select({
       projectId: sessions.projectId,
+      parentSessionId: sessions.parentSessionId,
       archivedAt: sessions.archivedAt,
       status: sessions.status,
     })
@@ -85,6 +98,17 @@ export function assertSessionAvailable(
     .get()
   if (!session || session.archivedAt || session.status === 'archived')
     throw new WorkspaceArchiveConflictError('This Session is archived. Nothing new was started.')
+  if (session.parentSessionId) {
+    const parent = database
+      .select({ archivedAt: sessions.archivedAt, status: sessions.status })
+      .from(sessions)
+      .where(eq(sessions.id, session.parentSessionId))
+      .get()
+    if (!parent || parent.archivedAt || parent.status === 'archived')
+      throw new WorkspaceArchiveConflictError(
+        'The parent Session is archived. Nothing new was started.',
+      )
+  }
   const project = database
     .select({ archivedAt: projects.archivedAt })
     .from(projects)
@@ -154,7 +178,7 @@ export function archiveScopeHasNativeWork(
       .where(
         and(
           scope.kind === 'session'
-            ? eq(sessions.id, scope.sessionId)
+            ? or(eq(sessions.id, scope.sessionId), eq(sessions.parentSessionId, scope.sessionId))
             : eq(sessions.projectId, scope.projectId),
           sql`(
       EXISTS (SELECT 1 FROM agent_runs r WHERE r.session_id=${sessions.id} AND r.fork_source_run_id IS NULL ${ignored}
@@ -186,7 +210,7 @@ export class WorkspaceArchiveRepository {
           sql`${operations.state} IN ('stopping', 'unresolved')`,
           eq(operations.state, 'unresolved'),
           scope.kind === 'session'
-            ? or(isNull(operations.sessionId), eq(operations.sessionId, scope.sessionId))
+            ? sessionArchiveScopeFilter(this.database, scope.sessionId)
             : undefined,
         ),
       )
@@ -215,7 +239,7 @@ export class WorkspaceArchiveRepository {
       .where(
         and(
           scope.kind === 'session'
-            ? eq(sessions.id, scope.sessionId)
+            ? or(eq(sessions.id, scope.sessionId), eq(sessions.parentSessionId, scope.sessionId))
             : eq(sessions.projectId, scope.projectId),
           inArray(collaborationInputs.state, ['accepted', 'blocked']),
         ),

@@ -9,12 +9,13 @@ import {
 } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 
-import type {
-  AgentRun,
-  CollaborationSession,
-  RuntimeAgentId,
-  SessionPermissionMode,
-  SessionPermissionSaveInput,
+import {
+  agentDisplayName,
+  type AgentRun,
+  type CollaborationSession,
+  type RuntimeAgentId,
+  type SessionPermissionMode,
+  type SessionPermissionSaveInput,
 } from '@pact/contracts'
 
 const modes = {
@@ -35,7 +36,7 @@ const modes = {
   },
   full: {
     label: 'Full access',
-    description: 'Broad access without routine approval prompts.',
+    description: 'No tool-approval prompts. Task and native policy limits still apply.',
     Icon: ShieldAlert,
   },
 }
@@ -44,7 +45,7 @@ function focusConfirmationCancel(button: HTMLButtonElement | null): void {
   button?.focus()
 }
 
-/** One next-task choice; the native runtime still owns every live approval. */
+/** One next-task choice, with the active Run's frozen scope described in existing help. */
 export function PermissionMenu({
   session,
   agent = session.settings.primaryAgentId,
@@ -91,13 +92,25 @@ export function PermissionMenu({
       trigger.current?.focus({ preventScroll: true })
     }
   }, [visible])
-  const selected =
-    session.settings.permissionModes?.[agent] ?? (agent === 'claude' ? 'ask' : 'native')
+  const fullName = agentDisplayName(agent)
+  const shortName = agent === 'claude' ? 'Claude' : agent === 'codex' ? 'Codex' : 'Antigravity'
+  const fallbackMode: SessionPermissionMode = agent === 'codex' ? 'native' : 'ask'
+  const selected = session.settings.permissionModes?.[agent] ?? fallbackMode
   const { label, Icon } = modes[selected]
+  const current =
+    run?.agentId === agent && (busy || ['starting', 'running', 'recovering'].includes(run.status))
+      ? run
+      : undefined
+  const currentMode = current ? modes[current.permissionMode ?? fallbackMode].label : undefined
+  const readOnly =
+    current?.collaboration && !['implement', 'repair'].includes(current.collaboration.stage)
+  const currentScope = currentMode
+    ? `Current task: ${currentMode}.${readOnly ? ' Project changes are blocked during this planning or review task.' : ''}`
+    : ''
   const pending =
     run?.agentId === agent &&
     (busy || ['starting', 'running', 'recovering'].includes(run.status)) &&
-    (run.permissionMode ?? (agent === 'claude' ? 'ask' : 'native')) !== selected
+    (run.permissionMode ?? fallbackMode) !== selected
   const choose = async (
     mode: SessionPermissionMode,
     confirmedFullAccess = false,
@@ -137,14 +150,14 @@ export function PermissionMenu({
   const id = `permissions-${session.id}-${agent}`
   const anchor = `--${id}`
   return (
-    <div className="flex min-h-8 min-w-0 max-w-full flex-wrap items-center gap-2 text-caption">
+    <div className="flex min-h-8 min-w-0 max-w-full items-center text-caption">
       <button
         ref={trigger}
         type="button"
         popoverTarget={id}
         disabled={disabled || saving}
-        title="Permissions for the next task"
-        aria-label={`${agent === 'claude' ? 'Claude Code' : 'Codex'} permissions: ${label}`}
+        title={`Permissions for the next task: ${label}.${currentScope ? ` ${currentScope}` : ''}`}
+        aria-label={`${fullName} permissions for the next task: ${label}`}
         aria-haspopup="menu"
         aria-expanded={expanded}
         style={{ anchorName: anchor }}
@@ -156,11 +169,15 @@ export function PermissionMenu({
           strokeWidth={1.75}
         />
         <span className={`truncate ${selected === 'full' ? 'text-status-warning-foreground' : ''}`}>
-          {agent === 'claude' ? 'Claude' : 'Codex'} · {label}
+          {shortName} · {label}
         </span>
         <ChevronDown aria-hidden="true" className="pact-agent-chevron size-3 shrink-0" />
       </button>
-      {pending ? <output className="text-tertiary">Pending · next task</output> : null}
+      {pending ? (
+        <output className="truncate text-tertiary" title="Pending · next task">
+          &nbsp; Pending · next task
+        </output>
+      ) : null}
       <div
         id={id}
         ref={panel}
@@ -180,11 +197,9 @@ export function PermissionMenu({
           maxHeight: 'calc(100dvh - 64px)',
         }}
         className="pact-agent-popover pact-composer-popover"
-        aria-label={`${agent === 'claude' ? 'Claude Code' : 'Codex'} permissions`}
+        aria-label={`${fullName} permissions`}
       >
-        <p className="pact-composer-menu-heading">
-          {agent === 'claude' ? 'Claude Code' : 'Codex'} permissions
-        </p>
+        <p className="pact-composer-menu-heading">{fullName} permissions</p>
         {!confirming &&
           (['native', 'ask', 'auto', 'full'] as const).map((mode) => {
             const option = modes[mode]
@@ -213,14 +228,14 @@ export function PermissionMenu({
         {confirming ? (
           <section id={`${id}-confirmation`} className="mt-1 px-3 pt-1 pb-1">
             <p className="font-medium text-status-warning-foreground">
-              Enable Full access for {agent === 'claude' ? 'Claude Code' : 'Codex'}?
+              Enable Full access for {fullName}?
             </p>
             <p className="mt-1.5 leading-relaxed text-secondary">
-              Allow files and network access beyond this project without routine approval. Native
-              policy still applies.
+              Allow file edits and network access beyond this project without asking first. Built-in
+              safety limits and plan or question prompts still apply.
             </p>
             <p className="mt-1.5 leading-relaxed text-secondary">
-              Only this Agent in this session, including restarts and rebuilds.
+              Applies only to {fullName} in this session.
             </p>
             <div className="mt-2.5 flex justify-end gap-1.5">
               <button
@@ -251,7 +266,7 @@ export function PermissionMenu({
                 Saving…
               </>
             ) : (
-              'Applies to the next task. Current work is unchanged.'
+              `Applies to the next task. ${currentScope || 'Current work is unchanged.'}`
             )}
           </p>
         )}

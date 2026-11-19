@@ -1,7 +1,16 @@
+import { randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { IPC_CHANNELS, IPC_TRAFFIC_UNIT, type DesktopBridge } from '@pact/contracts'
+import {
+  IPC_CHANNELS,
+  IPC_TRAFFIC_UNIT,
+  SIDE_CHAT_SYNC_INLINE_BYTES,
+  type CreateSideChatReceipt,
+  type DesktopBridge,
+  type ListSideChatsPage,
+  type SideChatSyncMainReceipt,
+} from '@pact/contracts'
 
 import {
   LogicalIpcTrafficCollector,
@@ -251,5 +260,234 @@ describe('Preload logical IPC observation at named bridge seams', () => {
     expect(
       result.value.ipcTraffic?.owners.find((owner) => owner.owner === 'renderer-bridge')?.issues,
     ).toContain('transport_error')
+  })
+})
+
+function sideChatReceipt(parentSessionId: string, operationId: string): CreateSideChatReceipt {
+  const now = new Date().toISOString()
+  return {
+    operationId,
+    sideChat: {
+      id: randomUUID(),
+      parentSessionId,
+      projectId: randomUUID(),
+      title: 'New side chat',
+      origin: 'btw',
+      anchorQuotePreview: null,
+      previewText: null,
+      status: 'draft',
+      isRunning: false,
+      needsAttention: false,
+      hasUnread: false,
+      createdAt: now,
+      updatedAt: now,
+    },
+    cutoffId: randomUUID(),
+    maxMessageSequence: 2,
+  }
+}
+
+describe('Side-chat DesktopBridge Zod validation at named seams', () => {
+  it('validates all 6 side-chat RPC inputs and responses and forwards multi-session interest', async () => {
+    const { bridge } = await load(false)
+    const parentSessionId = randomUUID()
+    const createOpId = randomUUID()
+    const createReceipt = sideChatReceipt(parentSessionId, createOpId)
+    const sideChatId = createReceipt.sideChat.id
+    const listPage: ListSideChatsPage = {
+      parentSessionId,
+      items: [createReceipt.sideChat],
+      nextCursor: null,
+      prevCursor: null,
+      hasMoreOlder: false,
+      hasMoreNewer: false,
+      activeCount: 0,
+      attentionCount: 0,
+      unreadCount: 0,
+    }
+    const syncOpId = randomUUID()
+    const syncReceipt: SideChatSyncMainReceipt = {
+      operationId: syncOpId,
+      sideChatId,
+      parentSessionId,
+      cutoffId: randomUUID(),
+      disposition: 'sent',
+      mainMessageId: randomUUID(),
+      queuedOperationId: null,
+    }
+
+    harness.invoke.mockImplementation(async (channel) => {
+      switch (channel) {
+        case IPC_CHANNELS.sideChatCreate:
+          return { ok: true, value: createReceipt }
+        case IPC_CHANNELS.sideChatCreateReceipt:
+          return { ok: true, value: createReceipt }
+        case IPC_CHANNELS.sideChatList:
+          return { ok: true, value: listPage }
+        case IPC_CHANNELS.sideChatDiscardEmpty:
+          return { ok: true, value: { discarded: true } }
+        case IPC_CHANNELS.sideChatSyncMain:
+          return { ok: true, value: syncReceipt }
+        case IPC_CHANNELS.sideChatSyncMainReceipt:
+          return { ok: true, value: null }
+        default:
+          return { ok: true, value: { ready: true } }
+      }
+    })
+
+    await expect(
+      bridge.createSideChat({ origin: 'btw', operationId: createOpId, parentSessionId }),
+    ).resolves.toEqual({ ok: true, value: createReceipt })
+    expect(harness.invoke).toHaveBeenLastCalledWith(IPC_CHANNELS.sideChatCreate, {
+      origin: 'btw',
+      operationId: createOpId,
+      parentSessionId,
+    })
+
+    await expect(bridge.readCreateSideChatReceipt({ operationId: createOpId })).resolves.toEqual({
+      ok: true,
+      value: createReceipt,
+    })
+    expect(harness.invoke).toHaveBeenLastCalledWith(IPC_CHANNELS.sideChatCreateReceipt, {
+      operationId: createOpId,
+    })
+
+    await expect(
+      bridge.listSideChats({ parentSessionId, direction: 'older', limit: 5 }),
+    ).resolves.toEqual({
+      ok: true,
+      value: listPage,
+    })
+    expect(harness.invoke).toHaveBeenLastCalledWith(IPC_CHANNELS.sideChatList, {
+      parentSessionId,
+      direction: 'older',
+      limit: 5,
+    })
+
+    await expect(bridge.discardEmptySideChat({ sideChatId })).resolves.toEqual({
+      ok: true,
+      value: { discarded: true },
+    })
+    expect(harness.invoke).toHaveBeenLastCalledWith(IPC_CHANNELS.sideChatDiscardEmpty, {
+      sideChatId,
+    })
+
+    await expect(
+      bridge.syncSideChatToMain({
+        operationId: syncOpId,
+        sideChatId,
+        content: '@Main Summarize key findings',
+        imageIds: [],
+        commentIds: [],
+        skills: [],
+        expectedCommentsRevision: 0,
+      }),
+    ).resolves.toEqual({ ok: true, value: syncReceipt })
+    expect(harness.invoke).toHaveBeenLastCalledWith(IPC_CHANNELS.sideChatSyncMain, {
+      operationId: syncOpId,
+      sideChatId,
+      content: '@Main Summarize key findings',
+      imageIds: [],
+      commentIds: [],
+      skills: [],
+      expectedCommentsRevision: 0,
+    })
+
+    await expect(bridge.readSyncSideChatReceipt({ operationId: syncOpId })).resolves.toEqual({
+      ok: true,
+      value: null,
+    })
+    expect(harness.invoke).toHaveBeenLastCalledWith(IPC_CHANNELS.sideChatSyncMainReceipt, {
+      operationId: syncOpId,
+    })
+
+    await bridge.setConversationInterest([parentSessionId, sideChatId], 3)
+    expect(harness.invoke).toHaveBeenLastCalledWith(IPC_CHANNELS.conversationInterest, {
+      sessionIds: [parentSessionId, sideChatId],
+      generation: 3,
+    })
+  })
+
+  it('rejects invalid inputs before invoking IPC and rejects malformed responses for all 6 side-chat RPCs', async () => {
+    const { bridge } = await load(false)
+    const parentSessionId = randomUUID()
+    const sideChatId = randomUUID()
+    const opId = randomUUID()
+
+    await expect(
+      bridge.createSideChat({
+        origin: 'selection',
+        operationId: opId,
+        parentSessionId,
+        messageId: randomUUID(),
+        quote: 'quoted',
+        startOffset: 5,
+        endOffset: 5,
+      }),
+    ).rejects.toThrow(/range is invalid/u)
+    await expect(bridge.readCreateSideChatReceipt({ operationId: 'not-a-uuid' })).rejects.toThrow(
+      /UUID/iu,
+    )
+    await expect(
+      bridge.listSideChats({ parentSessionId, direction: 'older', limit: 6 }),
+    ).rejects.toThrow(/<=5|at most 5|too_big/iu)
+    await expect(bridge.discardEmptySideChat({ sideChatId: 'not-a-uuid' })).rejects.toThrow(
+      /UUID/iu,
+    )
+    await expect(
+      bridge.syncSideChatToMain({
+        operationId: opId,
+        sideChatId,
+        content: '   ',
+        imageIds: [],
+        commentIds: [],
+        skills: [],
+        expectedCommentsRevision: 0,
+      }),
+    ).rejects.toThrow(/required/u)
+    await expect(
+      bridge.syncSideChatToMain({
+        operationId: opId,
+        sideChatId,
+        content: 'a'.repeat(SIDE_CHAT_SYNC_INLINE_BYTES + 1),
+        imageIds: [],
+        commentIds: [],
+        skills: [],
+        expectedCommentsRevision: 0,
+      }),
+    ).rejects.toThrow(/64 KiB/u)
+    await expect(
+      bridge.syncSideChatToMain({
+        operationId: opId,
+        sideChatId,
+        inputId: randomUUID(),
+        content: '',
+        imageIds: [],
+        commentIds: [],
+        skills: [],
+        expectedCommentsRevision: 0,
+      }),
+    ).rejects.toThrow(/contentSha256/u)
+    await expect(
+      bridge.syncSideChatToMain({
+        operationId: opId,
+        sideChatId,
+        content: 'dup comments',
+        imageIds: [],
+        commentIds: [opId, opId],
+        skills: [],
+        expectedCommentsRevision: 0,
+      }),
+    ).rejects.toThrow(/unique/u)
+    await expect(bridge.readSyncSideChatReceipt({ operationId: 'bad-id' })).rejects.toThrow(
+      /UUID/iu,
+    )
+
+    expect(harness.invoke).not.toHaveBeenCalled()
+
+    harness.invoke.mockResolvedValueOnce({ ok: true, value: { discarded: 'yes' } })
+    await expect(bridge.discardEmptySideChat({ sideChatId })).rejects.toThrow(/boolean/iu)
+    harness.invoke.mockResolvedValueOnce({ ok: true, value: { unexpected: true } })
+    await expect(bridge.readCreateSideChatReceipt({ operationId: opId })).rejects.toThrow(/.+/u)
   })
 })

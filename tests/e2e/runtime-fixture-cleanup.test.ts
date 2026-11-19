@@ -1,11 +1,13 @@
 import { _electron as electron, test as playwrightTest } from '@playwright/test'
 import { EventEmitter } from 'node:events'
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { beforeEach, expect, it, vi } from 'vitest'
 
 import type { ProviderConfiguration } from './provider-environment.js'
+
+import { quitPact } from './native-quit.js'
 
 const failureProbe = vi.hoisted(() => ({
   missingReceipt: false,
@@ -14,6 +16,8 @@ const failureProbe = vi.hoisted(() => ({
   clientReleasedError: false,
   root: '',
   clients: [] as Array<{ released: boolean; closeCalls: number }>,
+  credentialDisposeFails: false,
+  credentialStores: [] as Array<{ disposeCalls: number }>,
 }))
 
 beforeEach(() => {
@@ -26,6 +30,8 @@ beforeEach(() => {
   failureProbe.clientReleasedError = false
   failureProbe.root = ''
   failureProbe.clients = []
+  failureProbe.credentialDisposeFails = false
+  failureProbe.credentialStores = []
 })
 
 vi.mock('../native/native-harness.js', async (original) => {
@@ -71,6 +77,31 @@ vi.mock('../native/native-harness.js', async (original) => {
           return undefined
         })
         return this.closing
+      }
+    },
+  }
+})
+
+vi.mock('./mac-credential-store.js', async (original) => {
+  const actual = await original<typeof import('./mac-credential-store.js')>()
+  return {
+    ...actual,
+    MacCredentialStore: class {
+      private readonly record = { disposeCalls: 0 }
+
+      constructor() {
+        failureProbe.credentialStores.push(this.record)
+      }
+
+      async prepare(): Promise<void> {}
+
+      async install(): Promise<void> {}
+
+      dispose(): Promise<void> {
+        this.record.disposeCalls++
+        return failureProbe.credentialDisposeFails
+          ? Promise.reject(new Error('Native credential store release is unconfirmed'))
+          : Promise.resolve()
       }
     },
   }
@@ -157,6 +188,85 @@ function controlledQuitApp(code: number, alreadyClosed: boolean) {
   // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- Controlled lifecycle boundaries verify diagnostics, not Windows kernel behavior.
   return app as unknown as Awaited<ReturnType<typeof electron.launch>>
 }
+
+function quitConfirmationRace() {
+  const closed = Promise.withResolvers<void>()
+  const clicked = Promise.withResolvers<void>()
+  const child: { pid: number; exitCode: number | null; signalCode: NodeJS.Signals | null } = {
+    pid: 1337,
+    exitCode: null,
+    signalCode: null,
+  }
+  const click = vi.fn<() => Promise<void>>(() => clicked.promise)
+  const evaluate = vi.fn<() => Promise<void>>(async () => undefined)
+  const app = {
+    process: () => child,
+    firstWindow: async () => ({
+      isClosed: () => child.exitCode !== null || child.signalCode !== null,
+      getByRole: () => ({ waitFor: async () => undefined, click }),
+    }),
+    waitForEvent: () => closed.promise,
+    evaluate,
+  }
+  return {
+    // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- Replay independent UI and physical-close events at the helper's Electron boundary.
+    app: app as unknown as Awaited<ReturnType<typeof electron.launch>>,
+    click,
+    evaluate,
+    clicked,
+    closed,
+    close(signal: NodeJS.Signals | null = null) {
+      child.exitCode = signal ? null : 0
+      child.signalCode = signal
+      closed.resolve()
+    },
+  }
+}
+
+it.each(['close-first', 'click-error-first'] as const)(
+  'accepts confirmed natural exit when the quit button disappears: %s',
+  async (order) => {
+    const f = quitConfirmationRace()
+    const result = quitPact(f.app)
+    const settled = result.then(
+      () => undefined,
+      (error: unknown) => error,
+    )
+    await vi.waitFor(() => expect(f.click).toHaveBeenCalledOnce())
+    if (order === 'close-first') f.close()
+    f.clicked.reject(new Error('The quit button detached during click'))
+    if (order === 'click-error-first') {
+      await Promise.resolve()
+      f.close()
+    }
+    expect(await settled).toBeUndefined()
+    await quitPact(f.app)
+    expect(f.evaluate).toHaveBeenCalledOnce()
+  },
+)
+
+it('keeps a failed quit click fatal when physical exit is not confirmed', async () => {
+  const f = quitConfirmationRace()
+  const failure = new Error('The exit control could not be clicked')
+  const result = quitPact(f.app).catch((error: unknown) => error)
+  await vi.waitFor(() => expect(f.click).toHaveBeenCalledOnce())
+  f.clicked.reject(failure)
+  await Promise.resolve()
+  f.closed.reject(new Error('Physical exit was not observed before its deadline'))
+  expect(await result).toBe(failure)
+})
+
+it('does not turn a forced exit during quit confirmation into successful cleanup', async () => {
+  const f = quitConfirmationRace()
+  const result = quitPact(f.app).then(
+    () => false,
+    () => true,
+  )
+  await vi.waitFor(() => expect(f.click).toHaveBeenCalledOnce())
+  f.close('SIGTERM')
+  f.clicked.reject(new Error('The quit button detached during click'))
+  expect(await result).toBe(true)
+})
 
 it.each([true, false])(
   'keeps wrapper exit 1 fatal and records both observation phases; already closed=%s',
@@ -604,3 +714,147 @@ it
   },
   10_000,
 )
+
+it('retains the directory and fixture reservation when native credential release fails', async () => {
+  if (process.platform !== 'darwin') return
+  const { createRuntimeFixture } = await import('./runtime-fixture.js')
+  failureProbe.credentialDisposeFails = true
+  const fixture = await createRuntimeFixture({
+    mode: 'ui',
+    nativeCredentialStore: true,
+  })
+  const retainers: Array<{ dispose(): Promise<void> }> = []
+  try {
+    expect(failureProbe.credentialStores).toHaveLength(1)
+    await expect(fixture.dispose()).rejects.toThrow(/unconfirmed|retained/u)
+    expect(failureProbe.credentialStores[0]?.disposeCalls).toBe(1)
+    // An unconfirmed release retains the directory and the fixture reservation.
+    expect((await stat(fixture.directory)).isDirectory()).toBe(true)
+    for (let index = 0; index < 7; index++)
+      // oxlint-disable-next-line no-await-in-loop -- Sequential reservations own the capacity count.
+      retainers.push(await createRuntimeFixture({ mode: 'ui' }))
+    await expect(createRuntimeFixture({ mode: 'ui' })).rejects.toThrow('eight')
+  } finally {
+    failureProbe.credentialDisposeFails = false
+    for (const retainer of retainers)
+      // oxlint-disable-next-line no-await-in-loop -- Each retainer must settle before manual cleanup.
+      await retainer.dispose().catch(() => undefined)
+    await rm(fixture.directory, { recursive: true, force: true })
+  }
+})
+
+it('releases a definite owned store after a cancelled create without a second delete', async () => {
+  if (process.platform !== 'darwin') return
+  const { MacCredentialStore } = await vi.importActual<typeof import('./mac-credential-store.js')>(
+    './mac-credential-store.js',
+  )
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'pact-runtime-e2e-')))
+  try {
+    const home = join(root, 'home')
+    await mkdir(home, { recursive: true, mode: 0o700 })
+    let createGate!: (result: { exitCode: number; stdout: string; stderr: string }) => void
+    const calls: string[][] = []
+    const store = new MacCredentialStore({
+      directory: root,
+      environment: { HOME: home },
+      isCurrent: () => true,
+      run: (executable, args) => {
+        calls.push([executable, ...args])
+        if (args[0] === 'create')
+          return new Promise<{ exitCode: number; stdout: string; stderr: string }>((done) => {
+            createGate = done
+          })
+        if (args[0] === 'delete')
+          return Promise.resolve({ exitCode: 0, stdout: '{"ok":true,"deleted":true}', stderr: '' })
+        return Promise.resolve({ exitCode: 0, stdout: '', stderr: '' })
+      },
+    })
+    const preparing = store.prepare()
+    await vi.waitFor(() => {
+      expect(calls.some((call) => call[1] === 'create')).toBe(true)
+    })
+    const disposal = store.dispose()
+    createGate({ exitCode: 0, stdout: '{"ok":true,"created":true}', stderr: '' })
+    await expect(preparing).rejects.toThrow(/disposing|owner/u)
+    await disposal
+    expect(calls.filter((call) => call[1] === 'delete')).toHaveLength(1)
+    await store.dispose()
+    expect(calls.filter((call) => call[1] === 'delete')).toHaveLength(1)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+it('retains an unrecognised create receipt without any delete or retry', async () => {
+  if (process.platform !== 'darwin') return
+  const { MacCredentialStore } = await vi.importActual<typeof import('./mac-credential-store.js')>(
+    './mac-credential-store.js',
+  )
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'pact-runtime-e2e-')))
+  try {
+    const home = join(root, 'home')
+    await mkdir(home, { recursive: true, mode: 0o700 })
+    const calls: string[][] = []
+    const store = new MacCredentialStore({
+      directory: root,
+      environment: { HOME: home },
+      isCurrent: () => true,
+      run: (executable, args) => {
+        calls.push([executable, ...args])
+        if (args[0] === 'create')
+          return Promise.resolve({ exitCode: 0, stdout: 'not-json', stderr: '' })
+        if (args[0] === 'delete')
+          return Promise.resolve({ exitCode: 0, stdout: '{"ok":true,"deleted":true}', stderr: '' })
+        return Promise.resolve({ exitCode: 0, stdout: '', stderr: '' })
+      },
+    })
+    await expect(store.prepare()).rejects.toThrow('unrecognised')
+    await expect(store.dispose()).rejects.toThrow('unconfirmed')
+    expect(calls.filter((call) => call[1] === 'delete')).toHaveLength(0)
+    await expect(store.dispose()).rejects.toThrow('unconfirmed')
+    expect(calls.filter((call) => call[1] === 'delete')).toHaveLength(0)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+it('retains a failed release even when the cleanup reply is shaped like success', async () => {
+  if (process.platform !== 'darwin') return
+  const { MacCredentialStore } = await vi.importActual<typeof import('./mac-credential-store.js')>(
+    './mac-credential-store.js',
+  )
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'pact-runtime-e2e-')))
+  try {
+    const home = join(root, 'home')
+    await mkdir(home, { recursive: true, mode: 0o700 })
+    const calls: string[][] = []
+    const store = new MacCredentialStore({
+      directory: root,
+      environment: { HOME: home },
+      isCurrent: () => true,
+      run: (executable, args) => {
+        calls.push([executable, ...args])
+        if (args[0] === 'create')
+          return Promise.resolve({
+            exitCode: 2,
+            stdout: '{"ok":false,"stage":"private-preferences","status":-1,"created":true}',
+            stderr: '',
+          })
+        if (args[0] === 'delete')
+          return Promise.resolve({
+            exitCode: 1,
+            stdout: '{"ok":true,"deleted":true}',
+            stderr: '',
+          })
+        return Promise.resolve({ exitCode: 0, stdout: '', stderr: '' })
+      },
+    })
+    await expect(store.prepare()).rejects.toThrow('private-preferences')
+    await expect(store.dispose()).rejects.toThrow('unconfirmed')
+    expect(calls.filter((call) => call[1] === 'delete')).toHaveLength(1)
+    await expect(store.dispose()).rejects.toThrow('unconfirmed')
+    expect(calls.filter((call) => call[1] === 'delete')).toHaveLength(1)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})

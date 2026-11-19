@@ -3,10 +3,14 @@ import { describe, expect, it } from 'vitest'
 import {
   composerHasContent,
   composerListCommand,
+  composerPactCommand,
   editComposerDocument,
+  extractBtwSideChatDraft,
+  extractMainSyncDraft,
   indexComposerLists,
   releaseComposerRoute,
   resolveComposerRoute,
+  wholeComposerAtoms,
   type ComposerDocument,
 } from './composer-document'
 
@@ -20,6 +24,42 @@ function command(
   if (!result) throw new Error('Expected an owned list transaction')
   return result
 }
+
+describe('Pact command projection ranges', () => {
+  it.each(['plan', 'review', 'build'])('projects completed /%s without native metadata', (name) => {
+    expect(composerPactCommand(document(`  @codex /${name} task`))).toEqual({
+      kind: 'pact',
+      name,
+      start: 9,
+      end: 10 + name.length,
+    })
+    expect(composerPactCommand(document(`/${name}`))).toBeUndefined()
+    expect(composerPactCommand(document(`body /${name} task`))).toBeUndefined()
+  })
+
+  it('keeps explicit native names and conflicting command syntax as their original facts', () => {
+    expect(
+      composerPactCommand({
+        text: '/plan task',
+        skills: [
+          {
+            id: 'a'.repeat(64),
+            agentId: 'codex',
+            name: 'plan',
+            start: 0,
+            end: 5,
+          },
+        ],
+      }),
+    ).toBeUndefined()
+    for (const text of ['/plan /build task', '/native /plan task', '`/plan` task'])
+      expect(composerPactCommand(document(text))).toBeUndefined()
+    expect(wholeComposerAtoms(document('/plan task'), { start: 4, end: 5 })).toEqual({
+      start: 0,
+      end: 5,
+    })
+  })
+})
 
 describe('canonical list editing', () => {
   it('keeps an arbitrary start and renumbers an inserted middle item', () => {
@@ -140,5 +180,87 @@ describe('routing current and returned drafts', () => {
         'claude',
       ).targets,
     ).toEqual(['claude'])
+  })
+
+  it('extracts /btw and @Main drafts with shifted skill offsets and allows @Main only in side chats', () => {
+    expect(composerPactCommand(document('/btw quick question'))).toEqual({
+      kind: 'pact',
+      name: 'btw',
+      start: 0,
+      end: 4,
+    })
+    expect(composerPactCommand(document('/btw'))).toBeUndefined()
+
+    const btwDraft = extractBtwSideChatDraft({
+      text: '/btw /audit check auth',
+      skills: [{ id: 'a'.repeat(64), agentId: 'claude', name: 'audit', start: 5, end: 11 }],
+    })
+    expect(btwDraft).toEqual({
+      text: '/audit check auth',
+      skills: [{ id: 'a'.repeat(64), agentId: 'claude', name: 'audit', start: 0, end: 6 }],
+      returnedInputOperationId: undefined,
+      mention: undefined,
+      route: undefined,
+    })
+
+    expect(resolveComposerRoute(document('@Main takeaway'), 'codex').route).toEqual({
+      type: 'primary',
+    })
+    expect(
+      resolveComposerRoute(document('@Main takeaway'), 'codex', { allowMainRoute: true }),
+    ).toEqual({
+      route: { type: 'main' },
+      targets: ['codex'],
+      sendRoute: undefined,
+    })
+
+    const mainSync = extractMainSyncDraft({
+      text: '@Main /lint fix warnings',
+      skills: [{ id: 'b'.repeat(64), agentId: 'claude', name: 'lint', start: 6, end: 11 }],
+      mention: { route: { type: 'main' }, token: '@Main', start: 0, end: 5 },
+    })
+    expect(mainSync).toEqual({
+      text: '/lint fix warnings',
+      skills: [{ id: 'b'.repeat(64), agentId: 'claude', name: 'lint', start: 0, end: 5 }],
+      returnedInputOperationId: undefined,
+      mention: undefined,
+      route: { type: 'main' },
+    })
+  })
+
+  it('resolves @agy, /btw @agy /skill handoff, and @all against an explicit secondaryAgentId', () => {
+    expect(
+      resolveComposerRoute(document('@agy inspect trajectory'), 'claude', {
+        secondaryAgentId: 'agy',
+      }),
+    ).toEqual({
+      route: { type: 'agent', agentId: 'agy' },
+      targets: ['agy'],
+      sendRoute: { type: 'agent', agentId: 'agy' },
+    })
+
+    expect(
+      resolveComposerRoute(document('@all compare approaches'), 'claude', {
+        secondaryAgentId: 'agy',
+      }),
+    ).toEqual({
+      route: { type: 'all' },
+      targets: ['claude', 'agy'],
+      sendRoute: { type: 'all' },
+    })
+
+    const btwAgy = extractBtwSideChatDraft({
+      text: '/btw @agy /trace check latency',
+      mention: { route: { type: 'agent', agentId: 'agy' }, token: '@agy', start: 5, end: 9 },
+      route: { type: 'agent', agentId: 'agy' },
+      skills: [{ id: 'c'.repeat(64), agentId: 'agy', name: 'trace', start: 10, end: 16 }],
+    })
+    expect(btwAgy).toEqual({
+      text: '@agy /trace check latency',
+      mention: { route: { type: 'agent', agentId: 'agy' }, token: '@agy', start: 0, end: 4 },
+      route: { type: 'agent', agentId: 'agy' },
+      skills: [{ id: 'c'.repeat(64), agentId: 'agy', name: 'trace', start: 5, end: 11 }],
+      returnedInputOperationId: undefined,
+    })
   })
 })

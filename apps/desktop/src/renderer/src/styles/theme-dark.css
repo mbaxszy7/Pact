@@ -35,6 +35,7 @@
   --pact-speaker-user: #2b2941;
   --pact-speaker-claude: #382923;
   --pact-speaker-codex: #19372f;
+  --pact-speaker-agy: #17333d;
   --pact-diff-added: #17392b;
   --pact-diff-added-foreground: #9ce7b3;
   --pact-diff-removed: #402421;
@@ -50,6 +51,7 @@
   --pact-material-user: rgb(43 41 65 / var(--pact-material-message-alpha));
   --pact-material-claude: rgb(56 41 35 / var(--pact-material-message-alpha));
   --pact-material-codex: rgb(25 55 47 / var(--pact-material-message-alpha));
+  --pact-material-agy: rgb(23 51 61 / var(--pact-material-message-alpha));
 }
 
 @media (prefers-color-scheme: dark) {
@@ -88,6 +90,7 @@
     --pact-speaker-user: #2b2941;
     --pact-speaker-claude: #382923;
     --pact-speaker-codex: #19372f;
+    --pact-speaker-agy: #17333d;
     --pact-diff-added: #17392b;
     --pact-diff-added-foreground: #9ce7b3;
     --pact-diff-removed: #402421;
@@ -101,5 +104,6 @@
     --pact-material-user: rgb(43 41 65 / var(--pact-material-message-alpha));
     --pact-material-claude: rgb(56 41 35 / var(--pact-material-message-alpha));
     --pact-material-codex: rgb(25 55 47 / var(--pact-material-message-alpha));
+    --pact-material-agy: rgb(23 51 61 / var(--pact-material-message-alpha));
   }
 }

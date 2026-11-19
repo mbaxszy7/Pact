@@ -11,18 +11,21 @@ import {
 } from 'lucide-react'
 import { useEffect, useId, useRef, useState, type KeyboardEvent } from 'react'
 
-import type { ConversationQueueState, RuntimeAgentId } from '@pact/contracts'
+import { agentDisplayName, type ConversationQueueState, type RuntimeAgentId } from '@pact/contracts'
 
 interface QueueMessageBarProps {
   queue: ConversationQueueState
   pending: boolean
   disabled: boolean
   canSteer: boolean
+  canResume?: boolean
+  showSteer?: boolean
+  backgroundStatus?: 'waiting' | 'waiting_incomplete' | 'stopping' | undefined
   steerUnavailableReason: string
   respondingAgentId?: RuntimeAgentId | undefined
   onSteer: () => Promise<boolean>
   onRemove: () => Promise<boolean>
-  onEdit: () => Promise<boolean>
+  onEdit?: (() => Promise<boolean>) | undefined
   onResume: () => Promise<boolean>
   onSetEnabled: (enabled: boolean) => Promise<boolean>
   onCheckStatus?: (() => Promise<boolean>) | undefined
@@ -34,6 +37,9 @@ export function QueueMessageBar({
   pending,
   disabled,
   canSteer,
+  canResume = true,
+  showSteer = true,
+  backgroundStatus,
   steerUnavailableReason,
   respondingAgentId,
   onSteer,
@@ -118,30 +124,31 @@ export function QueueMessageBar({
       </div>
     ) : null
   }
-  const name =
-    entry.recipient === 'all'
-      ? 'All Agents'
-      : entry.recipient === 'claude'
-        ? 'Claude Code'
-        : 'Codex'
+  const name = entry.recipient === 'all' ? 'All Agents' : agentDisplayName(entry.recipient)
   const agentMismatchReason =
     respondingAgentId &&
     entry.recipient !== 'all' &&
     entry.recipient !== respondingAgentId &&
     !entry.workflowCommand
-      ? `${respondingAgentId === 'claude' ? 'Claude Code' : 'Codex'} is responding, but this message targets ${name}. Steer is only available for the Agent currently responding.`
+      ? `${agentDisplayName(respondingAgentId)} is replying right now, so this message for ${name} can’t be steered.`
       : undefined
   const steerInfoId = `queue-steer-info-${id}`
-  const stateLabel =
-    entry.state === 'dispatching'
-      ? 'Delivering message…'
+  const stoppingBackground = backgroundStatus === 'stopping'
+  const stateLabel = stoppingBackground
+    ? 'Stopping…'
+    : entry.state === 'dispatching'
+      ? 'Sending message…'
       : entry.state === 'unknown'
-        ? 'Delivery not confirmed'
+        ? 'Delivery unconfirmed'
         : entry.state === 'paused'
           ? 'Queue paused'
           : !queue.enabled
             ? 'Queue disabled'
-            : 'Queued'
+            : backgroundStatus === 'waiting_incomplete'
+              ? 'Waiting for background work · Response incomplete'
+              : backgroundStatus === 'waiting'
+                ? 'Waiting for background work'
+                : 'Queued'
   const attachments = [
     entry.imageCount ? `${entry.imageCount} ${entry.imageCount === 1 ? 'image' : 'images'}` : '',
     entry.commentCount
@@ -151,6 +158,15 @@ export function QueueMessageBar({
   ]
     .filter(Boolean)
     .join(' · ')
+  // Only an ordinary queued wait explains the confirmed replacement; other reasons stay authoritative.
+  const replacementWait =
+    entry.replacesTask &&
+    entry.state === 'queued' &&
+    queue.enabled &&
+    !entry.reason &&
+    !backgroundStatus
+      ? entry.replacesTask
+      : undefined
   const iconButton =
     'grid size-8 shrink-0 place-items-center rounded-control text-secondary hover:bg-surface-muted hover:text-primary disabled:cursor-default disabled:opacity-40'
   return (
@@ -177,21 +193,23 @@ export function QueueMessageBar({
           {entry.preview || attachments || 'Message'}
         </span>
         <div className="flex shrink-0 items-center gap-0.5">
-          <button
-            type="button"
-            disabled={busy || locked || !canSteer}
-            title={
-              canSteer
-                ? 'Send to the current response'
-                : (agentMismatchReason ?? steerUnavailableReason)
-            }
-            className="inline-flex min-h-8 items-center gap-1.5 rounded-control px-2 font-medium text-secondary hover:bg-surface-raised hover:text-primary disabled:cursor-default disabled:opacity-40"
-            onClick={() => void onSteer()}
-          >
-            <CornerDownRight aria-hidden="true" className="size-3.5" strokeWidth={1.75} />
-            Steer
-          </button>
-          {!canSteer && agentMismatchReason ? (
+          {showSteer ? (
+            <button
+              type="button"
+              disabled={busy || locked || !canSteer}
+              title={
+                canSteer
+                  ? 'Send to the current response'
+                  : (agentMismatchReason ?? steerUnavailableReason)
+              }
+              className="inline-flex min-h-8 items-center gap-1.5 rounded-control px-2 font-medium text-secondary hover:bg-surface-raised hover:text-primary disabled:cursor-default disabled:opacity-40"
+              onClick={() => void onSteer()}
+            >
+              <CornerDownRight aria-hidden="true" className="size-3.5" strokeWidth={1.75} />
+              Steer
+            </button>
+          ) : null}
+          {showSteer && !canSteer && agentMismatchReason ? (
             <span className="group relative inline-flex shrink-0">
               <button
                 type="button"
@@ -214,7 +232,7 @@ export function QueueMessageBar({
             type="button"
             className={iconButton}
             aria-label="Remove queued message"
-            title={removableDelivery ? 'Remove from Pact queue' : 'Remove queued message'}
+            title={removableDelivery ? 'Cancel and remove message' : 'Remove queued message'}
             disabled={busy || (locked && !removableDelivery)}
             onClick={() => void onRemove()}
           >
@@ -243,20 +261,43 @@ export function QueueMessageBar({
           </button>
         </div>
       </div>
-      {entry.state !== 'queued' || !queue.enabled || entry.reason || attachments ? (
+      {backgroundStatus ||
+      entry.state !== 'queued' ||
+      !queue.enabled ||
+      entry.reason ||
+      replacementWait ||
+      attachments ? (
         <div
           className="mt-1 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 pl-6 text-secondary"
           role="status"
         >
+          {stoppingBackground ? (
+            <LoaderCircle
+              aria-hidden="true"
+              className="size-3.5 shrink-0 animate-spin motion-reduce:animate-none"
+            />
+          ) : null}
           <span>
-            {stateLabel}
-            {removableDelivery
-              ? ' · The original execution was rebuilt. You can remove this item from the Pact queue; its delivery remains unconfirmed.'
-              : entry.reason
-                ? ` · ${entry.reason}`
-                : ''}
+            {replacementWait ? (
+              <>
+                {`Waiting for ${agentDisplayName(replacementWait.actor)}'s current response.`}
+                <br />
+                {`Then start this task instead of continuing /${replacementWait.kind}.`}
+              </>
+            ) : (
+              <>
+                {stateLabel}
+                {stoppingBackground
+                  ? ''
+                  : removableDelivery
+                    ? ' · The original execution was rebuilt. You can remove this item from the Pact queue; its delivery remains unconfirmed.'
+                    : entry.reason
+                      ? ` · ${entry.reason}`
+                      : ''}
+              </>
+            )}
           </span>
-          {entry.state === 'paused' ? (
+          {entry.state === 'paused' && !stoppingBackground && canResume ? (
             <button
               type="button"
               disabled={busy || !queue.enabled}
@@ -306,10 +347,10 @@ export function QueueMessageBar({
           type="button"
           role="menuitem"
           className="pact-composer-menu-item disabled:opacity-40"
-          disabled={busy || locked}
+          disabled={busy || locked || !onEdit}
           onClick={() => {
             close()
-            void onEdit()
+            void onEdit?.()
           }}
         >
           <Pencil aria-hidden="true" className="size-4" strokeWidth={1.75} />

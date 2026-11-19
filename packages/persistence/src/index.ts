@@ -20,6 +20,7 @@ export {
   HANDOFF_SAFETY_BYTES,
   HANDOFF_READ_DEADLINE_MS,
   RunOperationConflictError,
+  PreparedInformationConflictError,
   OversizedConversationEntityError,
   StaleConversationCursorError,
   type ConversationInputWrite,
@@ -28,11 +29,24 @@ export {
   type ImageAssetRecord,
   type BeginRunInput,
   type BeginRunResult,
+  type PreparedInputDispatch,
   type HandoffBundle,
   type HandoffSourceRef,
+  type RelayWorkflowSnapshot,
+  type RelayWorkflowTurnSource,
 } from './conversation-repository.js'
 export { ProjectCatalogRepository } from './project-catalog-repository.js'
-export { projectSessionIssues } from './session-issues.js'
+export { isRetiredAgentRecoverySettled, projectSessionIssues } from './session-issues.js'
+export {
+  SideChatPersistenceError,
+  type CapturedCutoffRecord,
+  type CutoffCatalogItem,
+  type CutoffInlineTailResult,
+  type CutoffSourcePage,
+  type MessageOriginCutoffInfo,
+  type PrepareMainSyncBackResult,
+  type SideChatAnchorCutoffInfo,
+} from './side-chat-persistence.js'
 export {
   WorkspaceArchiveRepository,
   WorkspaceArchiveConflictError,
@@ -49,7 +63,9 @@ export {
 export {
   OversizedCatalogSessionError,
   SessionRepository,
+  SessionSettingsConflictError,
   StaleCatalogCursorError,
+  StaleSessionGroupError,
   type NewSessionRecord,
 } from './session-repository.js'
 
@@ -70,15 +86,7 @@ export {
   anchoredComments,
   commentDraftReceipts,
   collaborationTasks,
-  collaborationTurns,
-  collaborationTodos,
-  collaborationTodoRevisions,
-  collaborationTurnAuthorizations,
-  collaborationRequiredInputMembers,
-  collaborationReviewFacts,
-  collaborationResultApplications,
-  collaborationResultOperations,
-  collaborationResultInputResponses,
+  workflowTurns,
   conversationInputBatches,
   conversationInputBatchMembers,
   conversationRunSourceRefs,
@@ -88,6 +96,8 @@ export {
   conversationMessageImages,
   conversationBodyInputs,
   conversationBodyParts,
+  conversationCutoffs,
+  conversationCutoffRevisions,
   defaultSessionSettings,
   sessionCatalogRevisions,
   pactSchemaMeta,
@@ -95,6 +105,9 @@ export {
   nativeAgentContexts,
   runtimeCliPaths,
   sessions,
+  sideChatOperations,
   sessionSettingsRevisions,
+  sessionGroups,
+  sessionGroupMembers,
   schema,
 } from './schema/index.js'

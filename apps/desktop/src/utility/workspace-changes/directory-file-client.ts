@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto'
 import {
   directoryFileOperationInputSchema,
   directoryFileOperationMessageSchema,
+  PROJECT_FILE_PREVIEW_TIMEOUT_MS,
   WORKSPACE_OPERATION_TIMEOUT_MS,
   type DirectoryFileOperationInput,
   type DirectoryFileOperationResult,
@@ -50,6 +51,19 @@ export class UtilityDirectoryFileClient {
         code: 'IO',
         message: 'The directory operation input is invalid.',
       })
+    const deadlineMs =
+      parsed.data.operation === 'preview'
+        ? Math.max(
+            0,
+            Math.min(PROJECT_FILE_PREVIEW_TIMEOUT_MS, parsed.data.deadlineAt - Date.now()),
+          )
+        : WORKSPACE_OPERATION_TIMEOUT_MS
+    if (parsed.data.operation === 'preview' && deadlineMs === 0)
+      return Promise.resolve({
+        ok: false,
+        code: 'CANCELLED',
+        message: 'File preview timed out.',
+      })
     const requestId = randomUUID()
     const message = { type: 'workspace.directory.request' as const, requestId, input: parsed.data }
     if (
@@ -64,7 +78,7 @@ export class UtilityDirectoryFileClient {
     return new Promise((resolve) => {
       const request: PendingDirectoryRequest = {
         resolve,
-        timer: setTimeout(() => this.cancel(requestId), WORKSPACE_OPERATION_TIMEOUT_MS),
+        timer: setTimeout(() => this.cancel(requestId), deadlineMs),
         signal,
         cancelling: false,
       }

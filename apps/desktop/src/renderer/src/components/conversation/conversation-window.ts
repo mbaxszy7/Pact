@@ -1,5 +1,6 @@
 import type {
   AnchoredComment,
+  CollaborationTask,
   ConversationObservation,
   ConversationPage,
   ConversationPageActivity,
@@ -18,6 +19,7 @@ import type {
 } from '@pact/contracts'
 
 import {
+  AGENTS,
   compareConversationMessages,
   compareConversationDisplayOrder,
   conversationMessageOrder,
@@ -56,12 +58,15 @@ export interface ConversationViewProjection {
   runs: ConversationSnapshot['runs']
   nativeContexts: ConversationSnapshot['nativeContexts']
   pendingNativeInteractions?: ConversationSnapshot['pendingNativeInteractions']
+  relaySchedulingDecision?: ConversationSnapshot['relaySchedulingDecision']
+  preparedInputContinuation?: ConversationSnapshot['preparedInputContinuation']
   forkOperation?: ConversationSnapshot['forkOperation']
   forkBlocked?: boolean | undefined
   rebuildOperations?: ConversationSnapshot['rebuildOperations']
   rebuildInputRecovery?: ConversationSnapshot['rebuildInputRecovery']
   sessionIssues?: SessionIssues | undefined
   queue?: ConversationQueueState | undefined
+  collaborationTask?: CollaborationTask | null | undefined
 }
 
 export interface ConversationWindow {
@@ -189,7 +194,7 @@ export function nativeRecoveryTargets(view: ConversationViewProjection | undefin
         ?.operation,
     }))
   }
-  for (const agentId of ['codex', 'claude'] as const) {
+  for (const agentId of AGENTS) {
     const context = view?.nativeContexts.find((item) => item.agentId === agentId)
     const rebuildOperation =
       view?.rebuildOperations?.find((item) => item.agentId === agentId)?.operation ??
@@ -529,6 +534,8 @@ export function windowFromPage(page: MessagePage): ConversationWindow {
         runs: uniqueRuns(page),
         nativeContexts: page.header.nativeContexts ?? [],
         pendingNativeInteractions: page.header.pendingNativeInteractions,
+        relaySchedulingDecision: page.header.relaySchedulingDecision,
+        preparedInputContinuation: page.header.preparedInputContinuation,
         rebuildOperations: page.header.rebuildOperations ?? [],
         forkOperation: page.header.forkOperation,
         forkBlocked: page.header.forkBlocked,
@@ -750,6 +757,12 @@ export function mergeMessagePage(
         pendingNativeInteractions: keepCurrentValues
           ? current.view.pendingNativeInteractions
           : (page.header.pendingNativeInteractions ?? current.view.pendingNativeInteractions),
+        relaySchedulingDecision: keepCurrentValues
+          ? current.view.relaySchedulingDecision
+          : page.header.relaySchedulingDecision,
+        preparedInputContinuation: keepCurrentValues
+          ? current.view.preparedInputContinuation
+          : page.header.preparedInputContinuation,
         forkOperation: keepCurrentValues
           ? current.view.forkOperation
           : (page.header.forkOperation ?? current.view.forkOperation),
@@ -1480,6 +1493,14 @@ export function mergeConversationPatch(
       nativeContexts: patch.nativeContexts ?? current.view.nativeContexts,
       pendingNativeInteractions:
         patch.pendingNativeInteractions ?? current.view.pendingNativeInteractions,
+      relaySchedulingDecision:
+        patch.relaySchedulingDecision === undefined
+          ? current.view.relaySchedulingDecision
+          : patch.relaySchedulingDecision,
+      preparedInputContinuation:
+        patch.preparedInputContinuation === undefined
+          ? current.view.preparedInputContinuation
+          : patch.preparedInputContinuation,
       rebuildOperations: patch.rebuildOperations ?? current.view.rebuildOperations,
       forkOperation: patch.forkOperation ?? current.view.forkOperation,
       forkBlocked: patch.forkBlocked ?? current.view.forkBlocked,

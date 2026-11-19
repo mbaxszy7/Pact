@@ -17,6 +17,82 @@ const createdAt = '2026-09-25T00:00:00.000Z'
 const assistantContent =
   'Here is the answer.\n\nThe Catalog keeps Session history durable while showing five recent entries.'
 
+test('renders Pact command badges from saved user messages', { tag: '@ui' }, async () => {
+  const fixture = await createRuntimeFixture()
+  let app: Awaited<ReturnType<typeof fixture.launch>> | undefined
+  try {
+    const projectDirectory = await fixture.createProjectDirectory('message-pact-badges')
+    const database = await PactDatabase.open({ filePath: fixture.databaseFile, migrationsFolder })
+    try {
+      const projectId = randomUUID()
+      const sessionId = randomUUID()
+      database.projectCatalogRepository.add({
+        id: projectId,
+        name: 'Message badges',
+        directoryPath: projectDirectory,
+        kind: 'git',
+        createdAt,
+      })
+      database.sessionRepository.create(
+        { id: sessionId, projectId, title: 'Pact message badges', createdAt },
+        {
+          primaryAgentId: 'codex',
+          secondaryAgentId: 'claude',
+          agents: {
+            claude: { model: null, effort: null },
+            codex: { model: null, effort: null },
+            agy: { model: null, effort: null },
+          },
+          maxDiscussionRounds: 6,
+          maxReviewCycles: 3,
+          maxRepairAttempts: 3,
+        },
+      )
+      database.drizzle
+        .insert(conversationMessages)
+        .values(
+          ['plan', 'review', 'build'].map((command, sequence) => ({
+            id: randomUUID(),
+            sessionId,
+            role: 'user' as const,
+            content: `/${command} Inspect this change.`,
+            state: 'complete' as const,
+            sequence,
+            createdAt,
+            updatedAt: createdAt,
+          })),
+        )
+        .run()
+    } finally {
+      database.close()
+    }
+    app = await fixture.launch()
+    const window = await app.firstWindow()
+    await window.getByRole('button', { name: 'Pact message badges', exact: true }).click()
+    const messages = window.locator('article[data-pact-speaker="user"]')
+    await expect(messages).toHaveCount(3)
+    await expect(messages.locator('[data-pact-command]')).toHaveCount(3)
+    await Promise.all(
+      ['plan', 'review', 'build'].map(async (command) => {
+        const badge = messages.locator(`[data-pact-command="${command}"]`)
+        await expect(badge).toBeVisible()
+        await expect(badge).toHaveAttribute('title', `Pact · ${command}`)
+        await expect(badge).toHaveText(`/${command}`)
+        expect(
+          await badge.evaluate((element) =>
+            getComputedStyle(element.querySelector('.break-all')!, '::before').getPropertyValue(
+              'content',
+            ),
+          ),
+        ).toBe('"pact:"')
+      }),
+    )
+  } finally {
+    if (app) await quitPact(app)
+    await fixture.dispose()
+  }
+})
+
 test(
   'keeps message actions with their bubble and collapses a long Work log from its foot',
   { tag: '@ui' },
@@ -43,12 +119,13 @@ test(
           { id: sessionId, projectId, title: 'Message actions preview', createdAt },
           {
             primaryAgentId: 'codex',
+            secondaryAgentId: 'claude',
             agents: {
               claude: { model: null, effort: null },
               codex: { model: null, effort: null },
+              agy: { model: null, effort: null },
             },
             maxDiscussionRounds: 6,
-            runningMessagePolicy: 'immediate_safe_point',
             maxReviewCycles: 3,
             maxRepairAttempts: 3,
           },
@@ -133,7 +210,9 @@ test(
       await expect(userActions.locator('time')).toHaveAttribute('datetime', createdAt)
       const userBubble = await user.locator('[data-pact-message-bubble]').boundingBox()
       const userActionsBox = await userActions.boundingBox()
-      const userCopyBox = await user.getByRole('button', { name: 'Copy You message' }).boundingBox()
+      const userCopyBox = await user
+        .getByRole('button', { name: 'Copy your message' })
+        .boundingBox()
       const assistantBubble = await assistant.locator('[data-pact-message-bubble]').boundingBox()
       if (!userBubble || !userActionsBox || !userCopyBox || !assistantBubble) {
         throw new Error('Message geometry is unavailable.')

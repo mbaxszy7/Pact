@@ -1,5 +1,6 @@
 import { app, type BrowserWindow } from 'electron'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { createRequire } from 'node:module'
 import { isAbsolute, join } from 'node:path'
 import { Worker } from 'node:worker_threads'
 
@@ -16,6 +17,61 @@ const PACKAGE_SMOKE_ENV = 'PACT_PACKAGE_SMOKE'
 const PACKAGE_SMOKE_PHASE_ENV = 'PACT_PACKAGE_SMOKE_PHASE'
 const PACKAGE_SMOKE_USER_DATA_ENV = 'PACT_PACKAGE_SMOKE_USER_DATA'
 const PACKAGE_SMOKE_TIMEOUT_MS = 10_000
+const RELAY_CREDENTIAL_PHASE_ENV = 'PACT_PACKAGE_RELAY_CREDENTIAL_PHASE'
+
+/** Exercise the registered Renderer IPC and genuine encrypted store with synthetic values only. */
+async function verifyPackagedRelayCredential(window: BrowserWindow): Promise<void> {
+  const phase = process.env[RELAY_CREDENTIAL_PHASE_ENV]
+  if (phase === undefined) return
+  if (process.platform !== 'darwin' || !['seed', 'verify', 'removed'].includes(phase))
+    throw new Error('Packaged credential phase is invalid.')
+  const load = createRequire(process.execPath)
+  const guard: unknown = load(join(process.resourcesPath, 'native', 'relay-credential-guard.node'))
+  if (!guard || typeof guard !== 'object' || Reflect.get(guard, 'guarded') !== true)
+    throw new Error('Packaged credential guard is unavailable.')
+  const verified: unknown = await window.webContents.executeJavaScript(`
+    (async () => {
+      const phase = ${JSON.stringify(phase)}
+      const first = 'sk-synthetic-packaged-relay-first-0000'
+      const second = 'sk-synthetic-packaged-relay-second-0000'
+      const bridge = window.pact
+      const state = await bridge.getSchedulingSettings()
+      const expectedRevision = phase === 'seed' ? 0 : phase === 'verify' ? 2 : 3
+      if (!state.ok || state.value.credential.revision !== expectedRevision ||
+          state.value.credential.configured !== (phase === 'verify')) return false
+      const reveal = async (revision, expected) => {
+        const value = await bridge.revealRelayApiKey({
+          expectedRevision: revision, deadlineAt: Date.now() + 5000
+        })
+        return value.ok && value.value.revision === revision && value.value.key === expected
+      }
+      if (phase === 'seed') {
+        for (const [revision, key] of [[0, first], [1, second]]) {
+          const nonce = crypto.randomUUID()
+          const saved = await bridge.saveRelayApiKey({
+            nonce, expectedRevision: revision, deadlineAt: Date.now() + 5000, key
+          })
+          if (!saved.ok || saved.value.nonce !== nonce || !saved.value.configured ||
+              saved.value.revision !== revision + 1 || !(await reveal(revision + 1, key)))
+            return false
+        }
+      } else if (phase === 'verify') {
+        if (!(await reveal(2, second))) return false
+        const nonce = crypto.randomUUID()
+        const removed = await bridge.removeRelayApiKey({
+          nonce, expectedRevision: 2, deadlineAt: Date.now() + 5000
+        })
+        if (!removed.ok || removed.value.nonce !== nonce || removed.value.configured ||
+            removed.value.revision !== 3) return false
+      }
+      const final = await bridge.getSchedulingSettings()
+      return final.ok && final.value.credential.configured === (phase === 'seed') &&
+        final.value.credential.revision === (phase === 'seed' ? 2 : 3)
+    })()
+  `)
+  if (verified !== true) throw new Error('Packaged credential verification failed.')
+  process.stdout.write(`PACT_RELAY_CREDENTIAL_SMOKE:PASS:${phase}\n`)
+}
 export function isPackageSmoke(): boolean {
   return process.env[PACKAGE_SMOKE_ENV] === '1'
 }
@@ -349,6 +405,7 @@ export async function completePackagedSmoke(
     throw new Error('Packaged smoke phase is missing or invalid.')
   }
 
+  await verifyPackagedRelayCredential(window)
   process.stdout.write('PACT_PACKAGE_SMOKE:PASS\n')
   app.quit()
 }

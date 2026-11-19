@@ -3,7 +3,14 @@ import { randomUUID } from 'node:crypto'
 
 import type { RpcResult } from '@pact/contracts'
 
-import { collaborationActionInputSchema } from '@pact/contracts'
+import {
+  collaborationActionInputSchema,
+  relayDecisionAnswerSchema,
+  preparedInputContinueSchema,
+  relayDecisionReceiptReadSchema,
+  relayDecisionReceiptSchema,
+  rpcResultSchema,
+} from '@pact/contracts'
 import {
   imageWriteInputSchema,
   imageReadInputSchema,
@@ -14,6 +21,7 @@ import {
 import {
   commentDraftRemoveInputSchema,
   commentDraftSaveInputSchema,
+  CONVERSATION_ACTIVE_SESSIONS_PER_VIEWER,
   conversationGetInputSchema,
   conversationInterestSchema,
   CONVERSATION_INTEREST_ITEMS,
@@ -26,20 +34,49 @@ import {
   conversationQueueActionInputSchema,
   conversationQueueReturnInputSchema,
   conversationQueueEnabledInputSchema,
+  createSideChatInputSchema,
+  discardEmptySideChatInputSchema,
+  listSideChatsInputSchema,
   nativeContextRebuildInputSchema,
+  readSideChatReceiptInputSchema,
   sessionForkInputSchema,
+  sideChatSyncMainInputSchema,
   peerProposalAcceptInputSchema,
   peerProposalDismissInputSchema,
+  utf8ByteLength,
   IPC_CHANNELS,
 } from '@pact/contracts'
 
 import type { RendererTrust } from '../../renderer-trust'
 import type { UtilityProcessClient } from '../../utility-process/client'
 
+export type ConversationIpcRegistration = (() => void) & {
+  isSessionVisible: (sessionId: string) => boolean
+  subscribeVisibilityChanges: (listener: () => void) => () => void
+}
+
 export function registerConversationIpcHandlers(
   trust: RendererTrust,
   utilityClient: UtilityProcessClient,
-): () => void {
+): ConversationIpcRegistration {
+  ipcMain.handle(IPC_CHANNELS.preparedInputContinue, async (event, raw: unknown) => {
+    trust.assertTrustedMainFrame(event)
+    return rpcResultSchema(conversationPatchSchema).parse(
+      await utilityClient.continuePreparedConversationInput(preparedInputContinueSchema.parse(raw)),
+    )
+  })
+  ipcMain.handle(IPC_CHANNELS.relayDecisionAnswer, async (event, raw: unknown) => {
+    trust.assertTrustedMainFrame(event)
+    return rpcResultSchema(relayDecisionReceiptSchema).parse(
+      await utilityClient.answerRelayDecision(relayDecisionAnswerSchema.parse(raw)),
+    )
+  })
+  ipcMain.handle(IPC_CHANNELS.relayDecisionReceiptRead, async (event, raw: unknown) => {
+    trust.assertTrustedMainFrame(event)
+    return rpcResultSchema(relayDecisionReceiptSchema).parse(
+      await utilityClient.getRelayDecisionReceipt(relayDecisionReceiptReadSchema.parse(raw)),
+    )
+  })
   // Each trusted renderer document owns only its unsubmitted input parts.
   // A new UUID on navigation/restart prevents recycled WebContents IDs from taking ownership.
   const inputOwners = new Map<WebContents, { key: string; release: () => void }>()
@@ -154,8 +191,13 @@ export function registerConversationIpcHandlers(
   // in-flight operation and one latest state, never a queue of UI transitions.
   const interests = new Map<
     object,
-    { sessionId: string | null; generation: number; visible: () => boolean; release: () => void }
+    { sessionIds: string[]; generation: number; visible: () => boolean; release: () => void }
   >()
+  const visibilityListeners = new Set<() => void>()
+  const notifyVisibility = (): void => {
+    if (disposed) return
+    for (const listener of visibilityListeners) listener()
+  }
   ipcMain.handle(IPC_CHANNELS.sessionFork, (event, rawInput: unknown) => {
     trust.assertTrustedMainFrame(event)
     const input = sessionForkInputSchema.safeParse(rawInput)
@@ -182,9 +224,7 @@ export function registerConversationIpcHandlers(
         const target = revision
         const sessionIds = [
           ...new Set(
-            [...interests.values()].flatMap((entry) =>
-              entry.sessionId && entry.visible() ? [entry.sessionId] : [],
-            ),
+            [...interests.values()].flatMap((entry) => (entry.visible() ? entry.sessionIds : [])),
           ),
         ]
         // oxlint-disable-next-line no-await-in-loop -- One ordered latest-state propagation owner.
@@ -214,9 +254,30 @@ export function registerConversationIpcHandlers(
         ok: false,
         error: { code: 'VALIDATION', message: 'Choose a valid Session interest.' },
       }
+    const nextSessionIds =
+      input.data.sessionIds !== undefined
+        ? [...new Set(input.data.sessionIds)]
+        : input.data.sessionId
+          ? [input.data.sessionId]
+          : []
+    if (nextSessionIds.length > CONVERSATION_ACTIVE_SESSIONS_PER_VIEWER)
+      return {
+        ok: false,
+        error: { code: 'VALIDATION', message: 'Choose at most two active Sessions per viewer.' },
+      }
     const sender = event.sender
     let entry = interests.get(sender)
     if (entry && input.data.generation <= entry.generation) return syncInterests()
+    const totalUniqueSessionIds = new Set(nextSessionIds)
+    for (const [owner, existing] of interests) {
+      if (owner === sender) continue
+      for (const id of existing.sessionIds) totalUniqueSessionIds.add(id)
+    }
+    if (totalUniqueSessionIds.size > CONVERSATION_INTEREST_ITEMS)
+      return {
+        ok: false,
+        error: { code: 'VALIDATION', message: 'Too many active Conversation sessions.' },
+      }
     if (!entry) {
       const ownerWindow = BrowserWindow.fromWebContents(sender)
       if (!ownerWindow)
@@ -237,13 +298,22 @@ export function registerConversationIpcHandlers(
         ownerWindow.removeListener('show', visibilityChanged)
         ownerWindow.removeListener('minimize', visibilityChanged)
         ownerWindow.removeListener('restore', visibilityChanged)
+        ownerWindow.removeListener('focus', focusChanged)
+        ownerWindow.removeListener('blur', focusChanged)
         interests.delete(sender)
         revision += 1
-        if (!disposed) void syncInterests()
+        if (!disposed) {
+          void syncInterests()
+          notifyVisibility()
+        }
+      }
+      const focusChanged = (): void => {
+        notifyVisibility()
       }
       const visibilityChanged = (): void => {
         revision += 1
         void syncInterests()
+        notifyVisibility()
       }
       const navigate = (
         _event: unknown,
@@ -254,7 +324,7 @@ export function registerConversationIpcHandlers(
         if (mainFrame && !inPlace) release()
       }
       entry = {
-        sessionId: null,
+        sessionIds: [],
         generation: input.data.generation,
         release,
         visible: () =>
@@ -268,10 +338,13 @@ export function registerConversationIpcHandlers(
       ownerWindow.on('show', visibilityChanged)
       ownerWindow.on('minimize', visibilityChanged)
       ownerWindow.on('restore', visibilityChanged)
+      ownerWindow.on('focus', focusChanged)
+      ownerWindow.on('blur', focusChanged)
     }
-    entry.sessionId = input.data.sessionId
+    entry.sessionIds = nextSessionIds
     entry.generation = input.data.generation
     revision += 1
+    notifyVisibility()
     return syncInterests()
   })
   ipcMain.handle(IPC_CHANNELS.conversationGet, (event, rawInput: unknown) => {
@@ -429,15 +502,93 @@ export function registerConversationIpcHandlers(
     },
   )
 
+  ipcMain.handle(IPC_CHANNELS.sideChatCreate, (event, rawInput: unknown) => {
+    trust.assertTrustedMainFrame(event)
+    const input = createSideChatInputSchema.safeParse(rawInput)
+    return input.success
+      ? utilityClient.createSideChat(input.data)
+      : Promise.resolve({
+          ok: false as const,
+          error: { code: 'VALIDATION' as const, message: 'Choose a valid side chat request.' },
+        })
+  })
+
+  ipcMain.handle(IPC_CHANNELS.sideChatCreateReceipt, (event, rawInput: unknown) => {
+    trust.assertTrustedMainFrame(event)
+    const input = readSideChatReceiptInputSchema.safeParse(rawInput)
+    return input.success
+      ? utilityClient.readCreateSideChatReceipt(input.data)
+      : Promise.resolve({
+          ok: false as const,
+          error: { code: 'VALIDATION' as const, message: 'Choose a valid side chat operation.' },
+        })
+  })
+
+  ipcMain.handle(IPC_CHANNELS.sideChatList, (event, rawInput: unknown) => {
+    trust.assertTrustedMainFrame(event)
+    const input = listSideChatsInputSchema.safeParse(rawInput)
+    return input.success
+      ? utilityClient.listSideChats(input.data)
+      : Promise.resolve({
+          ok: false as const,
+          error: { code: 'VALIDATION' as const, message: 'Choose a valid side chat page.' },
+        })
+  })
+
+  ipcMain.handle(IPC_CHANNELS.sideChatDiscardEmpty, (event, rawInput: unknown) => {
+    trust.assertTrustedMainFrame(event)
+    const input = discardEmptySideChatInputSchema.safeParse(rawInput)
+    return input.success
+      ? utilityClient.discardEmptySideChat(input.data)
+      : Promise.resolve({
+          ok: false as const,
+          error: { code: 'VALIDATION' as const, message: 'Choose a valid side chat.' },
+        })
+  })
+
+  ipcMain.handle(IPC_CHANNELS.sideChatSyncMain, (event, rawInput: unknown) => {
+    trust.assertTrustedMainFrame(event)
+    const input = sideChatSyncMainInputSchema.safeParse(rawInput)
+    const withinBudget =
+      input.success &&
+      (input.data.inputId !== undefined ||
+        utf8ByteLength(input.data.content) <= CONVERSATION_INPUT_WRITE_BYTES) &&
+      Buffer.byteLength(JSON.stringify(input.data), 'utf8') <= 128 * 1024
+    const ownerKey = withinBudget ? inputOwner(event.sender) : undefined
+    return input.success && withinBudget && ownerKey
+      ? utilityClient.syncSideChatToMain(input.data, ownerKey)
+      : Promise.resolve({
+          ok: false as const,
+          error: { code: 'VALIDATION' as const, message: 'Enter a valid message for main chat.' },
+        })
+  })
+
+  ipcMain.handle(IPC_CHANNELS.sideChatSyncMainReceipt, (event, rawInput: unknown) => {
+    trust.assertTrustedMainFrame(event)
+    const input = readSideChatReceiptInputSchema.safeParse(rawInput)
+    return input.success
+      ? utilityClient.readSyncSideChatReceipt(input.data)
+      : Promise.resolve({
+          ok: false as const,
+          error: {
+            code: 'VALIDATION' as const,
+            message: 'Choose a valid side chat sync operation.',
+          },
+        })
+  })
+
   const unsubscribe = utilityClient.subscribeConversation((patch, progress) => {
     const payload = conversationPatchSchema.parse(patch)
     for (const window of trust.trustedWindows()) {
       const entry = interests.get(window.webContents)
-      const interested = entry?.sessionId === patch.sessionId && entry.visible()
+      const interested = Boolean(entry?.sessionIds.includes(patch.sessionId) && entry.visible())
       if (progress && !interested) continue
       const routed = interested
         ? payload
         : {
+            ...(payload.documentProjection
+              ? { documentProjection: payload.documentProjection }
+              : {}),
             version: payload.version,
             sessionId: payload.sessionId,
             observation: payload.observation,
@@ -471,7 +622,7 @@ export function registerConversationIpcHandlers(
     }
   })
 
-  return () => {
+  const dispose = (): void => {
     disposed = true
     for (const entry of interests.values()) entry.release()
     for (const owner of inputOwners.values()) owner.release()
@@ -497,6 +648,9 @@ export function registerConversationIpcHandlers(
     ipcMain.removeHandler(IPC_CHANNELS.resumeConversationQueue)
     ipcMain.removeHandler(IPC_CHANNELS.setConversationQueueEnabled)
     ipcMain.removeHandler(IPC_CHANNELS.conversationStop)
+    ipcMain.removeHandler(IPC_CHANNELS.relayDecisionAnswer)
+    ipcMain.removeHandler(IPC_CHANNELS.preparedInputContinue)
+    ipcMain.removeHandler(IPC_CHANNELS.relayDecisionReceiptRead)
     ipcMain.removeHandler(IPC_CHANNELS.peerProposalAccept)
     ipcMain.removeHandler(IPC_CHANNELS.peerProposalDismiss)
     ipcMain.removeHandler(IPC_CHANNELS.conversationRetry)
@@ -504,6 +658,22 @@ export function registerConversationIpcHandlers(
     ipcMain.removeHandler(IPC_CHANNELS.commentDraftSave)
     ipcMain.removeHandler(IPC_CHANNELS.commentDraftRemove)
     ipcMain.removeHandler(IPC_CHANNELS.commentSourceResolve)
+    ipcMain.removeHandler(IPC_CHANNELS.sideChatCreate)
+    ipcMain.removeHandler(IPC_CHANNELS.sideChatCreateReceipt)
+    ipcMain.removeHandler(IPC_CHANNELS.sideChatList)
+    ipcMain.removeHandler(IPC_CHANNELS.sideChatDiscardEmpty)
+    ipcMain.removeHandler(IPC_CHANNELS.sideChatSyncMain)
+    ipcMain.removeHandler(IPC_CHANNELS.sideChatSyncMainReceipt)
     unsubscribe()
+    visibilityListeners.clear()
   }
+  const isSessionVisible = (sessionId: string): boolean =>
+    [...interests.values()].some((entry) => entry.sessionIds.includes(sessionId) && entry.visible())
+  const subscribeVisibilityChanges = (listener: () => void): (() => void) => {
+    visibilityListeners.add(listener)
+    return () => {
+      visibilityListeners.delete(listener)
+    }
+  }
+  return Object.assign(dispose, { isSessionVisible, subscribeVisibilityChanges })
 }

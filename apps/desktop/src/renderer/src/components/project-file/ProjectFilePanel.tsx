@@ -1,4 +1,13 @@
-import { AlertTriangle, FileText, Maximize2, Minimize2, RotateCcw, TextWrap, X } from 'lucide-react'
+import {
+  AlertTriangle,
+  ChevronLeft,
+  FileText,
+  Maximize2,
+  Minimize2,
+  RotateCcw,
+  TextWrap,
+  X,
+} from 'lucide-react'
 import { Component, lazy, Suspense, useMemo, useState, type ReactNode } from 'react'
 
 import type { FileCommentAnchor, ProjectFile } from '@pact/contracts'
@@ -25,6 +34,7 @@ interface ProjectFilePanelProps {
   state: ProjectFilePanelState
   expanded: boolean
   onClose: () => void
+  onBackToSideChat?: (() => void) | undefined
   onExpandedChange: (expanded: boolean) => void
   onRetry: () => void
   onCreateComment: (anchor: FileCommentAnchor, body: string) => Promise<boolean>
@@ -50,6 +60,7 @@ export function ProjectFilePanel({
   state,
   expanded,
   onClose,
+  onBackToSideChat,
   onExpandedChange,
   onRetry,
   onCreateComment,
@@ -66,6 +77,18 @@ export function ProjectFilePanel({
 
   return (
     <section className="flex h-full min-h-0 flex-col" aria-labelledby="project-file-title">
+      {onBackToSideChat ? (
+        <div className="flex h-10 shrink-0 items-center border-b border-border px-3">
+          <button
+            type="button"
+            className="inline-flex h-7 items-center gap-1 rounded-control px-2 text-caption font-medium text-secondary transition-colors hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-focus"
+            onClick={onBackToSideChat}
+          >
+            <ChevronLeft aria-hidden="true" className="size-4" strokeWidth={1.75} />
+            Back to side chat
+          </button>
+        </div>
+      ) : null}
       <header className="flex shrink-0 items-start justify-between gap-group border-b border-border px-panel py-group">
         <div className="flex min-w-0 items-start gap-2.5">
           <span className="mt-0.5 grid size-7 shrink-0 place-items-center rounded-control bg-status-info-muted text-status-info-foreground">
@@ -92,7 +115,11 @@ export function ProjectFilePanel({
                   : 'Wrap lines and hide line numbers'
               }
               aria-pressed={wrapPlain}
-              title={wrapPlain ? 'Show line numbers' : 'Wrap lines'}
+              title={
+                wrapPlain
+                  ? 'Show line numbers (turns off wrapping)'
+                  : 'Wrap lines (hides line numbers)'
+              }
               onClick={() => setWrapPlain((current) => !current)}
             >
               <TextWrap aria-hidden="true" className="size-4" strokeWidth={1.75} />
@@ -205,7 +232,7 @@ function FileContent({
           key={`${file.relativePath}:${file.updatedAt}`}
           fallback={plainTextFallback}
         >
-          <Suspense fallback={<FileLoadingState label="Preparing code view" />}>
+          <Suspense fallback={<FileLoadingState label="Loading code view" />}>
             <ProjectCodeViewer
               path={file.relativePath}
               content={file.content}
@@ -238,7 +265,9 @@ function FileContent({
       )}
       {selection ? (
         <section className="absolute inset-x-3 bottom-3 rounded-card border border-border bg-surface-raised p-3 shadow-lg">
-          <p className="text-caption text-secondary">Comment on “{selection.quote}”</p>
+          <p className="line-clamp-2 text-caption text-secondary" title={selection.quote}>
+            Comment on “{selection.quote}”
+          </p>
           <textarea
             className="mt-2 min-h-16 w-full resize-y rounded-control bg-surface-muted p-2 text-caption text-primary outline-none focus:outline-2 focus:outline-focus"
             value={selection.body}
@@ -270,7 +299,7 @@ function FileContent({
                 disabled={!selection.body.trim() || commentingDisabled}
                 onClick={() => void saveSelection()}
               >
-                Save Comment
+                Save comment
               </button>
             </div>
           </div>

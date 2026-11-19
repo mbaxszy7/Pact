@@ -9,6 +9,97 @@ import { prepareWindowsRunnerLauncher } from '../tests/e2e/windows-cli-launcher.
 
 const outputLimit = 256 * 1024
 
+function diagnosticInteger(number, min, max) {
+  if (!Number.isSafeInteger(number) || number < min || number > max)
+    throw new Error('Invalid diagnostic number')
+  return number
+}
+function diagnosticMembers(snapshot) {
+  if (
+    !Array.isArray(snapshot?.members) ||
+    snapshot.members.length > 16 ||
+    typeof snapshot.membersIncomplete !== 'boolean'
+  )
+    throw new Error('Invalid diagnostic members')
+  return {
+    members: snapshot.members.map((member) => {
+      if (
+        !['root', 'descendant'].includes(member?.role) ||
+        ![
+          'codex',
+          'node',
+          'cmd',
+          'conhost',
+          'git',
+          'rg',
+          'other',
+          'pnpm',
+          'esbuild',
+          'app-builder',
+          '7zip',
+          'nsis',
+          'compiler',
+          'powershell',
+          'owned-helper',
+          'electron',
+          'crash-reporter',
+        ].includes(member.image)
+      )
+        throw new Error('Invalid diagnostic category')
+      return {
+        pid: diagnosticInteger(member.pid, 1, 4294967295),
+        createdMs: diagnosticInteger(member.createdMs, 0, Number.MAX_SAFE_INTEGER),
+        role: member.role,
+        image: member.image,
+      }
+    }),
+    membersIncomplete: snapshot.membersIncomplete,
+  }
+}
+
+/** Diagnostics never authorize release; only fixed, bounded facts may enter CI logs. */
+export function windowsJobDiagnostic(value) {
+  try {
+    if (value?.version !== 1) throw new Error('Missing diagnostic')
+    let root = null,
+      stop = null,
+      afterTerminate = null
+    if (value.root !== null) {
+      if (typeof value.root?.natural !== 'boolean') throw new Error('Invalid root diagnostic')
+      root = {
+        pid: diagnosticInteger(value.root.pid, 1, 4294967295),
+        exitCode: diagnosticInteger(value.root.exitCode, -2147483648, 2147483647),
+        elapsedMs: diagnosticInteger(value.root.elapsedMs, 0, Number.MAX_SAFE_INTEGER),
+        natural: value.root.natural,
+        active: diagnosticInteger(value.root.active, 0, 256),
+        ...diagnosticMembers(value.root),
+      }
+    }
+    if (value.stop !== null) {
+      if (!['control-closed', 'deadline', 'descendants-still-running'].includes(value.stop?.reason))
+        throw new Error('Invalid stop diagnostic')
+      stop = { reason: value.stop.reason, active: diagnosticInteger(value.stop.active, 0, 256) }
+    }
+    if (value.afterTerminate !== null) {
+      if (value.afterTerminate?.phase !== 'after-terminate')
+        throw new Error('Invalid capture phase')
+      afterTerminate = { phase: 'after-terminate', ...diagnosticMembers(value.afterTerminate) }
+    }
+    return {
+      version: 1,
+      root,
+      stop,
+      afterTerminate,
+      errorCode:
+        value.errorCode === null
+          ? null
+          : diagnosticInteger(value.errorCode, -2147483648, 2147483647),
+    }
+  } catch {
+    return { incomplete: true }
+  }
+}
+
 /** NSIS parses its raw command line, not CRT argv; only these owned operations opt in. */
 export function validateWindowsArgumentMode(args, mode = 'crt') {
   if (mode === 'crt') return mode
@@ -174,6 +265,9 @@ export async function runWindows(args, timeout, options, { failure, scrubHeaders
     let pid = null,
       ownedProcessCount = 0,
       exitCode = 1,
+      supervisorExitCode = null,
+      firstStopReason = null,
+      diagnostic = { incomplete: true },
       error,
       killTimer,
       startupTimer,
@@ -223,12 +317,35 @@ export async function runWindows(args, timeout, options, { failure, scrubHeaders
         }
       }
       state('settled')
+      const result = stopping || signal?.aborted || performance.now() >= deadlineAt ? 1 : exitCode
+      if (error || result !== 0) {
+        try {
+          console.error(
+            '[pact-windows-job]',
+            JSON.stringify({
+              firstStopReason,
+              supervisorExitCode,
+              exitCode,
+              closed,
+              pumpsClosed,
+              groupGone,
+              ownedProcessCount,
+              jobAdmitted: goMayHaveBeenSent,
+              failed: Boolean(error),
+              diagnostic,
+            }),
+          )
+        } catch {
+          /* Failure observations must not change the execution result. */
+        }
+      }
       if (error) reject(error)
-      else done(stopping || signal?.aborted || performance.now() >= deadlineAt ? 1 : exitCode)
+      else done(result)
     }
     const stop = (reason) => {
       if (stopping || settled) return
       stopping = true
+      firstStopReason = reason
       buffers.stdout = Buffer.alloc(0)
       buffers.stderr = Buffer.alloc(0)
       bufferedBytes = 0
@@ -397,6 +514,7 @@ export async function runWindows(args, timeout, options, { failure, scrubHeaders
             groupGone = true
             ownedProcessCount = 0
             exitCode = message.exitCode
+            diagnostic = windowsJobDiagnostic(message.diagnostic)
           } else if (message.kind === 'error') {
             error = failure('Windows E2E supervisor could not execute its owned Job.')
             stop('supervisor-error')
@@ -427,7 +545,8 @@ export async function runWindows(args, timeout, options, { failure, scrubHeaders
         error = failure('Windows E2E supervisor could not start.')
         stop('spawn-failed')
       })
-      child.once('close', () => {
+      child.once('close', (code) => {
+        supervisorExitCode = Number.isInteger(code) ? code : null
         closed = true
         finish()
       })

@@ -171,13 +171,15 @@ async function bootstrap(): Promise<void> {
         DATABASE_IN_USE:
           'Another Pact process is using this data. Close that process before opening this copy.',
         DATABASE_INCOMPATIBLE:
-          'This Pact version cannot safely open the existing data. Use a build with compatible migration history.',
+          failure.reason === 'newer-migration-history'
+            ? 'This version of Pact can’t open your existing data. Try opening it with a newer version of Pact.'
+            : 'This version of Pact can’t open your existing data.',
         DATABASE_BACKUP_FAILED:
-          'Pact could not create the required upgrade backup. Check storage space and folder permissions.',
+          'Pact couldn’t create a backup before upgrading your data. Check free disk space and folder permissions.',
         DATABASE_MIGRATION_FAILED:
-          'Pact could not complete the data upgrade. Existing data and recovery files have been preserved.',
+          'Pact couldn’t upgrade your data. Your existing data and backup are safe.',
         DATABASE_STORAGE_FAILED:
-          'Pact could not open its data. Check that the data folder is available and accessible.',
+          'Pact couldn’t open its data folder. Check that the folder exists and is accessible.',
       }
       const canReveal =
         isAbsolute(failure.dataFilePath) &&
@@ -186,16 +188,16 @@ async function bootstrap(): Promise<void> {
       void dialog
         .showMessageBox({
           type: 'error',
-          title: `${productIdentity.productName} could not start`,
+          title: `${productIdentity.productName} couldn’t start`,
           message:
             failure.stage === 'runtime'
-              ? 'Pact could not start its local runtime. Quit and check the data folder before trying again.'
+              ? 'Pact couldn’t start its background service. Quit and check your data folder before trying again.'
               : messages[failure.code],
           detail: failure.partialBackupFilePath
-            ? 'Your data was preserved. An incomplete backup was kept separately and must not replace the original data.'
+            ? 'Your original data is safe. An incomplete backup file was kept separately and should not replace it.'
             : failure.backupFilePath
-              ? 'Your data and recovery backup were preserved. Open the data folder to locate them.'
-              : 'Your data was preserved. Pact will quit without recreating or clearing it.',
+              ? 'Your data and a recovery backup were kept safe. Open the data folder to find them.'
+              : 'Your data is safe. Pact will quit without changing or clearing it.',
           buttons: canReveal ? ['Open data folder', 'Quit'] : ['Quit'],
           defaultId: canReveal ? 1 : 0,
           cancelId: canReveal ? 1 : 0,
@@ -219,7 +221,14 @@ async function bootstrap(): Promise<void> {
     () => applicationUpdates?.openFromMenu(),
   )
   appearanceSettings = createAppearanceController(utilityClient, nativeTheme)
-  removeDesktopModules = registerDesktopModules(rendererTrust, utilityClient, appearanceSettings)
+  if (!nativePresence) throw new Error('Pact native presence was not initialized.')
+  removeDesktopModules = registerDesktopModules(
+    rendererTrust,
+    utilityClient,
+    appearanceSettings,
+    nativePresence,
+    (event) => diagnostics?.record(event),
+  )
 
   app.on('browser-window-created', (_, window) => {
     optimizer.watchWindowShortcuts(window)
@@ -266,6 +275,7 @@ let quitApproval: Promise<void> | undefined
 let quitCompletion: Promise<void> | undefined
 function finishQuit(): Promise<void> {
   quitCompletion ??= (async () => {
+    await utilityClient.settlement()
     try {
       await diagnostics?.close()
     } catch {

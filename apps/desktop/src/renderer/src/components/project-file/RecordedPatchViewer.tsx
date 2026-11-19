@@ -21,13 +21,13 @@ export function RecordedPatchViewer({
       contents.reduce((bytes, content) => bytes + new TextEncoder().encode(content).byteLength, 0) >
       WORKSPACE_PREVIEW_BYTES
     )
-      throw new Error('Recorded patch exceeds its preview limit.')
+      throw new Error('This patch is too large to preview.')
     const result: PatchRow[] = []
     for (const content of contents) {
       const source = content.startsWith('--- ') ? `diff --git a/file b/file\n${content}` : content
       const files = gitDiffParser.parse(source)
       if (files.length !== 1 || files[0]!.isBinary || !files[0]!.hunks.length)
-        throw new Error('This recorded patch has no supported text changes.')
+        throw new Error('This patch doesn’t contain previewable text changes.')
       for (const hunk of files[0]!.hunks) {
         result.push({ kind: 'hunk', content: hunk.content })
         for (const change of hunk.changes) result.push({ kind: 'change', change })

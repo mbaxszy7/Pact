@@ -50,7 +50,12 @@ export class ConversationImages {
     const entries = await opendir(this.folder)
     for await (const entry of entries) {
       const match = /^([a-f0-9-]{36})\.(part|png|jpg|webp|thumb\.webp)$/iu.exec(entry.name)
-      if (match && entry.isFile() && !this.repository.imageRecord(match[1]!))
+      if (
+        match &&
+        entry.isFile() &&
+        !this.repository.imageRecord(match[1]!) &&
+        !this.repository.imageStorageObjectReferenced(match[1]!)
+      )
         await rm(join(this.folder, entry.name), { force: true })
     }
     for (;;) {
@@ -93,7 +98,8 @@ export class ConversationImages {
           const row = this.repository.beginImage(input.sessionId, id, input.name, owner)
           if (row.ready)
             return { imageId: id, offset: row.bytes, ready: true, image: this.meta(row) }
-          const path = this.path(id, 'part')
+          const storageId = row.storageObjectId ?? id
+          const path = this.path(storageId, 'part')
           let fd
           try {
             fd = await open(path, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600)
@@ -107,6 +113,7 @@ export class ConversationImages {
         if (!row || row.ownerSessionId !== input.sessionId || row.ownerKey !== owner)
           throw new Error('This image belongs to another input.')
         if (row.ready) return { imageId: id, offset: row.bytes, ready: true, image: this.meta(row) }
+        const storageId = row.storageObjectId ?? id
         if (input.type === 'append') {
           if (!/^[A-Za-z0-9+/]*={0,2}$/u.test(input.data)) throw new Error('Invalid image segment.')
           const data = Buffer.from(input.data, 'base64')
@@ -119,7 +126,10 @@ export class ConversationImages {
           )
             throw new Error('Invalid image offset or preparation capacity.')
           this.repository.assertImageCapacity(owner, data.length)
-          const fd = await open(this.path(id, 'part'), constants.O_WRONLY | constants.O_NOFOLLOW)
+          const fd = await open(
+            this.path(storageId, 'part'),
+            constants.O_WRONLY | constants.O_NOFOLLOW,
+          )
           try {
             let written = 0
             while (written < data.length) {
@@ -146,8 +156,8 @@ export class ConversationImages {
           )
           return { imageId: id, offset: next.bytes, ready: false }
         }
-        const source = this.path(id, 'part'),
-          thumbnail = this.path(id, 'thumb.webp')
+        const source = this.path(storageId, 'part'),
+          thumbnail = this.path(storageId, 'thumb.webp')
         const named =
           process.platform === 'win32' ? await lstat(source, { bigint: true }) : undefined
         if (named && (!named.isFile() || named.isSymbolicLink() || named.nlink !== 1n))
@@ -209,7 +219,7 @@ export class ConversationImages {
         const decoded = await this.decode(source, thumbnail, signal)
         signal.throwIfAborted()
         if (!this.repository.imageRecord(id)) throw new Error('Image preparation was cancelled.')
-        await rename(source, this.path(id, suffix(decoded.mediaType)))
+        await rename(source, this.path(storageId, suffix(decoded.mediaType)))
         const image: ConversationImage = {
           id,
           name: row.name,
@@ -357,8 +367,9 @@ export class ConversationImages {
       const thumbnail = input.variant === 'thumbnail'
       const total = thumbnail ? row.thumbnailBytes : image.bytes
       if (input.offset > total) throw new Error('Invalid image read offset.')
+      const storageObjectId = row.storageObjectId ?? image.id
       const fd = await open(
-        this.path(image.id, thumbnail ? 'thumb.webp' : suffix(image.mediaType)),
+        this.path(storageObjectId, thumbnail ? 'thumb.webp' : suffix(image.mediaType)),
         constants.O_RDONLY | constants.O_NOFOLLOW,
       )
       try {
@@ -388,7 +399,8 @@ export class ConversationImages {
   ): ConversationImage & { path: string } {
     if (!this.repository.imageAccessible(session, image.id, owner))
       throw new Error('This image source is unavailable.')
-    return { ...image, path: this.path(image.id, suffix(image.mediaType)) }
+    const storageObjectId = this.repository.imageStorageObjectId(image.id) ?? image.id
+    return { ...image, path: this.path(storageObjectId, suffix(image.mediaType)) }
   }
   hold(ids: string[]): () => void {
     if (this.held.size + new Set(ids.filter((id) => !this.held.has(id))).size > 512)
@@ -408,10 +420,15 @@ export class ConversationImages {
   }
   async release(session: string, id: string, owner: string): Promise<void> {
     if (this.held.has(id)) return
-    if (this.repository.releaseImage(id, session, owner)) {
+    const { released, deleteStorageObjectId } = this.repository.releaseImageAsset(
+      id,
+      session,
+      owner,
+    )
+    if (released && deleteStorageObjectId && !this.held.has(deleteStorageObjectId)) {
       await Promise.all(
         ['part', 'png', 'jpg', 'webp', 'thumb.webp'].map((ext) =>
-          rm(this.path(id, ext), { force: true }),
+          rm(this.path(deleteStorageObjectId, ext), { force: true }),
         ),
       )
     }

@@ -30,7 +30,10 @@ export function useAppUpdates(
   }, [])
 
   const run = useCallback(
-    async (request: () => Promise<RpcResult<UpdateState>>): Promise<void> => {
+    async (
+      request: () => Promise<RpcResult<UpdateState>>,
+      fallbackError: string,
+    ): Promise<void> => {
       setBusy(true)
       setError(undefined)
       try {
@@ -39,7 +42,7 @@ export function useAppUpdates(
         if (result.ok) accept(result.value)
         else setError(result.error.message)
       } catch {
-        if (mounted.current) setError('Couldn’t load update settings. Try again.')
+        if (mounted.current) setError(fallbackError)
       } finally {
         if (mounted.current) setBusy(false)
       }
@@ -130,13 +133,15 @@ export function useAppUpdates(
     state,
     busy,
     error,
-    check: () => run(() => window.pact.checkForUpdates()),
-    retry: () => run(() => window.pact.getUpdateState()),
+    check: () => run(() => window.pact.checkForUpdates(), 'Couldn’t check for updates. Try again.'),
+    retry: () =>
+      run(() => window.pact.getUpdateState(), 'Couldn’t load update settings. Try again.'),
     setAutoCheck: (autoCheck: boolean) => {
       const value = current.current
       if (!value?.preferencesReady || busy) return Promise.resolve()
-      return run(() =>
-        window.pact.setUpdatePreferences({ autoCheck, expectedRevision: value.revision }),
+      return run(
+        () => window.pact.setUpdatePreferences({ autoCheck, expectedRevision: value.revision }),
+        'Couldn’t save update preferences. Try again.',
       )
     },
   }

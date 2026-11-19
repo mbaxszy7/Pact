@@ -3,6 +3,10 @@ import { contextBridge, ipcRenderer } from 'electron'
 import type { DesktopBridge } from '@pact/contracts'
 
 import {
+  relayDecisionAnswerSchema,
+  preparedInputContinueSchema,
+  relayDecisionReceiptReadSchema,
+  relayDecisionReceiptSchema,
   appearanceSnapshotSchema,
   updateStateSchema,
   updateNoticeResultSchema,
@@ -31,7 +35,37 @@ import {
   nativeQuitDecisionInputSchema,
   nativeQuitDecisionResultSchema,
   nativeSessionOpenedResultSchema,
+  sessionReminderActionSchema,
+  sessionReminderActionResultSchema,
+  sessionReminderStateSchema,
   sessionCatalogChangeSchema,
+  schedulingSettingsSchema,
+  schedulingStateSchema,
+  schedulingStateInputSchema,
+  schedulingSettingsSaveSchema,
+  relayCredentialSaveSchema,
+  relayCredentialRemoveSchema,
+  relayCredentialReceiptReadSchema,
+  relayCredentialReceiptSchema,
+  relayCredentialRevealSchema,
+  relayCredentialRevealedSchema,
+  schedulingActivityReadSchema,
+  schedulingActivityPageSchema,
+  schedulingChangedSchema,
+  providerUsageCancelInputSchema,
+  providerUsageCancelResultSchema,
+  providerUsageReadInputSchema,
+  providerUsageRefreshInputSchema,
+  providerUsageSnapshotSchema,
+  createSideChatInputSchema,
+  createSideChatReceiptSchema,
+  discardEmptySideChatInputSchema,
+  discardEmptySideChatResultSchema,
+  readSideChatReceiptInputSchema,
+  listSideChatsInputSchema,
+  listSideChatsPageSchema,
+  sideChatSyncMainInputSchema,
+  sideChatSyncMainReceiptSchema,
 } from '@pact/contracts'
 
 import {
@@ -148,6 +182,11 @@ const onAppearanceSettingsChanged = eventSubscription(
   appearanceSnapshotSchema,
   'business',
 )
+const onSchedulingChanged = eventSubscription(
+  IPC_CHANNELS.schedulingChanged,
+  schedulingChangedSchema,
+  'business',
+)
 
 if (traffic) {
   const add: unknown = Reflect.get(globalThis, 'addEventListener')
@@ -180,6 +219,12 @@ const onNativeNavigationChanged = eventSubscription(
 const onNativeQuitStateChanged = eventSubscription(
   IPC_CHANNELS.nativeQuitChanged,
   nativeQuitStateSchema.nullable(),
+  'business',
+)
+
+const onSessionReminderChanged = eventSubscription(
+  IPC_CHANNELS.sessionReminderChanged,
+  sessionReminderStateSchema,
   'business',
 )
 
@@ -226,6 +271,15 @@ const bridge: DesktopBridge = {
       await invoke(IPC_CHANNELS.nativeQuitRespond, nativeQuitDecisionInputSchema.parse(input)),
     ),
   onNativeQuitStateChanged,
+  onSessionReminderChanged,
+  viewSessionReminder: async (input) =>
+    rpcResultSchema(sessionReminderActionResultSchema).parse(
+      await invoke(IPC_CHANNELS.sessionReminderView, sessionReminderActionSchema.parse(input)),
+    ),
+  dismissSessionReminder: async (input) =>
+    rpcResultSchema(sessionReminderActionResultSchema).parse(
+      await invoke(IPC_CHANNELS.sessionReminderDismiss, sessionReminderActionSchema.parse(input)),
+    ),
   prepareWorkspaceArchive: async (input) =>
     rpcResultSchema(workspaceArchivePreviewSchema).parse(
       await invoke(IPC_CHANNELS.workspaceArchivePrepare, input),
@@ -312,7 +366,46 @@ const bridge: DesktopBridge = {
   },
   getRuntimePreparation: () => invoke(IPC_CHANNELS.runtimePreparationGet),
   chooseRuntimeExecutable: (agentId) => invoke(IPC_CHANNELS.runtimeExecutableChoose, agentId),
-  getDefaultSessionSettingsEditorState: () => invoke(IPC_CHANNELS.defaultSessionSettingsGet),
+  getSchedulingState: async (input) =>
+    rpcResultSchema(schedulingStateSchema).parse(
+      await invoke(IPC_CHANNELS.schedulingStateGet, schedulingStateInputSchema.parse(input)),
+    ),
+  getSchedulingSettings: async () =>
+    rpcResultSchema(schedulingSettingsSchema).parse(
+      await invoke(IPC_CHANNELS.schedulingSettingsGet),
+    ),
+  saveSchedulingSettings: async (input) =>
+    rpcResultSchema(schedulingSettingsSchema).parse(
+      await invoke(IPC_CHANNELS.schedulingSettingsSave, schedulingSettingsSaveSchema.parse(input)),
+    ),
+  saveRelayApiKey: async (input) =>
+    rpcResultSchema(relayCredentialReceiptSchema).parse(
+      await invoke(IPC_CHANNELS.relayCredentialSave, relayCredentialSaveSchema.parse(input)),
+    ),
+  removeRelayApiKey: async (input) =>
+    rpcResultSchema(relayCredentialReceiptSchema).parse(
+      await invoke(IPC_CHANNELS.relayCredentialRemove, relayCredentialRemoveSchema.parse(input)),
+    ),
+  revealRelayApiKey: async (input) =>
+    rpcResultSchema(relayCredentialRevealedSchema).parse(
+      await invoke(IPC_CHANNELS.relayCredentialReveal, relayCredentialRevealSchema.parse(input)),
+    ),
+  readRelayCredentialReceipt: async (input) =>
+    rpcResultSchema(relayCredentialReceiptSchema.nullable()).parse(
+      await invoke(
+        IPC_CHANNELS.relayCredentialReceiptRead,
+        relayCredentialReceiptReadSchema.parse(input),
+      ),
+    ),
+  readSchedulingActivity: async (input) =>
+    rpcResultSchema(schedulingActivityPageSchema).parse(
+      await invoke(IPC_CHANNELS.schedulingActivityRead, schedulingActivityReadSchema.parse(input)),
+    ),
+  onSchedulingChanged: (listener) => onSchedulingChanged(() => listener()),
+  getDefaultSessionSettingsEditorState: (activePair) =>
+    activePair !== undefined
+      ? invoke(IPC_CHANNELS.defaultSessionSettingsGet, activePair)
+      : invoke(IPC_CHANNELS.defaultSessionSettingsGet),
   saveDefaultSessionSettings: (input) => invoke(IPC_CHANNELS.defaultSessionSettingsSave, input),
   getProjectCatalog: () => invoke(IPC_CHANNELS.projectCatalogGet),
   readProjectContext: async (input) => {
@@ -345,14 +438,33 @@ const bridge: DesktopBridge = {
   },
   getSessionCatalog: (projectId, cursor) =>
     invoke(IPC_CHANNELS.sessionCatalogGet, projectId, cursor),
-  prepareSessionCreation: (projectId) => invoke(IPC_CHANNELS.sessionCreationPrepare, projectId),
+  getSessionPage: (input) => invoke(IPC_CHANNELS.sessionPageGet, input),
+  getSessionGroups: (input) => invoke(IPC_CHANNELS.sessionGroupsGet, input),
+  getSessionGroup: (input) => invoke(IPC_CHANNELS.sessionGroupGet, input),
+  getSessionMembership: (input) => invoke(IPC_CHANNELS.sessionMembershipGet, input),
+  locateSessionNavigation: (input) => invoke(IPC_CHANNELS.sessionNavigationLocate, input),
+  recoverSessionOrganization: () => invoke(IPC_CHANNELS.sessionOrganizationRecover),
+  getSessionCreationState: (input) => invoke(IPC_CHANNELS.sessionCreationState, input),
+  createSessionGroup: (input) => invoke(IPC_CHANNELS.sessionGroupCreate, input),
+  updateSessionGroup: (input) => invoke(IPC_CHANNELS.sessionGroupUpdate, input),
+  moveSessionGroup: (input) => invoke(IPC_CHANNELS.sessionGroupMove, input),
+  dissolveSessionGroup: (input) => invoke(IPC_CHANNELS.sessionGroupDissolve, input),
+  setSessionGroup: (input) => invoke(IPC_CHANNELS.sessionGroupSet, input),
+  prepareSessionCreation: (projectId, activePair) =>
+    activePair !== undefined
+      ? invoke(IPC_CHANNELS.sessionCreationPrepare, projectId, activePair)
+      : invoke(IPC_CHANNELS.sessionCreationPrepare, projectId),
   createSession: (input) => invoke(IPC_CHANNELS.sessionCreate, input),
   renameSession: (input) => invoke(IPC_CHANNELS.sessionRename, input),
   markSessionRead: (input) => invoke(IPC_CHANNELS.sessionMarkRead, input),
   archiveSession: (sessionId, operationId) =>
     invoke(IPC_CHANNELS.sessionArchive, sessionId, operationId),
   restoreSession: (sessionId) => invoke(IPC_CHANNELS.sessionRestore, sessionId),
-  getSessionSettings: (sessionId) => invoke(IPC_CHANNELS.sessionSettingsGet, sessionId),
+  setSessionSidebarHidden: (input) => invoke(IPC_CHANNELS.sessionSidebarHiddenSet, input),
+  getSessionSettings: (sessionId, activePair) =>
+    activePair !== undefined
+      ? invoke(IPC_CHANNELS.sessionSettingsGet, sessionId, activePair)
+      : invoke(IPC_CHANNELS.sessionSettingsGet, sessionId),
   saveSessionSettings: (input) => invoke(IPC_CHANNELS.sessionSettingsSave, input),
   saveSessionPermission: (input) => invoke(IPC_CHANNELS.sessionPermissionSave, input),
   saveSessionSpeed: (input) => invoke(IPC_CHANNELS.sessionSpeedSave, input),
@@ -361,9 +473,56 @@ const bridge: DesktopBridge = {
   readSkillDocument: (input) => invoke(IPC_CHANNELS.skillDocumentRead, input),
   cancelSkillDocument: (requestId) => invoke(IPC_CHANNELS.skillDocumentCancel, requestId),
   actOnCollaboration: (input) => invoke(IPC_CHANNELS.collaborationAction, input),
+  answerRelayDecision: async (input) =>
+    rpcResultSchema(relayDecisionReceiptSchema).parse(
+      await invoke(IPC_CHANNELS.relayDecisionAnswer, relayDecisionAnswerSchema.parse(input)),
+    ),
+  continuePreparedConversationInput: async (input) =>
+    rpcResultSchema(conversationPatchSchema).parse(
+      await invoke(IPC_CHANNELS.preparedInputContinue, preparedInputContinueSchema.parse(input)),
+    ),
+  getRelayDecisionReceipt: async (input) =>
+    rpcResultSchema(relayDecisionReceiptSchema).parse(
+      await invoke(
+        IPC_CHANNELS.relayDecisionReceiptRead,
+        relayDecisionReceiptReadSchema.parse(input),
+      ),
+    ),
   getConversation: (input) => invoke(IPC_CHANNELS.conversationGet, input),
   setConversationInterest: (sessionId, generation) =>
-    invoke(IPC_CHANNELS.conversationInterest, { sessionId, generation }),
+    invoke(
+      IPC_CHANNELS.conversationInterest,
+      typeof sessionId === 'string' || sessionId === null
+        ? { sessionId, generation }
+        : { sessionIds: [...sessionId], generation },
+    ),
+  createSideChat: async (input) =>
+    rpcResultSchema(createSideChatReceiptSchema).parse(
+      await invoke(IPC_CHANNELS.sideChatCreate, createSideChatInputSchema.parse(input)),
+    ),
+  readCreateSideChatReceipt: async (input) =>
+    rpcResultSchema(createSideChatReceiptSchema.nullable()).parse(
+      await invoke(IPC_CHANNELS.sideChatCreateReceipt, readSideChatReceiptInputSchema.parse(input)),
+    ),
+  listSideChats: async (input) =>
+    rpcResultSchema(listSideChatsPageSchema).parse(
+      await invoke(IPC_CHANNELS.sideChatList, listSideChatsInputSchema.parse(input)),
+    ),
+  discardEmptySideChat: async (input) =>
+    rpcResultSchema(discardEmptySideChatResultSchema).parse(
+      await invoke(IPC_CHANNELS.sideChatDiscardEmpty, discardEmptySideChatInputSchema.parse(input)),
+    ),
+  syncSideChatToMain: async (input) =>
+    rpcResultSchema(sideChatSyncMainReceiptSchema).parse(
+      await invoke(IPC_CHANNELS.sideChatSyncMain, sideChatSyncMainInputSchema.parse(input)),
+    ),
+  readSyncSideChatReceipt: async (input) =>
+    rpcResultSchema(sideChatSyncMainReceiptSchema.nullable()).parse(
+      await invoke(
+        IPC_CHANNELS.sideChatSyncMainReceipt,
+        readSideChatReceiptInputSchema.parse(input),
+      ),
+    ),
   writeConversationImage: (input) => invoke(IPC_CHANNELS.conversationImageWrite, input),
   chooseConversationImages: (input) => invoke(IPC_CHANNELS.conversationImageChoose, input),
   readConversationImage: (input) => invoke(IPC_CHANNELS.conversationImageRead, input),
@@ -396,6 +555,18 @@ const bridge: DesktopBridge = {
   updateAppearanceSettings: (input) => invoke(IPC_CHANNELS.appearanceUpdate, input),
   resetAppearanceSettings: (input) => invoke(IPC_CHANNELS.appearanceReset, input),
   onAppearanceSettingsChanged,
+  getProviderUsage: async (input) =>
+    rpcResultSchema(providerUsageSnapshotSchema).parse(
+      await invoke(IPC_CHANNELS.providerUsageGet, providerUsageReadInputSchema.parse(input)),
+    ),
+  refreshProviderUsage: async (input) =>
+    rpcResultSchema(providerUsageSnapshotSchema).parse(
+      await invoke(IPC_CHANNELS.providerUsageRefresh, providerUsageRefreshInputSchema.parse(input)),
+    ),
+  cancelProviderUsage: async (input) =>
+    rpcResultSchema(providerUsageCancelResultSchema).parse(
+      await invoke(IPC_CHANNELS.providerUsageCancel, providerUsageCancelInputSchema.parse(input)),
+    ),
 }
 
 contextBridge.exposeInMainWorld('pact', bridge)

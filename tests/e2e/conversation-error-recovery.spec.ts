@@ -35,12 +35,13 @@ test(
           { id: sessionId, projectId, title: 'Recoverable conversation', createdAt },
           {
             primaryAgentId: 'codex',
+            secondaryAgentId: 'claude',
             agents: {
               claude: { model: null, effort: null },
               codex: { model: null, effort: null },
+              agy: { model: null, effort: null },
             },
             maxDiscussionRounds: 6,
-            runningMessagePolicy: 'immediate_safe_point',
             maxReviewCycles: 3,
             maxRepairAttempts: 3,
           },

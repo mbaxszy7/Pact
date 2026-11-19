@@ -15,12 +15,14 @@ import {
 const projectId = '00000000-0000-4000-8000-000000000001'
 const settings: CollaborationSession['settings'] = {
   primaryAgentId: 'codex',
+  secondaryAgentId: 'claude',
   agents: {
     claude: { model: null, effort: null },
     codex: { model: null, effort: null },
+    agy: { model: null, effort: null },
   },
   maxDiscussionRounds: 6,
-  runningMessagePolicy: 'immediate_safe_point',
+
   maxReviewCycles: 3,
   maxRepairAttempts: 3,
 }

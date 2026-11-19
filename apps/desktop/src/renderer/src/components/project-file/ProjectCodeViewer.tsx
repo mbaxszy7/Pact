@@ -262,7 +262,7 @@ export function ProjectCodeViewer({
           className="absolute inset-0 grid place-items-center text-caption text-secondary"
           aria-busy="true"
         >
-          Preparing code view…
+          Loading code view…
         </span>
       ) : null}
       {selectionAction?.tooLarge ? (
@@ -274,7 +274,7 @@ export function ProjectCodeViewer({
         </output>
       ) : selectionAction ? (
         <button
-          className="absolute z-20 inline-flex h-8 w-32 items-center justify-center gap-1.5 whitespace-nowrap rounded-control bg-surface-raised px-2.5 text-caption font-medium text-primary shadow-sm transition-colors duration-150 ease-out-pact hover:bg-surface-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus"
+          className="absolute z-20 inline-flex h-8 w-32 items-center justify-center gap-1.5 whitespace-nowrap rounded-control bg-surface-inverse px-2.5 text-caption font-medium text-inverse shadow-popover transition-[filter] duration-150 ease-out-pact hover:brightness-95 active:brightness-90 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus"
           type="button"
           style={{ left: selectionAction.left, top: selectionAction.top }}
           aria-label="Comment on selected code"
@@ -415,7 +415,7 @@ export function ProjectDiffViewer({
     <div className="relative flex h-full min-h-0 w-full flex-col">
       {timedOut ? (
         <output className="shrink-0 border-b border-border px-3 py-2 text-caption text-secondary">
-          Diff could not be computed. Choose After to read the saved code.
+          Couldn’t compute diff. Choose After to read the saved code.
         </output>
       ) : null}
       <div ref={hostRef} className="min-h-0 w-full flex-1" />
@@ -424,7 +424,7 @@ export function ProjectDiffViewer({
           className="absolute inset-0 grid place-items-center text-caption text-secondary"
           aria-busy="true"
         >
-          Preparing Diff…
+          Loading diff…
         </span>
       ) : null}
     </div>

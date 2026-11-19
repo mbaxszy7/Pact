@@ -181,6 +181,90 @@ const nativeChannels = [
   IPC_CHANNELS.nativeQuitRespond,
 ]
 
+const WINDOWS_LAUNCH_ENV_DEFAULT_MAX_CACHE = 16
+const WINDOWS_BADGE_BITMAP_SIZE = 32
+
+const WINDOWS_BADGE_FONT: Record<string, readonly number[]> = {
+  '0': [0b0110, 0b1001, 0b1001, 0b1001, 0b0110],
+  '1': [0b0100, 0b1100, 0b0100, 0b0100, 0b1110],
+  '2': [0b0110, 0b1001, 0b0010, 0b0100, 0b1111],
+  '3': [0b1110, 0b0001, 0b0110, 0b0001, 0b1110],
+  '4': [0b1001, 0b1001, 0b1111, 0b0001, 0b0001],
+  '5': [0b1111, 0b1000, 0b1110, 0b0001, 0b1110],
+  '6': [0b0110, 0b1000, 0b1110, 0b1001, 0b0110],
+  '7': [0b1111, 0b0001, 0b0010, 0b0100, 0b0100],
+  '8': [0b0110, 0b1001, 0b0110, 0b1001, 0b0110],
+  '9': [0b0110, 0b1001, 0b0111, 0b0001, 0b0110],
+  '+': [0b000, 0b010, 0b111, 0b010, 0b000],
+}
+
+export function renderWindowsBadgeBitmap(label: string): Electron.NativeImage {
+  const size = WINDOWS_BADGE_BITMAP_SIZE
+  const buffer = Buffer.alloc(size * size * 4)
+  const center = (size - 1) / 2
+  const outerRadius = 14.5
+  const featherStart = 13.7
+
+  for (let y = 0; y < size; y += 1) {
+    for (let x = 0; x < size; x += 1) {
+      const distance = Math.hypot(x - center, y - center)
+      if (distance > outerRadius + 0.8) continue
+      const alpha =
+        distance <= featherStart
+          ? 1
+          : Math.max(
+              0,
+              Math.min(1, (outerRadius + 0.6 - distance) / (outerRadius + 0.6 - featherStart)),
+            )
+      if (alpha <= 0) continue
+      const offset = (y * size + x) * 4
+      // Chromium nativeImage.createFromBitmap expects premultiplied BGRA pixels.
+      buffer[offset] = Math.round(0x29 * alpha)
+      buffer[offset + 1] = Math.round(0x38 * alpha)
+      buffer[offset + 2] = Math.round(0xd9 * alpha)
+      buffer[offset + 3] = Math.round(255 * alpha)
+    }
+  }
+
+  const glyphs = label.split('').map((character) => ({
+    rows: WINDOWS_BADGE_FONT[character] ?? WINDOWS_BADGE_FONT['+']!,
+    cols: character === '+' ? 3 : 4,
+  }))
+  const scale = 2
+  const gap = 1
+  const totalWidth = glyphs.reduce(
+    (sum, glyph, index) => sum + glyph.cols * scale + (index > 0 ? gap : 0),
+    0,
+  )
+  const startX = Math.round((size - totalWidth) / 2)
+  const startY = Math.round((size - 5 * scale) / 2)
+
+  let cursorX = startX
+  for (const glyph of glyphs) {
+    for (let row = 0; row < 5; row += 1) {
+      const bits = glyph.rows[row] ?? 0
+      for (let col = 0; col < glyph.cols; col += 1) {
+        if ((bits & (1 << (glyph.cols - 1 - col))) === 0) continue
+        for (let dy = 0; dy < scale; dy += 1) {
+          for (let dx = 0; dx < scale; dx += 1) {
+            const px = cursorX + col * scale + dx
+            const py = startY + row * scale + dy
+            if (px < 0 || px >= size || py < 0 || py >= size) continue
+            const offset = (py * size + px) * 4
+            buffer[offset] = 0xff
+            buffer[offset + 1] = 0xff
+            buffer[offset + 2] = 0xff
+            buffer[offset + 3] = 0xff
+          }
+        }
+      }
+    }
+    cursorX += glyph.cols * scale + gap
+  }
+
+  return nativeImage.createFromBitmap(buffer, { width: size, height: size, scaleFactor: 2 })
+}
+
 function unavailable(message: string): RpcResult<never> {
   return { ok: false, error: { code: 'CONFLICT', message } }
 }
@@ -216,6 +300,11 @@ export class NativePresence {
   private systemEnding = false
   private jumpListAvailable = true
   private readonly taskbarTarget: WindowsTaskbarTarget | undefined
+  private notificationBadgeCount = 0
+  private notificationBadgeLabel = ''
+  private dockBounceId: number | undefined
+  private windowFlashing = false
+  private readonly windowsBadgeCache = new Map<string, Electron.NativeImage>()
   private readError = false
   private readonly removePresenceSubscription: () => void
 
@@ -357,9 +446,13 @@ export class NativePresence {
       this.rendererResponsive = false
       this.refreshQuitFallback()
     }
+    const focused = (): void => {
+      if (this.window === window) this.stopWindowFlash()
+    }
     const detach = (): void => {
       window.removeListener('close', close)
       window.removeListener('closed', closed)
+      window.removeListener('focus', focused)
       window.removeListener('session-end', this.systemShutdown)
       window.removeListener('unresponsive', unresponsive)
       window.removeListener('responsive', responsive)
@@ -371,12 +464,15 @@ export class NativePresence {
         this.window = undefined
         this.presentation = undefined
         this.quitUiReady = false
+        this.windowFlashing = false
       }
       if (this.detachWindow === detach) this.detachWindow = undefined
     }
     this.detachWindow = detach
+    this.applyWindowsOverlayBadge()
     window.on('close', close)
     window.once('closed', closed)
+    window.on('focus', focused)
     window.on('session-end', this.systemShutdown)
     window.on('unresponsive', unresponsive)
     window.on('responsive', responsive)
@@ -402,6 +498,144 @@ export class NativePresence {
     }
     this.presentation?.show()
     this.refreshQuitFallback()
+  }
+
+  isWindowUsable(): boolean {
+    return Boolean(
+      this.window &&
+      !this.window.isDestroyed() &&
+      !this.window.webContents.isDestroyed() &&
+      this.rendererResponsive,
+    )
+  }
+
+  isWindowFocused(): boolean {
+    return Boolean(this.window && !this.window.isDestroyed() && this.window.isFocused())
+  }
+
+  isWindowVisible(): boolean {
+    return Boolean(
+      this.window &&
+      !this.window.isDestroyed() &&
+      this.window.isVisible() &&
+      !this.window.isMinimized(),
+    )
+  }
+
+  setNotificationBadgeCount(count: number): void {
+    if (!this.publishShell) return
+    const normalizedCount =
+      this.disposed || !Number.isFinite(count) || count <= 0 ? 0 : Math.min(100, Math.floor(count))
+    const label =
+      normalizedCount === 0 ? '' : normalizedCount > 99 ? '99+' : String(normalizedCount)
+    const previousCount = this.notificationBadgeCount
+    this.notificationBadgeCount = normalizedCount
+
+    if (process.platform === 'darwin') {
+      if (label !== this.notificationBadgeLabel) {
+        this.notificationBadgeLabel = label
+        app.dock?.setBadge(label)
+      }
+      if (normalizedCount === 0) {
+        this.cancelDockBounce()
+      } else if (normalizedCount > previousCount) {
+        this.cancelDockBounce()
+        const bounceId = app.dock?.bounce('informational')
+        this.dockBounceId = typeof bounceId === 'number' && bounceId >= 0 ? bounceId : undefined
+      }
+      return
+    }
+
+    if (process.platform === 'win32') {
+      if (label !== this.notificationBadgeLabel) {
+        this.notificationBadgeLabel = label
+        this.applyWindowsOverlayBadge()
+      }
+      if (normalizedCount === 0) {
+        this.stopWindowFlash()
+      } else if (
+        normalizedCount > previousCount &&
+        !this.isWindowFocused() &&
+        this.window &&
+        !this.window.isDestroyed()
+      ) {
+        try {
+          this.window.flashFrame(true)
+          this.windowFlashing = true
+        } catch {
+          /* Best-effort taskbar flash on unsupported environments. */
+        }
+      }
+    }
+  }
+
+  private cancelDockBounce(): void {
+    if (this.dockBounceId === undefined) return
+    try {
+      app.dock?.cancelBounce(this.dockBounceId)
+    } catch {
+      /* Ignore bounce cancellation errors after dock reset. */
+    }
+    this.dockBounceId = undefined
+  }
+
+  private applyWindowsOverlayBadge(): void {
+    if (
+      !this.publishShell ||
+      process.platform !== 'win32' ||
+      !this.window ||
+      this.window.isDestroyed()
+    )
+      return
+    try {
+      if (!this.notificationBadgeLabel) {
+        this.window.setOverlayIcon(null, '')
+        return
+      }
+      let icon = this.windowsBadgeCache.get(this.notificationBadgeLabel)
+      if (!icon) {
+        if (this.windowsBadgeCache.size >= WINDOWS_LAUNCH_ENV_DEFAULT_MAX_CACHE) {
+          const oldest = this.windowsBadgeCache.keys().next().value
+          if (oldest !== undefined) this.windowsBadgeCache.delete(oldest)
+        }
+        icon = renderWindowsBadgeBitmap(this.notificationBadgeLabel)
+        this.windowsBadgeCache.set(this.notificationBadgeLabel, icon)
+      }
+      this.window.setOverlayIcon(
+        icon,
+        `${this.notificationBadgeLabel} unread Session notifications`,
+      )
+    } catch {
+      /* Taskbar overlay is best-effort until the Windows shell handle is ready. */
+    }
+  }
+
+  private stopWindowFlash(): void {
+    if (!this.windowFlashing) return
+    this.windowFlashing = false
+    if (!this.window || this.window.isDestroyed()) return
+    try {
+      this.window.flashFrame(false)
+    } catch {
+      /* Ignore window frame flash reset failures. */
+    }
+  }
+
+  openAttention(): void {
+    this.showAttention()
+  }
+
+  openWorkspace(): void {
+    if (this.isClosing()) {
+      this.show()
+      return
+    }
+    this.navigation = nativeNavigationIntentSchema.parse({
+      navigationId: randomUUID(),
+      kind: 'workspace',
+    })
+    this.show()
+    this.send(IPC_CHANNELS.nativeNavigationChanged, this.navigation)
   }
 
   navigate(sessionId: string): void {
@@ -434,11 +668,11 @@ export class NativePresence {
       const running = this.utility.isRunning()
       const choice = await dialog.showMessageBox({
         type: 'error',
-        title: 'Pact could not start',
-        message: 'Pact could not load your window settings.',
+        title: 'Pact couldn’t start',
+        message: 'Pact couldn’t load your window settings.',
         detail: running
-          ? 'Your saved settings have not been changed. Choose Retry to wait for the local runtime and read them again.'
-          : 'The local runtime has stopped. Exit Pact, then open it again. Your saved settings have not been changed.',
+          ? 'Your saved settings are intact. Click Retry to wait for the background service and try again.'
+          : 'The background service has stopped. Your saved settings are intact—exit Pact and open it again.',
         buttons: running ? ['Retry', 'Exit Pact'] : ['Exit Pact'],
         defaultId: 0,
         cancelId: running ? 1 : 0,
@@ -498,7 +732,7 @@ export class NativePresence {
         ...(!known
           ? {
               message:
-                'Pact could not confirm whether work is still active. Exiting may interrupt tasks.',
+                'Pact couldn’t confirm whether work is still active. Exiting may interrupt active tasks.',
             }
           : {}),
       })
@@ -515,8 +749,7 @@ export class NativePresence {
       ...state,
       phase: 'unconfirmed',
       unknown: true,
-      message:
-        'Runtime exit has not been confirmed. Pact is keeping its workspace open while cleanup finishes.',
+      message: 'Waiting for background tasks to close. Pact will exit once cleanup finishes.',
     })
     this.updateMenu()
   }
@@ -549,9 +782,8 @@ export class NativePresence {
           dialog.showMessageBox({
             type: 'warning',
             title: 'Pact is still closing',
-            message: 'Pact is waiting for its local runtime to exit.',
-            detail:
-              'Cleanup has not been confirmed. Pact will remain running until the runtime exits.',
+            message: 'Pact is waiting for background tasks to exit.',
+            detail: 'Cleanup is still finishing. Pact will close automatically when done.',
             buttons: ['OK'],
             noLink: true,
           }),
@@ -776,7 +1008,7 @@ export class NativePresence {
     if (this.tray && this.isClosing()) this.tray.setToolTip(`${this.identity.name}\nExiting…`)
     else if (this.tray && snapshot)
       this.tray.setToolTip(
-        `${this.identity.name}\n${snapshot.running.length} running · ${snapshot.attentionTotal} need attention`,
+        `${this.identity.name}\n${snapshot.running.length} running · ${snapshot.attentionTotal} ${snapshot.attentionTotal === 1 ? 'needs' : 'need'} attention`,
       )
   }
 
@@ -896,21 +1128,21 @@ export class NativePresence {
       const parsed = nativeSessionResolveInputSchema.safeParse(raw)
       return parsed.success && !this.isClosing()
         ? this.utility.resolveNativeSession(parsed.data)
-        : unavailable('This session cannot be opened right now.')
+        : unavailable('This session can’t be opened right now.')
     })
     ipcMain.handle(IPC_CHANNELS.nativeSessionOpened, (event, raw: unknown) => {
       this.trust.assertTrustedMainFrame(event)
       const parsed = nativeSessionOpenInputSchema.safeParse(raw)
       return parsed.success && !this.isClosing()
         ? this.utility.recordNativeSessionOpened(parsed.data)
-        : unavailable('The recent session could not be recorded.')
+        : unavailable('Couldn’t update recent sessions.')
     })
     ipcMain.handle(IPC_CHANNELS.nativeAttentionRead, (event, raw: unknown) => {
       this.trust.assertTrustedMainFrame(event)
       const parsed = nativeAttentionReadInputSchema.safeParse(raw)
       return parsed.success && !this.isClosing()
         ? this.utility.readNativeAttention(parsed.data)
-        : unavailable('Session status could not be read.')
+        : unavailable('Couldn’t load sessions needing attention.')
     })
     ipcMain.handle(IPC_CHANNELS.nativeNavigationGet, (event) => {
       this.trust.assertTrustedMainFrame(event)
@@ -920,7 +1152,7 @@ export class NativePresence {
       this.trust.assertTrustedMainFrame(event)
       const parsed = nativeNavigationAckInputSchema.safeParse(raw)
       if (!parsed.success || parsed.data.navigationId !== this.navigation?.navigationId)
-        return unavailable('A newer navigation request is already active.')
+        return unavailable('A newer session switch is already in progress.')
       this.navigation = undefined
       return { ok: true, value: { acknowledged: true } }
     })
@@ -937,7 +1169,7 @@ export class NativePresence {
       const parsed = nativeQuitDecisionInputSchema.safeParse(raw)
       return parsed.success
         ? this.decideQuit(parsed.data.operationId, parsed.data.decision)
-        : unavailable('Choose a valid exit action.')
+        : unavailable('Invalid exit action.')
     })
   }
 
@@ -948,12 +1180,22 @@ export class NativePresence {
     app.removeListener('activate', this.activate)
     app.removeListener('second-instance', this.secondInstance)
     if (this.started) powerMonitor.removeListener('shutdown', this.systemShutdown)
+    this.notificationBadgeCount = 0
+    this.notificationBadgeLabel = ''
+    if (this.publishShell && process.platform === 'win32') {
+      this.applyWindowsOverlayBadge()
+      this.stopWindowFlash()
+      this.windowsBadgeCache.clear()
+    }
     this.detachWindow?.()
     for (const channel of nativeChannels) ipcMain.removeHandler(channel)
     this.tray?.destroy()
     this.tray = undefined
-    if (this.publishShell && process.platform === 'darwin')
+    if (this.publishShell && process.platform === 'darwin') {
+      this.cancelDockBounce()
+      app.dock?.setBadge('')
       app.dock?.setMenu(Menu.buildFromTemplate([]))
+    }
     if (
       this.publishShell &&
       process.platform === 'win32' &&

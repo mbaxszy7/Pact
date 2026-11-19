@@ -30,6 +30,8 @@ export const diagnosticRequestTypeSchema = z.enum([
   'native-quit.prepare.request',
   'native-quit.cancel.request',
   'collaboration.action.request',
+  'relay.decision.answer.request',
+  'relay.decision.receipt.request',
   'session.fork.request',
   'conversation.interests.request',
   'runtime.shutdown.request',
@@ -43,6 +45,13 @@ export const diagnosticRequestTypeSchema = z.enum([
   'runtime-preparation.get.request',
   'runtime-preparation.path.update.request',
   'default-session-settings.get.request',
+  'scheduling.settings.get.request',
+  'scheduling.state.get.request',
+  'scheduling.settings.save.request',
+  'scheduling.activity.read.request',
+  'relay.credential.write.request',
+  'relay.credential.read.request',
+  'relay.credential.receipt.read.request',
   'default-session-settings.save.request',
   'project-catalog.get.request',
   'project-context.read.request',
@@ -54,12 +63,24 @@ export const diagnosticRequestTypeSchema = z.enum([
   'project-catalog.restore.request',
   'project-catalog.rename.request',
   'session-catalog.get.request',
+  'session-page.get.request',
+  'session-groups.get.request',
+  'session-group.get.request',
+  'session-membership.get.request',
+  'session-navigation.locate.request',
+  'session-creation.state.request',
+  'session-group.create.request',
+  'session-group.update.request',
+  'session-group.move.request',
+  'session-group.dissolve.request',
+  'session-group.set.request',
   'session-creation.prepare.request',
   'session.create.request',
   'session.rename.request',
   'session.mark-read.request',
   'session.archive.request',
   'session.restore.request',
+  'session-sidebar-hidden.set.request',
   'session-settings.get.request',
   'session-settings.save.request',
   'session-permission.save.request',
@@ -70,6 +91,7 @@ export const diagnosticRequestTypeSchema = z.enum([
   'skill-document.cancel.request',
   'skills.cancel.request',
   'conversation.send.request',
+  'conversation.prepared-input.continue.request',
   'conversation.queue.steer.request',
   'conversation.queue.return.request',
   'conversation.queue.remove.request',
@@ -93,10 +115,21 @@ export const diagnosticRequestTypeSchema = z.enum([
   'workspace-changes.read.request',
   'workspace-changes.file-read.request',
   'workspace-changes.undo.request',
+  'provider-usage.get.request',
+  'provider-usage.refresh.request',
+  'provider-usage.cancel.request',
+  'provider-usage.release-owner.request',
+  'side-chat.create.request',
+  'side-chat.create-receipt.request',
+  'side-chat.list.request',
+  'side-chat.discard-empty.request',
+  'side-chat.sync-main.request',
+  'side-chat.sync-main-receipt.request',
 ])
 export const diagnosticNativeMethodSchema = z.enum([
   'initialize',
   'account/read',
+  'account/rateLimits/read',
   'config/read',
   'model/list',
   'thread/start',
@@ -110,6 +143,15 @@ export const diagnosticNativeMethodSchema = z.enum([
   'turn/start',
   'turn/interrupt',
   'turn/steer',
+  'session/new',
+  'session/load',
+  'session/prompt',
+  'session/cancel',
+  'session/close',
+  'session/set_mode',
+  'session/set_config_option',
+  'session/request_permission',
+  'elicitation/create',
   'unrecognized',
 ])
 export const diagnosticFailureSourceSchema = z.enum([
@@ -123,7 +165,127 @@ export const diagnosticFailureSourceSchema = z.enum([
 export type DiagnosticFailureSource = z.infer<typeof diagnosticFailureSourceSchema>
 
 const boundedCount = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER)
+export const sourceReadStageSchema = z.enum([
+  'entry_owner',
+  'request_parse',
+  'native_root',
+  'native_current',
+  'reader_current',
+  'original_capture',
+  'repository_scope',
+  'page_read',
+  'navigation',
+  'page_validation',
+  'cursor',
+  'page_budget',
+  'unknown',
+])
+const sourceCheckSchema = z.enum(['passed', 'rejected', 'not_checked'])
+export const sourceReadDiagnosticSchema = z.strictObject({
+  version: z.literal('source-read-failure-v1'),
+  form: z.enum(['nativeRoot', 'sourceReference', 'legacy', 'unknown']),
+  source: z.enum([
+    'document',
+    'batch',
+    'root_batch',
+    'root_document',
+    'inputs',
+    'handoff_sources',
+    'cutoff',
+    'unknown',
+  ]),
+  offset: boundedCount.nullable(),
+  nativeCallSha256: z
+    .string()
+    .regex(/^[a-f0-9]{64}$/u)
+    .nullable(),
+  requestSha256: z
+    .string()
+    .regex(/^[a-f0-9]{64}$/u)
+    .nullable(),
+  entryOwner: sourceCheckSchema,
+  rootBinding: sourceCheckSchema,
+  currentBeforeRead: sourceCheckSchema,
+  readerEntered: z.boolean().nullable(),
+  stage: sourceReadStageSchema,
+})
+export type SourceReadDiagnostic = z.infer<typeof sourceReadDiagnosticSchema>
+export type SourceReadStage = z.infer<typeof sourceReadStageSchema>
+
+/** Canonical, domain-separated input for diagnostics only; never grants source authority. */
+export function sourceReadCallIdentity(
+  threadId: unknown,
+  turnId: unknown,
+  callId: unknown,
+): string | undefined {
+  if (
+    ![threadId, turnId, callId].every(
+      (value) => typeof value === 'string' && value.length > 0 && value.length <= 1024,
+    )
+  )
+    return undefined
+  return `pact-source-read-call-v1\0${JSON.stringify([threadId, turnId, callId])}`
+}
+
 export const diagnosticEventSchema = z.strictObject({
+  inputAdviceResult: z
+    .enum([
+      'clarify_prepared_input',
+      'route_codex',
+      'route_claude',
+      'route_agy',
+      'no_advice',
+      'other_candidate',
+      'disabled',
+      'busy',
+      'duplicate',
+      'invalid_input',
+      'invalid_output',
+      'cancelled',
+      'timeout',
+      'stale',
+      'runtime_unavailable',
+    ])
+    .optional(),
+  informationAdviceRefusal: z
+    .enum(['missing_field', 'unavailable_field', 'field_mismatch', 'host_validation'])
+    .optional(),
+  sourceRead: sourceReadDiagnosticSchema.optional(),
+  planStage: z.enum(['capture', 'submission']).optional(),
+  planReason: z
+    .enum([
+      'captured',
+      'submitted',
+      'retained',
+      'hook_prompt_missing',
+      'hook_prompt_mismatch',
+      'history_binding_missing',
+      'history_lookup_failed',
+      'history_operation_missing',
+      'history_operation_duplicate',
+      'plan_capture_failed',
+      'submission_hook_unverified',
+      'plan_pending',
+      'plan_unavailable',
+      'plan_missing',
+      'retained_basis_mismatch',
+    ])
+    .optional(),
+  planCapture: z
+    .strictObject({
+      code: z.enum([
+        'hook_prompt_missing',
+        'hook_prompt_mismatch',
+        'history_binding_missing',
+        'history_lookup_failed',
+        'history_operation_missing',
+        'history_operation_duplicate',
+        'plan_capture_failed',
+      ]),
+      tool: z.enum(['Write', 'Edit', 'ExitPlanMode', 'write_file', 'edit_file']),
+      phase: z.enum(['begin', 'success', 'failure']),
+    })
+    .optional(),
   settingsCatalogPhase: z
     .enum([
       'admission',
@@ -131,6 +293,7 @@ export const diagnosticEventSchema = z.strictObject({
       'catalogs',
       'claude_close',
       'codex_close',
+      'agy_close',
       'post_catalog',
       'repository_read',
     ])
@@ -201,6 +364,8 @@ export const diagnosticEventSchema = z.strictObject({
     'send',
     'stop',
     'native_check',
+    'claude_plan',
+    'agy_plan',
     'native_rebuild',
     'fork',
     'undo',
@@ -227,7 +392,7 @@ export const diagnosticEventSchema = z.strictObject({
   sessionId: z.uuid().optional(),
   runId: z.uuid().optional(),
   operationId: z.uuid().optional(),
-  agentId: z.enum(['claude', 'codex']).optional(),
+  agentId: z.enum(['claude', 'codex', 'agy']).optional(),
   cliVersion: z
     .string()
     .regex(/^\d{1,5}\.\d{1,5}\.\d{1,5}(?:\.\d{1,5})?$/u)

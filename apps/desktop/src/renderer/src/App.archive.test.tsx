@@ -16,6 +16,8 @@ import type {
   WorkspaceArchiveReceipt,
 } from '@pact/contracts'
 
+import { OPENAI_DECISION_MODEL } from '@pact/contracts'
+
 import type { WorkspaceView } from './components/workspace/WorkspaceView'
 
 import App from './App'
@@ -24,7 +26,12 @@ import { createRendererQueryClient } from './query-client'
 // Exercise App's public workspace callbacks, real catalog hooks, and named Bridge operations.
 // Conversation rendering and navigation visuals have their own tests and are unrelated to archiving.
 vi.mock('./components/conversation/useConversation', () => ({
-  useConversation: () => ({ snapshot: undefined, composer: '', composerSkills: [] }),
+  useConversation: () => ({
+    snapshot: undefined,
+    composer: '',
+    composerSkills: [],
+    history: { window: undefined, retryRead: vi.fn<() => void>() },
+  }),
   commentDraftSaveSucceeded: vi.fn<() => void>(),
 }))
 vi.mock('./components/workspace/WorkspaceView', () => ({
@@ -35,6 +42,7 @@ vi.mock('./components/workspace/WorkspaceView', () => ({
       </button>
       <output aria-label="Selected Session">{props.selectedSessionId ?? 'none'}</output>
       <output aria-label="Selected Project">{props.selectedProjectId ?? 'none'}</output>
+      <output aria-label="Session to reveal">{props.navigationIntent?.sessionId ?? 'none'}</output>
       <nav aria-label="Projects">
         {props.projects.map((project) => (
           <button key={project.id} type="button" onClick={() => props.onArchiveProject(project.id)}>
@@ -109,8 +117,12 @@ function fixture(projectCount = 2) {
     hasUnread: false,
     settings: {
       primaryAgentId: 'claude',
-      agents: { claude: { model: null, effort: null }, codex: { model: null, effort: null } },
-      runningMessagePolicy: 'next_round',
+      secondaryAgentId: 'codex',
+      agents: {
+        claude: { model: null, effort: null },
+        codex: { model: null, effort: null },
+        agy: { model: null, effort: null },
+      },
       maxDiscussionRounds: 3,
       maxReviewCycles: 3,
       maxRepairAttempts: 3,
@@ -145,6 +157,30 @@ function fixture(projectCount = 2) {
     projects: projects.filter((project) => !archivedProjects.has(project.id)),
   })
   const bridge = {
+    onSchedulingChanged: vi.fn<DesktopBridge['onSchedulingChanged']>(() => () => undefined),
+    getSchedulingState: vi.fn<DesktopBridge['getSchedulingState']>(async (input) => ({
+      ok: true,
+      value: {
+        settings: {
+          enabled: false,
+          provider: 'openai',
+          model: OPENAI_DECISION_MODEL,
+          credential: { configured: false, revision: 0 },
+          showIndicator: true,
+          revision: 0,
+          updatedAt: timestamp,
+        },
+        configurationGeneration: 0,
+        connection: { status: 'unconfirmed', checkedAt: null, expiresAt: null },
+        context: input?.sessionId
+          ? {
+              sessionId: input.sessionId,
+              eligibility: 'disabled',
+            }
+          : null,
+        activity: { decision: { status: 'idle' }, check: { status: 'idle' } },
+      },
+    })),
     getUpdateState: vi.fn<DesktopBridge['getUpdateState']>(async () => ({
       ok: true,
       value: {
@@ -166,6 +202,24 @@ function fixture(projectCount = 2) {
     })),
     onUpdateStateChanged: vi.fn<DesktopBridge['onUpdateStateChanged']>(() => () => undefined),
     onNativePresenceChanged: vi.fn<DesktopBridge['onNativePresenceChanged']>(() => () => undefined),
+    setConversationInterest: vi.fn<DesktopBridge['setConversationInterest']>(async () => ({
+      ok: true,
+      value: { ready: true },
+    })),
+    listSideChats: vi.fn<DesktopBridge['listSideChats']>(async ({ parentSessionId }) => ({
+      ok: true,
+      value: {
+        parentSessionId,
+        items: [],
+        nextCursor: null,
+        prevCursor: null,
+        hasMoreOlder: false,
+        hasMoreNewer: false,
+        activeCount: 0,
+        attentionCount: 0,
+        unreadCount: 0,
+      },
+    })),
     getAppInfo: vi.fn<DesktopBridge['getAppInfo']>(async () => ({
       ok: true,
       value: { name: 'Pact', version: '0.0.0', platform: 'win32', arch: 'x64', packaged: false },
@@ -213,15 +267,18 @@ function fixture(projectCount = 2) {
       ok: true,
       value: catalog(),
     })),
-    getSessionCatalog: vi.fn<DesktopBridge['getSessionCatalog']>(async (projectId) => ({
+    getSessionPage: vi.fn<DesktopBridge['getSessionPage']>(async ({ projectId, scope }) => ({
       ok: true,
       value: {
         kind: 'page',
         projectId,
+        scope,
+        groupRevision: 0,
         revision,
         sessions: sessions
           .filter((session) => session.projectId === projectId && !archivedSessions.has(session.id))
           .toSorted((left, right) => right.id.localeCompare(left.id)),
+        hasGroups: false,
       },
     })),
     prepareWorkspaceArchive: vi.fn<DesktopBridge['prepareWorkspaceArchive']>(
@@ -286,8 +343,12 @@ function fixture(projectCount = 2) {
   } satisfies Pick<
     DesktopBridge,
     | 'getUpdateState'
+    | 'onSchedulingChanged'
+    | 'getSchedulingState'
     | 'onUpdateStateChanged'
     | 'onNativePresenceChanged'
+    | 'setConversationInterest'
+    | 'listSideChats'
     | 'getAppInfo'
     | 'getRuntimePreparation'
     | 'getAppearanceSettings'
@@ -298,7 +359,7 @@ function fixture(projectCount = 2) {
     | 'getNativeQuitState'
     | 'recordNativeSessionOpened'
     | 'getProjectCatalog'
-    | 'getSessionCatalog'
+    | 'getSessionPage'
     | 'prepareWorkspaceArchive'
     | 'readWorkspaceArchive'
     | 'cancelWorkspaceArchive'
@@ -338,6 +399,7 @@ function dialog(): HTMLElement {
 describe('App archive flow through DesktopBridge', () => {
   it('keeps multiple success entries and removes only the independently restored item', async () => {
     const context = fixture()
+    fireEvent.click(await screen.findByRole('button', { name: 'Open Session C' }))
     await archiveSession('A')
     await archiveSession('B')
     const list = expandResults()
@@ -349,8 +411,12 @@ describe('App archive flow through DesktopBridge', () => {
     )
     expect(screen.getByRole('button', { name: 'Undo archive of B' })).not.toBeNull()
     expect(context.bridge.restoreSession).toHaveBeenCalledExactlyOnceWith(context.sessions[0]!.id)
-    expect(screen.getByRole('status', { name: 'Selected Session' }).textContent).toBe(
+    expect(screen.getByRole('status', { name: 'Session to reveal' }).textContent).toBe(
       context.sessions[0]!.id,
+    )
+    expect(screen.getByRole('button', { name: 'Open Session A' })).not.toBeNull()
+    expect(screen.getByRole('status', { name: 'Selected Session' }).textContent).toBe(
+      context.sessions[2]!.id,
     )
     expect(context.bridge.prepareWorkspaceArchive).toHaveBeenCalledTimes(2)
     expect(context.bridge.archiveSession).toHaveBeenCalledTimes(2)
@@ -476,9 +542,7 @@ describe('App archive flow through DesktopBridge', () => {
     const operationId = context.bridge.prepareWorkspaceArchive.mock.calls[1]![0].operationId
     expect(within(dialog()).queryByRole('button', { name: 'Review again' })).toBeNull()
     fireEvent.click(within(dialog()).getByRole('button', { name: 'Check status' }))
-    await within(dialog()).findByText(
-      'Could not check this archive. Try Check status again; its result is still unconfirmed.',
-    )
+    await within(dialog()).findByText('Couldn’t check status. Try Check status again.')
     fireEvent.click(within(dialog()).getByRole('button', { name: 'Close' }))
     expandResults()
     const check = screen.getByRole<HTMLButtonElement>('button', {
@@ -593,7 +657,7 @@ describe('App archive flow through DesktopBridge', () => {
     fireEvent.click(details)
     const panel = document.getElementById(details.getAttribute('aria-controls')!)!
     expect(panel.hidden).toBe(false)
-    expect(panel.textContent).toContain('The archive result could not be confirmed.')
+    expect(panel.textContent).toContain('Couldn’t confirm whether archiving finished.')
 
     const operationId = context.bridge.prepareWorkspaceArchive.mock.calls[1]![0].operationId
     context.operations.set(operationId, {
@@ -649,7 +713,7 @@ describe('App archive flow through DesktopBridge', () => {
     expandResults()
     fireEvent.click(screen.getByRole('button', { name: 'Undo archive of A' }))
     expect(
-      screen.getByText('Restore or re-add its Project first, then undo this Session archive.'),
+      screen.getByText('Restore or re-add its Project first, then try Undo again.'),
     ).not.toBeNull()
     expect(context.bridge.restoreSession).not.toHaveBeenCalled()
     fireEvent.click(screen.getByRole('button', { name: 'Undo archive of Project 1' }))
@@ -785,19 +849,24 @@ describe('App archive flow through DesktopBridge', () => {
     const context = fixture(52)
     await screen.findByRole('button', { name: 'Archive Project Project 52' })
     for (const project of context.projects.slice(0, 50)) {
-      fireEvent.click(screen.getByRole('button', { name: `Archive Project ${project.name}` }))
+      const button = screen.getByRole('button', { name: `Archive Project ${project.name}` })
+      fireEvent.click(button)
       // Each operation must settle before the next user action; admission is deliberately serialized.
       // oxlint-disable-next-line eslint/no-await-in-loop
-      await waitFor(() =>
-        expect(
-          screen.queryByRole('button', { name: `Archive Project ${project.name}` }),
-        ).toBeNull(),
-      )
+      await waitFor(() => {
+        // A still-mounted button cannot satisfy the original global absence assertion.
+        expect(button.isConnected).toBe(false)
+        expect(screen.queryByRole('button', { name: `Archive Project ${project.name}` })).toBeNull()
+      })
     }
     expect(screen.getByText('50 archived')).not.toBeNull()
     fireEvent.click(screen.getByRole('button', { name: 'Archive Project Project 51' }))
-    await screen.findByText('Review or dismiss some archive results before archiving more items.')
+    await screen.findByText('Dismiss or review older archive results before archiving more items.')
     expect(context.bridge.prepareWorkspaceArchive).toHaveBeenCalledTimes(50)
+    expect(context.bridge.archiveProject).toHaveBeenCalledTimes(50)
+    expect(context.bridge.archiveProject.mock.calls.map(([projectId]) => projectId)).toEqual(
+      context.projects.slice(0, 50).map((project) => project.id),
+    )
     const list = expandResults()
     fireEvent.click(
       within(list).getByRole('button', { name: 'Dismiss archive result for Project 50' }),
@@ -808,5 +877,23 @@ describe('App archive flow through DesktopBridge', () => {
     )
     expect(context.bridge.prepareWorkspaceArchive).toHaveBeenCalledTimes(51)
     expect(screen.getByText('50 archived')).not.toBeNull()
+    expect(context.bridge.archiveProject).toHaveBeenCalledTimes(51)
+    expect(screen.getByRole('button', { name: 'Archive Project Project 52' })).not.toBeNull()
+    const undoTitles: string[] = []
+    for (let page = 0; page < 50; page++) {
+      undoTitles.push(
+        ...within(expandResults())
+          .getAllByRole('button', { name: /^Undo archive of Project \d+$/u })
+          .map((button) => button.getAttribute('aria-label') ?? ''),
+      )
+      const next = screen.queryByRole<HTMLButtonElement>('button', { name: 'Next' })
+      if (!next || next.disabled) break
+      fireEvent.click(next)
+    }
+    expect(undoTitles.toSorted()).toEqual(
+      [...context.projects.slice(0, 49), context.projects[50]!]
+        .map((project) => `Undo archive of ${project.name}`)
+        .toSorted(),
+    )
   }, 15_000)
 })

@@ -27,7 +27,34 @@ import { codexProcessEnvironment } from '../../apps/desktop/src/utility/conversa
 import { OwnedProcessGroup } from '../../apps/desktop/src/utility/owned-process-group.js'
 import { PactDatabase } from '../../packages/persistence/src/index.js'
 import { readCiProviderConfiguration } from '../../scripts/ci.mjs'
-import { NativeRpc, within } from '../native/native-harness.js'
+import {
+  copyIsolatedAgyAuthConfig,
+  createWindowsFixtureProcessScope,
+  isolatedAgyAllowlistEnv,
+  isUnsafeWindowsCmdPath,
+  NativeRpc,
+  parseSupportedAgySemver,
+  redactRealAgyText,
+  requireExplicitAgyAuthDir,
+  verifyAgyMinimumVersion,
+  within,
+  type CopiedAgyAuthManifest,
+  type VerifyAgyMinimumVersionOptions,
+  type WindowsFixtureProcessScope,
+} from '../native/native-harness.js'
+
+export {
+  copyIsolatedAgyAuthConfig,
+  isolatedAgyAllowlistEnv,
+  isUnsafeWindowsCmdPath,
+  parseSupportedAgySemver,
+  redactRealAgyText,
+  requireExplicitAgyAuthDir,
+  verifyAgyMinimumVersion,
+  type CopiedAgyAuthManifest,
+  type VerifyAgyMinimumVersionOptions,
+}
+import { MacCredentialStore } from './mac-credential-store.js'
 import {
   writeNativeTransportFault,
   type NativeTransportFault,
@@ -41,7 +68,9 @@ import {
 import {
   writeWindowsNodeLauncher,
   writeWindowsObservedLauncher,
+  WindowsProcessTreeError,
   type WindowsLaunchOwner,
+  type WindowsProcessTree,
 } from './windows-cli-launcher.js'
 import { windowsFixtureRenameSource } from './windows-fixture-rename.js'
 
@@ -96,11 +125,23 @@ export const test = baseTest.extend<{ runtimeOwnership: void }>({
   ],
 })
 
-type ProbeState = 'ready' | 'authentication_required' | 'cannot_verify' | 'startup_failed'
+type ProbeState =
+  | 'ready'
+  | 'unsupported_version'
+  | 'authentication_required'
+  | 'cannot_verify'
+  | 'startup_failed'
 
 export interface RuntimeFixtureOptions {
   /** Credential-free fixture only; the fixture owns the nonce and canonical isolated root. */
   measureIpcTraffic?: boolean
+  /** Real isolated OS store for synthetic credential UI checks. */
+  nativeCredentialStore?: boolean
+  /** Owned OS store for the private-file Relay bootstrap in real-provider fixtures. */
+  realRelayCredentialStore?: true
+  /** Enforces real-provider redaction, artifact suppression, and Windows process-scope receipts on hybrid opt-in fixtures. */
+  realProviderProtection?: boolean
+  redactText?: (text: string) => string
   mode?: 'ui' | 'real' | 'deterministic'
   configuration?: ProviderConfiguration
   transportFault?: NativeTransportFault
@@ -108,6 +149,7 @@ export interface RuntimeFixtureOptions {
   sessionTitles?: boolean
   claude?: ProbeState
   codex?: ProbeState
+  agy?: ProbeState
   claudeConversation?:
     | 'complete'
     | 'failure_once'
@@ -122,6 +164,7 @@ export interface RuntimeFixtureOptions {
     scope: string
     enabled: boolean
   }>
+  codexModels?: Array<{ id: string; displayName: string }>
   codexAppServer?:
     | 'complete'
     | 'complete_title_silent'
@@ -136,6 +179,7 @@ export interface RuntimeFixtureOptions {
     | 'context_limit'
     | 'native_context_recovery'
     | 'session_permission_scope'
+    | 'native_question'
     | 'fork_complete'
     | 'writer_rejected_once'
     | 'native_title'
@@ -156,6 +200,11 @@ export interface RuntimeFixture {
   ): Promise<{ exitCode: number; stdout: string; stderr: string }>
   readConfigurationModels(): { claude: string | null; codex: string | null }
   appJobDiagnostic(this: void): ReturnType<WindowsLaunchOwner['diagnostic']> | undefined
+  observeWindowsProcessTree(
+    this: void,
+    rootPid: number,
+    deadlineAt: number,
+  ): Promise<WindowsProcessTree>
   databaseFile: string
   claudeHome: string
   codexHome: string
@@ -265,7 +314,7 @@ async function readUnpublishedTransportFacts(
 }
 
 function probeExitCode(state: ProbeState): number {
-  if (state === 'ready') return 0
+  if (state === 'ready' || state === 'unsupported_version') return 0
   if (state === 'authentication_required') return 1
   return 2
 }
@@ -277,11 +326,15 @@ async function writeCli(
   appServerPath?: string,
   sdkPath?: string,
 ): Promise<string> {
+  const version =
+    agentId === 'claude'
+      ? `${state === 'unsupported_version' ? '2.1.271' : '2.1.272'} (Claude Code)`
+      : `codex-cli ${state === 'unsupported_version' ? '0.159.1' : '0.159.2'}`
   if (agentId === 'claude' && sdkPath && process.platform === 'win32') {
     const entry = join(directory, 'claude-fixture-entry.mjs')
     await writeFile(
       entry,
-      `const args=process.argv.slice(2);if(args[0]==='--version'){console.log('2.1.272 (Claude Code)');process.exit(${state === 'startup_failed' ? 2 : 0})}else if(args[0]==='auth'&&args[1]==='status')process.exit(${probeExitCode(state)});else await import(${JSON.stringify(pathToFileURL(sdkPath).href)});\n`,
+      `const args=process.argv.slice(2);if(args[0]==='--version'){console.log(${JSON.stringify(version)});process.exit(${state === 'startup_failed' ? 2 : 0})}else if(args[0]==='auth'&&args[1]==='status')process.exit(${probeExitCode(state)});else await import(${JSON.stringify(pathToFileURL(sdkPath).href)});\n`,
       { flag: 'wx', mode: 0o600 },
     )
     return writeWindowsNodeLauncher(directory, 'claude-fixture', [entry])
@@ -293,7 +346,6 @@ async function writeCli(
         ? '.cmd'
         : ''
   const executablePath = join(directory, `${agentId}-fixture${extension}`)
-  const version = agentId === 'claude' ? '2.1.272 (Claude Code)' : 'codex-cli 0.146.0'
   const authCommand = agentId === 'claude' ? 'auth' : 'login'
   const versionExit = state === 'startup_failed' ? 2 : 0
   const authExit = probeExitCode(state)
@@ -324,6 +376,111 @@ async function writeCli(
       : `#!/bin/sh\nif [ "$1" = "--version" ]; then\n  echo '${version}'\n  exit ${versionExit}\nfi\nif [ "$1" = "${authCommand}" ] && [ "$2" = "status" ]; then\n  exit ${authExit}\nfi\n${posixFeatures}${appServerPath ? `if [ "$1" = "app-server" ]; then\n  exec '${process.execPath}' '${appServerPath}'\nfi\n` : ''}${sdkPath ? `exec '${process.execPath}' '${sdkPath}' "$@"\n` : 'exit 2\n'}`
   await writeFile(executablePath, source, { mode: 0o755 })
   if (process.platform !== 'win32') await chmod(executablePath, 0o755)
+  return executablePath
+}
+
+async function writeAgyCli(directory: string, state: ProbeState): Promise<string> {
+  const scriptPath = join(directory, 'agy-fixture-script.mjs')
+  const versionText = state === 'unsupported_version' ? '1.5.8' : '1.5.11'
+  const versionExit = state === 'startup_failed' ? 2 : 0
+  const scriptSource = `import { createInterface } from 'node:readline'
+
+const state = ${JSON.stringify(state)}
+const args = process.argv.slice(2)
+
+if (args[0] === '--version') {
+  if (${versionExit} !== 0) process.exit(${versionExit})
+  process.stdout.write('agy version ${versionText}\\n')
+  process.exit(0)
+}
+
+if (args[0] === '-p' && args[1] === '/usage') {
+  if (state === 'ready') {
+    process.stdout.write(JSON.stringify({ groups: [{ name: 'Gemini Models', buckets: [] }] }) + '\\n')
+    process.exit(0)
+  }
+  process.stderr.write('Authentication required. Run agy to sign in.\\n')
+  process.exit(1)
+}
+
+if (args[0] === '-p' && args[1] === '/skills') {
+  process.stdout.write('{"skills":[]}\\n')
+  process.exit(0)
+}
+
+if (args[0] === 'acp') {
+  if (state === 'cannot_verify') {
+    process.stdout.write('x'.repeat(300_000) + '\\n')
+    process.exit(1)
+  }
+  const send = (frame) => process.stdout.write(JSON.stringify(frame) + '\\n')
+  const rl = createInterface({ input: process.stdin })
+  rl.on('line', (line) => {
+    const trimmed = line.trim()
+    if (!trimmed) return
+    let req
+    try {
+      req = JSON.parse(trimmed)
+    } catch {
+      return
+    }
+    if (req.method === 'initialize') {
+      send({
+        jsonrpc: '2.0',
+        id: req.id,
+        result: { protocolVersion: 1, agentInfo: { name: 'agy', version: '1.5.11' } },
+      })
+      return
+    }
+    if (req.method === 'session/new') {
+      if (state === 'authentication_required') {
+        send({
+          jsonrpc: '2.0',
+          id: req.id,
+          error: { code: -32000, message: 'Authentication required. Run agy to sign in.' },
+        })
+        return
+      }
+      send({
+        jsonrpc: '2.0',
+        id: req.id,
+        result: {
+          sessionId: 'agy-fixture-probe-session',
+          modes: {
+            currentModeId: 'default',
+            availableModes: ['default', 'accept-edits', 'auto', 'plan'],
+          },
+          models: {
+            currentModelId: 'gemini-4-carbon-high',
+            availableModels: [
+              { modelId: 'gemini-4-carbon-high', name: 'Gemini 4 Carbon (High)' },
+            ],
+          },
+          configOptions: [],
+        },
+      })
+      return
+    }
+    if (req.method === 'session/close') {
+      send({ jsonrpc: '2.0', id: req.id, result: {} })
+    }
+  })
+  rl.on('close', () => process.exit(0))
+} else {
+  process.exit(2)
+}
+`
+  await writeFile(scriptPath, scriptSource, { mode: 0o600 })
+  if (process.platform === 'win32') {
+    return writeWindowsNodeLauncher(directory, 'agy-fixture', [scriptPath])
+  }
+  const executablePath = join(directory, 'agy-fixture')
+  const quotedExec = process.execPath.replace(/'/gu, "'\\''")
+  const quotedScript = scriptPath.replace(/'/gu, "'\\''")
+  await writeFile(executablePath, `#!/bin/sh\nexec '${quotedExec}' '${quotedScript}' "$@"\n`, {
+    mode: 0o755,
+  })
+  await chmod(executablePath, 0o755)
   return executablePath
 }
 
@@ -373,6 +530,10 @@ export async function createRuntimeFixture(
   options: RuntimeFixtureOptions = {},
 ): Promise<RuntimeFixture> {
   if (fixtureAdmissionClosed) throw new Error('Fixture admission is closed during teardown')
+  if (options.mode === 'real' && options.nativeCredentialStore)
+    throw new Error('Native credential stores are limited to synthetic fixture credentials')
+  if (options.realRelayCredentialStore && options.mode !== 'real')
+    throw new Error('Real Relay credential stores require a real-provider fixture')
   if (fixtureReservations >= 8) throw new Error('A test owns at most eight fixtures')
   fixtureReservations++
   let reserved = true,
@@ -403,10 +564,12 @@ export async function createRuntimeFixture(
     if (
       mode === 'real' &&
       (options.codexAppServer ||
+        options.codexModels ||
         options.codexSkills ||
         options.claudeConversation ||
         options.claude ||
-        options.codex)
+        options.codex ||
+        options.agy)
     ) {
       throw new Error('A real E2E fixture cannot select synthetic CLI or protocol behavior.')
     }
@@ -417,6 +580,13 @@ export async function createRuntimeFixture(
         Buffer.byteLength(JSON.stringify(options.codexSkills)) > 32 * 1024)
     )
       throw new Error('Synthetic Skills require one bounded protocol fixture catalog.')
+    if (
+      options.codexModels &&
+      (!options.codexAppServer ||
+        options.codexModels.length > 8 ||
+        Buffer.byteLength(JSON.stringify(options.codexModels)) > 16 * 1024)
+    )
+      throw new Error('Synthetic models require one bounded protocol fixture catalog.')
     // Missing credentials fail before creating an app, a CLI process or a Native Session.
     const configuration =
       mode === 'real'
@@ -431,6 +601,7 @@ export async function createRuntimeFixture(
     const apps = new Set<ElectronApplication>()
     const failedAppClosures = new Set<ElectronApplication>()
     const nativeClients = new Set<NativeRpc>()
+    let windowsProcessScope: WindowsFixtureProcessScope | undefined
     const launchOwners = new Set<WindowsLaunchOwner>()
     const unlaunchedOwners = new Set<WindowsLaunchOwner>()
     const commandLaunchOwners = new Set<WindowsLaunchOwner>()
@@ -449,8 +620,17 @@ export async function createRuntimeFixture(
     let claudePath: string
     let codexPath: string
     let transport: NativeTransportFaultFiles | undefined
+    let credentialStore: MacCredentialStore | undefined
     let controlGeneration = 0
-    const redact = (text: string): string => configuration?.redact(text) ?? text
+    const realProtected = mode === 'real' || options.realProviderProtection === true
+    const redact = (text: string): string => {
+      const base = configuration
+        ? configuration.redact(text)
+        : realProtected
+          ? redactRealAgyText(text)
+          : text
+      return options.redactText ? options.redactText(base) : base
+    }
     const releaseLaunch = (owner: WindowsLaunchOwner): Promise<void> => {
       if (!launchOwners.has(owner)) return Promise.resolve()
       const existing = releasingOwners.get(owner)
@@ -682,6 +862,10 @@ export async function createRuntimeFixture(
         }
         if (releaseUnconfirmed)
           throw new Error(`${failures.join('; ')}; owned fixture retained at ${directory}`)
+        if (credentialStore) await credentialStore.dispose()
+        // Auxiliary product groups have already joined above. Residual durable
+        // receipts or a replaced directory retain the fixture instead of being erased.
+        await windowsProcessScope?.assertReceiptsRetired()
         await rm(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 250 })
         ownedFixtures.delete(dispose)
         releaseFixtureSlot()
@@ -694,13 +878,39 @@ export async function createRuntimeFixture(
     registered = true
     try {
       if (creationCancelled) throw new Error('E2E fixture construction was cancelled')
-      environment = await prepareProviderEnvironment(directory, configuration)
+      environment = await prepareProviderEnvironment(directory, configuration, undefined, {
+        disableCodexPlugins: realProtected,
+      })
+      if (realProtected && process.platform === 'win32')
+        windowsProcessScope = await createWindowsFixtureProcessScope(directory)
       if (creationCancelled) throw new Error('E2E fixture construction was cancelled')
+      if (options.nativeCredentialStore || options.realRelayCredentialStore) {
+        if (process.platform === 'darwin') {
+          credentialStore = new MacCredentialStore({
+            directory,
+            environment: environment.env,
+            isCurrent: () => !disposed && !creationCancelled,
+            run: (executable, args, deadline) =>
+              boundedCommand(executable, args, directory, environment.env, redact, deadline),
+          })
+          const preparation = credentialStore.prepare()
+          pendingOperations.add(preparation)
+          const settled = (): void => {
+            pendingOperations.delete(preparation)
+          }
+          void preparation.then(settled, settled)
+          await preparation
+          if (creationCancelled) throw new Error('E2E fixture construction was cancelled')
+          if (disposed) throw new Error('E2E fixture is disposed')
+        }
+        // Windows keeps the genuine DPAPI store; other platforms have no native
+        // credential helper and the store stays unset rather than faked.
+      }
       environment.env.NODE_ENV = 'test'
       environment.env.PACT_TEST_DB_FILE = databaseFile
       environment.env.PACT_E2E_ROOT = directory
       if (options.measureIpcTraffic) {
-        if (mode === 'real')
+        if (realProtected)
           throw new Error('IPC performance fixtures cannot authorize real provider generation')
         environment.env.PACT_E2E_IPC_NONCE = randomBytes(32).toString('hex')
       }
@@ -710,6 +920,7 @@ export async function createRuntimeFixture(
             options.codexAppServer,
             options.codexSkills ?? [],
             options.sessionTitles,
+            options.codexModels,
           )
         : undefined
       const claudeSdkPath = options.claudeConversation
@@ -720,29 +931,41 @@ export async function createRuntimeFixture(
             options.sessionTitles,
           )
         : undefined
+      let agyPath: string | undefined
       if (mode === 'real') {
         claudePath = configuration!.claudePath
         codexPath = configuration!.codexPath
+        if (configuration!.agyPath) {
+          agyPath = configuration!.agyPath
+        }
         if (options.transportFault) {
           transport = await writeNativeTransportFault(directory, codexPath, options.transportFault)
           codexPath = transport.executablePath
         }
       } else {
-        ;[claudePath, codexPath] = await Promise.all([
+        ;[claudePath, codexPath, agyPath] = await Promise.all([
           writeCli(directory, 'claude', options.claude ?? 'ready', undefined, claudeSdkPath),
           writeCli(directory, 'codex', options.codex ?? 'ready', codexAppServerPath),
+          writeAgyCli(directory, options.agy ?? 'authentication_required'),
         ])
       }
       const database = await PactDatabase.open({ filePath: databaseFile, migrationsFolder })
       try {
         database.runtimePreparationRepository.saveSelectedExecutablePath('claude', claudePath)
         database.runtimePreparationRepository.saveSelectedExecutablePath('codex', codexPath)
+        if (agyPath) {
+          database.runtimePreparationRepository.saveSelectedExecutablePath('agy', agyPath)
+        }
         if (options.firstUse !== true) {
           database.defaultSessionSettingsRepository.save({
             primaryAgentId: 'codex',
-            agents: { claude: { model: null, effort: null }, codex: { model: null, effort: null } },
+            secondaryAgentId: 'claude',
+            agents: {
+              claude: { model: null, effort: null },
+              codex: { model: null, effort: null },
+              agy: { model: null, effort: null, speed: 'native' },
+            },
             maxDiscussionRounds: 6,
-            runningMessagePolicy: 'immediate_safe_point',
             maxReviewCycles: 3,
             maxRepairAttempts: 3,
           })
@@ -798,7 +1021,10 @@ export async function createRuntimeFixture(
                 CODEX_INTERNAL_ORIGINATOR_OVERRIDE: originator,
               },
               {
-                group: new OwnedProcessGroup({ startupObservationMs: 2_000 }),
+                group: new OwnedProcessGroup({
+                  startupObservationMs: 2_000,
+                  ...(windowsProcessScope ? { windows: windowsProcessScope.configuration } : {}),
+                }),
                 onReleased: () => nativeClients.delete(client),
               },
             )
@@ -881,7 +1107,7 @@ export async function createRuntimeFixture(
                 'PACT_TEST_APPEARANCE_WRITE_FAILURE',
                 'PACT_TEST_DIRECTORY_READ_DELAY',
                 'PACT_TEST_DIRECTORY_FAIL_ONCE',
-                ...(mode !== 'real' ? ['PACT_TEST_RECOVERY_RUN_ID'] : []),
+                ...(realProtected ? [] : ['PACT_TEST_RECOVERY_RUN_ID']),
               ])
               for (const key of Object.keys(extraEnvironment)) {
                 if (permitted.has(key)) continue
@@ -970,6 +1196,14 @@ export async function createRuntimeFixture(
                   if ((await realpath(actual!)) !== (await realpath(expected!)))
                     throw new Error('Electron escaped its owned data profile')
                 }
+                if (credentialStore) {
+                  const guardBudget = Math.min(5_000, remainingStartupTime(startupDeadline))
+                  await within(
+                    credentialStore.install(app),
+                    guardBudget,
+                    'Owned credential guard did not settle',
+                  )
+                }
                 await app.evaluate(({ BrowserWindow, screen }) => {
                   const secondary = screen
                     .getAllDisplays()
@@ -1003,8 +1237,7 @@ export async function createRuntimeFixture(
             }
           }),
         async captureUiFailure(info) {
-          if (mode === 'real')
-            throw new Error('Real Provider fixtures cannot export Renderer state')
+          if (realProtected) throw new Error('Real Provider fixtures cannot export Renderer state')
           const current = [...apps]
           if (current.length !== 1)
             throw new Error('No unique owned Electron window for diagnostics')
@@ -1049,6 +1282,10 @@ export async function createRuntimeFixture(
           })
         },
         appJobDiagnostic: () => appOwner?.diagnostic(),
+        observeWindowsProcessTree: (rootPid: number, deadlineAt: number) =>
+          appOwner
+            ? appOwner.observeProcessTree(rootPid, deadlineAt)
+            : Promise.reject(new WindowsProcessTreeError('query')),
         dispose,
         readCodexFacts: async () => {
           if (mode === 'real')
@@ -1084,72 +1321,36 @@ export async function createRuntimeFixture(
 /** Same bounded response semantics across the two synthetic provider transports. */
 const collaborationFixtureScript = `
 const fixturePrompt = prefix => {
-  const line=prefix.split('\\n').findLast(line=>line.startsWith('{')&&line.includes('"version":"pact-agent-prompt-v1"'))
+  const line=prefix.split('\\n').findLast(line=>line.startsWith('{')&&line.includes('"sourceGrant"'))
   if(!line)throw Error('Missing frozen fixture prompt')
   return JSON.parse(line)
 }
-const fixtureDelta = (todoId, expectedRevision, operation, fields={}) => ({
-  todoId,expectedRevision,operation,kind:null,title:null,detail:null,recommendation:null,evidence:null,
-  question:null,resolutionKind:null,mergeTargetId:null,reason:'Checked the frozen cancellation evidence.',userSourceIds:[],evidenceRefs:[],...fields
-})
 const collaborationReport = async (prefix, facts, transport) => {
   const context=fixturePrompt(prefix),reference=context.collaboration,auth=context.collaborationAuthorization
   if(!reference||!auth||!context.sourceGrant)throw Error('Missing frozen collaboration authorization')
   const read=request=>transport({...context.sourceGrant,...request})
-  const index=async source=>(await read({source,taskId:auth.taskId,revision:auth.baseTodoRevision})).flatMap(page=>page.items)
-  const todos=await index('todos'),required=await index('required_inputs')
   const task=typeof reference.task==='string'?reference.task:await read({document:reference.task})
-  if(reference.plan?.id)await read({document:reference.plan})
+  if(reference.plan?.document)await read({document:reference.plan.document})
   if(auth.reviewScopeRef)await read({document:auth.reviewScopeRef})
-  const answers=new Map(),batches=new Map()
-  for(const batchId of new Set(required.map(item=>item.batchId))) {
-    const pages=await read({source:'batch',batchId})
-    batches.set(batchId,pages.flatMap(page=>page.members))
-    for(const page of pages)if(page.body)await read({document:page.body})
-    for(const member of batches.get(batchId)) {
-      const anchor=JSON.parse(await read({document:member.anchorDocument}))
-      await read({document:member.body})
-      if(anchor.type==='todo'&&anchor.question)answers.set(anchor.todoId,{anchor,commentId:member.commentId})
-    }
-  }
-  const report={submission:auth.duty,outcome:'complete',summary:reference.stage+' inspected.',todoDeltas:[],inputResponses:required.map(item=>({batchId:item.batchId,memberId:item.memberId,disposition:'resolved',reason:'The authorized actor fully handled this frozen input.',todoId:null}))}
-  for(const todo of todos) {
-    const answer=answers.get(todo.id)
-    if(todo.question&&todo.answerResolver===auth.actor&&answer&&answer.anchor.question.id===todo.question.id&&answer.anchor.question.revision===todo.question.revision) {
-      report.todoDeltas.push(fixtureDelta(todo.id,todo.revision,'confirm',{resolutionKind:'resolved',reason:'Applied the user’s exact frozen answer to this question.',userSourceIds:[answer.commentId]}))
-    } else if(!todo.question&&todo.status==='awaiting_review'&&['plan_review','code_review'].includes(auth.duty)) {
-      report.todoDeltas.push(fixtureDelta(todo.id,todo.revision,'confirm',{resolutionKind:todo.resolutionKind??'resolved',reason:'Independently confirmed the submitted cancellation resolution.'}))
-    } else if(!todo.question&&['stage_result','plan_submission'].includes(auth.duty)) {
-      report.todoDeltas.push(fixtureDelta(todo.id,todo.revision,'propose_resolution',{resolutionKind:reference.stage==='respond'?'not_adopted':'resolved',reason:reference.stage==='respond'?'Checked the evidence; this suggestion is not needed.':'The authorized work now disposes the pending request.'}))
-    }
-  }
   const plan='1. Keep cancellation with its owner. 2. Verify Stop and restart. 3. Review the resulting code.'
-  if(['plan_submission','plan_adoption'].includes(auth.duty))report.plan=auth.basePlanRef??plan
-  if(auth.duty==='plan_review'||auth.duty==='plan_adoption') { report.reviewedPlan=auth.basePlanRef;report.verdict='accepted' }
-  const bareBuild=['','/build','@claude /build','@codex /build'].includes(task.trim())
-  if((auth.duty==='plan_submission'&&!auth.basePlanRef&&task.includes('unclear'))||(auth.duty==='stage_result'&&(reference.stage==='clarify'||(reference.stage==='implement'&&bareBuild))&&!todos.length)) {
-    report.outcome='needs_user';report.summary='One scope decision is needed.'
-    report.todoDeltas.push(fixtureDelta('scope',0,'create',{kind:'decision',title:'Choose the cancellation scope',detail:'The scope determines the implementation.',question:{id:'scope',revision:1,type:'choice',question:'Which cancellation scope should change?',reason:'The scope determines the implementation.',options:['Current request','All pending requests'],recommended:0,answerResolver:auth.duty==='plan_submission'?reference.primary:reference.implementer}}))
+  const questions=[{prompt:'Which cancellation scope should change?',selection:'single',options:[{label:'Current request'},{label:'All pending requests'}]}]
+  const firstQuestion=reference.stage==='plan'&&!reference.plan&&!reference.openMode&&(task.includes('unclear')||task.trim()==='/plan')
+  if((reference.stage==='plan'||reference.stage==='reply')&&reference.kind==='plan'&&auth.actor===reference.owner) {
+    if(task.includes('missing native plan'))return {text:'The native plan was not published.'}
+    if(firstQuestion)return {tool:'submit_input_result',args:{outcome:'needs_user',questions},text:'Choose the cancellation scope before preparing the plan.'}
+    return {plan,text:'The complete plan is ready for independent review.'}
   }
-  if(auth.duty==='code_review') {
-    report.reviewScopeRef=auth.reviewScopeRef
+  if(reference.stage==='plan_review'&&task.includes('reviewer decision')&&!facts.askedReviewerQuestion){facts.askedReviewerQuestion=true;return {tool:'submit_review',args:{verdict:'needs_user',questions},text:'The reviewer needs your cancellation scope decision.'}}
+  if(reference.stage==='plan_review')return {tool:'submit_review',args:{verdict:'accepted'},text:'The plan covers cancellation ownership and restart. Accepted.'}
+  if(reference.stage==='code_review') {
     facts.reviewCount=(facts.reviewCount??0)+1
-    report.verdict='accepted'
-    if(facts.reviewCount===1&&!todos.some(todo=>todo.id==='cleanup')) {
-      report.todoDeltas.push(fixtureDelta('cleanup',0,'create',{kind:'opinion',title:'Keep cancellation with its owner',detail:'The pending request needs explicit disposal.',recommendation:'Release the request when its owner stops.',evidence:'cancellation.ts:1'}))
-      if(task.includes('Todo navigation')) {
-        for(const [id,title] of [['navigation-second','Preserve the frozen source'],['navigation-third','Keep the clicked Todo aligned']])
-          report.todoDeltas.push(fixtureDelta(id,0,'create',{kind:'opinion',title,detail:('The request owner preserves its exact source and releases pending work.\\n\\n').repeat(100),recommendation:'Keep navigation on this exact Todo version.',evidence:'Checked the frozen cancellation scope.'}))
-      }
-      report.verdict='changes_requested'
-    }
+    const verdict=facts.reviewCount===1?'changes_requested':'accepted'
+    return {tool:'submit_review',args:{verdict},text:verdict==='accepted'?'No unresolved feedback. Cancellation and restart verified.':'Keep cancellation with its owner. Release the pending request when its owner stops.'}
   }
-  const unresolved=todos.some(todo=>!report.todoDeltas.some(delta=>delta.todoId===todo.id&&delta.operation==='confirm'))||report.todoDeltas.some(delta=>delta.operation==='create')
-  if(['plan_review','code_review','plan_adoption'].includes(auth.duty)&&unresolved)report.verdict='changes_requested'
-  if(auth.duty==='code_review'&&!unresolved){report.verdict='accepted';report.summary='No unresolved feedback'}
-  return report
+  if(reference.stage==='reply'&&!reference.openMode)return {tool:'submit_input_result',args:{outcome:'processed'},text:'The supplied scope decision has been handled.'}
+  const fileChange=(reference.stage==='implement'||reference.stage==='collaborate')&&!task.includes('no code change')?{name:'cancellation-'+auth.runId.slice(0,8)+'.ts',content:'export const owner = '+JSON.stringify(auth.runId)+'\\n'}:undefined
+  return {fileChange,text:reference.stage==='respond'?'The cancellation finding is confirmed; an explicit repair is required.':'Cancellation work is complete and ready for independent review.'}
 }
-const nativeReport = report => ({...report,plan:report.plan??null,reviewedPlan:report.reviewedPlan??null,reviewScopeRef:report.reviewScopeRef??null,verdict:report.verdict??null})
 const readFixtureSource = async (request, call) => {
   let offset=0,text='',pages=[]
   for(let index=0;index<128;index++) {
@@ -1173,7 +1374,8 @@ async function writeClaudeSdkFixture(
 ): Promise<string> {
   const path = join(directory, 'claude-sdk-fixture.mjs')
   const source = `import { randomUUID } from 'node:crypto'
-import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, realpathSync } from 'node:fs'
+import { join } from 'node:path'
 import { createInterface } from 'node:readline'
 ${collaborationFixtureScript}
 const scenario = ${JSON.stringify(scenario)}
@@ -1192,19 +1394,59 @@ const inputIterator = lines[Symbol.asyncIterator]()
 const facts = existsSync(statePath) ? JSON.parse(readFileSync(statePath, 'utf8')) : { count: 0, reviewCount: 0 }
 const persist = () => writeFileSync(statePath, JSON.stringify(facts))
 process.once('uncaughtException',error=>{facts.fixtureError=String(error.message).slice(0,512);persist();process.stderr.write(facts.fixtureError+'\\n');process.exit(1)})
-let collaborationPrefix = '', sdkServers = []
+let collaborationPrefix = '', sdkServers = [], sdkHooks = {}
 if (forkScenario && arg('--resume')) { (facts.resumes ??= []).push(fallbackSessionId); persist() }
-const sdkSource = async request => {
+const sdkControl = async request => {
+  const requestId=randomUUID();send({type:'control_request',request_id:requestId,request})
+  for(;;){const line=await inputIterator.next();if(line.done)throw Error('SDK transport ended');const reply=JSON.parse(line.value)
+    if(reply.type==='control_response'&&reply.response.request_id===requestId){if(reply.response.subtype==='error')throw Error(reply.response.error);return reply.response.response}
+    if(reply.type==='control_request')send({type:'control_response',response:{subtype:'success',request_id:reply.request_id,response:{}}})
+  }
+}
+const sdkCall = async (name,args) => {
   const own=sdkServers.find(name=>name.startsWith('pact_peer'))
-  const call = async message => { const requestId=randomUUID();send({type:'control_request',request_id:requestId,request:{subtype:'mcp_message',server_name:own,message}});for(;;){const line=await inputIterator.next();if(line.done)throw Error('Source transport ended');const reply=JSON.parse(line.value);if(reply.type==='control_response'&&reply.response.request_id===requestId){const response=reply.response.response?.mcp_response;if(!response?.result)throw Error('Source MCP call failed');return response.result}if(reply.type==='control_request')send({type:'control_response',response:{subtype:'success',request_id:reply.request_id,response:{}}})} }
-  if(!sdkSource.ready){await call({jsonrpc:'2.0',id:1,method:'initialize',params:{protocolVersion:'2025-03-26',capabilities:{},clientInfo:{name:'pact-fixture',version:'1'}}});await call({jsonrpc:'2.0',method:'notifications/initialized'});sdkSource.ready=true}
-  return readFixtureSource(request,args=>call({jsonrpc:'2.0',id:randomUUID(),method:'tools/call',params:{name:'read_collaboration_source',arguments:args}}))
+  const call=async message=>(await sdkControl({subtype:'mcp_message',server_name:own,message})).mcp_response
+  if(!sdkCall.ready){await call({jsonrpc:'2.0',id:1,method:'initialize',params:{protocolVersion:'2025-03-26',capabilities:{},clientInfo:{name:'pact-fixture',version:'1'}}});await call({jsonrpc:'2.0',method:'notifications/initialized'});sdkCall.ready=true}
+  const response=await call({jsonrpc:'2.0',id:randomUUID(),method:'tools/call',params:{name,arguments:args}})
+  if(!response?.result)throw Error('Source MCP call failed')
+  return response.result
+}
+const sdkSource = request => readFixtureSource(request,args=>sdkCall('read_collaboration_source',args))
+const nativePlan = async (sessionId, promptId, plan) => {
+  const cwd=realpathSync(process.cwd()), project=join(process.env.CLAUDE_CONFIG_DIR,'projects',cwd.replace(/[^a-z0-9]/giu,'-'))
+  mkdirSync(project,{recursive:true})
+  const transcript=join(project,sessionId+'.jsonl'),path=join(process.env.CLAUDE_CONFIG_DIR,'plans','fixture-'+sessionId+'.md')
+  // Continued native planning roots retain the real Session ancestry.
+  let parent=existsSync(transcript)?readFileSync(transcript,'utf8').trim().split('\\n').filter(Boolean).map(line=>JSON.parse(line)).at(-1)?.uuid??null:null
+  const append=record=>{const entry={...record,sessionId,cwd,timestamp:new Date().toISOString(),parentUuid:parent};appendFileSync(transcript,JSON.stringify(entry)+'\\n');parent=entry.uuid}
+  append({type:'user',uuid:promptId,promptId,message:{role:'user',content:'Native planning request'}})
+  append({type:'attachment',uuid:randomUUID(),attachment:{type:'plan_mode',isSubAgent:false,planFilePath:path}})
+  const id=randomUUID(),args={file_path:path,content:plan}
+  append({type:'assistant',uuid:randomUUID(),message:{id:randomUUID(),role:'assistant',content:[{type:'tool_use',id,name:'Write',input:args}]}})
+  const hook=async(event,toolId,name,input,response)=>{for(const group of sdkHooks[event]??[])for(const callback of group.hookCallbackIds??[])await sdkControl({subtype:'hook_callback',callback_id:callback,tool_use_id:toolId,input:{hook_event_name:event,session_id:sessionId,prompt_id:promptId,cwd,transcript_path:transcript,tool_name:name,tool_use_id:toolId,tool_input:input,...(response?{tool_response:response}:{})}})}
+  await hook('PreToolUse',id,'Write',args)
+  mkdirSync(join(process.env.CLAUDE_CONFIG_DIR,'plans'),{recursive:true});writeFileSync(path,plan)
+  const receipt={filePath:path,content:plan,userModified:false}
+  append({type:'user',uuid:randomUUID(),toolUseResult:receipt,message:{role:'user',content:[{type:'tool_result',tool_use_id:id,content:'Plan written',is_error:false}]}})
+  await hook('PostToolUse',id,'Write',args,receipt)
+  const exitId=randomUUID()
+  append({type:'assistant',uuid:randomUUID(),message:{id:randomUUID(),role:'assistant',content:[{type:'tool_use',id:exitId,name:'ExitPlanMode',input:{}}]}})
+  await hook('PreToolUse',exitId,'ExitPlanMode',{})
+  await sdkControl({subtype:'can_use_tool',tool_name:'ExitPlanMode',tool_use_id:exitId,input:{}})
+}
+const nativeWrite = async (sessionId, promptId, fileChange) => {
+  const cwd=realpathSync(process.cwd()), filePath=join(cwd,fileChange.name), id=randomUUID(), args={file_path:filePath,content:fileChange.content}
+  const hook=async(event,toolId,name,input,response)=>{for(const group of sdkHooks[event]??[])for(const callback of group.hookCallbackIds??[])await sdkControl({subtype:'hook_callback',callback_id:callback,tool_use_id:toolId,input:{hook_event_name:event,session_id:sessionId,prompt_id:promptId,cwd,transcript_path:'',tool_name:name,tool_use_id:toolId,tool_input:input,...(response?{tool_response:response}:{})}})}
+  await hook('PreToolUse',id,'Write',args)
+  writeFileSync(filePath,fileChange.content)
+  const receipt={type:'create',filePath,content:fileChange.content,originalFile:null,userModified:false}
+  await hook('PostToolUse',id,'Write',args,receipt)
 }
 for (;;) {
   const line=await inputIterator.next();if(line.done)break
   const message = JSON.parse(line.value)
   if (message.type === 'control_request') {
-    if (message.request.subtype === 'initialize') { collaborationPrefix = message.request.appendSystemPrompt ?? ''; sdkServers = message.request.sdkMcpServers ?? [] }
+    if (message.request.subtype === 'initialize') { collaborationPrefix = message.request.appendSystemPrompt ?? ''; sdkServers = message.request.sdkMcpServers ?? []; sdkHooks=message.request.hooks??{} }
     let response = { commands: [], agents: [], output_style: 'default', available_output_styles: ['default'], models: forkScenario ? [{ value: 'opus', displayName: resolvedModel, description: 'Synthetic alias', resolvedModel }] : [], account: {}, hooks_applied: true, current_permission_mode: permissionMode }
     if (forkScenario) {
       if (message.request.subtype === 'set_model') model = message.request.model
@@ -1227,7 +1469,7 @@ for (;;) {
     const count = facts.count + 1
     facts.count = count; writeFileSync(statePath, JSON.stringify(facts))
     await new Promise((resolve) => setTimeout(resolve, 1800))
-    if (sessionTitles && JSON.stringify(message.message.content).includes('Pact Session metadata:')) {
+    if (sessionTitles) {
       const own = sdkServers.find(name => name.startsWith('pact_peer'))
       const args = {title:'Title from the authorized Turn'}
       const metadataTool = 'mcp__'+own+'__publish_session_title'
@@ -1237,16 +1479,23 @@ for (;;) {
       send({type:'assistant',session_id:sessionId,uuid:randomUUID(),parent_tool_use_id:null,user_message_uuid:message.uuid,message:{id:randomUUID(),role:'assistant',type:'message',model:'claude-fixture',content:[{type:'tool_use',id:callId,name:metadataTool,input:args}],stop_reason:'tool_use',stop_sequence:null,usage:{input_tokens:0,output_tokens:0}}})
       send({type:'user',session_id:sessionId,uuid:randomUUID(),parent_tool_use_id:null,message:{role:'user',content:[{type:'tool_result',tool_use_id:callId,content:'Title validated',is_error:false}]}})
     }
-    let formalOutput
-    if (scenario === 'collaboration' && arg('--json-schema')) {
+    let answer='Claude fixture response.'
+    if (scenario === 'collaboration') {
       const content=typeof message.message.content==='string'?message.message.content:message.message.content.filter(item=>item.type==='text').map(item=>item.text).join('\\n')
       const report = await collaborationReport(collaborationPrefix+'\\n'+content, facts, sdkSource)
-      formalOutput={version:JSON.parse(arg('--json-schema')).properties.version.const,answer:'Claude fixture response.',result:nativeReport(report)}
-      persist()
+      if(report.plan)await nativePlan(sessionId,message.uuid,report.plan)
+      if(report.fileChange)await nativeWrite(sessionId,message.uuid,report.fileChange)
+      if(report.tool){
+        const own=sdkServers.find(name=>name.startsWith('pact_peer')),id=randomUUID(),name='mcp__'+own+'__'+report.tool
+        send({type:'assistant',session_id:sessionId,uuid:randomUUID(),parent_tool_use_id:null,user_message_uuid:message.uuid,message:{id:randomUUID(),role:'assistant',type:'message',model:'claude-fixture',content:[{type:'tool_use',id,name,input:report.args}],stop_reason:'tool_use',stop_sequence:null,usage:{input_tokens:0,output_tokens:0}}})
+        const result=await sdkCall(report.tool,report.args)
+        send({type:'user',session_id:sessionId,uuid:randomUUID(),parent_tool_use_id:null,message:{role:'user',content:[{type:'tool_result',tool_use_id:id,content:result.content,is_error:result.isError??false}]}})
+      }
+      answer=report.text;persist()
     }
     const failed = scenario === 'failure_once' && count === 1
-    if (!failed) send({ type: 'assistant', session_id: sessionId, uuid: randomUUID(), parent_tool_use_id: null, user_message_uuid: message.uuid, message: { id: randomUUID(), role: 'assistant', type: 'message', model: 'claude-fixture', content: [{ type: 'text', text: 'Claude fixture response.' }], stop_reason: 'end_turn', stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } } })
-    send({ type: 'result', subtype: failed ? 'error_during_execution' : 'success', session_id: sessionId, uuid: randomUUID(), user_message_uuid: message.uuid, user_message_uuids: [message.uuid], ...(formalOutput ? {structured_output:formalOutput} : {}), result: failed ? '' : 'Claude fixture response.', errors: failed ? ['Fixture context window exceeded'] : [], is_error: failed, duration_ms: 1, duration_api_ms: 0, num_turns: 1, total_cost_usd: 0, usage: { input_tokens: 0, output_tokens: 0 }, modelUsage: {}, permission_denials: [], stop_reason: 'end_turn' })
+    if (!failed) send({ type: 'assistant', session_id: sessionId, uuid: randomUUID(), parent_tool_use_id: null, user_message_uuid: message.uuid, message: { id: randomUUID(), role: 'assistant', type: 'message', model: 'claude-fixture', content: [{ type: 'text', text: answer }], stop_reason: 'end_turn', stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } } })
+    send({ type: 'result', subtype: failed ? 'error_during_execution' : 'success', session_id: sessionId, uuid: randomUUID(), user_message_uuid: message.uuid, user_message_uuids: [message.uuid], result: failed ? '' : answer, errors: failed ? ['Fixture context window exceeded'] : [], is_error: failed, duration_ms: 1, duration_api_ms: 0, num_turns: 1, total_cost_usd: 0, usage: { input_tokens: 0, output_tokens: 0 }, modelUsage: {}, permission_denials: [], stop_reason: 'end_turn' })
   }
 }
 `
@@ -1259,6 +1508,7 @@ async function writeCodexAppServer(
   scenario: NonNullable<RuntimeFixtureOptions['codexAppServer']>,
   skills: NonNullable<RuntimeFixtureOptions['codexSkills']>,
   sessionTitles = false,
+  models: NonNullable<RuntimeFixtureOptions['codexModels']> = [],
 ): Promise<string> {
   const path = join(directory, 'codex-app-server-fixture.mjs')
   const statePath = join(directory, 'codex-app-server-state.json')
@@ -1267,7 +1517,7 @@ async function writeCodexAppServer(
       ? `${windowsFixtureRenameSource}\nconst persist = () => { const temporary = statePath + '.' + process.pid + '.tmp'; writeFileSync(temporary, JSON.stringify(state)); windowsFixtureRename(temporary, statePath) }`
       : "const persist = () => { const temporary = statePath + '.' + process.pid + '.tmp'; writeFileSync(temporary, JSON.stringify(state)); renameSync(temporary, statePath) }"
   const source = `import { appendFileSync, existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { join } from 'node:path'
 import { createInterface } from 'node:readline'
 
@@ -1314,7 +1564,11 @@ for await (const line of lines) {
     if (state.methods.length >= 4096) throw new Error('Fixture request history budget exceeded.')
     state.methods.push(request.method); persist()
   }
-  if (request.id === 'session-scope-approval' && !request.method) {
+  if (request.id === 'native-question' && !request.method) {
+    if(request.result?.answers?.scope?.answers?.[0]!=='Current request')throw Error('Native answer was not delivered to its root')
+    const finish=approvalComplete;approvalComplete=undefined;finish?.()
+  }
+  else if (request.id === 'session-scope-approval' && !request.method) {
     if (state.permissionDecisions.length >= 8) throw new Error('Fixture permission response budget exceeded.')
     state.permissionDecisions.push(request.result?.decision ?? 'error'); persist()
     const finish = approvalComplete; approvalComplete = undefined
@@ -1334,7 +1588,7 @@ for await (const line of lines) {
     send({id:request.id,result:{}})
     send({method:'turn/completed',params:{threadId:stop.threadId,turn:{id:stop.turnId,status:'interrupted'}}})
   }
-  else if (request.method === 'model/list') send({ id: request.id, result: { data: [] } })
+  else if (request.method === 'model/list') send({ id: request.id, result: { data: ${JSON.stringify(models)} } })
   else if (request.method === 'skills/list') send({ id: request.id, result: { data: [{ cwd: request.params.cwds?.[0] ?? process.cwd(), skills, errors: [] }] } })
   else if (request.method === 'config/read') send({ id: request.id, result: { config: { model: 'gpt-fixture', model_reasoning_effort: 'medium', approval_policy: 'on-request', approvals_reviewer: 'user', sandbox_mode: 'danger-full-access' } } })
   else if (request.method === 'thread/settings/update') {
@@ -1431,24 +1685,39 @@ for await (const line of lines) {
       const complete = () => {
         native(threadId).status = 'idle'
         if (scenario === 'native_title' && !native(threadId).name) native(threadId).name = 'Native auto title'
+        if (scenario === 'fork_complete') {
+          const userInputText = request.params.input.filter((item) => item.type === 'text').map((item) => item.text).join('\\n')
+          appendFileSync(native(threadId).path, [
+            { type: 'event_msg', payload: { type: 'task_started', turn_id: turnId } },
+            { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: userInputText }] } },
+            { type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text }] }, metadata: { client_authored: false } },
+            { type: 'event_msg', payload: { type: 'task_complete', turn_id: turnId } },
+          ].map((record) => JSON.stringify(record) + '\\n').join(''))
+        }
         native(threadId).turns.push({ id: turnId, status: 'completed', startedAt: 1, completedAt: 2, durationMs: 1, error: null })
         native(threadId).items.push({ turnId, item: { type: 'userMessage', id: 'fixture-user', clientId: request.params.clientUserMessageId, content: [] } }, { turnId, item: { type: 'agentMessage', id: 'fixture-message', text } }); persist()
         send({ method: 'item/completed', params: { threadId, turnId, item: { type: 'agentMessage', id: 'fixture-message', text } } })
         send({ method: 'turn/completed', params: { threadId, turn: { id: turnId, status: 'completed' } } })
       }
-      if (sessionTitles && request.params.input.some(item => item.type === 'text' && item.text.includes('Pact Session metadata:'))) {
+      if (sessionTitles) {
         const key = Object.keys(native(threadId).config).find(key=>key.startsWith('mcp_servers.pact_peer'))
         const args = {title:'Title from the authorized Turn'}
         const rpc = await fetch(native(threadId).config[key].url,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({jsonrpc:'2.0',id:99,method:'tools/call',params:{name:'publish_session_title',arguments:args}}),signal:AbortSignal.timeout(5000)}).then(response=>response.json())
         send({method:'item/completed',params:{threadId,turnId,item:{id:'title-'+turnId,type:'mcpToolCall',server:key.slice('mcp_servers.'.length),tool:'publish_session_title',arguments:args,result:rpc.result,error:null,status:'completed'}}})
       }
-      if (scenario === 'collaboration' && request.params.outputSchema) {
+      if (scenario === 'collaboration') {
         const prefix = request.params.input.filter(item=>item.type==='text').map(item=>item.text).join('\\n')
-        const own=Object.entries(native(threadId).config).find(([name])=>name.startsWith('mcp_servers.pact_peer'))[1]
-        const readSource=request=>readFixtureSource(request,async args=>{const rpc=await fetch(own.url,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({jsonrpc:'2.0',id:1,method:'tools/call',params:{name:'read_collaboration_source',arguments:args}}),signal:AbortSignal.timeout(5000)}).then(response=>response.json());if(!rpc.result)throw Error('Source MCP failed');return rpc.result})
-        const report = await collaborationReport(prefix, state, readSource)
-        text=JSON.stringify({version:request.params.outputSchema.properties.version.const,answer:'Bounded lifecycle response.',result:nativeReport(report)})
+        const own=Object.entries(native(threadId).config).find(([name])=>name.startsWith('mcp_servers.pact_peer'))
+        const call=async(name,args)=>{const rpc=await fetch(own[1].url,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({jsonrpc:'2.0',id:randomUUID(),method:'tools/call',params:{name,arguments:args}}),signal:AbortSignal.timeout(5000)}).then(response=>response.json());if(!rpc.result)throw Error('Source MCP failed');return rpc.result}
+        const report = await collaborationReport(prefix, state, request=>readFixtureSource(request,args=>call('read_collaboration_source',args)))
+        if(report.plan)send({method:'item/completed',params:{threadId,turnId,item:{id:'plan-'+turnId,type:'plan',text:report.plan}}})
+        if(report.fileChange){const filePath=join(request.params.cwd??process.cwd(),report.fileChange.name);writeFileSync(filePath,report.fileChange.content);send({method:'item/completed',params:{threadId,turnId,item:{id:'fc-'+turnId,type:'fileChange',status:'completed',changes:[{path:filePath,kind:{type:'add'},diff:'@@ -0,0 +1,1 @@\\n+'+report.fileChange.content.trim()}]}}})}
+        if(report.tool){const result=await call(report.tool,report.args);send({method:'item/completed',params:{threadId,turnId,item:{id:'workflow-'+turnId,type:'mcpToolCall',server:own[0].slice('mcp_servers.'.length),tool:report.tool,arguments:report.args,result,error:null,status:'completed'}}})}
+        text=report.text
         persist();complete()
+      } else if (scenario === 'native_question') {
+        approvalComplete = complete
+        setTimeout(()=>send({id:'native-question',method:'item/tool/requestUserInput',params:{threadId,turnId,itemId:'question-tool',questions:[{id:'scope',header:'Cancellation scope',question:'Which cancellation scope?',options:[{label:'Current request',description:'Stop this request only.'},{label:'All requests',description:'Stop every request.'}]}]}}),1000)
       } else if (scenario === 'session_permission_scope') {
         approvalComplete = complete
         send({ id: 'session-scope-approval', method: 'item/commandExecution/requestApproval', params: {

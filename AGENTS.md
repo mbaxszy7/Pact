@@ -12,6 +12,8 @@
 
 ## Delivery and design
 
+Any UI change requires the user's explicit authorization before implementation.
+
 Implement one approved, reviewable module at a time; split oversized work and obtain acceptance before
 starting the next product module. Keep unrelated refactors and future scope out of the diff. Delivery
 includes scope, interfaces/invariants, files, verification, platform impact, limitations, and a

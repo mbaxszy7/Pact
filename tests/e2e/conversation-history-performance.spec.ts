@@ -501,12 +501,13 @@ async function seedLongConversation(fixture: RuntimeFixture): Promise<{
     { id: sessionId, projectId, title: sessionTitle, createdAt },
     {
       primaryAgentId: 'codex',
+      secondaryAgentId: 'claude',
       agents: {
         claude: { model: null, effort: null },
         codex: { model: 'gpt-5.6-sol', effort: 'high' },
+        agy: { model: null, effort: null },
       },
       maxDiscussionRounds: 6,
-      runningMessagePolicy: 'immediate_safe_point',
       maxReviewCycles: 3,
       maxRepairAttempts: 3,
     },

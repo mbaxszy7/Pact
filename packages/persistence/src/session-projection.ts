@@ -16,9 +16,10 @@ export interface LatestRunActivity {
 export function projectSessionTitle(
   title: string,
   source: SessionTitleSource,
+  placeholder = 'New session',
 ): { title: string; titleSource: SessionTitleSource } {
   return source === 'agent' && title.includes(PACT_PROMPT_ENVELOPE_MARKER)
-    ? { title: 'New session', titleSource: 'placeholder' }
+    ? { title: placeholder, titleSource: 'placeholder' }
     : { title, titleSource: source }
 }
 

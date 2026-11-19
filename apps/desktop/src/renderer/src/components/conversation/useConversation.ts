@@ -4,7 +4,8 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react
 import type { SkillSelection } from '@pact/contracts'
 import type {
   AnchoredComment,
-  CommentAnchor,
+  CollaborationDecisionQuestions,
+  CollaborationSession,
   ConversationPatch,
   ConversationPage,
   ConversationSendInput,
@@ -24,6 +25,9 @@ import {
   NATIVE_PERMISSION_REQUESTS,
   NATIVE_PERMISSION_TIMEOUT_MS,
   nativeInputValuesSchema,
+  userInformationDeclarationSchema,
+  relaySchedulingDecisionSchema,
+  parseComposerCommandPrefix,
 } from '@pact/contracts'
 import { IMAGE_REFERENCE_ITEMS, type ConversationImage } from '@pact/contracts/images'
 
@@ -36,7 +40,7 @@ import {
   COMPOSER_DRAFT_BYTES,
   COMPOSER_DRAFT_ITEMS,
 } from './composer-capacity'
-import { releaseComposerRoute } from './composer-document'
+import { composerRouteIntent, releaseComposerRoute } from './composer-document'
 import {
   mergeActivityPage,
   mergeRunArtifactPage,
@@ -57,7 +61,67 @@ import {
 } from './conversation-window'
 import { uploadConversationImage, releaseDraftImage, type DraftImage } from './image-client'
 
+export interface DecisionReplyContext {
+  reference: NonNullable<ConversationSendInput['replyToDecision']>
+  questions: CollaborationDecisionQuestions
+}
+export interface DecisionAnswerDraft extends DecisionReplyContext {
+  originalReply?: string | undefined
+  answers: Record<string, { optionIds: string[]; text: string }>
+}
+export const sameDecision = (
+  left: DecisionReplyContext['reference'] | undefined,
+  right: DecisionReplyContext['reference'] | undefined,
+): boolean => JSON.stringify(left) === JSON.stringify(right)
+export const hasDecisionAnswers = (draft: DecisionAnswerDraft | undefined): boolean =>
+  Boolean(
+    draft &&
+    (draft.originalReply?.trim() ||
+      Object.values(draft.answers).some((answer) => answer.optionIds.length || answer.text.trim())),
+  )
+const decisionAnswerMarkdownText = (text: string) => text.replace(/[\\`*_[\]<>]/gu, '\\$&')
+
+function formatDecisionAnswers(draft: DecisionAnswerDraft): string {
+  if (!draft.questions.length) return draft.originalReply?.trim() ?? ''
+  return draft.questions
+    .flatMap((question, index) => {
+      const answer = draft.answers[question.id]
+      if (!answer || (!answer.optionIds.length && !answer.text.trim())) return []
+      const choices =
+        question.options?.filter((option) => answer.optionIds.includes(option.id)) ?? []
+      return [
+        [
+          `**${index + 1}. ${decisionAnswerMarkdownText(question.prompt)}**`,
+          '',
+          '**Your answer:**',
+          '',
+          ...choices.map(
+            (option) =>
+              `- ${decisionAnswerMarkdownText(option.label)}${option.description ? ` — ${decisionAnswerMarkdownText(option.description)}` : ''}`,
+          ),
+          ...(answer.text.trim() ? ['', decisionAnswerMarkdownText(answer.text.trim())] : []),
+        ].join('\n'),
+      ]
+    })
+    .join('\n\n')
+}
+
 export interface ConversationHistoryControls {
+  decisionDraft?: DecisionAnswerDraft | undefined
+  setDecisionDraft?: ((draft: DecisionAnswerDraft) => boolean) | undefined
+  clearDecisionDraft?: ((keepInMessage: boolean) => boolean) | undefined
+  informationCancellation?:
+    | {
+        request: import('@pact/contracts').RelaySchedulingDecision
+        status: 'submitting' | 'checking_receipt' | 'receipt_unconfirmed'
+        error?: string | undefined
+      }
+    | undefined
+  cancelledInformationDecisionId?: string | undefined
+  cancelPreparedInformation?:
+    | ((request: import('@pact/contracts').RelaySchedulingDecision) => Promise<boolean>)
+    | undefined
+  checkInformationCancellation?: (() => Promise<boolean>) | undefined
   collapseEarlierResponses?: ((runId: string) => Promise<void>) | undefined
   setSnapshotFoldGuard?: ((guard: (() => boolean) | undefined) => void) | undefined
   queueActions?: {
@@ -124,6 +188,8 @@ export interface ConversationHistoryControls {
 }
 
 const EMPTY_ACTIVITY_META: ConversationWindow['activityMeta'] = {}
+const EMPTY_COMPOSER_IMAGES: readonly DraftImage[] = []
+const EMPTY_COMPOSER_SKILLS: SkillSelection[] = []
 const bodyTextEncoder = new TextEncoder()
 const MAX_SENT_COMMENTS = CONVERSATION_PAGE_ITEMS * 3
 const MAX_SENT_COMMENT_PAGES = Math.ceil(MAX_SENT_COMMENTS / CONVERSATION_PAGE_ITEMS)
@@ -132,6 +198,163 @@ const INITIAL_SYNC_TIMEOUT_MS = 15_000
 const INLINE_INPUT_BYTES = 64 * 1024
 const INPUT_UPLOAD_TIMEOUT_MS = 10_000
 const INPUT_UPLOAD_CHARS = 8192
+const MAX_PENDING_SYNC_MAIN_SESSIONS = 32
+
+interface PendingSyncMain {
+  operationId: string
+  content: string
+  imageIds: string[]
+  commentIds: string[]
+  skills: SkillSelection[]
+  userInformation?: import('@pact/contracts').UserInformationDeclaration | undefined
+  expectedRevision: number
+  expectedCommentsRevision: number
+  inputId?: string | undefined
+  contentSha256?: string | undefined
+  inputPreparation?: AbortController | undefined
+}
+
+function sameSyncMainPayload(
+  left: PendingSyncMain,
+  right: Omit<PendingSyncMain, 'operationId' | 'inputPreparation' | 'inputId' | 'contentSha256'>,
+): boolean {
+  return (
+    left.content === right.content &&
+    left.expectedRevision === right.expectedRevision &&
+    left.expectedCommentsRevision === right.expectedCommentsRevision &&
+    left.imageIds.length === right.imageIds.length &&
+    left.imageIds.every((id, index) => id === right.imageIds[index]) &&
+    left.commentIds.length === right.commentIds.length &&
+    left.commentIds.every((id, index) => id === right.commentIds[index]) &&
+    JSON.stringify(left.skills) === JSON.stringify(right.skills) &&
+    JSON.stringify(left.userInformation ?? null) === JSON.stringify(right.userInformation ?? null)
+  )
+}
+
+async function sha256Hex(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', bodyTextEncoder.encode(value))
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
+}
+
+function releasePreparedInput(targetSessionId: string, targetInputId: string): void {
+  void window.pact
+    .writeConversationInput({
+      type: 'release',
+      sessionId: targetSessionId,
+      inputId: targetInputId,
+    })
+    .catch(() => undefined)
+}
+
+/** Uploads oversized conversation text via bounded UTF-16 chunks before submit/sync-back. */
+async function uploadLargeConversationInput(params: {
+  sessionId: string
+  clientMessageId: string
+  content: string
+  controller: AbortController
+  cancelErrorMessage: string
+  startErrorMessage: string
+  appendErrorMessage: string
+  sealErrorMessage: string
+  cancelledCheckErrorMessage: string
+  onInputId?: (inputId: string | undefined) => void
+  isCurrent?: () => boolean
+}): Promise<string> {
+  const { sessionId, clientMessageId, content, controller } = params
+  let preparedInputId: string | undefined
+  const timeout = window.setTimeout(() => controller.abort(), INPUT_UPLOAD_TIMEOUT_MS)
+  const write = (input: Parameters<typeof window.pact.writeConversationInput>[0]) =>
+    new Promise<Awaited<ReturnType<typeof window.pact.writeConversationInput>>>(
+      (resolve, reject) => {
+        const abort = () => reject(new Error(params.cancelErrorMessage))
+        controller.signal.addEventListener('abort', abort, { once: true })
+        if (controller.signal.aborted) {
+          controller.signal.removeEventListener('abort', abort)
+          abort()
+          return
+        }
+        void window.pact.writeConversationInput(input).then(
+          (reply) => {
+            controller.signal.removeEventListener('abort', abort)
+            if (controller.signal.aborted) {
+              if (reply.ok)
+                void window.pact
+                  .writeConversationInput({
+                    type: 'release',
+                    sessionId,
+                    inputId: reply.value.inputId,
+                  })
+                  .catch(() => undefined)
+              return undefined
+            }
+            resolve(reply)
+            return undefined
+          },
+          (writeError: unknown) => {
+            controller.signal.removeEventListener('abort', abort)
+            reject(writeError)
+            return undefined
+          },
+        )
+      },
+    )
+  try {
+    const initial = unwrapRpcResult(await write({ type: 'begin', sessionId, clientMessageId }))
+    preparedInputId = initial.inputId
+    params.onInputId?.(preparedInputId)
+    if (initial.offset !== 0 || initial.sealed) throw new Error(params.startErrorMessage)
+    let offset = 0
+    while (offset < content.length) {
+      let end = Math.min(content.length, offset + INPUT_UPLOAD_CHARS)
+      const high = content.charCodeAt(end - 1),
+        low = content.charCodeAt(end)
+      if (
+        end < content.length &&
+        high >= 0xd800 &&
+        high <= 0xdbff &&
+        low >= 0xdc00 &&
+        low <= 0xdfff
+      )
+        end -= 1
+      const part: import('@pact/contracts').ConversationInputState = unwrapRpcResult(
+        // oxlint-disable-next-line no-await-in-loop -- Each bounded UTF-16 segment follows the acknowledged offset under one deadline.
+        await write({
+          type: 'append',
+          sessionId,
+          inputId: preparedInputId,
+          offset,
+          text: content.slice(offset, end),
+        }),
+      )
+      if (part.inputId !== preparedInputId || part.offset !== end || part.sealed)
+        throw new Error(params.appendErrorMessage)
+      offset = end
+    }
+    const sealed = unwrapRpcResult(
+      await write({ type: 'seal', sessionId, inputId: preparedInputId }),
+    )
+    if (
+      !sealed.sealed ||
+      sealed.inputId !== preparedInputId ||
+      sealed.offset !== content.length ||
+      sealed.chars !== content.length
+    )
+      throw new Error(params.sealErrorMessage)
+    if (controller.signal.aborted || (params.isCurrent && !params.isCurrent()))
+      throw new Error(params.cancelledCheckErrorMessage)
+    return preparedInputId
+  } catch (error) {
+    if (preparedInputId) {
+      params.onInputId?.(undefined)
+      void window.pact
+        .writeConversationInput({ type: 'release', sessionId, inputId: preparedInputId })
+        .catch(() => undefined)
+    }
+    throw error
+  } finally {
+    window.clearTimeout(timeout)
+  }
+}
 
 async function readActivityBody(
   sessionId: string,
@@ -139,14 +362,14 @@ async function readActivityBody(
   isCurrent: () => boolean,
 ): Promise<string> {
   if (source.bodyBytes > CONVERSATION_EXPAND_BYTES) {
-    throw new Error('This Work log detail exceeds the inline reading limit.')
+    throw new Error('This work log entry is too large to expand here.')
   }
   const chunks = [source.preview]
   let offset = source.previewChars
   let loadedBytes = bodyTextEncoder.encode(source.preview).byteLength
   const deadline = Date.now() + 30_000
   for (let pageCount = 0; pageCount < 256; pageCount += 1) {
-    if (!isCurrent()) throw new Error('The content request was cancelled.')
+    if (!isCurrent()) throw new Error('Loading was cancelled.')
     if (Date.now() > deadline) throw new Error('Loading took too long. Try again.')
     const page = unwrapRpcResult(
       // oxlint-disable-next-line eslint/no-await-in-loop -- The next offset comes from this bounded page.
@@ -164,23 +387,23 @@ async function readActivityBody(
       page.detailRevision !== source.revision ||
       page.offset !== offset
     )
-      throw new Error('The Work log detail changed or could not load. Try again.')
-    if (!isCurrent()) throw new Error('The content request was cancelled.')
+      throw new Error('Work log details changed. Try again.')
+    if (!isCurrent()) throw new Error('Loading was cancelled.')
     loadedBytes += bodyTextEncoder.encode(page.text).byteLength
     if (loadedBytes > CONVERSATION_EXPAND_BYTES) {
-      throw new Error('This Work log detail exceeds the inline reading limit.')
+      throw new Error('This work log entry is too large to expand here.')
     }
     chunks.push(page.text)
     if (page.nextOffset === undefined) {
       if (loadedBytes !== source.bodyBytes) {
-        throw new Error('The Work log detail changed while loading. Try again.')
+        throw new Error('Work log details changed while loading. Try again.')
       }
       return chunks.join('')
     }
-    if (page.nextOffset <= offset) throw new Error('The content did not advance.')
+    if (page.nextOffset <= offset) throw new Error('Couldn’t load the next part of the work log.')
     offset = page.nextOffset
   }
-  throw new Error('This Work log detail exceeds the inline page limit.')
+  throw new Error('This work log entry is too long to display in full.')
 }
 
 async function readSentComments(
@@ -196,7 +419,7 @@ async function readSentComments(
   let bytes = 0
   for (let pageCount = 0; pageCount <= MAX_SENT_COMMENT_PAGES; pageCount += 1) {
     if (!isCurrent()) return { comments: [], hasMore: false }
-    if (Date.now() > deadline) throw new Error('Comment loading timed out.')
+    if (Date.now() > deadline) throw new Error('Loading comments took too long. Try again.')
     const page = unwrapRpcResult(
       // oxlint-disable-next-line eslint/no-await-in-loop -- Every bounded page supplies the next cursor.
       await window.pact.getConversation({
@@ -207,15 +430,15 @@ async function readSentComments(
       }),
     )
     if (page.scope !== 'comments' || page.sessionId !== sessionId) {
-      throw new Error('The Comment response did not match this Session.')
+      throw new Error('Couldn’t load comments for this session.')
     }
     if (!isCurrent()) return { comments: [], hasMore: false }
     for (const comment of page.comments) {
       if (!comment.sentWithMessageId || !requested.has(comment.sentWithMessageId)) {
-        throw new Error('The Comment response did not match the visible Messages.')
+        throw new Error('Couldn’t match loaded comments to these messages.')
       }
       if (afterPosition !== undefined && comment.position <= afterPosition) {
-        throw new Error('The Comment response did not advance.')
+        throw new Error('Couldn’t load the next page of comments.')
       }
       bytes += encoder.encode(JSON.stringify(comment)).byteLength
       if (comments.length >= MAX_SENT_COMMENTS || bytes > MAX_SENT_COMMENT_BYTES)
@@ -225,14 +448,19 @@ async function readSentComments(
     }
     if (!page.hasMore) return { comments, hasMore: false }
     if (pageCount === MAX_SENT_COMMENT_PAGES - 1) return { comments, hasMore: true }
-    if (page.comments.length === 0) throw new Error('The Comment response did not advance.')
+    if (page.comments.length === 0) throw new Error('Couldn’t load the next page of comments.')
   }
-  throw new Error('Visible Comments exceed the safe page limit.')
+  throw new Error('Too many comments to display at once.')
 }
 
 export interface ConversationFlow {
   snapshot: ConversationViewProjection | undefined
   composer: string
+  /** Legacy draft metadata remains available to in-flight receipts, without a Composer control. */
+  composerUserInformation: import('@pact/contracts').UserInformationDeclaration | undefined
+  setComposerUserInformation(
+    value: import('@pact/contracts').UserInformationDeclaration | undefined,
+  ): boolean
   choosingImages: boolean
   composerImages: readonly DraftImage[]
   addComposerImages(this: void, files: readonly File[]): Promise<void>
@@ -246,6 +474,21 @@ export interface ConversationFlow {
   setComposerSkills(value: SkillSelection[]): void
   composerMention: ConversationComposerMention | undefined
   setComposerMention(value: ConversationComposerMention | undefined): void
+  composerRevision: number
+  seedComposerDraft(
+    targetSessionId: string,
+    value: import('./composer-document').ComposerDocument,
+  ): boolean
+  clearSubmittedComposerDraft(
+    targetSessionId: string,
+    expectedRevision: number,
+    consumedImageIds?: readonly string[],
+  ): void
+  syncToMain?: (
+    content: string,
+    commentIds: string[],
+    skills?: SkillSelection[],
+  ) => Promise<import('@pact/contracts').SideChatSyncMainReceipt | undefined>
   loading: boolean
   sending: boolean
   stopping: boolean
@@ -255,7 +498,8 @@ export interface ConversationFlow {
     commentIds: string[],
     route?: NonNullable<ConversationSendInput['route']>,
     skills?: SkillSelection[],
-    planningAction?: ConversationSendInput['planningAction'],
+    decision?: DecisionReplyContext,
+    replaceTask?: ConversationSendInput['replaceTask'],
   ): Promise<boolean>
   acceptPeerProposal(proposalId: string): Promise<boolean>
   dismissPeerProposal(proposalId: string): Promise<boolean>
@@ -275,8 +519,8 @@ export interface ConversationFlow {
     draft: Pick<NativeInputDraft, 'values' | 'page'>,
     initializeOnly?: boolean,
   ): void
-  stop(): Promise<boolean>
-  checkNativeContext(agentId: RuntimeAgentId): Promise<boolean>
+  stop(background?: import('@pact/contracts').BackgroundStopTarget): Promise<boolean>
+  checkNativeContext(agentId: RuntimeAgentId, runId?: string): Promise<boolean>
   rebuildNativeContext(
     agentId: RuntimeAgentId,
     options?: Omit<NativeContextRebuildInput, 'sessionId' | 'agentId'>,
@@ -311,12 +555,13 @@ function liveNativeDraft(
 export type ConversationComposerMention = import('./composer-document').ComposerMention
 
 interface ConversationComposerDraft {
+  userInformation?: import('@pact/contracts').UserInformationDeclaration | undefined
+  decisionAnswers?: DecisionAnswerDraft | undefined
   text: string
   images?: DraftImage[] | undefined
   revision?: number
   returnedInputOperationId?: string | undefined
   queueReturnOperationId?: string | undefined
-  planningAction?: ConversationSendInput['planningAction'] | undefined
   skills?: SkillSelection[] | undefined
   mention?: ConversationComposerMention | undefined
   route?: import('./composer-document').ComposerDocument['route']
@@ -329,12 +574,11 @@ export type CommentDraftInputWithoutRevision =
       sessionId: string
       commentId: string
       body: string
-      anchor: CommentAnchor
+      anchor: Extract<import('@pact/contracts').CommentDraftSaveInput, { mode: 'create' }>['anchor']
     }
   | {
       mode: 'edit'
       requestId?: string | undefined
-      anchor?: import('@pact/contracts').TodoCommentAnchor | undefined
       sessionId: string
       commentId: string
       body: string
@@ -345,12 +589,17 @@ export const commentDraftSaveSucceeded = (value: CommentDraftSaveOutcome): value
   value === true || (typeof value === 'string' && value.length > 0)
 
 interface PendingSubmission {
-  planningAction?: ConversationSendInput['planningAction'] | undefined
+  kind: 'message' | 'decision'
+  askOnly?: ConversationSendInput['askOnly']
+  replyToDecision?: ConversationSendInput['replyToDecision'] | undefined
+  replaceTask?: ConversationSendInput['replaceTask'] | undefined
+  userInformation?: import('@pact/contracts').UserInformationDeclaration | undefined
   sourceDocument: ConversationComposerDraft
   imageIds: string[]
   inputId?: string | undefined
   inputPreparation?: AbortController | undefined
   composerRevision?: number
+  routeIntent?: NonNullable<ConversationSendInput['routeIntent']>
   returnedInputOperationId?: string | undefined
   queueReturnOperationId?: string | undefined
   acknowledgementError?: string
@@ -373,6 +622,8 @@ interface ReturnedInputRead {
 
 function emptyComposerDraft(value: ConversationComposerDraft): boolean {
   return (
+    !value.userInformation &&
+    !hasDecisionAnswers(value.decisionAnswers) &&
     !value.images?.length &&
     !value.text &&
     !value.skills?.length &&
@@ -390,7 +641,20 @@ export function shouldClearComposerAfterAck(
   return currentComposer === pending.composerSnapshot
 }
 
+const INFORMATION_CANCELLATION_ITEMS = 32
+
+interface InformationCancellation {
+  request: import('@pact/contracts').RelaySchedulingDecision
+  input: import('@pact/contracts').RelayDecisionAnswer
+  declaration?: import('@pact/contracts').UserInformationDeclaration | undefined
+  status: 'submitting' | 'checking_receipt' | 'receipt_unconfirmed'
+  busy: boolean
+  error?: string | undefined
+}
+
 interface SessionOperationState {
+  informationCancellation?: InformationCancellation | undefined
+  cancelledInformationDecisionId?: string | undefined
   choosingImages?: boolean | undefined
   sendingOperationId?: string | undefined
   stoppingOperationId?: string | undefined
@@ -405,11 +669,28 @@ export function useConversation(
   visible = true,
   onErrorNotice: (message: string) => void = onNotice,
   onInfoNotice: (message: string) => void = onNotice,
+  hookOptions?: {
+    disableAutoInterest?: boolean | undefined
+    waitForInterest?: (() => Promise<boolean>) | undefined
+    onSessionRead?: ((session: CollaborationSession) => void) | undefined
+  },
 ): ConversationFlow {
+  const onSessionReadRef = useRef(hookOptions?.onSessionRead)
+  useLayoutEffect(() => {
+    onSessionReadRef.current = hookOptions?.onSessionRead
+  }, [hookOptions?.onSessionRead])
+  const disableAutoInterest = Boolean(hookOptions?.disableAutoInterest)
+  const disableAutoInterestRef = useRef(disableAutoInterest)
+  const waitForInterestRef = useRef(hookOptions?.waitForInterest)
+  useLayoutEffect(() => {
+    disableAutoInterestRef.current = disableAutoInterest
+    waitForInterestRef.current = hookOptions?.waitForInterest
+  }, [disableAutoInterest, hookOptions?.waitForInterest])
   const queryClient = useQueryClient()
   const [operationsBySession, setOperationsBySession] = useState<
     Record<string, SessionOperationState>
   >({})
+  const operationsBySessionRef = useRef<Record<string, SessionOperationState>>({})
   const [composerDraftsBySession, setComposerDraftsBySession] = useState<
     Record<string, ConversationComposerDraft>
   >({})
@@ -432,6 +713,17 @@ export function useConversation(
   const [nativeInputDrafts, setNativeInputDrafts] = useState<Record<string, NativeInputDraft>>({})
   const markedReadRef = useRef<{ sessionId: string; sequence: number } | undefined>(undefined)
   const pendingBySessionRef = useRef(new Map<string, PendingSubmission>())
+  const pendingSyncMainRef = useRef(new Map<string, PendingSyncMain>())
+  const pendingSyncInFlightRef = useRef(new Set<string>())
+  useEffect(() => {
+    const pendingSync = pendingSyncMainRef.current
+    const inFlight = pendingSyncInFlightRef.current
+    return () => {
+      for (const entry of pendingSync.values()) entry.inputPreparation?.abort()
+      pendingSync.clear()
+      inFlight.clear()
+    }
+  }, [])
   const activeSessionIdRef = useRef(sessionId)
   const admitComposerResidency = useCallback(
     (
@@ -466,7 +758,13 @@ export function useConversation(
               skills: value.skills,
               imageIds: value.imageIds,
               route: value.route,
+              routeIntent: value.routeIntent,
+              composerRevision: value.composerRevision,
               commentIds: value.commentIds,
+              replyToDecision: value.replyToDecision,
+              askOnly: value.askOnly,
+              replaceTask: value.replaceTask,
+              userInformation: value.userInformation,
             }),
           ).byteLength
         if (value.content !== value.sourceDocument.text) bytes += value.content.length * 2
@@ -491,13 +789,21 @@ export function useConversation(
               route: value.route,
               returnedInputOperationId: value.returnedInputOperationId,
               queueReturnOperationId: value.queueReturnOperationId,
+              decisionAnswers: value.decisionAnswers,
+              userInformation: value.userInformation,
             }),
           ).byteLength
+        if (value.decisionAnswers) bytes += JSON.stringify(value.decisionAnswers).length * 2
+        if (value.userInformation) bytes += JSON.stringify(value.userInformation).length * 2
         if (bytes > COMPOSER_DRAFT_BYTES || items > COMPOSER_DRAFT_ITEMS) break
       }
       if (textCandidate) {
         items += 1
         bytes += textCandidate.chars * 2 + 64 * 1024 + 1024
+        const answers = drafts[textCandidate.sessionId]?.decisionAnswers
+        if (answers) bytes += JSON.stringify(answers).length * 3
+        const declaration = JSON.stringify(drafts[textCandidate.sessionId]?.userInformation ?? null)
+        bytes += bodyTextEncoder.encode(declaration).byteLength + declaration.length * 2
       }
       const imageIdentities = new Set(
         [...documents].flatMap((value) =>
@@ -681,7 +987,13 @@ export function useConversation(
       }
       const read = async () => {
         checkCurrent()
-        unwrapRpcResult(await window.pact.setConversationInterest(sessionId ?? null, generation))
+        if (!disableAutoInterestRef.current) {
+          unwrapRpcResult(await window.pact.setConversationInterest(sessionId ?? null, generation))
+        } else if (waitForInterestRef.current) {
+          if (!(await waitForInterestRef.current())) {
+            throw new Error('Could not subscribe to active sessions.')
+          }
+        }
         checkCurrent()
         const aroundMessageId = readingMessageIdRef.current
         let result = await window.pact.getConversation({
@@ -760,9 +1072,11 @@ export function useConversation(
           queryKey: conversationQueryKeys.session(sessionId),
           exact: true,
         })
-      void window.pact
-        .setConversationInterest(null, ++interestGenerationRef.current)
-        .catch(() => undefined)
+      if (!disableAutoInterestRef.current) {
+        void window.pact
+          .setConversationInterest(null, ++interestGenerationRef.current)
+          .catch(() => undefined)
+      }
     }
   }, [queryClient, refetchConversation, sessionId, visible])
   /* oxlint-enable react/set-state-in-effect */
@@ -785,6 +1099,7 @@ export function useConversation(
           )
             releaseDraftImage(ownerSessionId, entry.image.id)
       composerDraftsRef.current = {}
+      operationsBySessionRef.current = {}
       latestComposerDraft.current = undefined
       for (const [ownerSessionId, pending] of pendingBySessionRef.current) {
         pending.inputPreparation?.abort()
@@ -798,9 +1113,11 @@ export function useConversation(
             .catch(() => undefined)
       }
       pendingBySessionRef.current.clear()
-      void window.pact
-        .setConversationInterest(null, ++interestGenerationRef.current)
-        .catch(() => undefined)
+      if (!disableAutoInterestRef.current) {
+        void window.pact
+          .setConversationInterest(null, ++interestGenerationRef.current)
+          .catch(() => undefined)
+      }
     },
     [],
   )
@@ -811,9 +1128,46 @@ export function useConversation(
   const actionError = currentOperations?.error
   const composerDraft = sessionId ? composerDraftsBySession[sessionId] : undefined
   const composer = composerDraft?.text ?? ''
-  const composerImages = composerDraft?.images ?? []
+  const composerUserInformation = composerDraft?.userInformation
+  const setComposerUserInformation = (
+    userInformation: import('@pact/contracts').UserInformationDeclaration | undefined,
+  ): boolean => {
+    if (!sessionId || returnOperation.current?.sessionId === sessionId) return false
+    if (
+      userInformation &&
+      bodyTextEncoder.encode(JSON.stringify(userInformation)).byteLength > 4096
+    ) {
+      onNotice('This information is too long. Your previous draft was kept.')
+      return false
+    }
+    const previous = composerDraftsRef.current[sessionId] ?? { text: '' }
+    return putComposerDraft(sessionId, {
+      ...previous,
+      // Each field edit gets a fresh identity, including a change back to earlier text.
+      userInformation: userInformation ? { ...userInformation } : undefined,
+      revision: (previous.revision ?? 0) + 1,
+    })
+  }
+  const clearCancelledInformation = (
+    ownerSessionId: string,
+    expected: import('@pact/contracts').UserInformationDeclaration,
+  ): boolean => {
+    const previous = composerDraftsRef.current[ownerSessionId]
+    if (
+      !previous ||
+      expected.state.status !== 'unanswered' ||
+      previous.userInformation !== expected
+    )
+      return false
+    return putComposerDraft(ownerSessionId, {
+      ...previous,
+      userInformation: undefined,
+      revision: (previous.revision ?? 0) + 1,
+    })
+  }
+  const composerImages = composerDraft?.images ?? EMPTY_COMPOSER_IMAGES
   const composerMention = composerDraft?.mention
-  const composerSkills = composerDraft?.skills ?? []
+  const composerSkills = composerDraft?.skills ?? EMPTY_COMPOSER_SKILLS
   useLayoutEffect(() => {
     if (
       sessionId &&
@@ -839,14 +1193,53 @@ export function useConversation(
         previous.returnedInputOperationId || previous.queueReturnOperationId
           ? editing.route
           : releaseComposerRoute(editing.route),
-      planningAction:
-        previous.text === editing.text &&
-        JSON.stringify(previous.route) === JSON.stringify(editing.route)
-          ? previous.planningAction
-          : undefined,
       revision: (previous.revision ?? 0) + 1,
     }
     return putComposerDraft(sessionId, draft)
+  }
+  const setDecisionDraft = (decisionAnswers: DecisionAnswerDraft): boolean => {
+    if (!sessionId || sending || returnOperation.current?.sessionId === sessionId) return false
+    const previous = composerDraftsRef.current[sessionId] ?? { text: '' }
+    if (
+      hasDecisionAnswers(previous.decisionAnswers) &&
+      !sameDecision(previous.decisionAnswers?.reference, decisionAnswers.reference)
+    )
+      return false
+    if (
+      (decisionAnswers.originalReply?.length ?? 0) > 4096 ||
+      (decisionAnswers.questions.length > 0 && Boolean(decisionAnswers.originalReply?.trim())) ||
+      decisionAnswers.questions.length > 3 ||
+      Object.keys(decisionAnswers.answers).length > 3 ||
+      Object.entries(decisionAnswers.answers).some(([id, answer]) => {
+        const question = decisionAnswers.questions.find((item) => item.id === id)
+        return (
+          !question ||
+          answer.text.length > 4096 ||
+          answer.optionIds.length > (question.selection === 'single' ? 1 : 6) ||
+          answer.optionIds.some(
+            (optionId) => !question.options?.some((option) => option.id === optionId),
+          )
+        )
+      })
+    )
+      return false
+    return putComposerDraft(sessionId, {
+      ...previous,
+      decisionAnswers,
+      revision: (previous.revision ?? 0) + 1,
+    })
+  }
+  const clearDecisionDraft = (keepInMessage: boolean): boolean => {
+    if (!sessionId || sending || returnOperation.current?.sessionId === sessionId) return false
+    const previous = composerDraftsRef.current[sessionId]
+    if (!previous?.decisionAnswers) return true
+    const saved = keepInMessage ? formatDecisionAnswers(previous.decisionAnswers) : ''
+    return putComposerDraft(sessionId, {
+      ...previous,
+      text: saved ? [previous.text, saved].filter(Boolean).join('\n\n') : previous.text,
+      decisionAnswers: undefined,
+      revision: (previous.revision ?? 0) + 1,
+    })
   }
   const setComposerSkills = (skills: SkillSelection[]): void => {
     if (!sessionId || returnOperation.current?.sessionId === sessionId) return
@@ -866,7 +1259,6 @@ export function useConversation(
       putComposerDraft(sessionId, {
         ...previous,
         text: value,
-        planningAction: previous?.text === value ? previous.planningAction : undefined,
         revision: (previous?.revision ?? 0) + 1,
       })
     },
@@ -881,11 +1273,67 @@ export function useConversation(
         ...previous,
         text: previous?.text ?? '',
         mention: value,
-        planningAction: undefined,
         revision: (previous?.revision ?? 0) + 1,
       })
     },
     [sessionId, putComposerDraft],
+  )
+  const seedComposerDraft = useCallback(
+    (targetSessionId: string, value: import('./composer-document').ComposerDocument): boolean => {
+      const previous = composerDraftsRef.current[targetSessionId]
+      const next: ConversationComposerDraft = {
+        ...previous,
+        text: value.text,
+        skills: value.skills.length ? value.skills : undefined,
+        mention: value.mention,
+        route: value.route ? releaseComposerRoute(value.route) : undefined,
+        returnedInputOperationId: undefined,
+        queueReturnOperationId: undefined,
+        revision: (previous?.revision ?? 0) + 1,
+      }
+      const admitted = putComposerDraft(targetSessionId, next)
+      if (admitted && activeSessionIdRef.current === targetSessionId) {
+        latestComposerDraft.current = { sessionId: targetSessionId, draft: next }
+      }
+      return admitted
+    },
+    [putComposerDraft],
+  )
+  const clearSubmittedComposerDraft = useCallback(
+    (
+      targetSessionId: string,
+      expectedRevision: number,
+      consumedImageIds: readonly string[] = [],
+    ): void => {
+      const latest =
+        latestComposerDraft.current?.sessionId === targetSessionId
+          ? latestComposerDraft.current.draft
+          : composerDraftsRef.current[targetSessionId]
+      if (!latest) return
+      const currentRevision = latest.revision ?? 0
+      const remainingImages = latest.images?.filter(
+        (entry) => !entry.image || !consumedImageIds.includes(entry.image.id),
+      )
+      const cleared: ConversationComposerDraft =
+        currentRevision === expectedRevision
+          ? {
+              ...(remainingImages?.length ? { images: remainingImages } : {}),
+              text: '',
+              revision: currentRevision + 1,
+            }
+          : {
+              ...latest,
+              ...(remainingImages !== undefined
+                ? { images: remainingImages.length ? remainingImages : undefined }
+                : {}),
+              revision: currentRevision + 1,
+            }
+      putComposerDraft(targetSessionId, cleared)
+      if (latestComposerDraft.current?.sessionId === targetSessionId) {
+        latestComposerDraft.current = { sessionId: targetSessionId, draft: cleared }
+      }
+    },
+    [putComposerDraft],
   )
 
   const updateImages = useCallback(
@@ -995,7 +1443,7 @@ export function useConversation(
                 ? {
                     ...value,
                     status: 'failed',
-                    error: 'Image preparation took too long. Remove it and try again.',
+                    error: 'Adding this image took too long. Remove it and try again.',
                   }
                 : value,
             ),
@@ -1066,13 +1514,201 @@ export function useConversation(
       ownerSessionId: string,
       update: (current: SessionOperationState) => SessionOperationState,
     ): void => {
-      setOperationsBySession((current) => ({
-        ...current,
-        [ownerSessionId]: update(current[ownerSessionId] ?? {}),
-      }))
+      const current = operationsBySessionRef.current,
+        next = { ...current, [ownerSessionId]: update(current[ownerSessionId] ?? {}) }
+      operationsBySessionRef.current = next
+      setOperationsBySession(next)
     },
     [],
   )
+
+  const currentInformationCancellation = (owner: InformationCancellation) =>
+    operationsBySessionRef.current[owner.request.sessionId]?.informationCancellation?.input
+      .clientOperationId === owner.input.clientOperationId
+
+  const observeInformationCancellation = async (
+    owner: InformationCancellation,
+    invoke: () => Promise<
+      import('@pact/contracts').RpcResult<import('@pact/contracts').RelayDecisionReceipt>
+    >,
+    phase: 'cancel' | 'receipt',
+  ): Promise<boolean> => {
+    let result: Awaited<ReturnType<typeof invoke>>
+    try {
+      result = await invoke()
+    } catch {
+      result = {
+        ok: false,
+        error: {
+          code: 'UNCERTAIN',
+          message:
+            'The cancellation result is not confirmed. Check this decision before sending again.',
+        },
+      }
+    }
+    if (!currentInformationCancellation(owner)) return false
+    // This endpoint returns CONFLICT only before mutation; committed Cancel has its positive receipt.
+    if (!result.ok && phase === 'cancel' && result.error.code === 'CONFLICT') {
+      updateSessionOperations(owner.request.sessionId, (state) => ({
+        ...state,
+        informationCancellation: undefined,
+      }))
+      onErrorNotice(result.error.message)
+      void queryClient.invalidateQueries({
+        queryKey: conversationQueryKeys.session(owner.request.sessionId),
+        exact: true,
+      })
+      return false
+    }
+    if (
+      result.ok &&
+      result.value.disposition === 'cancelled' &&
+      result.value.sessionId === owner.request.sessionId &&
+      result.value.decisionId === owner.request.decisionId &&
+      result.value.clientOperationId === owner.input.clientOperationId &&
+      result.value.runId === null &&
+      result.value.rebuildId === null
+    ) {
+      if (owner.declaration) clearCancelledInformation(owner.request.sessionId, owner.declaration)
+      const consumer = owner.request.request
+      const pending = pendingBySessionRef.current.get(owner.request.sessionId)
+      const cancelledSubmission =
+        consumer.category === 'necessary_information' &&
+        pending?.clientMessageId === consumer.consumer.clientMessageId
+          ? pending
+          : undefined
+      if (cancelledSubmission) {
+        pendingBySessionRef.current.delete(owner.request.sessionId)
+        cancelledSubmission.inputPreparation?.abort()
+      }
+      updateSessionOperations(owner.request.sessionId, (state) => ({
+        ...state,
+        ...(cancelledSubmission
+          ? {
+              sendingOperationId:
+                state.sendingOperationId === cancelledSubmission.operationId
+                  ? undefined
+                  : state.sendingOperationId,
+              error:
+                state.error === cancelledSubmission.acknowledgementError ? undefined : state.error,
+            }
+          : {}),
+        informationCancellation: undefined,
+        cancelledInformationDecisionId: owner.request.decisionId,
+      }))
+      void queryClient.invalidateQueries({
+        queryKey: conversationQueryKeys.session(owner.request.sessionId),
+        exact: true,
+      })
+      return true
+    }
+    updateSessionOperations(owner.request.sessionId, (state) => ({
+      ...state,
+      informationCancellation: {
+        ...owner,
+        busy: false,
+        status: 'receipt_unconfirmed',
+        error: result.ok
+          ? 'The cancellation receipt does not match. Check this decision before sending again.'
+          : 'The cancellation result is not confirmed. Check this decision before sending again.',
+      },
+    }))
+    return false
+  }
+
+  const checkInformationCancellation = async (ownerSessionId = sessionId): Promise<boolean> => {
+    const owner = ownerSessionId
+      ? operationsBySessionRef.current[ownerSessionId]?.informationCancellation
+      : undefined
+    if (!owner || owner.busy) return false
+    updateSessionOperations(owner.request.sessionId, (state) => ({
+      ...state,
+      informationCancellation: {
+        ...owner,
+        busy: true,
+        status: 'checking_receipt',
+        error: undefined,
+      },
+    }))
+    return observeInformationCancellation(
+      owner,
+      () =>
+        window.pact.getRelayDecisionReceipt({
+          sessionId: owner.request.sessionId,
+          decisionId: owner.request.decisionId,
+          clientOperationId: owner.input.clientOperationId,
+        }),
+      'receipt',
+    )
+  }
+
+  const cancelPreparedInformation = async (
+    raw: import('@pact/contracts').RelaySchedulingDecision,
+  ): Promise<boolean> => {
+    const parsed = relaySchedulingDecisionSchema.safeParse(raw)
+    if (!parsed.success) return false
+    const request = parsed.data
+    if (request.sessionId !== sessionId || request.request.category !== 'necessary_information')
+      return false
+    const current = operationsBySessionRef.current[request.sessionId]
+    if (
+      current?.informationCancellation ||
+      current?.cancelledInformationDecisionId === request.decisionId
+    )
+      return false
+    // At most 32 pending operations: one 4 KiB card, one 4 KiB declaration and fixed metadata each.
+    if (
+      Object.values(operationsBySessionRef.current).filter((state) => state.informationCancellation)
+        .length >= INFORMATION_CANCELLATION_ITEMS
+    ) {
+      onNotice('Resolve a pending cancellation before cancelling another request.')
+      return false
+    }
+    const declaration = composerDraftsRef.current[request.sessionId]?.userInformation,
+      field = request.request.field,
+      expected =
+        declaration?.state.status === 'unanswered' &&
+        declaration.id === field.fieldId &&
+        declaration.question === field.prompt &&
+        declaration.input === field.input.kind &&
+        (field.input.kind === 'text' ||
+          JSON.stringify(declaration.options) === JSON.stringify(field.input.options))
+          ? declaration
+          : undefined,
+      owner: InformationCancellation = {
+        request,
+        declaration: expected,
+        busy: true,
+        status: 'submitting',
+        input: {
+          reference: {
+            sessionId: request.sessionId,
+            decisionId: request.decisionId,
+            revision: request.revision,
+          },
+          clientOperationId: crypto.randomUUID(),
+          answer: { kind: 'cancel' },
+        },
+      }
+    // Completed markers protect only mounted stale projections; other Session Views unmount.
+    const states = { ...operationsBySessionRef.current }
+    for (const [id, state] of Object.entries(states))
+      if (id !== request.sessionId && state.cancelledInformationDecisionId)
+        states[id] = { ...state, cancelledInformationDecisionId: undefined }
+    operationsBySessionRef.current = states
+    updateSessionOperations(request.sessionId, (state) => ({
+      ...state,
+      informationCancellation: owner,
+    }))
+    const confirmed = await observeInformationCancellation(
+      owner,
+      () => window.pact.answerRelayDecision(owner.input),
+      'cancel',
+    )
+    if (confirmed || !currentInformationCancellation(owner)) return confirmed
+    // Only receipt observation follows an uncertain answer; never repeat the mutation or poll.
+    return checkInformationCancellation(request.sessionId)
+  }
 
   const settleSubmission = useCallback(
     (ownerSessionId: string, clientMessageId: string): void => {
@@ -1082,6 +1718,20 @@ export function useConversation(
       const settleDraft = (
         draft: ConversationComposerDraft | undefined,
       ): ConversationComposerDraft | undefined => {
+        if (pending.askOnly) {
+          return draft &&
+            (draft.revision ?? 0) === (pending.composerRevision ?? 0) &&
+            shouldClearComposerAfterAck(draft.text, pending)
+            ? { ...draft, text: '', revision: (draft.revision ?? 0) + 1 }
+            : draft
+        }
+        if (pending.kind === 'decision') {
+          return draft?.decisionAnswers &&
+            JSON.stringify(draft.decisionAnswers) ===
+              JSON.stringify(pending.sourceDocument.decisionAnswers)
+            ? { ...draft, decisionAnswers: undefined, revision: (draft.revision ?? 0) + 1 }
+            : draft
+        }
         if (
           (draft?.revision ?? 0) === (pending.composerRevision ?? 0) &&
           shouldClearComposerAfterAck(draft?.text ?? '', pending)
@@ -1563,12 +2213,26 @@ export function useConversation(
         const change = unwrapRpcResult(
           await window.pact.markSessionRead({ sessionId, throughSequence: sequence }),
         )
+        const currentWindow = windowRef.current
+        if (
+          currentWindow?.view.sessionId === change.session.id &&
+          currentWindow.view.session.hasUnread !== change.session.hasUnread
+        ) {
+          commitWindow({
+            ...currentWindow,
+            view: {
+              ...currentWindow.view,
+              session: { ...currentWindow.view.session, hasUnread: change.session.hasUnread },
+            },
+          })
+        }
         acceptSessionCatalogChange(queryClient, change)
+        onSessionReadRef.current?.(change.session)
       } catch {
         if (markedReadRef.current === request) markedReadRef.current = undefined
       }
     },
-    [queryClient, sessionId, visible],
+    [commitWindow, queryClient, sessionId, visible],
   )
 
   useLayoutEffect(() => {
@@ -2272,11 +2936,60 @@ export function useConversation(
     commentIds: string[],
     route?: NonNullable<ConversationSendInput['route']>,
     skills?: SkillSelection[],
-    planningAction?: ConversationSendInput['planningAction'],
+    decision?: DecisionReplyContext,
+    replaceTask?: ConversationSendInput['replaceTask'],
   ): Promise<boolean> => {
-    if (!sessionId || sending || returnOperation.current?.sessionId === sessionId) return false
-    const content = composerSnapshot.trim()
-    const images = composerDraftsRef.current[sessionId]?.images ?? []
+    if (
+      !sessionId ||
+      sending ||
+      returnOperation.current?.sessionId === sessionId ||
+      (!decision && operationsBySessionRef.current[sessionId]?.informationCancellation)
+    )
+      return false
+    const original = composerSnapshot.trim()
+    const draftAnswers = composerDraftsRef.current[sessionId]?.decisionAnswers
+    if (
+      decision &&
+      hasDecisionAnswers(draftAnswers) &&
+      !sameDecision(draftAnswers?.reference, decision.reference)
+    ) {
+      onNotice(
+        'Saved answers belong to an earlier request. Keep them in your message or discard them before answering the current questions.',
+      )
+      return false
+    }
+    const answers =
+      decision && draftAnswers && sameDecision(draftAnswers.reference, decision.reference)
+        ? formatDecisionAnswers(draftAnswers)
+        : ''
+    if (decision && !answers) return false
+    const content = decision ? `**Replies to your questions**\n\n${answers}` : original
+    const submissionSkills = decision ? undefined : skills
+    const selectedRoute = decision ? undefined : route
+    const userInformation = decision
+      ? undefined
+      : composerDraftsRef.current[sessionId]?.userInformation
+    if (userInformation) {
+      const validation = userInformationDeclarationSchema.safeParse(userInformation)
+      const prefix = parseComposerCommandPrefix(content, submissionSkills)
+      if (
+        !validation.success ||
+        decision ||
+        (userInformation &&
+          (submissionSkills?.length ||
+            selectedRoute?.type === 'all' ||
+            prefix.pact ||
+            prefix.skills.length ||
+            prefix.error ||
+            composerDraftsRef.current[sessionId]?.returnedInputOperationId ||
+            composerDraftsRef.current[sessionId]?.queueReturnOperationId ||
+            composerDraftsRef.current[sessionId]?.images?.length))
+      ) {
+        onNotice('This saved input cannot be sent in this context. Your draft was kept.')
+        return false
+      }
+    }
+    const images = decision ? [] : (composerDraftsRef.current[sessionId]?.images ?? [])
     if (images.some((image) => image.status !== 'ready' || !image.image)) {
       onNotice('Wait for images to finish preparing, or remove an image that could not be added.')
       return false
@@ -2284,7 +2997,7 @@ export function useConversation(
     const imageIds = images.map((entry) => entry.image!.id)
     const currentRevision = windowRef.current?.view.commentsRevision
     if (currentRevision === undefined) return false
-    if (draftsReadyRevision !== currentRevision) {
+    if (!decision && draftsReadyRevision !== currentRevision) {
       updateSessionOperations(sessionId, (current) => ({
         ...current,
         error: 'Comment drafts are still loading. Try again in a moment.',
@@ -2296,9 +3009,12 @@ export function useConversation(
       pending &&
       (JSON.stringify(pending.imageIds) !== JSON.stringify(imageIds) ||
         pending.content !== content ||
-        JSON.stringify(pending.route) !== JSON.stringify(route) ||
-        pending.planningAction !== planningAction ||
-        JSON.stringify(pending.skills ?? []) !== JSON.stringify(skills ?? []))
+        JSON.stringify(pending.userInformation) !== JSON.stringify(userInformation) ||
+        JSON.stringify(pending.route) !== JSON.stringify(selectedRoute) ||
+        JSON.stringify(pending.skills ?? []) !== JSON.stringify(submissionSkills ?? []) ||
+        !sameDecision(pending.replyToDecision, decision?.reference) ||
+        pending.askOnly !== undefined ||
+        JSON.stringify(pending.replaceTask) !== JSON.stringify(replaceTask))
     ) {
       pending.acknowledgementError =
         'Confirm the previous message before sending different content.'
@@ -2310,36 +3026,61 @@ export function useConversation(
     }
     const preserved = pending
     const expectedCommentsRevision = preserved?.expectedCommentsRevision ?? currentRevision
-    const submissionCommentIds = preserved?.commentIds ?? commentIds
-    const submissionRoute = preserved?.route ?? route
+    const submissionCommentIds = preserved?.commentIds ?? (decision ? [] : commentIds)
+    const submissionRoute = preserved ? preserved.route : selectedRoute
     const clientMessageId = preserved?.clientMessageId ?? crypto.randomUUID()
     const operationId = crypto.randomUUID()
-    const sourceDocument =
-      preserved?.sourceDocument ??
-      (latestComposerDraft.current?.sessionId === sessionId
+    const currentDocument =
+      latestComposerDraft.current?.sessionId === sessionId
         ? latestComposerDraft.current.draft
-        : (composerDraftsRef.current[sessionId] ?? { text: composerSnapshot }))
+        : composerDraftsRef.current[sessionId]
+    const sourceDocument = preserved?.sourceDocument ??
+      currentDocument ?? { text: composerSnapshot }
+    const returnedInputOperationId = decision
+      ? undefined
+      : preserved
+        ? preserved.returnedInputOperationId
+        : sourceDocument.returnedInputOperationId
+    const queueReturnOperationId = decision
+      ? undefined
+      : preserved
+        ? preserved.queueReturnOperationId
+        : sourceDocument.queueReturnOperationId
+    const routeIntent = preserved
+      ? (preserved.routeIntent ?? 'explicit')
+      : decision ||
+          returnedInputOperationId ||
+          queueReturnOperationId ||
+          selectedRoute?.type === 'agent' ||
+          selectedRoute?.type === 'all' ||
+          !currentDocument ||
+          currentDocument.text !== composerSnapshot
+        ? 'explicit'
+        : composerRouteIntent({ ...sourceDocument, skills: sourceDocument.skills ?? [] })
     const frozen: PendingSubmission = {
+      kind: decision ? 'decision' : 'message',
+      userInformation: decision
+        ? undefined
+        : (preserved?.userInformation ?? sourceDocument.userInformation),
       sourceDocument,
       imageIds: preserved?.imageIds ?? imageIds,
       inputId: preserved?.inputId,
-      composerRevision:
-        (latestComposerDraft.current?.sessionId === sessionId
-          ? latestComposerDraft.current.draft
-          : composerDraftsBySession[sessionId]
-        )?.revision ?? 0,
-      returnedInputOperationId: composerDraftsBySession[sessionId]?.returnedInputOperationId,
-      queueReturnOperationId:
-        preserved?.queueReturnOperationId ?? sourceDocument.queueReturnOperationId,
+      composerRevision: preserved
+        ? (preserved.composerRevision ?? preserved.sourceDocument.revision ?? 0)
+        : (sourceDocument.revision ?? 0),
+      routeIntent,
+      returnedInputOperationId,
+      queueReturnOperationId,
       operationId,
       content,
       composerSnapshot,
-      skills: preserved?.skills ?? skills,
+      skills: preserved?.skills ?? submissionSkills,
       commentIds: submissionCommentIds,
       expectedCommentsRevision,
       clientMessageId,
       route: submissionRoute,
-      planningAction: preserved?.planningAction ?? planningAction ?? sourceDocument.planningAction,
+      replyToDecision: preserved?.replyToDecision ?? decision?.reference,
+      replaceTask: preserved?.replaceTask ?? replaceTask,
     }
     if (!admitComposerResidency(composerDraftsRef.current, { sessionId, value: frozen }))
       return false
@@ -2360,12 +3101,17 @@ export function useConversation(
         ? { queueReturnOperationId: frozen.queueReturnOperationId }
         : {}),
       expectedCommentsRevision,
+      routeIntent: frozen.routeIntent,
+      composerRevision: frozen.composerRevision,
+      ...(frozen.userInformation ? { userInformation: frozen.userInformation } : {}),
+      ...(frozen.replyToDecision ? { replyToDecision: frozen.replyToDecision } : {}),
+      ...(frozen.replaceTask ? { replaceTask: frozen.replaceTask } : {}),
       commentIds: [],
-      freezeDrafts: true,
+      freezeDrafts: frozen.kind !== 'decision' && !frozen.askOnly,
+      ...(frozen.askOnly ? { askOnly: frozen.askOnly } : {}),
       batchId: clientMessageId,
       ...(submissionRoute ? { route: submissionRoute } : {}),
       ...(frozen.skills?.length ? { skills: frozen.skills } : {}),
-      ...(frozen.planningAction ? { planningAction: frozen.planningAction } : {}),
       ...(frozen.imageIds.length ? { imageIds: frozen.imageIds } : {}),
     }
     const inlineBytes =
@@ -2375,93 +3121,23 @@ export function useConversation(
       if (!frozen.inputId && inlineBytes > INLINE_INPUT_BYTES) {
         const controller = new AbortController()
         frozen.inputPreparation = controller
-        const timeout = window.setTimeout(() => controller.abort(), INPUT_UPLOAD_TIMEOUT_MS)
-        const write = (input: Parameters<typeof window.pact.writeConversationInput>[0]) =>
-          new Promise<Awaited<ReturnType<typeof window.pact.writeConversationInput>>>(
-            (resolve, reject) => {
-              const abort = () =>
-                reject(
-                  new Error('Input preparation was cancelled or timed out. Your draft was kept.'),
-                )
-              controller.signal.addEventListener('abort', abort, { once: true })
-              if (controller.signal.aborted) {
-                controller.signal.removeEventListener('abort', abort)
-                abort()
-                return
-              }
-              void window.pact.writeConversationInput(input).then(
-                (reply) => {
-                  controller.signal.removeEventListener('abort', abort)
-                  if (controller.signal.aborted) {
-                    if (reply.ok)
-                      void window.pact
-                        .writeConversationInput({
-                          type: 'release',
-                          sessionId,
-                          inputId: reply.value.inputId,
-                        })
-                        .catch(() => undefined)
-                    return undefined
-                  }
-                  resolve(reply)
-                  return undefined
-                },
-                (writeError: unknown) => {
-                  controller.signal.removeEventListener('abort', abort)
-                  reject(writeError)
-                  return undefined
-                },
-              )
-            },
-          )
         try {
-          const initial = unwrapRpcResult(
-            await write({ type: 'begin', sessionId, clientMessageId }),
-          )
-          frozen.inputId = initial.inputId
-          if (initial.offset !== 0 || initial.sealed)
-            throw new Error('Input preparation returned an unexpected source.')
-          let offset = 0
-          while (offset < content.length) {
-            let end = Math.min(content.length, offset + INPUT_UPLOAD_CHARS)
-            const high = content.charCodeAt(end - 1),
-              low = content.charCodeAt(end)
-            if (
-              end < content.length &&
-              high >= 0xd800 &&
-              high <= 0xdbff &&
-              low >= 0xdc00 &&
-              low <= 0xdfff
-            )
-              end -= 1
-            const part: import('@pact/contracts').ConversationInputState = unwrapRpcResult(
-              // oxlint-disable-next-line no-await-in-loop -- Each bounded UTF-16 segment follows the acknowledged offset under one deadline.
-              await write({
-                type: 'append',
-                sessionId,
-                inputId: frozen.inputId,
-                offset,
-                text: content.slice(offset, end),
-              }),
-            )
-            if (part.inputId !== frozen.inputId || part.offset !== end || part.sealed)
-              throw new Error('Input preparation did not acknowledge the complete segment.')
-            offset = end
-          }
-          const sealed = unwrapRpcResult(
-            await write({ type: 'seal', sessionId, inputId: frozen.inputId }),
-          )
-          if (
-            !sealed.sealed ||
-            sealed.inputId !== frozen.inputId ||
-            sealed.offset !== content.length ||
-            sealed.chars !== content.length
-          )
-            throw new Error('Input preparation did not seal the complete text.')
-          if (controller.signal.aborted || pendingBySessionRef.current.get(sessionId) !== frozen)
-            throw new Error('Input preparation was cancelled. Your draft was kept.')
+          frozen.inputId = await uploadLargeConversationInput({
+            sessionId,
+            clientMessageId,
+            content,
+            controller,
+            cancelErrorMessage: 'Sending was cancelled or timed out. Your draft was kept.',
+            startErrorMessage: 'Couldn’t start sending this message. Your draft was kept.',
+            appendErrorMessage: 'Couldn’t send all of this message. Your draft was kept.',
+            sealErrorMessage: 'Couldn’t finish sending this message. Your draft was kept.',
+            cancelledCheckErrorMessage: 'Sending was cancelled. Your draft was kept.',
+            onInputId: (id) => {
+              frozen.inputId = id
+            },
+            isCurrent: () => pendingBySessionRef.current.get(sessionId) === frozen,
+          })
         } finally {
-          window.clearTimeout(timeout)
           frozen.inputPreparation = undefined
         }
       }
@@ -2514,10 +3190,16 @@ export function useConversation(
       // including when the bounded Patch carries resync instead of the oversized message.
       if (
         result.value.queuedInputIds?.includes(clientMessageId) &&
+        !result.value.sessionIssues?.agents.some((issue) => issue.phase === 'background_working') &&
         !result.value.messages.some((item) => item.message.id === clientMessageId)
       )
         onInfoNotice("Your message is queued until the current Agent's work finishes.")
-      if (result.value.sessionId === sessionId) settleSubmission(sessionId, clientMessageId)
+      if (result.value.sessionId === sessionId) {
+        if (result.value.sendDisposition === 'held_for_information') {
+          if (pendingBySessionRef.current.get(sessionId)?.operationId === operationId)
+            pendingBySessionRef.current.delete(sessionId)
+        } else settleSubmission(sessionId, clientMessageId)
+      }
       cachePatch(result.value)
       return true
     } catch (error) {
@@ -2547,6 +3229,320 @@ export function useConversation(
           .catch(() => undefined)
       updateSessionOperations(sessionId, (current) =>
         current.sendingOperationId === operationId
+          ? { ...current, sendingOperationId: undefined }
+          : current,
+      )
+    }
+  }
+
+  const finalizeSyncedSideChatDraft = (
+    ownerSessionId: string,
+    draftRevision: number,
+    consumedImageIds: readonly string[],
+    consumedCommentCount: number,
+  ): void => {
+    clearSubmittedComposerDraft(ownerSessionId, draftRevision, consumedImageIds)
+    for (const id of consumedImageIds) {
+      if (
+        !composerDraftsRef.current[ownerSessionId]?.images?.some((entry) => entry.image?.id === id)
+      ) {
+        releaseDraftImage(ownerSessionId, id)
+      }
+    }
+    if (consumedCommentCount > 0 && activeSessionIdRef.current === ownerSessionId) {
+      void refetchConversation({ cancelRefetch: false })
+      draftReloadTokenRef.current += 1
+      setDraftReloadToken(draftReloadTokenRef.current)
+    }
+  }
+
+  const syncToMain = async (
+    composerSnapshot: string,
+    commentIds: string[],
+    skills?: SkillSelection[],
+  ): Promise<import('@pact/contracts').SideChatSyncMainReceipt | undefined> => {
+    if (
+      !sessionId ||
+      sending ||
+      returnOperation.current?.sessionId === sessionId ||
+      pendingSyncInFlightRef.current.has(sessionId)
+    )
+      return undefined
+    const ownerSessionId = sessionId
+    const draft =
+      latestComposerDraft.current?.sessionId === ownerSessionId
+        ? latestComposerDraft.current.draft
+        : composerDraftsRef.current[ownerSessionId]
+    const expectedRevision = draft?.revision ?? 0
+    const images = draft?.images ?? []
+    if (images.some((image) => image.status !== 'ready' || !image.image)) {
+      onNotice('Wait for images to finish preparing, or remove an image that could not be added.')
+      return undefined
+    }
+    const imageIds = images.map((entry) => entry.image!.id)
+    const content = composerSnapshot.trim()
+    const hasDraftComments = commentIds.length > 0 || draftHasMore || draftHasEarlier
+    if (content.length === 0 && imageIds.length === 0 && !hasDraftComments) {
+      onNotice('Write a message before sending to the main chat.')
+      return undefined
+    }
+    const currentRevision = windowRef.current?.view.commentsRevision
+    if (currentRevision === undefined) return undefined
+    if (draftsReadyRevision !== currentRevision) {
+      updateSessionOperations(ownerSessionId, (current) => ({
+        ...current,
+        error: 'Comment drafts are still loading. Try again in a moment.',
+      }))
+      return undefined
+    }
+    const normalizedSkills = [...(skills ?? [])]
+    const currentPayload: Omit<
+      PendingSyncMain,
+      'operationId' | 'inputPreparation' | 'inputId' | 'contentSha256'
+    > = {
+      content,
+      imageIds: [...imageIds],
+      commentIds: [...commentIds],
+      skills: normalizedSkills,
+      ...(draft?.userInformation ? { userInformation: draft.userInformation } : {}),
+      expectedRevision,
+      expectedCommentsRevision: currentRevision,
+    }
+    const preserved = pendingSyncMainRef.current.get(ownerSessionId)
+    let activeOperationId = preserved?.operationId ?? crypto.randomUUID()
+    let pendingEntry: PendingSyncMain | undefined
+    let preparedInputId: string | undefined
+    let preparedContentSha256: string | undefined
+    let keepRemoteInput = false
+    pendingSyncInFlightRef.current.add(ownerSessionId)
+    updateSessionOperations(ownerSessionId, (current) => ({
+      ...current,
+      sendingOperationId: activeOperationId,
+      error: undefined,
+    }))
+    try {
+      if (preserved) {
+        const verifiedPrevious = await window.pact
+          .readSyncSideChatReceipt({ operationId: preserved.operationId })
+          .catch(() => undefined)
+        if (!verifiedPrevious?.ok) {
+          const probeError =
+            verifiedPrevious?.error?.message ??
+            'Could not verify whether your previous message finished sending. Try again.'
+          if (!sameSyncMainPayload(preserved, currentPayload)) {
+            onErrorNotice(probeError)
+            updateSessionOperations(ownerSessionId, (current) => ({
+              ...current,
+              error: probeError,
+            }))
+            return undefined
+          }
+          preparedInputId = preserved.inputId
+          preparedContentSha256 = preserved.contentSha256
+        } else if (verifiedPrevious.value) {
+          if (pendingSyncMainRef.current.get(ownerSessionId) === preserved) {
+            pendingSyncMainRef.current.delete(ownerSessionId)
+          }
+          if (preserved.inputId) releasePreparedInput(ownerSessionId, preserved.inputId)
+          finalizeSyncedSideChatDraft(
+            ownerSessionId,
+            preserved.expectedRevision,
+            preserved.imageIds,
+            Math.max(1, preserved.commentIds.length),
+          )
+          if (sameSyncMainPayload(preserved, currentPayload)) {
+            return verifiedPrevious.value
+          }
+          onNotice(
+            'Your previous message was already sent to the main chat. Send again if you also want to send your edits.',
+          )
+          return undefined
+        } else if (!sameSyncMainPayload(preserved, currentPayload)) {
+          if (pendingSyncMainRef.current.get(ownerSessionId) === preserved) {
+            pendingSyncMainRef.current.delete(ownerSessionId)
+          }
+          if (preserved.inputId) releasePreparedInput(ownerSessionId, preserved.inputId)
+          activeOperationId = crypto.randomUUID()
+          updateSessionOperations(ownerSessionId, (current) => ({
+            ...current,
+            sendingOperationId: activeOperationId,
+          }))
+        } else {
+          preparedInputId = preserved.inputId
+          preparedContentSha256 = preserved.contentSha256
+        }
+      }
+      if (
+        !pendingSyncMainRef.current.has(ownerSessionId) &&
+        pendingSyncMainRef.current.size >= MAX_PENDING_SYNC_MAIN_SESSIONS
+      ) {
+        for (const [candidateSessionId, candidateEntry] of pendingSyncMainRef.current.entries()) {
+          // oxlint-disable-next-line no-await-in-loop -- Settle or discard one confirmed completed pending sync-back before admitting another.
+          const candidateStatus = await window.pact
+            .readSyncSideChatReceipt({ operationId: candidateEntry.operationId })
+            .catch(() => undefined)
+          if (!candidateStatus?.ok) continue
+          if (pendingSyncMainRef.current.get(candidateSessionId) === candidateEntry) {
+            pendingSyncMainRef.current.delete(candidateSessionId)
+          }
+          if (candidateEntry.inputId) {
+            releasePreparedInput(candidateSessionId, candidateEntry.inputId)
+          }
+          if (candidateStatus.value) {
+            finalizeSyncedSideChatDraft(
+              candidateSessionId,
+              candidateEntry.expectedRevision,
+              candidateEntry.imageIds,
+              Math.max(1, candidateEntry.commentIds.length),
+            )
+          }
+          break
+        }
+        if (pendingSyncMainRef.current.size >= MAX_PENDING_SYNC_MAIN_SESSIONS) {
+          const capacityMessage =
+            'Too many side chats have unconfirmed messages waiting for verification. Retry or wait for one to finish.'
+          onErrorNotice(capacityMessage)
+          updateSessionOperations(ownerSessionId, (current) => ({
+            ...current,
+            error: capacityMessage,
+          }))
+          return undefined
+        }
+      }
+      pendingEntry = {
+        ...currentPayload,
+        operationId: activeOperationId,
+        ...(preparedInputId ? { inputId: preparedInputId } : {}),
+        ...(preparedContentSha256 ? { contentSha256: preparedContentSha256 } : {}),
+      }
+      pendingSyncMainRef.current.set(ownerSessionId, pendingEntry)
+
+      const syncMetadata = {
+        operationId: activeOperationId,
+        sideChatId: ownerSessionId,
+        imageIds,
+        commentIds,
+        skills: normalizedSkills,
+        ...(draft?.userInformation ? { userInformation: draft.userInformation } : {}),
+        expectedCommentsRevision: currentRevision,
+      }
+      const encodedContentBytes = bodyTextEncoder.encode(content).byteLength
+      const inlineBytes =
+        bodyTextEncoder.encode(JSON.stringify({ ...syncMetadata, content: '' })).byteLength +
+        encodedContentBytes
+      const needsSealedInput =
+        content.length > 0 &&
+        (encodedContentBytes > INLINE_INPUT_BYTES || inlineBytes > INLINE_INPUT_BYTES)
+      if (needsSealedInput && (!preparedInputId || !preparedContentSha256)) {
+        const controller = new AbortController()
+        pendingEntry.inputPreparation = controller
+        try {
+          preparedInputId = await uploadLargeConversationInput({
+            sessionId: ownerSessionId,
+            clientMessageId: activeOperationId,
+            content,
+            controller,
+            cancelErrorMessage: 'Sending was cancelled or timed out. Your draft was kept.',
+            startErrorMessage: 'Couldn’t start sending this message. Your draft was kept.',
+            appendErrorMessage: 'Couldn’t send all of this message. Your draft was kept.',
+            sealErrorMessage: 'Couldn’t finish sending this message. Your draft was kept.',
+            cancelledCheckErrorMessage: 'Sending was cancelled. Your draft was kept.',
+            onInputId: (id) => {
+              preparedInputId = id
+              if (pendingEntry) pendingEntry.inputId = id
+            },
+            isCurrent: () => pendingSyncMainRef.current.get(ownerSessionId) === pendingEntry,
+          })
+        } finally {
+          pendingEntry.inputPreparation = undefined
+        }
+        preparedContentSha256 = await sha256Hex(content)
+        pendingEntry.contentSha256 = preparedContentSha256
+        if (
+          controller.signal.aborted ||
+          pendingSyncMainRef.current.get(ownerSessionId) !== pendingEntry
+        ) {
+          throw new Error('Sending was cancelled. Your draft was kept.')
+        }
+      }
+
+      keepRemoteInput = Boolean(preparedInputId)
+      const result = await window.pact.syncSideChatToMain({
+        ...syncMetadata,
+        ...(preparedInputId && preparedContentSha256
+          ? { content: '', inputId: preparedInputId, contentSha256: preparedContentSha256 }
+          : { content }),
+      })
+      let receipt: import('@pact/contracts').SideChatSyncMainReceipt | undefined
+      let uncertainOutcome = false
+      if (result.ok) {
+        receipt = result.value
+      } else if (result.error.code === 'TIMEOUT' || result.error.code === 'UNCERTAIN') {
+        const verified = await window.pact
+          .readSyncSideChatReceipt({ operationId: activeOperationId })
+          .catch(() => undefined)
+        if (verified?.ok && verified.value) {
+          receipt = verified.value
+        } else {
+          uncertainOutcome = true
+        }
+      }
+      if (!receipt) {
+        if (!uncertainOutcome && pendingSyncMainRef.current.get(ownerSessionId) === pendingEntry) {
+          pendingSyncMainRef.current.delete(ownerSessionId)
+          keepRemoteInput = false
+        }
+        const message = result.ok
+          ? 'The message could not be sent to the main chat.'
+          : result.error.message
+        onErrorNotice(message)
+        updateSessionOperations(ownerSessionId, (current) => ({
+          ...current,
+          error: message,
+        }))
+        return undefined
+      }
+      if (pendingSyncMainRef.current.get(ownerSessionId) === pendingEntry) {
+        pendingSyncMainRef.current.delete(ownerSessionId)
+      }
+      keepRemoteInput = false
+      finalizeSyncedSideChatDraft(
+        ownerSessionId,
+        expectedRevision,
+        imageIds,
+        hasDraftComments ? Math.max(1, commentIds.length) : 0,
+      )
+      return receipt
+    } catch (error) {
+      const uncertainError =
+        error instanceof RpcError && (error.code === 'TIMEOUT' || error.code === 'UNCERTAIN')
+      if (!uncertainError) {
+        if (pendingEntry && pendingSyncMainRef.current.get(ownerSessionId) === pendingEntry) {
+          pendingSyncMainRef.current.delete(ownerSessionId)
+        }
+        keepRemoteInput = false
+      }
+      const message =
+        error instanceof Error ? error.message : 'The message could not be sent to the main chat.'
+      onErrorNotice(message)
+      updateSessionOperations(ownerSessionId, (current) => ({
+        ...current,
+        error: message,
+      }))
+      return undefined
+    } finally {
+      pendingSyncInFlightRef.current.delete(ownerSessionId)
+      if (preparedInputId && !keepRemoteInput) {
+        void window.pact
+          .writeConversationInput({
+            type: 'release',
+            sessionId: ownerSessionId,
+            inputId: preparedInputId,
+          })
+          .catch(() => undefined)
+      }
+      updateSessionOperations(ownerSessionId, (current) =>
+        current.sendingOperationId === activeOperationId
           ? { ...current, sendingOperationId: undefined }
           : current,
       )
@@ -2711,8 +3707,9 @@ export function useConversation(
     }
   }
 
-  const checkNativeContext = (agentId: RuntimeAgentId): Promise<boolean> => {
+  const checkNativeContext = (agentId: RuntimeAgentId, runId?: string): Promise<boolean> => {
     if (!sessionId) return Promise.resolve(false)
+    if (runId) return inspectNativeContext(runId, agentId)
     const current = windowRef.current
     const context = current?.view.nativeContexts.find((item) => item.agentId === agentId)
     const matching = context
@@ -2917,7 +3914,6 @@ export function useConversation(
       let restoredImages: ConversationImage[] = [],
         restoredSkills: SkillSelection[] = []
       let restoredRoute: import('@pact/contracts').ConversationMessageRoute | undefined
-      let planningAction: ConversationSendInput['planningAction'] | undefined
       const chunks: string[] = []
       while (true) {
         if (owner.controller.signal.aborted)
@@ -2951,7 +3947,6 @@ export function useConversation(
           restoredImages = page.images ?? []
           restoredSkills = page.skills ?? []
           restoredRoute = page.route
-          planningAction = page.planningAction
           first = false
         } else if (JSON.stringify(restoredRoute) !== JSON.stringify(page.route)) {
           throw new Error('The returned message routing changed while loading.')
@@ -2983,7 +3978,6 @@ export function useConversation(
         text: chunks.join(''),
         revision: (draft.revision ?? 0) + 1,
         queueReturnOperationId: operationId,
-        planningAction,
         skills: restoredSkills,
         route: restoredRoute,
         images: restoredImages.map((image) => ({
@@ -3077,7 +4071,7 @@ export function useConversation(
                 image.status === 'preparing' && !imageUploads.current.has(image.id)
                   ? Object.assign({}, image, {
                       status: 'failed',
-                      error: 'Image preparation was cancelled. Remove it and try again.',
+                      error: 'Image upload was cancelled. Remove it and try again.',
                     })
                   : image,
               ),
@@ -3109,6 +4103,7 @@ export function useConversation(
       )
         return false
       if (
+        hasDecisionAnswers(draft?.decisionAnswers) ||
         draft?.images?.length ||
         draft?.text ||
         draft?.mention ||
@@ -3196,7 +4191,8 @@ export function useConversation(
           (latest?.revision ?? 0) !== (draft?.revision ?? 0) ||
           latest?.text ||
           latest?.mention ||
-          latest?.images?.length
+          latest?.images?.length ||
+          hasDecisionAnswers(latest?.decisionAnswers)
         )
           return false
         let restoredMention: ConversationComposerMention | undefined
@@ -3206,10 +4202,12 @@ export function useConversation(
               ? '@all'
               : restoredRoute.agentId === 'codex'
                 ? '@codex'
-                : '@claude'
+                : restoredRoute.agentId === 'agy'
+                  ? '@agy'
+                  : '@claude'
           let candidate: RegExpExecArray | undefined,
             ambiguous = false
-          for (const entry of text.matchAll(/(?:^|\s)(@(claude|codex|all))(?=\s|$)/gu)) {
+          for (const entry of text.matchAll(/(?:^|\s)(@(claude|codex|agy|all))(?=\s|$)/gu)) {
             if (entry[1] !== token) continue
             if (candidate) {
               ambiguous = true
@@ -3268,7 +4266,8 @@ export function useConversation(
           (value?.revision ?? 0) !== (draft?.revision ?? 0) ||
           value?.text ||
           value?.mention ||
-          value?.images?.length
+          value?.images?.length ||
+          hasDecisionAnswers(value?.decisionAnswers)
         )
           return false
         return putComposerDraft(sessionId, restoredDraft)
@@ -3302,11 +4301,20 @@ export function useConversation(
   const recovery =
     windowState?.view.sessionId === sessionId ? windowState?.view.rebuildInputRecovery : undefined
   useEffect(() => {
-    if (!recovery || composer || composerMention || composerImages.length || !visible) return
+    if (
+      !recovery ||
+      composer ||
+      composerMention ||
+      composerImages.length ||
+      hasDecisionAnswers(composerDraft?.decisionAnswers) ||
+      !visible
+    )
+      return
     if (draftsReadyRevision !== windowState?.view.commentsRevision) return
     void restoreReturnedInput(true)
   }, [
     recovery,
+    composerDraft?.decisionAnswers,
     composer,
     composerMention,
     composerImages.length,
@@ -3353,10 +4361,14 @@ export function useConversation(
     }
   }
 
-  const stop = async (): Promise<boolean> => {
+  const stop = async (
+    background?: import('@pact/contracts').BackgroundStopTarget,
+  ): Promise<boolean> => {
     if (!sessionId || stopping) return false
-    const preparing = pendingBySessionRef.current.get(sessionId)?.inputPreparation
-    if (preparing) {
+    const preparing =
+      pendingBySessionRef.current.get(sessionId)?.inputPreparation ??
+      pendingSyncMainRef.current.get(sessionId)?.inputPreparation
+    if (preparing && !background) {
       preparing.abort()
       return true
     }
@@ -3367,7 +4379,10 @@ export function useConversation(
       error: undefined,
     }))
     try {
-      const result = await window.pact.stopConversation({ sessionId })
+      const result = await window.pact.stopConversation({
+        sessionId,
+        ...(background ? { background } : {}),
+      })
       if (!result.ok) {
         updateSessionOperations(sessionId, (current) => ({
           ...current,
@@ -3437,6 +4452,8 @@ export function useConversation(
   return {
     snapshot: visibleWindow?.view,
     composer,
+    composerUserInformation,
+    setComposerUserInformation,
     composerImages,
     choosingImages: Boolean(currentOperations?.choosingImages),
     addComposerImages,
@@ -3451,6 +4468,10 @@ export function useConversation(
     setComposerSkills,
     composerMention,
     setComposerMention,
+    composerRevision: composerDraft?.revision ?? 0,
+    seedComposerDraft,
+    clearSubmittedComposerDraft,
+    syncToMain,
     loading: Boolean(sessionId && visible && (query.isFetching || (!query.isError && readPending))),
     sending,
     stopping,
@@ -3469,6 +4490,19 @@ export function useConversation(
     rebuildNativeContext,
     checkNativeContext,
     history: {
+      decisionDraft: composerDraft?.decisionAnswers,
+      setDecisionDraft,
+      clearDecisionDraft,
+      informationCancellation: currentOperations?.informationCancellation
+        ? {
+            request: currentOperations.informationCancellation.request,
+            status: currentOperations.informationCancellation.status,
+            error: currentOperations.informationCancellation.error,
+          }
+        : undefined,
+      cancelledInformationDecisionId: currentOperations?.cancelledInformationDecisionId,
+      cancelPreparedInformation,
+      checkInformationCancellation,
       queueActions: {
         pending: Boolean(currentOperations?.queueOperationId) || restoringInput,
         steer: () => performQueueAction('steer'),

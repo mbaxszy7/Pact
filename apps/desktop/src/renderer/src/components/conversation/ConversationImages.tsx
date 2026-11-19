@@ -86,11 +86,11 @@ export function ImageThumbnail({
               : `Preview ${name}`
         }
         aria-busy={preparing || Boolean(image && !thumbnail.url && !thumbnail.error)}
-        disabled={preparing || (!image && !problem)}
+        disabled={preparing || !image}
         title={problem ?? name}
         onClick={() => {
           if (image && onOpen) onOpen()
-          else if (thumbnail.error) thumbnail.retry()
+          else if (image && thumbnail.error) thumbnail.retry()
         }}
       >
         {thumbnail.url ? (
@@ -104,7 +104,7 @@ export function ImageThumbnail({
           <span
             className={`grid h-full w-full place-items-center text-tertiary ${preparing || !problem ? 'pact-image-loading' : ''}`}
           >
-            {problem ? (
+            {image && thumbnail.error ? (
               <RotateCcw aria-hidden="true" className="size-4" strokeWidth={1.75} />
             ) : (
               <ImageIcon aria-hidden="true" className="size-5" strokeWidth={1.75} />

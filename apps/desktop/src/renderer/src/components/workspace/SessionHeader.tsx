@@ -1,4 +1,4 @@
-import { Check, FolderClosed, Pencil, SlidersHorizontal, X } from 'lucide-react'
+import { Check, FolderClosed, MessagesSquare, Pencil, SlidersHorizontal, X } from 'lucide-react'
 import { useRef, useState } from 'react'
 
 import type { CollaborationSession } from '@pact/contracts'
@@ -10,6 +10,12 @@ interface SessionHeaderProps {
   onSave: (title: string) => Promise<boolean>
   onOpenSettings: () => void
   settingsButtonRef?: React.RefObject<HTMLButtonElement | null> | undefined
+  sideChatsOpen?: boolean | undefined
+  sideChatActiveCount?: number | undefined
+  sideChatAttentionCount?: number | undefined
+  sideChatUnreadCount?: number | undefined
+  onOpenSideChats?: (() => void) | undefined
+  sideChatsButtonRef?: React.RefObject<HTMLButtonElement | null> | undefined
 }
 
 export function SessionHeader({
@@ -19,7 +25,14 @@ export function SessionHeader({
   onSave,
   onOpenSettings,
   settingsButtonRef,
+  sideChatsOpen = false,
+  sideChatActiveCount = 0,
+  sideChatAttentionCount = 0,
+  sideChatUnreadCount = 0,
+  onOpenSideChats,
+  sideChatsButtonRef,
 }: SessionHeaderProps): React.JSX.Element {
+  const showSideChats = !session.parentSessionId && Boolean(onOpenSideChats)
   return (
     <div className="flex h-full min-w-0 items-center justify-between gap-group">
       <div className="flex min-w-0 flex-1 items-center gap-2">
@@ -31,15 +44,55 @@ export function SessionHeader({
         </span>
         <EditableSessionTitle session={session} saving={saving} onSave={onSave} />
       </div>
-      <button
-        ref={settingsButtonRef}
-        className="inline-flex h-8 shrink-0 items-center gap-2 rounded-control px-2.5 text-caption font-medium text-secondary hover:bg-surface-muted hover:text-primary"
-        type="button"
-        onClick={onOpenSettings}
-      >
-        <SlidersHorizontal aria-hidden="true" className="size-4" strokeWidth={1.75} />
-        Session settings
-      </button>
+      <div className="flex shrink-0 items-center gap-1.5">
+        {showSideChats ? (
+          <button
+            ref={sideChatsButtonRef}
+            className="inline-flex h-8 shrink-0 items-center gap-2 rounded-control px-2.5 text-caption font-medium text-secondary transition-colors hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus"
+            type="button"
+            aria-expanded={sideChatsOpen}
+            onClick={onOpenSideChats}
+          >
+            <MessagesSquare aria-hidden="true" className="size-4" strokeWidth={1.75} />
+            <span>Side chats</span>
+            {sideChatAttentionCount > 0 ? (
+              <span
+                key="attention"
+                className="pact-reminder-icon-pop inline-flex items-center gap-1 rounded-pill bg-status-warning-muted px-1.5 py-0.5 text-caption font-medium leading-none text-status-warning-foreground"
+                aria-label={`${sideChatAttentionCount} side chat${sideChatAttentionCount === 1 ? '' : 's'} needing attention`}
+              >
+                <span aria-hidden="true" className="size-1.5 rounded-pill bg-status-warning" />
+                {sideChatAttentionCount}
+              </span>
+            ) : sideChatActiveCount > 0 ? (
+              <span
+                key="active"
+                className="pact-reminder-icon-pop inline-flex items-center gap-1 rounded-pill bg-status-info-muted px-1.5 py-0.5 text-caption font-medium leading-none text-status-info-foreground"
+                aria-label={`${sideChatActiveCount} active side chat${sideChatActiveCount === 1 ? '' : 's'}`}
+              >
+                <span aria-hidden="true" className="size-1.5 rounded-pill bg-status-info" />
+                {sideChatActiveCount}
+              </span>
+            ) : sideChatUnreadCount > 0 ? (
+              <span
+                key="unread"
+                className="pact-reminder-icon-pop size-1.5 shrink-0 rounded-pill bg-focus"
+                aria-label={`${sideChatUnreadCount} unread side chat${sideChatUnreadCount === 1 ? '' : 's'}`}
+                title={`${sideChatUnreadCount} unread side chat${sideChatUnreadCount === 1 ? '' : 's'}`}
+              />
+            ) : null}
+          </button>
+        ) : null}
+        <button
+          ref={settingsButtonRef}
+          className="inline-flex h-8 shrink-0 items-center gap-2 rounded-control px-2.5 text-caption font-medium text-secondary hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus"
+          type="button"
+          onClick={onOpenSettings}
+        >
+          <SlidersHorizontal aria-hidden="true" className="size-4" strokeWidth={1.75} />
+          Session settings
+        </button>
+      </div>
     </div>
   )
 }
@@ -89,7 +142,9 @@ function EditableSessionTitle({
         data-titlebar-interactive
         className="group/title flex min-w-0 max-w-full items-center gap-1.5"
       >
-        <h1 className="truncate text-body font-medium text-primary">{session.title}</h1>
+        <h1 className="truncate text-body font-medium text-primary" title={session.title}>
+          {session.title}
+        </h1>
         <button
           className="grid size-7 shrink-0 place-items-center rounded-control text-tertiary opacity-0 transition-opacity duration-150 hover:bg-surface-muted hover:text-primary focus-visible:opacity-100 group-hover/title:opacity-100 group-focus-within/title:opacity-100"
           type="button"

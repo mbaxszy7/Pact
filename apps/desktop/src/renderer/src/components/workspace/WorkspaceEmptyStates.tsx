@@ -35,7 +35,7 @@ export function ProjectEmptyState({
           Start with a project
         </h2>
         <p className="mx-auto mt-group max-w-[54ch] text-body leading-relaxed text-secondary">
-          Choose a local Git repository or folder. The project reference stays on this device.
+          Open a local Git repository or folder to get started.
         </p>
         {error ? <ErrorNotice message={error} onRetry={onRetry} /> : null}
         <div className="mt-section flex flex-wrap items-center justify-center gap-group">
@@ -62,7 +62,7 @@ export function ProjectEmptyState({
           >
             Open settings
             {updateAvailable ? (
-              <span className="ml-2 text-caption font-medium text-focus">New</span>
+              <span className="ml-2 text-caption font-medium text-focus">Update</span>
             ) : null}
           </button>
         </div>
@@ -97,7 +97,7 @@ export function ProjectReadyState({
           </span>
         </h2>
         <p className="mx-auto mt-group max-w-[48ch] text-body leading-relaxed text-secondary">
-          Create a shared workspace for Claude Code, Codex, and you.
+          Create a shared workspace for Claude Code, Codex, Antigravity, and you.
         </p>
         {error ? <ErrorNotice message={error} onRetry={onRetry} /> : null}
         <button className="primary-action-button mt-section" type="button" onClick={onCreate}>

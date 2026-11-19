@@ -11,6 +11,7 @@ import { PactDatabase } from '@pact/persistence'
 
 import { ProjectFileReader } from '../project-file/project-file-reader.js'
 import { RuntimePreparation } from '../runtime-preparation/runtime-preparation.js'
+import { runDirectoryWorker } from '../workspace-changes/directory-worker.test-support.js'
 import { AgentExecutionError } from './agent-execution-error.js'
 import { Conversation } from './conversation.js'
 
@@ -52,6 +53,11 @@ function adapter(agentId: RuntimeAgentId) {
           text: native.answer,
         }
         yield { agentId, type: 'turn.completed', turnId: input.runId, outcome: 'completed' }
+        input.reportNativeEffects?.({
+          runId: input.runId,
+          generation: input.nativeGeneration!,
+          state: 'settled',
+        })
       } finally {
         native.active -= 1
       }
@@ -102,9 +108,14 @@ async function fixture(primaryAgentId: RuntimeAgentId) {
     { id: sessionId, projectId, title: 'All', createdAt },
     {
       primaryAgentId,
-      agents: { codex: { model: null, effort: null }, claude: { model: null, effort: null } },
+      secondaryAgentId: primaryAgentId === 'claude' ? 'codex' : 'claude',
+      agents: {
+        codex: { model: null, effort: null },
+        claude: { model: null, effort: null },
+        agy: { model: null, effort: null },
+      },
       maxDiscussionRounds: 3,
-      runningMessagePolicy: 'next_round',
+
       maxReviewCycles: 3,
       maxRepairAttempts: 3,
     },
@@ -136,7 +147,11 @@ async function fixture(primaryAgentId: RuntimeAgentId) {
       owner.db.sessionRepository,
       owner.db.projectCatalogRepository,
       preparation,
-      new ProjectFileReader(owner.db.sessionRepository, owner.db.projectCatalogRepository),
+      new ProjectFileReader(
+        owner.db.sessionRepository,
+        owner.db.projectCatalogRepository,
+        runDirectoryWorker,
+      ),
     )
     return owner.flow
   }
@@ -283,6 +298,7 @@ it('resumes only an uncreated secondary after reopening the database and retains
   f.owner.db.sessionRepository.saveSettings(f.sessionId, {
     ...saved,
     primaryAgentId: 'codex',
+    secondaryAgentId: 'claude',
     agents: { ...saved.agents, codex: { model: 'changed-after-send', effort: 'high' } },
   })
   f.owner.db.close()

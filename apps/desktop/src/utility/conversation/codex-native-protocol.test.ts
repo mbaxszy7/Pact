@@ -85,6 +85,9 @@ function nativeProcess(
       queueMicrotask(() => {
         Object.assign(child, { exitCode: 0 })
         child.emit('exit', 0, null)
+        stdout.end()
+        stderr.end()
+        child.emit('close', 0, null)
       })
       return true
     },
@@ -190,6 +193,7 @@ describe('Codex bounded native protocol', () => {
             id,
             result: {
               thread: { id: 'thread-1' },
+              model: 'gpt-test',
               approvalPolicy: 'on-request',
               approvalsReviewer: 'user',
               sandbox: { type: 'dangerFullAccess' },
@@ -362,7 +366,7 @@ describe('Codex bounded native protocol', () => {
       })
       const adapter = new CodexAgentAdapter('/fake/codex', forkingFactory(child), home)
       try {
-        const result = await adapter.probeNativeStatus(
+        const checking = adapter.beginNativeStatusCheck(
           {
             target: 'initialized_binding',
             sessionId: 'session-1',
@@ -382,6 +386,8 @@ describe('Codex bounded native protocol', () => {
           },
           new AbortController().signal,
         )
+        const result = await checking.result
+        await checking.physicalCompletion
         expect(result.kind).toBe(
           ['idle', 'notLoaded'].includes(scenario)
             ? 'binding_ready'
@@ -527,11 +533,13 @@ describe('Codex bounded native protocol', () => {
             initializationWitness: { kind: 'codex_rollout_v1' },
           })
         else await expect(created).rejects.toThrow(/native|frozen|initialization/iu)
-        const checked = await adapter.inspectNativeRebuild(
+        const checking = adapter.beginNativeRebuildCheck(
           { ...rebuild, nativeSessionId: 'new-thread' },
           seed(),
           new AbortController().signal,
         )
+        const checked = await checking.result
+        await checking.physicalCompletion
         expect(Boolean(checked?.initializationWitness)).toBe(fault === 'valid')
         if (fault === 'open-hook') {
           expect(adapter.hasActiveBackgroundWork(rebuild.rebuildId)).toBe(true)
@@ -543,13 +551,13 @@ describe('Codex bounded native protocol', () => {
               run: { id: 'hook-1', status: 'completed' },
             },
           })
-          await expect(
-            adapter.inspectNativeRebuild(
-              { ...rebuild, nativeSessionId: 'new-thread' },
-              seed(),
-              new AbortController().signal,
-            ),
-          ).resolves.toBeUndefined()
+          const wrongHookCheck = adapter.beginNativeRebuildCheck(
+            { ...rebuild, nativeSessionId: 'new-thread' },
+            seed(),
+            new AbortController().signal,
+          )
+          await expect(wrongHookCheck.result).resolves.toBeUndefined()
+          await wrongHookCheck.physicalCompletion
           notify!({
             method: 'hook/completed',
             params: {
@@ -558,13 +566,15 @@ describe('Codex bounded native protocol', () => {
               run: { id: 'hook-1', status: 'completed' },
             },
           })
-          await expect(
-            adapter.inspectNativeRebuild(
-              { ...rebuild, nativeSessionId: 'new-thread' },
-              seed(),
-              new AbortController().signal,
-            ),
-          ).resolves.toMatchObject({ initializationWitness: { kind: 'codex_rollout_v1' } })
+          const completedHookCheck = adapter.beginNativeRebuildCheck(
+            { ...rebuild, nativeSessionId: 'new-thread' },
+            seed(),
+            new AbortController().signal,
+          )
+          await expect(completedHookCheck.result).resolves.toMatchObject({
+            initializationWitness: { kind: 'codex_rollout_v1' },
+          })
+          await completedHookCheck.physicalCompletion
           expect(adapter.hasActiveBackgroundWork(rebuild.rebuildId)).toBe(false)
         }
         expect(methods.filter((method) => method === 'thread/start')).toHaveLength(1)
@@ -745,6 +755,7 @@ describe('Codex bounded native protocol', () => {
           id,
           result: {
             thread: { id: 'live-thread' },
+            model: 'gpt-test',
             approvalPolicy: 'on-request',
             approvalsReviewer: 'user',
             sandbox: { type: 'dangerFullAccess' },
@@ -957,7 +968,11 @@ describe('Codex bounded native protocol', () => {
             })
           })().catch((error) => {
             errors.push(error)
+            Object.assign(child, { exitCode: 1 })
             child.emit('exit', 1, null)
+            child.stdout.destroy()
+            child.stderr.destroy()
+            child.emit('close', 1, null)
           })
         }
       })

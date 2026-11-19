@@ -1,15 +1,26 @@
 import { useState } from 'react'
 
-import type { DefaultSessionSettings, DefaultSessionSettingsEditorState } from '@pact/contracts'
+import {
+  resolveActiveAgentPair,
+  type ActiveAgentPairInput,
+  type DefaultSessionSettings,
+  type DefaultSessionSettingsEditorState,
+  type RuntimePreparation,
+} from '@pact/contracts'
 
 import {
+  deriveAgentAvailability,
   initialSessionSettings,
+  preferredReadyPair,
+  resolveMergedDefaultModelCatalogs,
   SessionSettingsFields,
   sessionSettingsEqual,
+  useActivePairCatalogs,
 } from './SessionSettingsFields'
 
 interface DefaultSessionSettingsViewProps {
   editorState?: DefaultSessionSettingsEditorState | undefined
+  runtimePreparation?: RuntimePreparation | undefined
   loading: boolean
   saving: boolean
   saveError?: string | undefined
@@ -17,6 +28,29 @@ interface DefaultSessionSettingsViewProps {
   firstUse: boolean
   onRetry: () => void
   onSave: (settings: DefaultSessionSettings) => void
+}
+
+function resolveInitialDefaults(
+  editorState?: DefaultSessionSettingsEditorState,
+  runtimePreparation?: RuntimePreparation,
+): DefaultSessionSettings {
+  if (editorState?.current?.settings) return editorState.current.settings
+  if (editorState?.recommendedPair) {
+    return {
+      ...initialSessionSettings,
+      primaryAgentId: editorState.recommendedPair.primaryAgentId,
+      secondaryAgentId: editorState.recommendedPair.secondaryAgentId,
+    }
+  }
+  const [primaryAgentId, secondaryAgentId] = preferredReadyPair(runtimePreparation, [
+    initialSessionSettings.primaryAgentId,
+    initialSessionSettings.secondaryAgentId,
+  ])
+  return {
+    ...initialSessionSettings,
+    primaryAgentId,
+    secondaryAgentId,
+  }
 }
 
 function SettingsSkeleton(): React.JSX.Element {
@@ -31,6 +65,7 @@ function SettingsSkeleton(): React.JSX.Element {
 
 export function DefaultSessionSettingsView({
   editorState,
+  runtimePreparation,
   loading,
   saving,
   saveError,
@@ -39,9 +74,34 @@ export function DefaultSessionSettingsView({
   onRetry,
   onSave,
 }: DefaultSessionSettingsViewProps): React.JSX.Element {
-  const [settings, setSettings] = useState<DefaultSessionSettings>(
-    () => editorState?.current?.settings ?? initialSessionSettings,
+  const [draft, setDraft] = useState<DefaultSessionSettings | undefined>(() =>
+    editorState ? resolveInitialDefaults(editorState, runtimePreparation) : undefined,
   )
+  const settings = draft ?? resolveInitialDefaults(editorState, runtimePreparation)
+  const agentAvailability = deriveAgentAvailability(runtimePreparation)
+  const activePair = resolveActiveAgentPair(settings)
+  const bridgeLoader =
+    typeof window !== 'undefined' &&
+    typeof window.pact?.getDefaultSessionSettingsEditorState === 'function'
+      ? (pair: ActiveAgentPairInput) => window.pact.getDefaultSessionSettingsEditorState(pair)
+      : undefined
+  const { fetchedCatalogs, sameSource, pairCatalogLoading, refreshCatalogs } =
+    useActivePairCatalogs({
+      editorState,
+      baseCatalogs: editorState?.modelCatalogs,
+      activePair,
+      agentAvailability,
+      enabled: Boolean(editorState),
+      loadForPair: bridgeLoader,
+      onFallbackRefresh: onRetry,
+    })
+  const mergedCatalogs = editorState
+    ? resolveMergedDefaultModelCatalogs(editorState.modelCatalogs, fetchedCatalogs, sameSource)
+    : undefined
+  const pairReady =
+    !firstUse ||
+    !agentAvailability ||
+    activePair.every((agentId) => agentAvailability[agentId]?.available ?? true)
   const hasChanges =
     !editorState?.current || !sessionSettingsEqual(settings, editorState.current.settings)
 
@@ -52,8 +112,7 @@ export function DefaultSessionSettingsView({
           {firstUse ? 'Set your collaboration defaults' : 'Default session settings'}
         </h1>
         <p className="mt-group max-w-[68ch] text-body leading-relaxed text-secondary">
-          Choose how new Sessions begin. Each Session receives its own copy and can change it
-          without changing this App default.
+          Applied to new sessions. Existing sessions keep their own settings.
         </p>
       </header>
 
@@ -90,12 +149,12 @@ export function DefaultSessionSettingsView({
             type="button"
             onClick={onRetry}
           >
-            Retry
+            Try again
           </button>
         </div>
       ) : null}
 
-      {editorState ? (
+      {editorState && mergedCatalogs ? (
         <form
           onSubmit={(event) => {
             event.preventDefault()
@@ -105,12 +164,13 @@ export function DefaultSessionSettingsView({
           <SessionSettingsFields
             idPrefix="default-session"
             settings={settings}
-            modelCatalogs={editorState.modelCatalogs}
+            modelCatalogs={mergedCatalogs}
+            agentAvailability={agentAvailability}
             disabled={saving}
-            refreshing={loading}
+            refreshing={loading || pairCatalogLoading}
             showRefresh={!firstUse}
-            onChange={setSettings}
-            onRefresh={onRetry}
+            onChange={setDraft}
+            onRefresh={refreshCatalogs}
           />
 
           <footer className="flex flex-wrap items-center justify-between gap-group border-t border-border py-section">
@@ -119,14 +179,12 @@ export function DefaultSessionSettingsView({
                 <p className="text-danger" role="alert">
                   {saveError}
                 </p>
-              ) : (
-                <p>Only Sessions created after this save use the updated defaults.</p>
-              )}
+              ) : null}
             </div>
             <button
               className="primary-action-button"
               type="submit"
-              disabled={saving || loading || !hasChanges}
+              disabled={saving || loading || pairCatalogLoading || !hasChanges || !pairReady}
               data-busy={saving}
               aria-busy={saving}
             >

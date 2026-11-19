@@ -19,6 +19,11 @@ import { promisify } from 'node:util'
 
 import identities from '../apps/desktop/app-identities.json' with { type: 'json' }
 import {
+  inspectWindowsOwnedProcessResource,
+  validateWindowsOwnedProcessManifest,
+} from '../apps/desktop/build/windows-owned-process-resource.mjs'
+import { MacCredentialStore } from '../tests/e2e/mac-credential-store.ts'
+import {
   loadProviderConfiguration,
   prepareProviderEnvironment,
 } from '../tests/e2e/provider-environment.ts'
@@ -320,6 +325,7 @@ export async function readDistributionManifest(path) {
     )
       throw new Error('Distribution artifact metadata is invalid.')
   }
+  validateWindowsOwnedProcessManifest(manifest)
   return manifest
 }
 
@@ -347,7 +353,17 @@ export async function verifyApplication(application, manifest, installed) {
     }
     throw mismatch
   }
+  const windowsOwnedProcess = validateWindowsOwnedProcessManifest(manifest)
   const executable = resolveWithin(application, manifest.application.executable)
+  if (windowsOwnedProcess) {
+    const observed = await inspectWindowsOwnedProcessResource(
+      join(application, 'resources/native'),
+      manifest.arch,
+      windowsOwnedProcess.sourceSha256,
+    )
+    if (JSON.stringify(observed) !== JSON.stringify(windowsOwnedProcess))
+      throw new Error('Installed Windows helper differs from its exact distribution identity.')
+  }
   if (!(await pathExists(executable)))
     throw new Error('The explicit packaged executable is missing or not executable.')
   return executable
@@ -665,6 +681,8 @@ export async function prepareApplication({
 
 async function runOwnedPackagedProcess(executable, environment, phase, redact, timeoutMs, onState) {
   let passed = false
+  let credentialPassed = false
+  const credentialPhase = environment.PACT_PACKAGE_RELAY_CREDENTIAL_PHASE
   let identity
   let output = ''
   const exit = await run(
@@ -679,6 +697,11 @@ async function runOwnedPackagedProcess(executable, environment, phase, redact, t
       write: (_channel, text) => {
         output = appendLog(output, text)
         if (text.trim() === PACKAGE_SMOKE_PASS_MARKER) passed = true
+        if (
+          credentialPhase &&
+          text.trim() === `PACT_RELAY_CREDENTIAL_SMOKE:PASS:${credentialPhase}`
+        )
+          credentialPassed = true
         if (text.startsWith('PACT_PACKAGE_IDENTITY:')) {
           if (identity) throw new Error('Packaged process emitted duplicate identities.')
           identity = JSON.parse(text.slice('PACT_PACKAGE_IDENTITY:'.length))
@@ -712,6 +735,8 @@ async function runOwnedPackagedProcess(executable, environment, phase, redact, t
         }),
       },
     )
+  if (credentialPhase && !credentialPassed)
+    throw new Error('Packaged credential phase omitted its genuine verification receipt.')
   return identity
 }
 
@@ -740,6 +765,7 @@ export function packagedRuntimeFailureFacts(code, output, markers) {
     ['IMAGE_CODEC', /Packaged image codec/u],
     ['MARKDOWN_PROJECTION', /Packaged projection/u],
     ['APPEARANCE', /Packaged appearance/u],
+    ['RELAY_CREDENTIAL', /Packaged credential/u],
   ]
   return {
     runtimeFailure: categories.find(([, pattern]) => pattern.test(text))?.[0] ?? 'UNCLASSIFIED',
@@ -858,6 +884,8 @@ const smokePhases = new Set([
   'installation',
   'seed',
   'verify',
+  'credential-store',
+  'credential-removed',
   'content',
   'production-paths',
   'real-core',
@@ -978,6 +1006,7 @@ export function packageSmokeFailureReport(facts) {
       'IMAGE_CODEC',
       'MARKDOWN_PROJECTION',
       'APPEARANCE',
+      'RELAY_CREDENTIAL',
       'UNCLASSIFIED',
     ].includes(facts.runtimeFailureFacts?.runtimeFailure)
       ? {
@@ -1008,6 +1037,7 @@ export function packageSmokeFailureReport(facts) {
           'private-root-removal',
           'provider-copies',
           'process-release',
+          'credential-store',
         ].includes(facts[key])
           ? [[key, facts[key]]]
           : [],
@@ -1025,6 +1055,9 @@ export function packageSmokeFailureReport(facts) {
     processes,
     processReleaseVerified,
     installationCleanupVerified: facts.installationCleanupVerified === true,
+    ...(facts.credentialStoreCleanupVerified !== undefined
+      ? { credentialStoreCleanupVerified: facts.credentialStoreCleanupVerified === true }
+      : {}),
     providerCopiesCleanupVerified: facts.providerCopiesCleanupVerified === true,
     privateRootCreated: facts.privateRootCreated === true,
     privateRootCleanupVerified: facts.privateRootCleanupVerified === true,
@@ -1032,6 +1065,7 @@ export function packageSmokeFailureReport(facts) {
     cleanupVerified:
       processReleaseVerified &&
       facts.installationCleanupVerified === true &&
+      facts.credentialStoreCleanupVerified !== false &&
       facts.providerCopiesCleanupVerified === true &&
       facts.privateRootCleanupVerified === true,
   }
@@ -1063,6 +1097,7 @@ async function performPackagedSmoke(
     productionPaths = false,
     sourceEnvironment = process.env,
     realCore = false,
+    relayCredentials = false,
     spawnProcess = spawn,
   } = {},
   facts,
@@ -1087,6 +1122,11 @@ async function performPackagedSmoke(
   if (manifest && spawnProcess !== spawn)
     throw new Error('A distribution verification report requires the genuine owned process runner.')
   if (
+    relayCredentials &&
+    (process.platform !== 'darwin' || realCore || !manifest || spawnProcess !== spawn)
+  )
+    throw new Error('Packaged credential verification requires a genuine isolated macOS smoke.')
+  if (
     productionPaths &&
     (!manifest || manifest.smokeProtocolVersion !== 2 || spawnProcess !== spawn)
   )
@@ -1094,7 +1134,9 @@ async function performPackagedSmoke(
       'Production paths require a genuine application with smoke protocol 2; older packages cannot safely serve that probe.',
     )
   facts.phase = 'environment'
-  const requestedRoot = await mkdtemp(join(tmpdir(), 'pact-package-smoke-'))
+  const requestedRoot = await mkdtemp(
+    join(tmpdir(), relayCredentials ? 'pact-runtime-e2e-package-smoke-' : 'pact-package-smoke-'),
+  )
   facts.privateRootCreated = true
   facts.privateRootCleanupVerified = false
   let application
@@ -1103,6 +1145,8 @@ async function performPackagedSmoke(
   let providerHomes = []
   let privateRootIdentity
   let privateRootReport = {}
+  let credentialStore
+  let credentialCurrent = true
   const cleanup = async () => {
     let cleanupError
     const unresolvedProcess =
@@ -1121,6 +1165,17 @@ async function performPackagedSmoke(
         preserveRoot = true
         facts.installationCleanupVerified = false
         cleanupError = error
+      }
+      credentialCurrent = false
+      if (credentialStore && !preserveRoot) {
+        try {
+          await credentialStore.dispose()
+          facts.credentialStoreCleanupVerified = true
+        } catch (error) {
+          facts.cleanupFailureStage = 'credential-store'
+          preserveRoot = true
+          cleanupError = error
+        }
       }
     }
     const unresolvedAfterCleanup =
@@ -1170,6 +1225,46 @@ async function performPackagedSmoke(
     providerHomes = [prepared.claudeHome, prepared.codexHome]
     await mkdir(join(root, 'logs', 'production'), { recursive: true, mode: 0o700 })
     const environment = { ...prepared.env, PACT_E2E_ROOT: root }
+    if (relayCredentials) {
+      facts.credentialStoreCleanupVerified = false
+      credentialStore = new MacCredentialStore({
+        directory: root,
+        environment,
+        isCurrent: () => credentialCurrent,
+        run: async (helperExecutable, args, deadline) => {
+          const observation = { phase: 'credential-store', releaseVerified: false }
+          facts.processes.push(observation)
+          let stdout = '',
+            stderr = ''
+          const exitCode = await run(args, Math.max(1, deadline - performance.now()), {
+            executable: helperExecutable,
+            cwd: root,
+            env: environment,
+            onState(state) {
+              observation.releaseVerified =
+                state.kind === 'settled' &&
+                state.groupGone === true &&
+                state.ownedProcessCount === 0 &&
+                state.ownershipEvidenceIncomplete !== true &&
+                state.ownershipProbeIncomplete !== true
+            },
+            write(channel, text) {
+              if (
+                Buffer.byteLength(stdout) + Buffer.byteLength(stderr) + Buffer.byteLength(text) >
+                16384
+              )
+                throw new Error('Credential helper output exceeded its bound.')
+              if (channel === 'stdout') stdout += text
+              else stderr += text
+            },
+          })
+          if (!observation.releaseVerified)
+            throw new Error('Credential helper release unconfirmed.')
+          return { exitCode, stdout, stderr }
+        },
+      })
+      await credentialStore.prepare()
+    }
     facts.phase = 'installation'
     if (manifest) facts.installationCleanupVerified = false
     application = manifest
@@ -1271,6 +1366,7 @@ async function performPackagedSmoke(
         {
           ...smokeEnvironment,
           [PACKAGE_SMOKE_PHASE_ENV]: 'seed',
+          ...(relayCredentials ? { PACT_PACKAGE_RELAY_CREDENTIAL_PHASE: 'seed' } : {}),
         },
         'seed',
         spawnProcess,
@@ -1283,11 +1379,28 @@ async function performPackagedSmoke(
         {
           ...smokeEnvironment,
           [PACKAGE_SMOKE_PHASE_ENV]: 'verify',
+          ...(relayCredentials ? { PACT_PACKAGE_RELAY_CREDENTIAL_PHASE: 'verify' } : {}),
         },
         'verify',
         spawnProcess,
         (text) => text,
       )
+      if (relayCredentials) {
+        facts.phase = 'credential-removed'
+        const removedIdentity = await launch(
+          selectedExecutable,
+          {
+            ...smokeEnvironment,
+            [PACKAGE_SMOKE_PHASE_ENV]: 'verify',
+            PACT_PACKAGE_RELAY_CREDENTIAL_PHASE: 'removed',
+          },
+          'credential-removed',
+          spawnProcess,
+          (text) => text,
+        )
+        if (JSON.stringify(removedIdentity) !== JSON.stringify(verifiedIdentity))
+          throw new Error('Packaged credential cold removal changed application identity.')
+      }
       if (manifest) {
         facts.phase = 'content'
         await verifyApplication(
@@ -1359,7 +1472,20 @@ async function performPackagedSmoke(
           artifacts: application.artifact ? [application.artifact] : [],
           installationVerified: application.installationVerified,
           verificationMode: application.verificationMode,
-          phases: ['seed', 'verify'],
+          phases: relayCredentials ? ['seed', 'verify', 'credential-removed'] : ['seed', 'verify'],
+          ...(relayCredentials
+            ? {
+                relayCredentialVerification: {
+                  synthetic: true,
+                  saved: true,
+                  replaced: true,
+                  revealed: true,
+                  coldRead: true,
+                  removed: true,
+                  coldRemoval: true,
+                },
+              }
+            : {}),
           processOwnership: process.platform === 'win32' ? 'native-job' : 'verified-process-groups',
           defaultChannelPathsVerified: true,
           productionDataRootVerified,
@@ -1381,6 +1507,9 @@ async function performPackagedSmoke(
     await writeSmokeReport(reportPath, {
       ...pendingReport,
       ...privateRootReport,
+      ...(relayCredentials
+        ? { credentialStoreCleanupVerified: facts.credentialStoreCleanupVerified }
+        : {}),
       cleanupVerified: true,
     })
   }
@@ -1466,6 +1595,10 @@ if (isScriptEntry(import.meta.url)) {
           options.realCore = true
           continue
         }
+        if (argument === '--relay-credentials') {
+          options.relayCredentials = true
+          continue
+        }
         if (argument === '--unpacked') {
           options.unpacked = true
           continue
@@ -1476,7 +1609,7 @@ if (isScriptEntry(import.meta.url)) {
         }
         if (!names[argument] || !args[index + 1] || args[index + 1].startsWith('--'))
           throw new Error(
-            'Supported invocation: package-smoke.mjs --manifest <path> [--artifact <path> | --unpacked [--app <path>]] [--report <path>] [--real-core]',
+            'Supported invocation: package-smoke.mjs --manifest <path> [--artifact <path> | --unpacked [--app <path>]] [--report <path>] [--real-core | --relay-credentials] [--production-paths]',
           )
         options[names[argument]] = args[++index]
       }

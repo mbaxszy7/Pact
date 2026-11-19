@@ -66,6 +66,20 @@ function adapter(agentId: RuntimeAgentId) {
     readonly id = agentId
     readonly executorId = randomUUID()
     inspectNativeRebuild = native.inspect
+    beginNativeRebuildCheck(
+      input: AgentNativeContextRebuildInput,
+      source: AsyncIterable<NativeContextRebuildChunk>,
+      signal: AbortSignal,
+    ) {
+      const result = this.inspectNativeRebuild(input, source, signal)
+      return {
+        result,
+        physicalCompletion: result.then(
+          () => undefined,
+          () => undefined,
+        ),
+      }
+    }
 
     hasActiveBackgroundWork(runId?: string) {
       return [...native.runs.values()].some(
@@ -114,7 +128,6 @@ function adapter(agentId: RuntimeAgentId) {
           source: 'live_terminal',
           outcome,
           identity: {
-            ...(input.answerFormat ? { answerFormat: input.answerFormat } : {}),
             sessionId: input.sessionId,
             agentId,
             runId: input.runId,
@@ -161,9 +174,13 @@ vi.mock('./claude-agent-adapter.js', () => ({ ClaudeAgentAdapter: adapter('claud
 const migrationsFolder = resolve(import.meta.dirname, '../../../../../packages/persistence/drizzle')
 const settings: DefaultSessionSettings = {
   primaryAgentId: 'codex',
-  agents: { claude: { model: null, effort: null }, codex: { model: null, effort: null } },
+  secondaryAgentId: 'claude',
+  agents: {
+    claude: { model: null, effort: null },
+    codex: { model: null, effort: null },
+    agy: { model: null, effort: null },
+  },
   maxDiscussionRounds: 3,
-  runningMessagePolicy: 'next_round',
   maxReviewCycles: 3,
   maxRepairAttempts: 3,
 }
@@ -297,7 +314,7 @@ async function fixture(withWorkspace = false) {
       db.sessionRepository,
       db.projectCatalogRepository,
       preparation,
-      new ProjectFileReader(db.sessionRepository, db.projectCatalogRepository),
+      new ProjectFileReader(db.sessionRepository, db.projectCatalogRepository, runDirectoryWorker),
       workspace,
     )
   const owner = {
@@ -430,13 +447,15 @@ async function settledUnconfirmedCandidate(f: Awaited<ReturnType<typeof fixture>
     abandon: false,
   })
   const chunks: NativeContextRebuildChunk[] = []
+  const sourceRevisions = new Map<string, number>()
   for await (const chunk of repo.nativeContextRebuildSource(
     sessionId,
     new AbortController().signal,
     rebuildId,
+    sourceRevisions,
   ))
     chunks.push(chunk)
-  repo.freezeNativeRebuildSource(rebuildId, chunks)
+  repo.freezeNativeRebuildSource(rebuildId, chunks, sourceRevisions)
   const creatingExecutorId = randomUUID()
   const candidateNativeSessionId = 'settled-unconfirmed-claude'
   repo.markNativeRebuildDispatched(rebuildId, creatingExecutorId)
@@ -876,7 +895,7 @@ describe('Conversation workspace archive', () => {
         receipt: f.db.conversationRepository.archives.read(preview.operationId)?.state,
         input: f.db.conversationRepository.receivedCollaborationInput(sessionId),
         cancelled: f.db.conversationRepository.receivedCollaborationInput(sessionId, true)?.state,
-        collaboration: f.db.conversationRepository.collaboration(sessionId)?.status,
+        collaboration: f.db.conversationRepository.collaboration(sessionId)?.automation,
       }
       const result = stop(input)
       stopResult = result
@@ -1030,6 +1049,7 @@ describe('Conversation workspace archive', () => {
     const scope = { kind: 'session', sessionId: f.sessionIds[0] } as const
     const sending = f.owner.flow.send(f.input(scope.sessionId))
     await vi.waitFor(() => expect(f.owner.flow.diagnostics().preparingExecutions).toBe(1))
+    await vi.waitFor(() => expect(preparationSignal).toBeDefined())
     const first = f.prepare(scope)
     expect(first.tasks[0]?.state).toBe('preparing')
     f.owner.flow.cancelWorkspaceArchive(first.operationId)

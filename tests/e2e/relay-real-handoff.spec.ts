@@ -1,0 +1,875 @@
+import { expect, type Page } from '@playwright/test'
+import { createHash, randomUUID } from 'node:crypto'
+import { lstat, open } from 'node:fs/promises'
+import { dirname, join, resolve } from 'node:path'
+
+import type { CollaborationDocument, DesktopBridge } from '../../packages/contracts/src/index.js'
+
+import { diagnosticRecordSchema } from '../../packages/contracts/src/diagnostics.js'
+import {
+  collaborationTaskSchema,
+  advanceAutomaticCollaboration,
+  OPENAI_DECISION_MODEL,
+  collaborationTurnAuthorizationSchema,
+} from '../../packages/contracts/src/index.js'
+import { PactDatabase } from '../../packages/persistence/src/pact-database.js'
+import { nativeAgentContexts, workflowTurns } from '../../packages/persistence/src/schema/index.js'
+import { ReadonlyFixtureDatabase } from './readonly-fixture-database.js'
+import {
+  closeRealWorkspace,
+  restartRealWorkspace,
+  selectRealSession,
+  waitForRealCompletion,
+  type RealWorkspace,
+} from './real-harness.js'
+import { resolveRealConfiguredModel } from './real-model-selection.js'
+import { findNativeRecord } from './real-native-evidence.js'
+import { createRealRelayFixture } from './relay-real-credential.js'
+import { routingSchedulingObservation } from './relay-routing-real-observation.js'
+import { test, type RuntimeFixture } from './runtime-fixture.js'
+
+// The five preceding Turns are explicit fixture prerequisites produced through
+// the real Repository, not native/model execution evidence. Only the later
+// Electron Continue, DecisionRuntime and fixed reviewer are real Provider work.
+// The transparent Codex transport holds any following turn before native
+// dispatch. Stop is used only after the genuine reviewer and its effects finish.
+const goal =
+  'Draft a conceptual three-step cancellation note. Acceptance: distinguish normal completion, cancellation, and disposal; name one cancellation owner; join that owner before releasing resources. Use only the supplied frozen sources. Do not inspect or modify project files, run commands, delegate, or add implementation. The scope is fully specified.'
+const plan =
+  '1. On normal completion, the existing operation owner joins its pending work before releasing its resources.\n2. On cancellation, that same owner signals cancellation once, then joins its pending work before releasing resources.\n3. On disposal, that same owner cancels remaining work and joins it before releasing resources. No second controller, project edit, or user choice is required.'
+const review =
+  'Clarify that cancellation and disposal keep the same operation owner and join pending work before resource release.'
+const response =
+  'The complete unchanged plan now distinguishes all three paths and keeps one owner responsible for cancellation and joining. No scope or permission change is requested.'
+const focus = { id: 'cancellation-owner-join', terms: ['cancel', 'join'], source: review }
+const migrationsFolder = resolve(import.meta.dirname, '../../packages/persistence/drizzle')
+
+interface Seed {
+  sessionId: string
+  projectId: string
+  projectDirectory: string
+  taskId: string
+  planVersion: number
+  sourceHashes: Array<{ roles: string[]; sha256: string; bytes: number; chars: number }>
+  sourceDocuments: Array<{ document: CollaborationDocument; sourceRunId: string | undefined }>
+  fixtureRunIds: string[]
+}
+
+async function seed(
+  fixture: RuntimeFixture,
+  db: PactDatabase,
+  label: 'Off' | 'On',
+  claudeModel: string,
+): Promise<Seed> {
+  const projectDirectory = await fixture.createProjectDirectory(`relay-real-${label.toLowerCase()}`)
+  const projectId = randomUUID(),
+    sessionId = randomUUID(),
+    messageId = randomUUID(),
+    createdAt = new Date().toISOString(),
+    repo = db.conversationRepository
+  const settings = {
+    primaryAgentId: 'codex',
+    secondaryAgentId: 'claude',
+    agents: {
+      codex: { model: 'gpt-6-luna', effort: 'low' },
+      claude: { model: claudeModel, effort: null },
+      agy: { model: null, effort: null },
+    },
+    maxDiscussionRounds: 2,
+    maxReviewCycles: 3,
+    maxRepairAttempts: 3,
+  } as const
+  db.projectCatalogRepository.add({
+    id: projectId,
+    name: `Relay real ${label}`,
+    directoryPath: projectDirectory,
+    kind: 'directory',
+    createdAt,
+  })
+  db.sessionRepository.create(
+    { id: sessionId, projectId, title: `Relay real ${label}`, createdAt },
+    settings,
+  )
+  const initial = collaborationTaskSchema.parse({
+    id: randomUUID(),
+    sessionId,
+    kind: 'plan',
+    revision: 0,
+    protocol: 'native-workflow-v1',
+    owner: 'codex',
+    reviewer: 'claude',
+    automation: 'active',
+    inputSequence: 0,
+    handledInputSequence: 0,
+    task: goal,
+    taskMessageId: messageId,
+    stage: 'plan',
+    actor: 'codex',
+    status: 'running',
+    runId: messageId,
+    planVersion: 0,
+    discussionRounds: 0,
+    reviewCycles: 0,
+    repairAttempts: 0,
+  })
+  const ids: string[] = []
+  const finish = (runId: string, publish: boolean, verdict?: 'changes_requested') => {
+    const run = repo.findRun(runId)!,
+      nativeSessionId = `fixture-${sessionId}-${run.agentId}`,
+      turnId = `fixture-${runId}`
+    repo.applyEvent(sessionId, runId, {
+      type: 'session.started',
+      agentId: run.agentId,
+      nativeSessionId,
+    })
+    repo.applyEvent(sessionId, runId, { type: 'turn.started', agentId: run.agentId, turnId })
+    if (publish) repo.recordWorkflowPlan(runId, { nativeId: `fixture-plan-${runId}`, text: plan })
+    if (verdict) repo.recordWorkflowReview(runId, { verdict })
+    repo.applyEvent(sessionId, runId, {
+      type: 'text.completed',
+      agentId: run.agentId,
+      turnId,
+      outputId: `fixture-answer-${runId}`,
+      text: verdict ? review : response,
+    })
+    repo.recordNativeEvidence({
+      kind: 'ended',
+      source: 'stored_terminal',
+      outcome: 'completed',
+      identity: {
+        sessionId,
+        agentId: run.agentId,
+        requestId: runId,
+        runId,
+        nativeSessionId,
+        nativeTurnId: turnId,
+        bindingGeneration: run.bindingGeneration ?? 1,
+      },
+    })
+    repo.recordNativeEffects(runId, 'settled')
+    if (!publish && run.collaboration?.stage === 'plan') {
+      const document = repo.collaboration(sessionId)!.planReference!.document
+      repo.recordWorkflowPlanRetained(runId, {
+        nativeId: `fixture-retained-${runId}`,
+        confirmation: 'native_root_settled_v1',
+        sha256: document.sha256,
+        bytes: document.bytes,
+        chars: document.chars,
+      })
+    }
+    repo.applyEvent(sessionId, runId, {
+      type: 'turn.completed',
+      agentId: run.agentId,
+      turnId,
+      outcome: 'completed',
+    })
+    repo.recordNativeEffects(runId, 'settled')
+    ids.push(runId)
+  }
+  const first = repo.beginRun({
+    sessionId,
+    clientMessageId: messageId,
+    content: `/plan ${goal}`,
+    commentIds: [],
+    expectedCommentsRevision: 0,
+    agentId: 'codex',
+    settingsRevision: 1,
+    model: 'gpt-6-luna',
+    effort: 'low',
+    collaboration: initial,
+  }).run
+  finish(first.id, true)
+  const next = () => {
+    const task = repo.collaboration(sessionId)!,
+      candidate = advanceAutomaticCollaboration(task, settings),
+      agent = settings.agents[candidate.actor]
+    return repo.beginRun({
+      sessionId,
+      clientMessageId: randomUUID(),
+      content: 'Continue the same conceptual plan and its fixed review.',
+      commentIds: [],
+      expectedCommentsRevision: 0,
+      agentId: candidate.actor,
+      settingsRevision: 1,
+      model: agent.model,
+      effort: agent.effort,
+      preserveDraftComments: true,
+      expectedCollaborationRevision: task.revision,
+      collaboration: candidate,
+      schedulingHandoff: repo.workflowHandoff(task, candidate.actor),
+    }).run
+  }
+  finish(next().id, false, 'changes_requested')
+  finish(next().id, false)
+  finish(next().id, false, 'changes_requested')
+  finish(next().id, false)
+  const task = repo.collaboration(sessionId)!,
+    handoff = repo.workflowHandoff(task, task.reviewer)
+  expect(
+    repo
+      .relayWorkflowAlternatives(handoff)
+      ?.alternatives.find((entry) => entry.kind === 'extend_plan_review'),
+  ).toMatchObject({ kind: 'extend_plan_review' })
+  const material = await repo.readRelayWorkflowDecisionSources(
+    handoff,
+    [
+      {
+        id: 'propose_extend_plan_review',
+        description: 'Propose one additional read-only review of the current plan.',
+      },
+    ],
+    { signal: new AbortController().signal, deadlineAt: Date.now() + 15_000 },
+  )
+  // Every byte was read; equality is by literal content, not by unrelated UUIDs.
+  const sourceHashes = material.sources
+    .map((source) => ({
+      roles: source.roles.toSorted(),
+      sha256: source.document.sha256,
+      bytes: source.document.bytes,
+      chars: source.document.chars,
+    }))
+    .toSorted((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))
+  repo.setCollaborationState({
+    ...task,
+    revision: task.revision + 1,
+    automation: 'paused',
+    pauseReason: 'limit',
+  })
+  return {
+    sessionId,
+    projectId,
+    projectDirectory,
+    taskId: task.id,
+    planVersion: task.planVersion,
+    sourceHashes,
+    sourceDocuments: material.sources.map(({ document, sourceRunId }) => ({
+      document,
+      sourceRunId,
+    })),
+    fixtureRunIds: ids,
+  }
+}
+
+async function resume(page: Page, sessionId: string) {
+  const editor = await page.evaluate(
+    async (payload) => {
+      const bridge: DesktopBridge = Reflect.get(globalThis, 'pact')
+      const reply = await bridge.getSessionSettings(payload.sessionId)
+      if (!reply.ok) throw Error('Current session settings are unavailable')
+      return reply.value
+    },
+    { sessionId },
+  )
+  const settings = {
+    primaryAgentId: editor.session.settings.primaryAgentId,
+    secondaryAgentId: editor.session.settings.secondaryAgentId,
+    agents: {
+      agy: editor.session.settings.agents.agy,
+      codex: {
+        ...editor.session.settings.agents.codex,
+        model: resolveRealConfiguredModel(
+          editor.modelCatalogs.codex,
+          editor.session.settings.agents.codex.model,
+        ).id,
+      },
+      claude: {
+        ...editor.session.settings.agents.claude,
+        model: resolveRealConfiguredModel(
+          editor.modelCatalogs.claude,
+          editor.session.settings.agents.claude.model,
+          'haiku',
+        ).id,
+      },
+    },
+    maxDiscussionRounds: editor.session.settings.maxDiscussionRounds + 1,
+    maxReviewCycles: editor.session.settings.maxReviewCycles,
+    maxRepairAttempts: editor.session.settings.maxRepairAttempts,
+  }
+  const actionResult = await page.evaluate(
+    async (payload) => {
+      const bridge: DesktopBridge = Reflect.get(globalThis, 'pact')
+      const saved = await bridge.saveSessionSettings({
+        sessionId: payload.sessionId,
+        settings: payload.settings,
+      })
+      if (!saved.ok) return { ok: false, error: saved.error.code }
+      const current = await bridge.getConversation({
+        scope: 'collaboration',
+        sessionId: payload.sessionId,
+      })
+      if (!current.ok || current.value.scope !== 'collaboration' || !current.value.view.task)
+        throw Error('Current workflow is unavailable')
+      const task = current.value.view.task,
+        actionReply = await bridge.actOnCollaboration({
+          sessionId: payload.sessionId,
+          taskId: task.id,
+          revision: task.revision,
+          clientMessageId: crypto.randomUUID(),
+          action: 'review_plan',
+        })
+      return actionReply.ok ? { ok: true } : { ok: false, error: actionReply.error.code }
+    },
+    { sessionId, settings },
+  )
+  expect(actionResult).toEqual({ ok: true })
+}
+async function readCompleteSource(
+  page: Page,
+  sessionId: string,
+  runId: string,
+  source: CollaborationDocument,
+) {
+  const completeText = await page.evaluate(
+    async (payload) => {
+      const bridge: DesktopBridge = Reflect.get(globalThis, 'pact')
+      let text = '',
+        offset = 0
+      for (;;) {
+        // oxlint-disable-next-line eslint/no-await-in-loop -- Consume the complete immutable source one physical page at a time.
+        const result = await bridge.getConversation({
+          scope: 'collaboration-text',
+          sessionId: payload.sessionId,
+          runId: payload.runId,
+          document: payload.source,
+          offset,
+        })
+        if (!result.ok || result.value.scope !== 'collaboration-text')
+          throw Error('Complete source is unavailable')
+        text += result.value.text
+        if (result.value.nextOffset === null) return text
+        offset = result.value.nextOffset
+      }
+    },
+    { sessionId, runId, source },
+  )
+  expect(Buffer.byteLength(completeText)).toBe(source.bytes)
+  expect(createHash('sha256').update(completeText).digest('hex')).toBe(source.sha256)
+  return completeText
+}
+async function safeLogPhases(fixture: RuntimeFixture) {
+  try {
+    const path = join(dirname(fixture.databaseFile), 'logs/development/pact-0.jsonl'),
+      before = await lstat(path)
+    if (!before.isFile() || before.isSymbolicLink() || before.size > 5 * 1024 * 1024)
+      return { status: 'unavailable' }
+    const handle = await open(path, 'r')
+    try {
+      const current = await handle.stat()
+      if (current.dev !== before.dev || current.ino !== before.ino) return { status: 'changed' }
+      const size = Math.min(current.size, 64 * 1024),
+        start = current.size - size,
+        bytes = Buffer.alloc(size)
+      const read = await handle.read(bytes, 0, size, start),
+        text = bytes.subarray(0, read.bytesRead).toString('utf8'),
+        lines = text.split('\n')
+      if (start) lines.shift()
+      const events = lines.flatMap((line) => {
+        if (!line) return []
+        let raw: unknown
+        try {
+          raw = JSON.parse(line)
+        } catch {
+          return []
+        }
+        const parsed = diagnosticRecordSchema.safeParse(raw)
+        if (!parsed.success) return []
+        const value = parsed.data
+        return [
+          {
+            operation: value.operation,
+            phase: value.phase,
+            level: value.level,
+            agent: value.agentId ?? null,
+            code: value.code ?? null,
+            catalogPhase: value.settingsCatalogPhase ?? null,
+            catalogFailure: value.settingsCatalogFailure ?? null,
+            boundary: value.runtimeBoundary ?? null,
+            errorType: value.runtimeErrorType ?? null,
+          },
+        ]
+      })
+      return { status: 'bounded-tail', tailBytes: read.bytesRead, events: events.slice(-32) }
+    } finally {
+      await handle.close()
+    }
+  } catch {
+    return { status: 'unavailable' }
+  }
+}
+function usageCounts(text: string | null) {
+  if (!text) return null
+  const value: unknown = JSON.parse(text)
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const counts: Record<string, number> = {}
+  for (const key of ['inputTokens', 'outputTokens', 'cachedInputTokens', 'totalTokens']) {
+    const count: unknown = Reflect.get(value, key)
+    if (typeof count === 'number' && Number.isSafeInteger(count) && count >= 0) counts[key] = count
+  }
+  return counts
+}
+
+async function runHandoff(ctx: RealWorkspace, prepared: Seed, enabled: boolean) {
+  await ctx.fixture.controlTransportFault('arm')
+  ctx.projectId = prepared.projectId
+  ctx.sessionId = prepared.sessionId
+  ctx.projectDirectory = prepared.projectDirectory
+  await selectRealSession(ctx, prepared.sessionId)
+  const beforeObservation = await routingSchedulingObservation(ctx.page, prepared.sessionId)
+  const probeStartedAt = Date.now()
+  if (enabled)
+    await expect
+      .poll(
+        async () => {
+          const value = await routingSchedulingObservation(ctx.page, prepared.sessionId)
+          return value.ok ? value.decision : 'unavailable'
+        },
+        { timeout: 20_000, intervals: [100, 250, 500] },
+      )
+      .toBe('idle')
+  const afterObservation = await routingSchedulingObservation(ctx.page, prepared.sessionId)
+  const observationElapsedMs = Date.now() - probeStartedAt
+  // Disposable observations never authorize this handoff: production Runtime
+  // independently performs every admission/native check again after Continue.
+  const observation = ReadonlyFixtureDatabase.open(ctx.fixture)
+  const startedAt = Date.now()
+  let answeredCards = 0
+  let fallbackResumed = false
+  const answered = new Set<string>()
+  try {
+    if (!enabled) await resume(ctx.page, prepared.sessionId)
+    let realRunId: string | undefined
+    await expect
+      .poll(
+        async () => {
+          const rows = observation.drizzle.query.agentRuns
+            .findMany({
+              where: (fields, { eq }) => eq(fields.sessionId, prepared.sessionId),
+              columns: { id: true, agentId: true, nativeTurnId: true, dispatchPhase: true },
+              limit: 8,
+            })
+            .sync()
+          const real = rows.filter((row) => !prepared.fixtureRunIds.includes(row.id))
+          const reviewers = real.filter((row) => row.agentId === 'claude')
+          if (
+            real.length > 2 ||
+            reviewers.length > 1 ||
+            real.some((row) => row.agentId === 'codex' && row.nativeTurnId)
+          )
+            throw Error('Unexpected additional native business generation')
+          if (reviewers[0]?.nativeTurnId) {
+            realRunId = reviewers[0].id
+            return true
+          }
+          const pending = await ctx.page.evaluate(async (sessionId) => {
+            const bridge: DesktopBridge = Reflect.get(globalThis, 'pact'),
+              header = await bridge.getConversation({ scope: 'messages', sessionId })
+            return header.ok && header.value.scope === 'messages'
+              ? header.value.header.relaySchedulingDecision
+              : null
+          }, prepared.sessionId)
+          if (pending && !answered.has(pending.decisionId)) {
+            expect(enabled).toBe(true)
+            expect(pending.request).toMatchObject({
+              category: 'new_authorization',
+              operation: { kind: 'extend_plan_review' },
+            })
+            answered.add(pending.decisionId)
+            const result = await ctx.page.evaluate(
+              async (reference) => {
+                const bridge: DesktopBridge = Reflect.get(globalThis, 'pact')
+                return bridge.answerRelayDecision({
+                  reference,
+                  clientOperationId: crypto.randomUUID(),
+                  answer: { kind: 'confirm' },
+                })
+              },
+              {
+                sessionId: prepared.sessionId,
+                decisionId: pending.decisionId,
+                revision: pending.revision,
+              },
+            )
+            expect(result).toMatchObject({ ok: true, value: { disposition: 'confirmed' } })
+            answeredCards++
+            return false
+          }
+          if (enabled && !fallbackResumed && answeredCards === 0) {
+            const evaluations = observation.drizzle.query.schedulingEvaluations
+              .findMany({
+                where: (fields, { eq }) => eq(fields.sessionId, prepared.sessionId),
+                limit: 4,
+              })
+              .sync()
+            const settled = evaluations.find(
+              (entry) => entry.called && !entry.active && entry.outcome === 'completed',
+            )
+            if (settled && settled.selectedCandidateId === null) {
+              fallbackResumed = true
+              await resume(ctx.page, prepared.sessionId)
+            }
+          }
+          return false
+        },
+        { timeout: 45_000, intervals: [50, 100, 250] },
+      )
+      .toBe(true)
+    if (!realRunId) throw Error('The genuine reviewer was not admitted')
+    // The measured advice has already settled. Bound this experiment to that
+    // handoff; later recovery/advice must not add another paid Decision call.
+    const disabled = await ctx.page.evaluate(async () => {
+      const bridge: DesktopBridge = Reflect.get(globalThis, 'pact'),
+        settings = await bridge.getSchedulingSettings()
+      if (!settings.ok) throw Error('Relay settings unavailable')
+      return bridge.saveSchedulingSettings({
+        expectedRevision: settings.value.revision,
+        enabled: false,
+      })
+    })
+    expect(disabled).toMatchObject({ ok: true, value: { enabled: false } })
+    await expect
+      .poll(
+        () => {
+          const row = observation.conversationRepository.findRun(realRunId!)
+          if (row && ['failed', 'interrupted'].includes(row.status))
+            throw Error(`The genuine reviewer failed: ${row.failureKind ?? 'unknown'}`)
+          return row?.status === 'completed' && row.nativeEffectsState === 'settled'
+        },
+        { timeout: 300_000, intervals: [250, 500, 1000] },
+      )
+      .toBe(true)
+    const reviewCompletedAt = Date.now()
+    const stopped = await ctx.page.evaluate(async (sessionId) => {
+      const bridge: DesktopBridge = Reflect.get(globalThis, 'pact')
+      return bridge.stopConversation({ sessionId })
+    }, prepared.sessionId)
+    expect(stopped).toMatchObject({ ok: true })
+    const following = observation.drizzle.query.agentRuns
+      .findMany({
+        where: (fields, { eq }) => eq(fields.sessionId, prepared.sessionId),
+        columns: { id: true, agentId: true, nativeTurnId: true, status: true },
+        limit: 8,
+      })
+      .sync()
+      .filter((row) => !prepared.fixtureRunIds.includes(row.id) && row.id !== realRunId)
+    expect(following.length).toBeLessThanOrEqual(1)
+    for (const row of following) {
+      expect(row).toMatchObject({ agentId: 'codex', nativeTurnId: null })
+      expect(['failed', 'interrupted']).toContain(row.status)
+    }
+    const transport = await ctx.fixture.readTransportFacts()
+    expect(transport.length).toBeGreaterThan(0)
+    expect(transport.every((entry) => entry.forwardedTurns === 0)).toBe(true)
+    const complete = await waitForRealCompletion(
+      ctx,
+      prepared.fixtureRunIds.length + 1 + following.length,
+      prepared.sessionId,
+      following.map((row) => row.id),
+    )
+    expect(
+      complete.runs.filter(
+        (value) => !prepared.fixtureRunIds.includes(value.id) && value.nativeTurnId,
+      ),
+    ).toHaveLength(1)
+    const run = complete.runs.find((value) => value.id === realRunId)!
+    expect(run).toMatchObject({
+      agentId: 'claude',
+      status: 'completed',
+      collaboration: { taskId: prepared.taskId, stage: 'plan_review' },
+    })
+    expect(observation.conversationRepository.findRun(run.id)?.nativeOutcome).toBe('completed')
+    await expect
+      .poll(() => observation.conversationRepository.findRun(run.id)?.nativeEffectsState, {
+        timeout: 15_000,
+      })
+      .toBe('settled')
+    const answer = complete.messages.find((value) => value.id === run.responseMessageId)!
+    expect(answer).toMatchObject({ state: 'complete', role: 'assistant' })
+    expect(answer.content.trim().length).toBeGreaterThan(0)
+    const turn = observation.drizzle
+      .select()
+      .from(workflowTurns)
+      .all()
+      .find((value) => value.runId === run.id)!
+    expect(turn.reportBodyId).toBeTruthy()
+    const auth = collaborationTurnAuthorizationSchema.parse(JSON.parse(turn.authorizationJson))
+    expect(auth.userAuthority?.purpose).toBe('action')
+    expect(auth.sourceManifestRef).toBeUndefined()
+    // Decisions generates no prose or new document grants. Check the complete frozen
+    // source bytes independently of its choice; this is source integrity, not native tool-use evidence.
+    for (const source of prepared.sourceDocuments) {
+      expect(prepared.sourceHashes.map((value) => value.sha256)).toContain(source.document.sha256)
+      expect(source.sourceRunId).toBeTruthy()
+      // oxlint-disable-next-line eslint/no-await-in-loop -- Read every original source completely in order.
+      await readCompleteSource(ctx.page, prepared.sessionId, source.sourceRunId!, source.document)
+    }
+    const evaluations = observation.drizzle.query.schedulingEvaluations
+      .findMany({ where: (fields, { eq }) => eq(fields.sessionId, prepared.sessionId), limit: 4 })
+      .sync()
+    const diagnostic = {
+      evaluation: evaluations.map((value) => ({
+        called: value.called,
+        active: value.active,
+        outcome: value.outcome,
+        provider: value.provider,
+        model: value.model,
+        createdAt: value.createdAt,
+        deadline: value.deadline,
+        settledAt: value.settledAt,
+        usage: usageCounts(value.usageJson),
+      })),
+      beforeObservation,
+      afterObservation,
+      afterHandoff: await routingSchedulingObservation(ctx.page, prepared.sessionId),
+      observationElapsedMs,
+      logs: await safeLogPhases(ctx.fixture),
+    }
+    const diagnosticText = JSON.stringify(diagnostic)
+    if (Buffer.byteLength(diagnosticText) > 16 * 1024)
+      throw Error('Bounded handoff diagnostics exceeded their observation limit')
+    console.info('[pact-relay-real-admission]', diagnosticText)
+    await test.info().attach(`relay-${enabled ? 'on' : 'off'}-admission-evidence`, {
+      body: Buffer.from(diagnosticText),
+      contentType: 'application/json',
+    })
+    expect(evaluations, diagnosticText).toHaveLength(enabled ? 1 : 0)
+    const evaluated = evaluations[0]
+    if (evaluated) {
+      expect(evaluated, diagnosticText).toMatchObject({
+        called: true,
+        active: false,
+        outcome: 'completed',
+        remoteOutcome: 'responded',
+      })
+      const owner = observation.drizzle.query.schedulingRuntimeOwners
+        .findFirst({ where: (fields, { eq }) => eq(fields.evaluationId, evaluated.id) })
+        .sync()!
+      expect(owner).toMatchObject({ kind: 'evaluation', active: false, phase: 'released' })
+    }
+    const task = observation.drizzle.query.collaborationTasks
+      .findFirst({ where: (fields, { eq }) => eq(fields.id, prepared.taskId) })
+      .sync()!
+    const final = collaborationTaskSchema.parse(JSON.parse(task.stateJson))
+    expect(final).toMatchObject({
+      id: prepared.taskId,
+      owner: 'codex',
+      reviewer: 'claude',
+      planVersion: prepared.planVersion,
+      repairAttempts: 0,
+      reviewCycles: 0,
+    })
+    expect(final.planReference?.document.sha256).toBe(
+      createHash('sha256').update(plan).digest('hex'),
+    )
+    const reservations = observation.drizzle.query.schedulingBudgetReservations
+      .findMany({ where: (fields, { eq }) => eq(fields.sessionId, prepared.sessionId), limit: 4 })
+      .sync()
+    expect(reservations).toHaveLength(answeredCards)
+    if (answeredCards === 1)
+      expect(reservations[0]).toMatchObject({ budget: 'extra_plan_turn', state: 'settled' })
+    const decisions = observation.drizzle.query.relayDecisions
+      .findMany({ where: (fields, { eq }) => eq(fields.sessionId, prepared.sessionId), limit: 4 })
+      .sync()
+    expect(decisions.length).toBe(answeredCards)
+    const native = await findNativeRecord(ctx, 'claude', run.nativeSessionId!)
+    expect(native.claudeUserInputs).toBe(1)
+    expect(native.assistantModels).toContain(run.model)
+    const publicActivity = await ctx.page.evaluate(async () => {
+      const bridge: DesktopBridge = Reflect.get(globalThis, 'pact')
+      return bridge.readSchedulingActivity({})
+    })
+    expect(publicActivity.ok).toBe(true)
+    return {
+      enabled,
+      fixtureBusinessTurns: prepared.fixtureRunIds.length,
+      admittedRuns: 1 + following.length,
+      realBusinessTurns: 1,
+      cancelledUnsentFollowups: following.length,
+      codexForwardedTurns: 0,
+      requiredReviewRetained: true,
+      fixedReviewer: 'claude',
+      realReviewerModel: run.model,
+      completeReportSha256: createHash('sha256').update(answer.content).digest('hex'),
+      nativeRecordSha256: native.sha256,
+      reviewFocusCovered: focus.terms.every((term) => answer.content.toLowerCase().includes(term)),
+      elapsedMs: reviewCompletedAt - startedAt,
+      elapsedBoundary: 'resume_to_review_effects_settled',
+      preflightObservationElapsedMs: observationElapsedMs,
+      decisionCalls: evaluations.filter((value) => value.called).length,
+      decisionModel: evaluated?.model ?? null,
+      decisionProvider: evaluated?.provider ?? null,
+      decisionOutcome: evaluated?.outcome ?? null,
+      selectedCandidateId: evaluated?.selectedCandidateId ?? null,
+      decisionElapsedMs: evaluated?.settledAt
+        ? Date.parse(evaluated.settledAt) - Date.parse(evaluated.createdAt)
+        : null,
+      observableDecisionUsage: usageCounts(evaluated?.usageJson ?? null),
+      decisionPhysicalReleased: !evaluated || !evaluated.active,
+      decisionCards: decisions.length,
+      manualCheckRequests: 0,
+      cancelledCards: 0,
+      answeredCards,
+      stoppedAfterReviewerCompleted: true,
+      relayDisabledAfterAdmission: true,
+      generatedGuidance: false,
+    }
+  } finally {
+    try {
+      // Never release a held following model request, including on failed checks.
+      await ctx.fixture.controlTransportFault('cancel')
+    } finally {
+      observation.close()
+    }
+  }
+}
+
+// Preserve reviewed case identities; both cases now use OpenAI Decisions exclusively.
+for (const target of ['codex_luna', 'claude_haiku_5_5'] as const)
+  test(
+    `real Relay ${target} compares Off and On through the fixed native reviewer`,
+    { tag: ['@real', '@real-extended'] },
+    async () => {
+      test.skip(
+        process.platform !== 'darwin',
+        'This real native collaboration journey is verified on macOS.',
+      )
+      test.setTimeout(360_000)
+      const fixture = await createRealRelayFixture('pause-turn')
+      let ctx: RealWorkspace | undefined
+      try {
+        const claudeModel = fixture.readConfigurationModels().claude
+        if (!claudeModel || !/^claude-haiku-5-5(?:-\d{8})?$/u.test(claudeModel))
+          throw Error('Exact configured Claude Haiku 5.5 wire model is required')
+        const db = await PactDatabase.open({ filePath: fixture.databaseFile, migrationsFolder })
+        let off: Seed, on: Seed
+        try {
+          off = await seed(fixture, db, 'Off', claudeModel)
+          on = await seed(fixture, db, 'On', claudeModel)
+          expect(on.sourceHashes).toEqual(off.sourceHashes)
+          db.conversationRepository.saveSchedulingSettings({
+            expectedRevision: db.conversationRepository.schedulingSettings().revision,
+            enabled: false,
+          })
+          db.drizzle.delete(nativeAgentContexts).run()
+        } finally {
+          db.close()
+        }
+        const app = await fixture.launch(),
+          page = await app.firstWindow()
+        ctx = {
+          fixture,
+          app,
+          page,
+          projectId: off.projectId,
+          projectDirectory: off.projectDirectory,
+          sessionId: off.sessionId,
+        }
+        await expect
+          .poll(
+            () =>
+              page.evaluate(async () => {
+                const bridge: DesktopBridge = Reflect.get(globalThis, 'pact'),
+                  state = await bridge.getRuntimePreparation()
+                return state.ok ? state.value.agents.map((value) => value.state) : []
+              }),
+            { timeout: 30_000 },
+          )
+          .toEqual(['ready', 'ready'])
+        // Normal zero-inference catalog initialization owns installation identity;
+        // DecisionRuntime must never fabricate or repair native configuration.
+        const catalog = await page.evaluate(async (sessionId) => {
+          const bridge: DesktopBridge = Reflect.get(globalThis, 'pact'),
+            settings = await bridge.getSessionSettings(sessionId)
+          if (!settings.ok) throw Error('Actual native catalogs are unavailable')
+          return {
+            codex: settings.value.modelCatalogs.codex.models.some(
+              (model) => model.id === 'gpt-6-luna' || model.resolvedModel === 'gpt-6-luna',
+            ),
+            claude: settings.value.modelCatalogs.claude.models.some(
+              (model) =>
+                model.id === settings.value.session.settings.agents.claude.model ||
+                model.resolvedModel === settings.value.session.settings.agents.claude.model,
+            ),
+          }
+        }, off.sessionId)
+        expect(catalog).toEqual({ codex: true, claude: true })
+        const without = await runHandoff(ctx, off, false)
+        // Retire the first transport and its held-request state before rearming.
+        await restartRealWorkspace(ctx)
+        await ctx.fixture.controlTransportFault('arm')
+        await expect
+          .poll(
+            () =>
+              ctx!.page.evaluate(async () => {
+                const bridge: DesktopBridge = Reflect.get(globalThis, 'pact'),
+                  state = await bridge.getRuntimePreparation()
+                return state.ok ? state.value.agents.map((value) => value.state) : []
+              }),
+            { timeout: 30_000 },
+          )
+          .toEqual(['ready', 'ready'])
+        expect(
+          await ctx.page.evaluate(async (sessionId) => {
+            const bridge: DesktopBridge = Reflect.get(globalThis, 'pact')
+            return (await bridge.getSessionSettings(sessionId)).ok
+          }, on.sessionId),
+        ).toBe(true)
+        const enabled = await ctx.page.evaluate(async () => {
+          const bridge: DesktopBridge = Reflect.get(globalThis, 'pact'),
+            settings = await bridge.getSchedulingSettings()
+          if (!settings.ok) throw Error('Relay settings unavailable')
+          return bridge.saveSchedulingSettings({
+            expectedRevision: settings.value.revision,
+            enabled: true,
+          })
+        })
+        expect(enabled).toMatchObject({
+          ok: true,
+          value: {
+            enabled: true,
+            provider: 'openai',
+            model: OPENAI_DECISION_MODEL,
+            credential: { configured: true },
+          },
+        })
+        const withRelay = await runHandoff(ctx, on, true)
+        expect(withRelay.decisionModel).toBe(OPENAI_DECISION_MODEL)
+        expect(withRelay.decisionProvider).toBe('openai')
+        expect(withRelay.decisionCalls).toBe(1)
+        const comparison = {
+          baselineCase: target,
+          fixturePrerequisitesOnly: true,
+          sourceContentEqual: true,
+          sourceHashes: off.sourceHashes,
+          businessSettings: {
+            codex: { model: 'gpt-6-luna', effort: 'low' },
+            claude: { model: claudeModel, effort: null },
+          },
+          predefinedFocus: { id: focus.id, terms: focus.terms },
+          metrics: [
+            'source integrity',
+            'fixed reviewer',
+            'required review',
+            'business Turns',
+            'decision cards',
+            'manual checks',
+            'latency',
+            'observable usage',
+          ],
+          off: without,
+          on: withRelay,
+          optimizationBenefitClaimed: false,
+        }
+        const comparisonText = JSON.stringify(comparison)
+        if (Buffer.byteLength(comparisonText) > 16 * 1024)
+          throw Error('Safe Relay comparison exceeded its observation limit')
+        console.info('[pact-relay-real-comparison]', comparisonText)
+        await test.info().attach(`relay-real-${target}-comparison`, {
+          contentType: 'application/json',
+          body: Buffer.from(comparisonText),
+        })
+      } finally {
+        if (ctx) await closeRealWorkspace(ctx)
+        else await fixture.dispose()
+      }
+    },
+  )

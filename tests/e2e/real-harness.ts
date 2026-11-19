@@ -100,19 +100,22 @@ export async function launchRealWorkspace(
     const projectDirectory = await fixture.createProjectDirectory(name)
     const app = await fixture.launch()
     const page = await app.firstWindow()
-    if (process.platform === 'win32') await waitForWindowsRuntimeReady(page, fixture)
-    else
-      await expect
-        .poll(
-          async () =>
-            page.evaluate(async () => {
-              const bridge: DesktopBridge = Reflect.get(globalThis, 'pact')
-              const state = await bridge.getRuntimePreparation()
-              return state.ok ? state.value.agents.map((agent) => agent.state) : []
-            }),
-          { timeout: 30_000 },
-        )
-        .toEqual(['ready', 'ready'])
+    await waitForWindowsRuntimeReady(page, fixture)
+    await expect
+      .poll(
+        async () =>
+          page.evaluate(async () => {
+            const bridge: DesktopBridge = Reflect.get(globalThis, 'pact')
+            const state = await bridge.getRuntimePreparation()
+            return state.ok
+              ? state.value.agents
+                  .filter((agent) => agent.agentId === 'claude' || agent.agentId === 'codex')
+                  .map((agent) => agent.state)
+              : []
+          }),
+        { timeout: 30_000 },
+      )
+      .toEqual(['ready', 'ready'])
     await app.evaluate(({ dialog }, path) => {
       Reflect.set(dialog, 'showOpenDialog', async () => ({ canceled: false, filePaths: [path] }))
     }, projectDirectory)
@@ -228,8 +231,11 @@ export async function selectRealSession(context: RealWorkspace, id: string): Pro
     if (++moves > 128 || Date.now() > deadline)
       throw new Error('Owned Session is unavailable in the paginated Catalog')
     const more = context.page
-      .locator(`[data-project-menu="${context.projectId}"]`)
-      .getByRole('button', { name: /^Load more Sessions in /u })
+      .locator(`[data-drop-project="${context.projectId}"][data-drop-group=""]`)
+      .getByRole('button', {
+        name: /^(?:Load more Sessions in |Refresh Sessions$|Load newer Sessions$)/u,
+      })
+      .first()
     // oxlint-disable-next-line no-await-in-loop -- Each real UI page must settle before the next Catalog action.
     if (await more.isVisible()) await more.click()
     else {
@@ -268,8 +274,7 @@ export async function sendRealMessage(
       () => new Promise<void>((done) => requestAnimationFrame(() => done())),
     )
     await composer.press('End')
-    if (process.platform === 'win32' && /[\r\n]/u.test(content))
-      await context.page.keyboard.insertText(content)
+    if (/[\r\n]/u.test(content)) await context.page.keyboard.insertText(content)
     else await composer.pressSequentially(content)
   }
   await composer.press('Enter')
@@ -297,6 +302,7 @@ export async function selectRealAskPermission(
 export async function selectRealConfiguredEffort(
   ctx: RealWorkspace,
   agentIds: readonly ('claude' | 'codex')[] = ['claude', 'codex'],
+  primaryAgentId?: 'claude' | 'codex',
 ): Promise<void> {
   if (agentIds.length < 1 || agentIds.length > 2 || new Set(agentIds).size !== agentIds.length)
     throw new Error('Real effort selection requires one or two unique Agents')
@@ -331,10 +337,13 @@ export async function selectRealConfiguredEffort(
     {
       sessionId: ctx.sessionId,
       settings: {
-        primaryAgentId: previous.primaryAgentId,
+        primaryAgentId: primaryAgentId ?? previous.primaryAgentId,
+        secondaryAgentId:
+          (primaryAgentId ?? previous.primaryAgentId) === previous.secondaryAgentId
+            ? previous.primaryAgentId
+            : previous.secondaryAgentId,
         agents,
         maxDiscussionRounds: previous.maxDiscussionRounds,
-        runningMessagePolicy: previous.runningMessagePolicy,
         maxReviewCycles: previous.maxReviewCycles,
         maxRepairAttempts: previous.maxRepairAttempts,
       },
@@ -462,6 +471,7 @@ export async function restartRealWorkspace(context: RealWorkspace): Promise<void
   await quitPact(context.app)
   context.app = await context.fixture.launch()
   context.page = await context.app.firstWindow()
+  await waitForWindowsRuntimeReady(context.page, context.fixture)
   await selectRealSession(context, context.sessionId)
 }
 

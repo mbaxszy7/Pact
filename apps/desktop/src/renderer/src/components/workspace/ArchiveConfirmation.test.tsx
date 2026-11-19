@@ -69,7 +69,7 @@ describe('Archive confirmation', () => {
     const view = render(<ArchiveConfirmation {...callbacks} />)
     expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Cancel' }))
     expect(
-      screen.getByText('Archiving this Project will stop its 2 active Sessions first.'),
+      screen.getByText('Archiving this project will stop its 2 active sessions first.'),
     ).not.toBeNull()
     expect(callbacks.onConfirm).not.toHaveBeenCalled()
     fireEvent.click(screen.getByRole('button', { name: 'Stop and archive' }))
@@ -132,7 +132,7 @@ describe('Archive confirmation', () => {
     expect(screen.getByText('Stopped')).not.toBeNull()
     expect(screen.getByText('Needs checking')).not.toBeNull()
     expect(screen.getByRole('alert').textContent).toBe(receipt.message)
-    expect(screen.getByText(/Tasks already stopped will not restart automatically/)).not.toBeNull()
+    expect(screen.getByText(/Already stopped tasks stay stopped/)).not.toBeNull()
     fireEvent.click(screen.getByRole('button', { name: 'Review again' }))
     expect(callbacks.onReview).toHaveBeenCalledOnce()
     expect(callbacks.onConfirm).not.toHaveBeenCalled()

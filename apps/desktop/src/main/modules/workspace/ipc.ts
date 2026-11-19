@@ -12,7 +12,19 @@ import {
   projectNameChangeSchema,
   projectFileReadInputSchema,
   sessionArchiveInputSchema,
+  sessionSidebarHiddenInputSchema,
   sessionCatalogPageInputSchema,
+  sessionPageInputSchema,
+  sessionGroupPageInputSchema,
+  sessionGroupDetailInputSchema,
+  sessionMembershipInputSchema,
+  locateSessionNavigationInputSchema,
+  sessionCreationStateInputSchema,
+  createSessionGroupInputSchema,
+  updateSessionGroupInputSchema,
+  moveSessionGroupInputSchema,
+  dissolveSessionGroupInputSchema,
+  setSessionGroupInputSchema,
   sessionCreateInputSchema,
   sessionCreationPrepareInputSchema,
   sessionMarkReadInputSchema,
@@ -198,16 +210,148 @@ export function registerWorkspaceIpcHandlers(
     },
   )
 
-  ipcMain.handle(IPC_CHANNELS.sessionCreationPrepare, (event, projectIdInput: unknown) => {
+  ipcMain.handle(IPC_CHANNELS.sessionPageGet, (event, rawInput: unknown) => {
     trust.assertTrustedMainFrame(event)
-    const input = sessionCreationPrepareInputSchema.safeParse({ projectId: projectIdInput })
+    const input = sessionPageInputSchema.safeParse(rawInput)
     return input.success
-      ? utilityClient.prepareSessionCreation(input.data)
+      ? utilityClient.getSessionPage(input.data)
       : Promise.resolve({
           ok: false as const,
-          error: { code: 'VALIDATION' as const, message: 'Choose a valid Project.' },
+          error: { code: 'VALIDATION' as const, message: 'Invalid Session page request.' },
         })
   })
+
+  ipcMain.handle(IPC_CHANNELS.sessionGroupsGet, (event, rawInput: unknown) => {
+    trust.assertTrustedMainFrame(event)
+    const input = sessionGroupPageInputSchema.safeParse(rawInput)
+    return input.success
+      ? utilityClient.getSessionGroups(input.data)
+      : Promise.resolve({
+          ok: false as const,
+          error: { code: 'VALIDATION' as const, message: 'Invalid Session group page request.' },
+        })
+  })
+
+  ipcMain.handle(IPC_CHANNELS.sessionGroupGet, (event, rawInput: unknown) => {
+    trust.assertTrustedMainFrame(event)
+    const input = sessionGroupDetailInputSchema.safeParse(rawInput)
+    return input.success
+      ? utilityClient.getSessionGroup(input.data)
+      : Promise.resolve({
+          ok: false as const,
+          error: { code: 'VALIDATION' as const, message: 'Invalid Session group request.' },
+        })
+  })
+
+  ipcMain.handle(IPC_CHANNELS.sessionMembershipGet, (event, rawInput: unknown) => {
+    trust.assertTrustedMainFrame(event)
+    const input = sessionMembershipInputSchema.safeParse(rawInput)
+    return input.success
+      ? utilityClient.getSessionMembership(input.data)
+      : Promise.resolve({
+          ok: false as const,
+          error: { code: 'VALIDATION' as const, message: 'Invalid Session membership request.' },
+        })
+  })
+
+  ipcMain.handle(IPC_CHANNELS.sessionNavigationLocate, (event, rawInput: unknown) => {
+    trust.assertTrustedMainFrame(event)
+    const input = locateSessionNavigationInputSchema.safeParse(rawInput)
+    return input.success
+      ? utilityClient.locateSessionNavigation(input.data)
+      : Promise.resolve({
+          ok: false as const,
+          error: { code: 'VALIDATION' as const, message: 'Invalid Session location request.' },
+        })
+  })
+
+  ipcMain.handle(IPC_CHANNELS.sessionOrganizationRecover, (event) => {
+    trust.assertTrustedMainFrame(event)
+    return utilityClient.recoverSessionOrganization()
+  })
+
+  ipcMain.handle(IPC_CHANNELS.sessionCreationState, (event, rawInput: unknown) => {
+    trust.assertTrustedMainFrame(event)
+    const input = sessionCreationStateInputSchema.safeParse(rawInput)
+    return input.success
+      ? utilityClient.getSessionCreationState(input.data)
+      : Promise.resolve({
+          ok: false as const,
+          error: { code: 'VALIDATION' as const, message: 'Invalid Session creation request.' },
+        })
+  })
+
+  ipcMain.handle(IPC_CHANNELS.sessionGroupCreate, (event, rawInput: unknown) => {
+    trust.assertTrustedMainFrame(event)
+    const input = createSessionGroupInputSchema.safeParse(rawInput)
+    return input.success
+      ? utilityClient.createSessionGroup(input.data)
+      : Promise.resolve({
+          ok: false as const,
+          error: { code: 'VALIDATION' as const, message: 'Choose a valid Session group.' },
+        })
+  })
+
+  ipcMain.handle(IPC_CHANNELS.sessionGroupUpdate, (event, rawInput: unknown) => {
+    trust.assertTrustedMainFrame(event)
+    const input = updateSessionGroupInputSchema.safeParse(rawInput)
+    return input.success
+      ? utilityClient.updateSessionGroup(input.data)
+      : Promise.resolve({
+          ok: false as const,
+          error: { code: 'VALIDATION' as const, message: 'Choose a valid Session group.' },
+        })
+  })
+
+  ipcMain.handle(IPC_CHANNELS.sessionGroupMove, (event, rawInput: unknown) => {
+    trust.assertTrustedMainFrame(event)
+    const input = moveSessionGroupInputSchema.safeParse(rawInput)
+    return input.success
+      ? utilityClient.moveSessionGroup(input.data)
+      : Promise.resolve({
+          ok: false as const,
+          error: { code: 'VALIDATION' as const, message: 'Choose a valid Session group move.' },
+        })
+  })
+
+  ipcMain.handle(IPC_CHANNELS.sessionGroupDissolve, (event, rawInput: unknown) => {
+    trust.assertTrustedMainFrame(event)
+    const input = dissolveSessionGroupInputSchema.safeParse(rawInput)
+    return input.success
+      ? utilityClient.dissolveSessionGroup(input.data)
+      : Promise.resolve({
+          ok: false as const,
+          error: { code: 'VALIDATION' as const, message: 'Choose a valid Session group.' },
+        })
+  })
+
+  ipcMain.handle(IPC_CHANNELS.sessionGroupSet, (event, rawInput: unknown) => {
+    trust.assertTrustedMainFrame(event)
+    const input = setSessionGroupInputSchema.safeParse(rawInput)
+    return input.success
+      ? utilityClient.setSessionGroup(input.data)
+      : Promise.resolve({
+          ok: false as const,
+          error: { code: 'VALIDATION' as const, message: 'Choose a valid Session group.' },
+        })
+  })
+
+  ipcMain.handle(
+    IPC_CHANNELS.sessionCreationPrepare,
+    (event, projectIdInput: unknown, activePairInput?: unknown) => {
+      trust.assertTrustedMainFrame(event)
+      const input = sessionCreationPrepareInputSchema.safeParse({
+        projectId: projectIdInput,
+        ...(activePairInput !== undefined ? { activePair: activePairInput } : {}),
+      })
+      return input.success
+        ? utilityClient.prepareSessionCreation(input.data)
+        : Promise.resolve({
+            ok: false as const,
+            error: { code: 'VALIDATION' as const, message: 'Choose a valid Project.' },
+          })
+    },
+  )
 
   ipcMain.handle(IPC_CHANNELS.sessionCreate, (event, rawInput: unknown) => {
     trust.assertTrustedMainFrame(event)
@@ -267,16 +411,30 @@ export function registerWorkspaceIpcHandlers(
         })
   })
 
-  ipcMain.handle(IPC_CHANNELS.sessionSettingsGet, (event, sessionIdInput: unknown) => {
+  ipcMain.handle(IPC_CHANNELS.sessionSidebarHiddenSet, (event, rawInput: unknown) => {
     trust.assertTrustedMainFrame(event)
-    const input = sessionSettingsInputSchema.safeParse({ sessionId: sessionIdInput })
+    const input = sessionSidebarHiddenInputSchema.safeParse(rawInput)
     return input.success
-      ? utilityClient.getSessionSettings(input.data)
-      : Promise.resolve({
-          ok: false as const,
-          error: { code: 'VALIDATION' as const, message: 'Choose a valid Session.' },
-        })
+      ? utilityClient.setSessionSidebarHidden(input.data)
+      : { ok: false, error: { code: 'VALIDATION', message: 'Choose a valid Session.' } }
   })
+
+  ipcMain.handle(
+    IPC_CHANNELS.sessionSettingsGet,
+    (event, sessionIdInput: unknown, activePairInput?: unknown) => {
+      trust.assertTrustedMainFrame(event)
+      const input = sessionSettingsInputSchema.safeParse({
+        sessionId: sessionIdInput,
+        ...(activePairInput !== undefined ? { activePair: activePairInput } : {}),
+      })
+      return input.success
+        ? utilityClient.getSessionSettings(input.data)
+        : Promise.resolve({
+            ok: false as const,
+            error: { code: 'VALIDATION' as const, message: 'Choose a valid Session.' },
+          })
+    },
+  )
 
   ipcMain.handle(IPC_CHANNELS.sessionSettingsSave, (event, rawInput: unknown) => {
     trust.assertTrustedMainFrame(event)
@@ -381,6 +539,7 @@ export function registerWorkspaceIpcHandlers(
     ipcMain.removeHandler(IPC_CHANNELS.sessionMarkRead)
     ipcMain.removeHandler(IPC_CHANNELS.sessionArchive)
     ipcMain.removeHandler(IPC_CHANNELS.sessionRestore)
+    ipcMain.removeHandler(IPC_CHANNELS.sessionSidebarHiddenSet)
     ipcMain.removeHandler(IPC_CHANNELS.sessionSettingsGet)
     ipcMain.removeHandler(IPC_CHANNELS.sessionSettingsSave)
     ipcMain.removeHandler(IPC_CHANNELS.sessionPermissionSave)

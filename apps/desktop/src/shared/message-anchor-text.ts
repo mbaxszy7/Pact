@@ -134,6 +134,9 @@ export function* markdownProjectionPages(markdown: string): Generator<{
     text = '',
     nodes = 0
   let tree: Node = { type: 'root', children: [] }
+  const encoder = new TextEncoder()
+  const jsonBytes = (node: Node): number => encoder.encode(JSON.stringify(node)).byteLength
+  let treeBytes = jsonBytes(tree)
   let copies = new Map<Node, Node>()
   const clean = (node: Node): Node => ({
     type: node.type,
@@ -151,8 +154,10 @@ export function* markdownProjectionPages(markdown: string): Generator<{
     ...(node.value !== undefined ? { value: node.value } : {}),
     ...(node.children ? { children: [] } : {}),
   })
-  const append = (leaf: Node): void => {
+  const append = (leaf: Node): boolean => {
     let parent = tree
+    let addedBytes = 0
+    const additions: Array<{ parent: Node; copy: Node; original?: Node }> = []
     for (const [i, ancestor] of ancestors.entries()) {
       const original = ancestor.node
       if (original.type === 'root') continue
@@ -170,15 +175,23 @@ export function* markdownProjectionPages(markdown: string): Generator<{
             start: Number(original.properties?.start ?? 1) + before,
           }
         }
-        copies.set(original, copy)
-        parent.children!.push(copy)
-        nodes++
+        addedBytes += jsonBytes(copy) + (parent.children?.length ? 1 : 0)
+        additions.push({ parent, copy, original })
       }
       parent = copy
     }
-    parent.children ??= []
-    parent.children.push(leaf)
-    nodes++
+    addedBytes += jsonBytes(leaf) + (parent.children?.length ? 1 : 0)
+    additions.push({ parent, copy: leaf })
+    // Include cloned ancestor properties and JSON escaping before changing the page.
+    if (treeBytes + addedBytes > 40 * 1024) return false
+    for (const { parent: target, copy, original } of additions) {
+      if (original) copies.set(original, copy)
+      target.children ??= []
+      target.children.push(copy)
+      nodes++
+    }
+    treeBytes += addedBytes
+    return true
   }
   const page = () => ({ ordinal, visibleStart: start, visibleEnd: end, tree, visibleText: text })
   const reset = (): void => {
@@ -187,6 +200,7 @@ export function* markdownProjectionPages(markdown: string): Generator<{
     text = ''
     nodes = 0
     tree = { type: 'root', children: [] }
+    treeBytes = jsonBytes(tree)
     copies = new Map()
   }
   function* visit(node: Node, index: number): Generator<ReturnType<typeof page>> {
@@ -208,18 +222,34 @@ export function* markdownProjectionPages(markdown: string): Generator<{
           reset()
           continue
         }
-        const piece = value.slice(offset, stop)
         const at = node.properties['data-pact-projection-start'] + offset
-        append({
-          type: 'element',
-          tagName: 'span',
-          properties: {
-            'data-pact-node-id': nodeId(node),
-            'data-pact-projection-start': at,
-            'data-pact-projection-end': at + piece.length,
-          },
-          children: [{ type: 'text', value: piece }],
-        })
+        let piece = value.slice(offset, stop)
+        let accepted = false
+        while (piece.length) {
+          accepted = append({
+            type: 'element',
+            tagName: 'span',
+            properties: {
+              'data-pact-node-id': nodeId(node),
+              'data-pact-projection-start': at,
+              'data-pact-projection-end': at + piece.length,
+            },
+            children: [{ type: 'text', value: piece }],
+          })
+          if (accepted || nodes) break
+          stop = offset + Math.floor((stop - offset) / 2)
+          if (/[\uD800-\uDBFF]/u.test(value.charAt(stop - 1))) stop--
+          piece = value.slice(offset, stop)
+        }
+        if (!accepted) {
+          if (!nodes)
+            throw new Error(
+              'A Markdown element exceeds its page byte budget. Original content is preserved.',
+            )
+          yield page()
+          reset()
+          continue
+        }
         text += piece
         end = at + piece.length
         offset = stop
@@ -236,7 +266,16 @@ export function* markdownProjectionPages(markdown: string): Generator<{
         yield page()
         reset()
       }
-      append(clean(node))
+      if (!append(clean(node))) {
+        if (nodes) {
+          yield page()
+          reset()
+        }
+        if (!append(clean(node)))
+          throw new Error(
+            'A Markdown element exceeds its page byte budget. Original content is preserved.',
+          )
+      }
       return
     }
     ancestors.push({ node, index })
