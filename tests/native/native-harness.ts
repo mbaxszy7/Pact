@@ -18,7 +18,6 @@ import {
   realpath,
   rm,
   stat,
-  symlink,
   writeFile,
 } from 'node:fs/promises'
 import { createServer, type Server } from 'node:http'
@@ -925,20 +924,86 @@ export interface AdapterBundle {
     [key: string]: unknown
   }
   agyNativeStorage: Record<string, unknown>
+  configureAgyStorageChildScriptForTesting: (scriptPath: string | undefined) => void
+  getNodeAgyStorageChildStatsForTesting: () => Readonly<{
+    live: number
+    started: number
+    lastPid: number | undefined
+  }>
+  getAgySqliteFileModuleIdentity: () => Readonly<{
+    version: 1
+    platform: string
+    architecture: string
+    sourceSha256: string
+  }>
+  getOpenAgySqliteViewCountForTesting: () => number
+  openAnchoredLockedSqliteView: (
+    rootDir: string,
+    parentSegments: readonly string[],
+    leafName: string,
+    options?: {
+      readonly acquireSharedLock?: boolean
+      readonly openWal?: boolean
+      readonly openShm?: boolean
+      readonly checkJournal?: boolean
+    },
+  ) => {
+    readonly byteLength: number
+    readonly walByteLength: number
+    readonly shmByteLength: number
+    readonly hasWal: boolean
+    readonly hasShm: boolean
+    readonly hasJournal: boolean
+    readonly sharedLockHeld: boolean
+    readAt(offset: number, length: number): Buffer
+    verifyUnchanged(): { readonly unchanged: boolean; readonly reason?: string }
+    close(): void
+  }
 }
 
-// Actual production modules and their real Worker are built together, so a renamed
-// Worker or unbundled dependency fails this gate as it would in the Electron build.
+async function ensureAgySqliteFileNativeBinary(extraTargetDirs: readonly string[]): Promise<void> {
+  const filename = `agy-sqlite-file-${process.platform}-${process.arch}.node`
+  const repoNativeDir = join(desktopRoot, 'out', 'native')
+  const repoBinary = join(repoNativeDir, filename)
+  const repoMeta = `${repoBinary}.json`
+  const hasVerifiedRepoBinary = async (): Promise<boolean> => {
+    try {
+      const [binStat, metaStat] = await Promise.all([lstat(repoBinary), lstat(repoMeta)])
+      return (
+        binStat.isFile() &&
+        !binStat.isSymbolicLink() &&
+        metaStat.isFile() &&
+        !metaStat.isSymbolicLink()
+      )
+    } catch {
+      return false
+    }
+  }
+  if (!(await hasVerifiedRepoBinary())) {
+    const buildScript = resolve(desktopRoot, '../../scripts/build-agy-sqlite-file.mjs')
+    await execFileAsync(process.execPath, [buildScript], {
+      cwd: resolve(desktopRoot, '../..'),
+      shell: false,
+      windowsHide: true,
+      timeout: 30_000,
+      maxBuffer: 256 * 1024,
+    })
+  }
+  for (const dir of extraTargetDirs) {
+    // oxlint-disable-next-line no-await-in-loop -- Stage regular non-symlink copies into bounded fixture native directories.
+    await mkdir(dir, { recursive: true, mode: 0o700 })
+    // oxlint-disable-next-line no-await-in-loop -- Copy verified native binary and metadata into fixture layout.
+    await Promise.all([
+      copyFile(repoBinary, join(dir, filename)),
+      copyFile(repoMeta, join(dir, `${filename}.json`)),
+    ])
+  }
+}
+
+// Actual production modules and their real Worker/storage-child entrypoints are built together,
+// so a renamed entrypoint or unbundled dependency fails this gate as it would in Electron.
 export async function buildAdapters(root: string): Promise<AdapterBundle> {
-  const buildDir = join(root, 'adapter-build')
-  await mkdir(buildDir, { recursive: true })
-  await copyFile(join(desktopRoot, 'package.json'), join(buildDir, 'package.json'))
-  await symlink(
-    join(desktopRoot, 'node_modules'),
-    join(buildDir, 'node_modules'),
-    process.platform === 'win32' ? 'junction' : 'dir',
-  )
-  const entry = join(buildDir, 'native-adapters.ts')
+  const entry = join(root, 'native-adapters.ts')
   await writeFile(
     entry,
     [
@@ -949,22 +1014,40 @@ export async function buildAdapters(root: string): Promise<AdapterBundle> {
       `export {NativeForkFiles} from ${JSON.stringify(join(desktopRoot, 'src/utility/conversation/native-fork-files.ts'))};`,
       `export {createAgyNativeStorageClient} from ${JSON.stringify(join(desktopRoot, 'src/utility/conversation/conversation.ts'))};`,
       `export * as agyNativeStorage from ${JSON.stringify(join(desktopRoot, 'src/utility/conversation/agy-native-storage.ts'))};`,
+      `export {configureAgyStorageChildScriptForTesting, getNodeAgyStorageChildStatsForTesting} from ${JSON.stringify(join(desktopRoot, 'src/utility/conversation/agy-storage-runner.ts'))};`,
+      `export {getAgySqliteFileModuleIdentity, getOpenAgySqliteViewCountForTesting, openAnchoredLockedSqliteView} from ${JSON.stringify(join(desktopRoot, 'src/utility/conversation/agy-sqlite-file.ts'))};`,
     ].join(' '),
   )
-  const configFile = join(buildDir, 'native.config.mjs')
-  const outDir = join(buildDir, 'bundle')
+  const externalModules = ['better-sqlite3', 'sharp', '@anthropic-ai/claude-agent-sdk'] as const
+  const externalPaths = Object.fromEntries(
+    await Promise.all(
+      externalModules.map(async (specifier) => [
+        specifier,
+        pathToFileURL(await realpath(desktopRequire.resolve(specifier))).href,
+      ]),
+    ),
+  )
+  const configFile = join(root, 'native.config.mjs')
+  const outDir = join(root, 'bundle')
   await writeFile(
     configFile,
-    `import {externalizeDepsPlugin} from ${JSON.stringify(pathToFileURL(desktopRequire.resolve('electron-vite')).href)}; export default {main:{plugins:[externalizeDepsPlugin({exclude:['@pact/contracts','@pact/contracts/images','@pact/contracts/diagnostics','@pact/agent-runtime']})],build:{outDir:${JSON.stringify(outDir)},rollupOptions:{external:['better-sqlite3','@anthropic-ai/claude-agent-sdk'],input:{'native-adapters':${JSON.stringify(entry)},'native-fork-worker':${JSON.stringify(join(desktopRoot, 'src/utility/conversation/native-fork-worker.ts'))},'native-json-parser-worker':${JSON.stringify(join(desktopRoot, 'src/utility/conversation/native-json-parser-worker.ts'))}}}}}};`,
+    `import {externalizeDepsPlugin} from ${JSON.stringify(pathToFileURL(desktopRequire.resolve('electron-vite')).href)}; export default {main:{plugins:[externalizeDepsPlugin({exclude:['@pact/contracts','@pact/contracts/images','@pact/contracts/diagnostics','@pact/agent-runtime']})],build:{outDir:${JSON.stringify(outDir)},rollupOptions:{external:${JSON.stringify(externalModules)},output:{paths:${JSON.stringify(externalPaths)}},input:{'native-adapters':${JSON.stringify(entry)},'native-fork-worker':${JSON.stringify(join(desktopRoot, 'src/utility/conversation/native-fork-worker.ts'))},'native-json-parser-worker':${JSON.stringify(join(desktopRoot, 'src/utility/conversation/native-json-parser-worker.ts'))},'agy-storage-child':${JSON.stringify(join(desktopRoot, 'src/utility/agy-storage-child.ts'))}}}}}};`,
   )
   // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- This is the installed, trusted build API rather than provider data.
   const { build } = desktopRequire('electron-vite') as {
     build: (options: object) => Promise<void>
   }
-  await build({ root: buildDir, configFile, ignoreConfigWarning: true, logLevel: 'silent' })
+  await build({ root: desktopRoot, configFile, ignoreConfigWarning: true, logLevel: 'silent' })
+  await ensureAgySqliteFileNativeBinary([
+    join(root, 'native'),
+    join(root, 'out', 'native'),
+    join(outDir, 'native'),
+  ])
   await writeFile(join(outDir, 'package.json'), '{"type":"module"}\n')
   // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- The entry above exports exactly these actual production classes.
-  return desktopRequire(join(outDir, 'native-adapters.js')) as AdapterBundle
+  const bundle = desktopRequire(join(outDir, 'native-adapters.js')) as AdapterBundle
+  bundle.configureAgyStorageChildScriptForTesting(join(outDir, 'agy-storage-child.js'))
+  return bundle
 }
 
 export function actualSdk(): {
@@ -2335,6 +2418,7 @@ export interface VerifyAgyMinimumVersionOptions {
   platform?: NodeJS.Platform
   cwd?: string
   isolatedRoot?: string
+  minimumVersion?: string
 }
 
 /**
@@ -2489,12 +2573,15 @@ export async function verifyAgyMinimumVersion(
         },
       )
     })
-    const parsed = parseSupportedAgySemver(stdout)
+    const requiredMinimum = options.minimumVersion ?? '1.5.9'
+    const parsed = parseSupportedAgySemver(stdout, requiredMinimum)
     if (parsed.status === 'unknown') {
       throw new Error('Real agy --version did not report a semantic version.')
     }
     if (parsed.status === 'outdated') {
-      throw new Error(`Real agy version ${parsed.version} is older than required 1.5.9.`)
+      throw new Error(
+        `Real agy version ${parsed.version} is older than required ${requiredMinimum}.`,
+      )
     }
     return parsed.version
   } finally {

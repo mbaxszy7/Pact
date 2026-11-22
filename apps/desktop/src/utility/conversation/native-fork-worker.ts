@@ -2,9 +2,9 @@ import type { SessionStore, SessionStoreEntry } from '@anthropic-ai/claude-agent
 
 import { createHash } from 'node:crypto'
 import { constants, type BigIntStats } from 'node:fs'
-import { lstat, open, realpath } from 'node:fs/promises'
+import { link, lstat, open, realpath, unlink, type FileHandle } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { isAbsolute, join, relative } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative } from 'node:path'
 import { parentPort, workerData } from 'node:worker_threads'
 
 import {
@@ -13,12 +13,9 @@ import {
   claudePlanCheckpointSchema,
   claudePlanCheckpointReplySchema,
   claudePlanCheckpointWorkingBytes,
-  type AgyRebuildInitializationWitness,
 } from '@pact/contracts'
 
 import type {
-  AgyColdInspectionResult,
-  AgyRebuildSeedResult,
   NativeForkFileInput,
   NativeForkFileResult,
   NativeForkAnswerResult,
@@ -27,16 +24,6 @@ import type {
   NativeSessionExistenceResult,
 } from './native-fork-files'
 
-import {
-  confirmAgyRebuildColdLoad,
-  executeAgyFork,
-  inspectAgyTrajectory,
-  inspectAgyFork,
-  prepareAgyFork,
-  verifyAgyRebuildSeed,
-  withAgyTempStagingRoot,
-  writeAgyRebuildSeed,
-} from './agy-native-storage'
 import { ClaudeAnswerAssembler } from './claude-answer-assembler'
 import {
   ClaudeNativePlan,
@@ -127,102 +114,16 @@ function isClaudeCostState(entry: RecordValue, nativeSessionId: string): boolean
   }
   return true
 }
-function isValidAgyRebuildChunk(entry: unknown): boolean {
-  if (
-    !isObject(entry) ||
-    typeof entry.messageId !== 'string' ||
-    !uuid.test(entry.messageId) ||
-    typeof entry.sequence !== 'number' ||
-    !Number.isSafeInteger(entry.sequence) ||
-    entry.sequence < 0
-  ) {
-    return false
-  }
-  if (entry.kind === 'message') {
-    return (
-      ['user', 'claude', 'codex', 'agy'].includes(String(entry.speaker)) &&
-      ['complete', 'incomplete'].includes(String(entry.state)) &&
-      typeof entry.part === 'number' &&
-      Number.isSafeInteger(entry.part) &&
-      entry.part >= 0 &&
-      typeof entry.final === 'boolean' &&
-      typeof entry.content === 'string' &&
-      entry.content.length <= 64 * 1024
-    )
-  }
-  if (entry.kind === 'comment') return isObject(entry.comment)
-  if (entry.kind === 'image') {
-    return (
-      isObject(entry.image) &&
-      typeof entry.image.id === 'string' &&
-      uuid.test(entry.image.id) &&
-      ['image/png', 'image/jpeg', 'image/webp'].includes(String(entry.image.mediaType)) &&
-      typeof entry.image.bytes === 'number' &&
-      Number.isSafeInteger(entry.image.bytes) &&
-      entry.image.bytes > 0 &&
-      typeof entry.image.sha256 === 'string' &&
-      /^[a-f\d]{64}$/iu.test(entry.image.sha256)
-    )
-  }
-  return false
-}
-
-function isValidPromptImage(entry: unknown): boolean {
-  return (
-    isObject(entry) &&
-    typeof entry.id === 'string' &&
-    uuid.test(entry.id) &&
-    typeof entry.path === 'string' &&
-    entry.path.length > 0 &&
-    entry.path.length <= 4096 &&
-    ['image/png', 'image/jpeg', 'image/webp'].includes(String(entry.mediaType)) &&
-    typeof entry.bytes === 'number' &&
-    Number.isSafeInteger(entry.bytes) &&
-    entry.bytes > 0 &&
-    entry.bytes <= MAX_BYTES &&
-    typeof entry.width === 'number' &&
-    Number.isSafeInteger(entry.width) &&
-    entry.width > 0 &&
-    typeof entry.height === 'number' &&
-    Number.isSafeInteger(entry.height) &&
-    entry.height > 0 &&
-    typeof entry.sha256 === 'string' &&
-    /^[a-f\d]{64}$/iu.test(entry.sha256)
-  )
-}
-
 function isInput(value: unknown): value is NativeForkFileInput {
   if (
     !isObject(value) ||
-    !['claude', 'codex', 'agy'].includes(String(value.provider)) ||
-    ![
-      'prepare',
-      'fork',
-      'inspect',
-      'read',
-      'read-answer',
-      'verify-seed',
-      'exists',
-      'rebuild_seed',
-      'verify-agy-seed',
-      'confirm-agy-rebuild-cold-load',
-      'inspect-agy-run',
-    ].includes(String(value.action))
+    !['claude', 'codex'].includes(String(value.provider)) ||
+    !['prepare', 'fork', 'inspect', 'read', 'read-answer', 'verify-seed', 'exists'].includes(
+      String(value.action),
+    )
   )
     return false
-  if (value.action === 'exists' && !['claude', 'agy'].includes(String(value.provider))) return false
-  if (
-    [
-      'rebuild_seed',
-      'verify-agy-seed',
-      'confirm-agy-rebuild-cold-load',
-      'inspect-agy-run',
-    ].includes(String(value.action)) &&
-    value.provider !== 'agy'
-  )
-    return false
-  if (value.provider === 'agy' && ['read-answer', 'verify-seed'].includes(String(value.action)))
-    return false
+  if (value.action === 'exists' && value.provider !== 'claude') return false
   if (
     value.planHook !== undefined &&
     (value.action !== 'read-answer' ||
@@ -302,124 +203,12 @@ function isInput(value: unknown): value is NativeForkFileInput {
       Buffer.byteLength(JSON.stringify(value.expectedSeed)) > 1024 * 1024
     )
       return false
-  } else if (
-    value.expectedSeed !== undefined ||
-    (value.rejectAdditionalWork !== undefined &&
-      !(value.action === 'verify-agy-seed' && typeof value.rejectAdditionalWork === 'boolean'))
-  )
+  } else if (value.expectedSeed !== undefined || value.rejectAdditionalWork !== undefined)
     return false
   if (
-    value.tempStagingDir !== undefined &&
-    (value.provider !== 'agy' ||
-      typeof value.tempStagingDir !== 'string' ||
-      !value.tempStagingDir.length ||
-      value.tempStagingDir.length > 4096 ||
-      !isAbsolute(value.tempStagingDir))
-  )
-    return false
-  if (
-    value.candidateNativeSessionId !== undefined &&
-    (value.provider !== 'agy' ||
-      value.action !== 'fork' ||
-      typeof value.candidateNativeSessionId !== 'string' ||
-      !uuid.test(value.candidateNativeSessionId))
-  )
-    return false
-  if (
-    value.awaitCandidateCommit !== undefined &&
-    (value.provider !== 'agy' ||
-      value.action !== 'fork' ||
-      typeof value.awaitCandidateCommit !== 'boolean')
-  )
-    return false
-  if (value.action === 'rebuild_seed' || value.action === 'verify-agy-seed') {
-    if (
-      typeof value.rebuildId !== 'string' ||
-      !uuid.test(value.rebuildId) ||
-      (value.sourceHash !== undefined &&
-        (typeof value.sourceHash !== 'string' || !/^[a-f\d]{64}$/iu.test(value.sourceHash))) ||
-      !Array.isArray(value.rebuildChunks) ||
-      value.rebuildChunks.length > 4096 ||
-      !value.rebuildChunks.every(isValidAgyRebuildChunk) ||
-      Buffer.byteLength(JSON.stringify(value.rebuildChunks)) > TEXT_BYTES ||
-      (value.rebuildImages !== undefined &&
-        (!Array.isArray(value.rebuildImages) ||
-          value.rebuildImages.length > 4096 ||
-          !value.rebuildImages.every(isValidPromptImage)))
-    )
-      return false
-    if (value.action === 'verify-agy-seed') {
-      if (
-        (value.expectedSeedHash !== undefined &&
-          (typeof value.expectedSeedHash !== 'string' ||
-            !/^[a-f\d]{64}$/iu.test(value.expectedSeedHash))) ||
-        (value.expectedTrajectoryId !== undefined &&
-          (typeof value.expectedTrajectoryId !== 'string' ||
-            !value.expectedTrajectoryId.length ||
-            value.expectedTrajectoryId.length > 256)) ||
-        (value.expectedPbSha256 !== undefined &&
-          (typeof value.expectedPbSha256 !== 'string' ||
-            !/^[a-f\d]{64}$/iu.test(value.expectedPbSha256))) ||
-        (value.expectedPbBytes !== undefined &&
-          (typeof value.expectedPbBytes !== 'number' ||
-            !Number.isSafeInteger(value.expectedPbBytes) ||
-            value.expectedPbBytes <= 0 ||
-            value.expectedPbBytes > 64 * 1024 * 1024)) ||
-        (value.expectedVerifiedPrefixSha256 !== undefined &&
-          (typeof value.expectedVerifiedPrefixSha256 !== 'string' ||
-            !/^[a-f\d]{64}$/iu.test(value.expectedVerifiedPrefixSha256))) ||
-        (value.expectedVerifiedPrefixBytes !== undefined &&
-          (typeof value.expectedVerifiedPrefixBytes !== 'number' ||
-            !Number.isSafeInteger(value.expectedVerifiedPrefixBytes) ||
-            value.expectedVerifiedPrefixBytes <= 0 ||
-            value.expectedVerifiedPrefixBytes > MAX_BYTES)) ||
-        (value.expectedRecordCount !== undefined &&
-          (typeof value.expectedRecordCount !== 'number' ||
-            !Number.isSafeInteger(value.expectedRecordCount) ||
-            value.expectedRecordCount <= 0 ||
-            value.expectedRecordCount > MAX_RECORDS))
-      )
-        return false
-    } else if (
-      value.expectedSeedHash !== undefined ||
-      value.expectedTrajectoryId !== undefined ||
-      value.expectedPbSha256 !== undefined ||
-      value.expectedPbBytes !== undefined ||
-      value.expectedVerifiedPrefixSha256 !== undefined ||
-      value.expectedVerifiedPrefixBytes !== undefined ||
-      value.expectedRecordCount !== undefined
-    )
-      return false
-    if (
-      value.pbSha256 !== undefined ||
-      value.pbBytes !== undefined ||
-      value.stepCount !== undefined
-    )
-      return false
-  } else if (value.action === 'confirm-agy-rebuild-cold-load') {
-    if (
-      typeof value.sourceHash !== 'string' ||
-      !/^[a-f0-9]{64}$/u.test(value.sourceHash) ||
-      typeof value.pbSha256 !== 'string' ||
-      !/^[a-f0-9]{64}$/u.test(value.pbSha256) ||
-      typeof value.pbBytes !== 'number' ||
-      !Number.isSafeInteger(value.pbBytes) ||
-      value.pbBytes <= 0 ||
-      value.pbBytes > 64 * 1024 * 1024 ||
-      value.stepCount !== 2 ||
-      value.rebuildId !== undefined ||
-      value.rebuildChunks !== undefined ||
-      value.rebuildImages !== undefined ||
-      value.expectedSeedHash !== undefined ||
-      value.expectedTrajectoryId !== undefined ||
-      value.expectedPbSha256 !== undefined ||
-      value.expectedPbBytes !== undefined ||
-      value.expectedVerifiedPrefixSha256 !== undefined ||
-      value.expectedVerifiedPrefixBytes !== undefined ||
-      value.expectedRecordCount !== undefined
-    )
-      return false
-  } else if (
+    value.tempStagingDir !== undefined ||
+    value.candidateNativeSessionId !== undefined ||
+    value.awaitCandidateCommit !== undefined ||
     value.rebuildId !== undefined ||
     value.sourceHash !== undefined ||
     value.rebuildChunks !== undefined ||
@@ -523,6 +312,227 @@ function inside(root: string, path: string): boolean {
     !isAbsolute(location)
   )
 }
+function deterministicClaudeForkStagingPath(directory: string, sessionId: string): string {
+  return join(directory, `.pact-fork-${sessionId}.tmp`)
+}
+
+async function readBoundedFileDigestAndValidateJsonl(
+  filePath: string,
+  expected: {
+    readonly dev: bigint
+    readonly ino: bigint
+    readonly size: bigint
+    readonly nlink: bigint
+  },
+  validateJsonl: boolean,
+): Promise<string | undefined> {
+  const handle = await open(filePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
+  try {
+    const opened = await handle.stat({ bigint: true })
+    if (
+      !opened.isFile() ||
+      opened.dev !== expected.dev ||
+      opened.ino !== expected.ino ||
+      opened.size !== expected.size ||
+      opened.nlink !== expected.nlink
+    ) {
+      return undefined
+    }
+    const digest = createHash('sha256')
+    const decoder = validateJsonl ? new TextDecoder('utf-8', { fatal: true }) : undefined
+    const buffer = Buffer.alloc(64 * 1024)
+    let total = 0
+    let textRemainder = ''
+    let parsedLines = 0
+    for (;;) {
+      // oxlint-disable-next-line eslint/no-await-in-loop -- Bounded sequential 64 KiB file stream.
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, null)
+      if (bytesRead === 0) break
+      total += bytesRead
+      if (total > MAX_BYTES || BigInt(total) > expected.size) {
+        return undefined
+      }
+      const slice = buffer.subarray(0, bytesRead)
+      digest.update(slice)
+      if (decoder) {
+        const chunk = decoder.decode(slice, { stream: true })
+        const lines = `${textRemainder}${chunk}`.split('\n')
+        textRemainder = lines.pop() ?? ''
+        for (const rawLine of lines) {
+          const trimmed = rawLine.trim()
+          if (!trimmed) continue
+          try {
+            const parsed: unknown = JSON.parse(trimmed)
+            if (!isObject(parsed)) return undefined
+            parsedLines += 1
+          } catch {
+            return undefined
+          }
+        }
+      }
+    }
+    if (decoder) {
+      const finalChunk = `${textRemainder}${decoder.decode()}`.trim()
+      if (finalChunk.length > 0) {
+        try {
+          const parsed: unknown = JSON.parse(finalChunk)
+          if (!isObject(parsed)) return undefined
+          parsedLines += 1
+        } catch {
+          return undefined
+        }
+      }
+      if (parsedLines === 0) return undefined
+    }
+    const afterRead = await handle.stat({ bigint: true })
+    if (
+      BigInt(total) !== expected.size ||
+      !stable(opened, afterRead) ||
+      afterRead.nlink !== expected.nlink
+    ) {
+      return undefined
+    }
+    return digest.digest('hex')
+  } catch {
+    return undefined
+  } finally {
+    await handle.close().catch(() => undefined)
+  }
+}
+
+/**
+ * Recovers an interrupted atomic no-replace Claude Fork publication where the worker exited after
+ * `link(stagingPath, targetPath)` and before `unlink(stagingPath)`, leaving both entries pointing
+ * to the same inode (`nlink === 2`). Verifies deterministic staging leaf name, verified parent
+ * directory, identical `(dev, ino, size)`, matching SHA-256 content digest, and valid JSONL before
+ * unlinking ONLY the deterministic staging entry so unrelated files are never touched.
+ */
+async function recoverInterruptedClaudeForkStagingLink(
+  targetPath: string,
+  canonicalRoot: string,
+): Promise<BigIntStats | undefined> {
+  const leaf = basename(targetPath)
+  if (!leaf.endsWith('.jsonl')) return undefined
+  const sessionId = leaf.slice(0, -'.jsonl'.length)
+  if (!uuid.test(sessionId)) return undefined
+
+  const dir = dirname(targetPath)
+  let dirHandle: FileHandle | undefined
+  try {
+    const dirStat = await lstat(dir, { bigint: true })
+    if (
+      !dirStat.isDirectory() ||
+      dirStat.isSymbolicLink() ||
+      (await realpath(dir)) !== dir ||
+      !inside(canonicalRoot, dir)
+    ) {
+      return undefined
+    }
+    if (process.platform !== 'win32') {
+      dirHandle = await open(
+        dir,
+        constants.O_RDONLY | (constants.O_DIRECTORY ?? 0) | (constants.O_NOFOLLOW ?? 0),
+      )
+      const pinnedDir = await dirHandle.stat({ bigint: true })
+      if (
+        !pinnedDir.isDirectory() ||
+        pinnedDir.dev !== dirStat.dev ||
+        pinnedDir.ino !== dirStat.ino
+      ) {
+        return undefined
+      }
+    }
+
+    const stagingPath = deterministicClaudeForkStagingPath(dir, sessionId)
+    const targetStat = await lstat(targetPath, { bigint: true })
+    if (
+      !targetStat.isFile() ||
+      targetStat.isSymbolicLink() ||
+      targetStat.nlink !== 2n ||
+      targetStat.size <= 0n ||
+      targetStat.size > BigInt(MAX_BYTES) ||
+      (await realpath(targetPath)) !== targetPath
+    ) {
+      return undefined
+    }
+
+    let stageStat: BigIntStats
+    try {
+      stageStat = await lstat(stagingPath, { bigint: true })
+    } catch {
+      return undefined
+    }
+    if (
+      !stageStat.isFile() ||
+      stageStat.isSymbolicLink() ||
+      stageStat.nlink !== 2n ||
+      stageStat.dev !== targetStat.dev ||
+      stageStat.ino !== targetStat.ino ||
+      stageStat.size !== targetStat.size ||
+      (await realpath(stagingPath)) !== stagingPath
+    ) {
+      return undefined
+    }
+
+    const targetDigest = await readBoundedFileDigestAndValidateJsonl(targetPath, targetStat, true)
+    if (!targetDigest) return undefined
+    const stageDigest = await readBoundedFileDigestAndValidateJsonl(stagingPath, stageStat, false)
+    if (!stageDigest || stageDigest !== targetDigest) return undefined
+
+    // Re-verify parent dir and deterministic staging identity right before unlinking.
+    const dirNow = await lstat(dir, { bigint: true })
+    if (
+      !dirNow.isDirectory() ||
+      dirNow.isSymbolicLink() ||
+      dirNow.dev !== dirStat.dev ||
+      dirNow.ino !== dirStat.ino ||
+      (await realpath(dir)) !== dir
+    ) {
+      return undefined
+    }
+    if (dirHandle) {
+      const pinnedDirNow = await dirHandle.stat({ bigint: true })
+      if (pinnedDirNow.dev !== dirStat.dev || pinnedDirNow.ino !== dirStat.ino) {
+        return undefined
+      }
+    }
+    const stageBeforeUnlink = await lstat(stagingPath, { bigint: true })
+    if (
+      !stageBeforeUnlink.isFile() ||
+      stageBeforeUnlink.isSymbolicLink() ||
+      stageBeforeUnlink.nlink !== 2n ||
+      stageBeforeUnlink.dev !== targetStat.dev ||
+      stageBeforeUnlink.ino !== targetStat.ino ||
+      stageBeforeUnlink.size !== targetStat.size
+    ) {
+      return undefined
+    }
+
+    await unlink(stagingPath)
+    if (dirHandle) {
+      await dirHandle.sync()
+    }
+    const targetAfter = await lstat(targetPath, { bigint: true })
+    if (
+      !targetAfter.isFile() ||
+      targetAfter.isSymbolicLink() ||
+      targetAfter.nlink !== 1n ||
+      targetAfter.dev !== targetStat.dev ||
+      targetAfter.ino !== targetStat.ino ||
+      targetAfter.size !== targetStat.size
+    ) {
+      return undefined
+    }
+    return targetAfter
+  } catch {
+    return undefined
+  } finally {
+    if (dirHandle) {
+      await dirHandle.close().catch(() => undefined)
+    }
+  }
+}
+
 /** Reads a stable ordinary file in fixed chunks. Growth never bypasses the byte ceiling. */
 async function records(
   path: string,
@@ -546,7 +556,13 @@ async function records(
     canonical = await realpath(path)
   if (!inside(canonicalRoot, canonical))
     throw new Error('Native transcript escaped its effective storage root.')
-  const before = await lstat(path, { bigint: true })
+  let before = await lstat(path, { bigint: true })
+  if (before.isFile() && !before.isSymbolicLink() && before.nlink === 2n) {
+    const recovered = await recoverInterruptedClaudeForkStagingLink(canonical, canonicalRoot)
+    if (recovered) {
+      before = recovered
+    }
+  }
   if (
     !before.isFile() ||
     before.isSymbolicLink() ||
@@ -1828,16 +1844,6 @@ async function claude(
             : reject(new Error('Candidate persistence was not acknowledged.')),
         ),
       )
-      if (!inside(await realpath(root), directory))
-        throw new Error('Native Fork directory escaped its storage root.')
-      const writeDirectory = await lstat(directory, { bigint: true })
-      if (
-        (await realpath(projectDirectory)) !== directory ||
-        writeDirectory.dev !== directoryIdentity.dev ||
-        writeDirectory.ino !== directoryIdentity.ino ||
-        (await realpath(root)) !== result.nativeStorageRoot
-      )
-        throw new Error('Native Fork store identity changed before its exclusive write.')
       const text = values.map((entry) => JSON.stringify(entry)).join('\n') + '\n'
       const outputBytes = Buffer.byteLength(text)
       if (
@@ -1846,37 +1852,191 @@ async function claude(
           TEXT_BYTES
       )
         throw new Error('Native Fork output exceeds its text/image byte budget.')
-      const handle = await open(
-        join(directory, `${key.sessionId}.jsonl`),
-        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0),
-        0o600,
-      )
-      try {
-        await handle.writeFile(text)
-        await handle.sync()
-      } finally {
-        await handle.close()
-      }
-      if (process.platform !== 'win32') {
-        const dir = await open(directory, constants.O_RDONLY | (constants.O_DIRECTORY ?? 0))
-        try {
-          await dir.sync()
-        } finally {
-          await dir.close()
+
+      const verifiedProjectDirectory = projectDirectory
+      const targetPath = join(directory, `${key.sessionId}.jsonl`)
+      const stagingPath = deterministicClaudeForkStagingPath(directory, key.sessionId)
+      let dirHandle: FileHandle | undefined
+      let stageFdStat: BigIntStats | undefined
+      let stagingPublishedOrRemoved = false
+
+      const assertPinnedDirectoryUnchanged = async (): Promise<void> => {
+        const canonicalRootNow = await realpath(root)
+        if (
+          canonicalRootNow !== result!.nativeStorageRoot ||
+          !inside(canonicalRootNow, directory)
+        ) {
+          throw new Error('Native Fork directory escaped its storage root.')
+        }
+        const writeDirectory = await lstat(directory, { bigint: true })
+        if (
+          (await realpath(verifiedProjectDirectory)) !== directory ||
+          !writeDirectory.isDirectory() ||
+          writeDirectory.isSymbolicLink() ||
+          writeDirectory.dev !== directoryIdentity.dev ||
+          writeDirectory.ino !== directoryIdentity.ino
+        ) {
+          throw new Error('Native Fork store identity changed before its exclusive write.')
+        }
+        if (dirHandle) {
+          const pinnedDirStat = await dirHandle.stat({ bigint: true })
+          if (
+            !pinnedDirStat.isDirectory() ||
+            pinnedDirStat.dev !== directoryIdentity.dev ||
+            pinnedDirStat.ino !== directoryIdentity.ino
+          ) {
+            throw new Error('Native Fork pinned directory handle identity changed.')
+          }
         }
       }
-      const readback = await records(
-        join(directory, `${key.sessionId}.jsonl`),
-        root,
-        undefined,
-        MAX_RECORDS,
-        false,
-      )
-      Object.assign(result, {
-        rawHash: readback.rawHash,
-        rawBytes: readback.rawBytes,
-        rawRecords: readback.rawRecords,
-      })
+
+      try {
+        if (process.platform !== 'win32') {
+          dirHandle = await open(
+            directory,
+            constants.O_RDONLY | (constants.O_DIRECTORY ?? 0) | (constants.O_NOFOLLOW ?? 0),
+          )
+        }
+        await assertPinnedDirectoryUnchanged()
+
+        // If a prior attempt crashed between link(stagingPath, targetPath) and unlink(stagingPath),
+        // restore targetPath to nlink === 1 without deleting unrelated files, then fail EEXIST.
+        const recoveredPriorTarget = result.nativeStorageRoot
+          ? await recoverInterruptedClaudeForkStagingLink(targetPath, result.nativeStorageRoot)
+          : undefined
+        if (recoveredPriorTarget) {
+          throw Object.assign(new Error('Native Fork target already exists.'), {
+            code: 'EEXIST',
+          })
+        }
+
+        // Create an EMPTY exclusive staging file first and fence both the opened FD and pinned
+        // parent directory BEFORE writing a single byte of transcript data.
+        const stageHandle = await open(
+          stagingPath,
+          constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0),
+          0o600,
+        )
+        let writtenStat: BigIntStats
+        try {
+          stageFdStat = await stageHandle.stat({ bigint: true })
+          if (
+            !stageFdStat.isFile() ||
+            stageFdStat.nlink !== 1n ||
+            stageFdStat.size !== 0n ||
+            stageFdStat.dev !== directoryIdentity.dev
+          ) {
+            throw new Error('Native Fork staging descriptor identity is invalid.')
+          }
+          await assertPinnedDirectoryUnchanged()
+          const liveStageStat = await lstat(stagingPath, { bigint: true })
+          if (
+            liveStageStat.isSymbolicLink() ||
+            !liveStageStat.isFile() ||
+            liveStageStat.nlink !== 1n ||
+            liveStageStat.dev !== stageFdStat.dev ||
+            liveStageStat.ino !== stageFdStat.ino ||
+            (await realpath(stagingPath)) !== stagingPath
+          ) {
+            throw new Error('Native Fork store identity changed before its exclusive write.')
+          }
+
+          await stageHandle.writeFile(text)
+          await stageHandle.sync()
+          writtenStat = await stageHandle.stat({ bigint: true })
+          if (
+            writtenStat.dev !== stageFdStat.dev ||
+            writtenStat.ino !== stageFdStat.ino ||
+            writtenStat.size !== BigInt(outputBytes)
+          ) {
+            throw new Error('Native Fork staged file changed during write.')
+          }
+        } finally {
+          await stageHandle.close()
+        }
+
+        await assertPinnedDirectoryUnchanged()
+        const prePublishStageStat = await lstat(stagingPath, { bigint: true })
+        if (
+          prePublishStageStat.isSymbolicLink() ||
+          !prePublishStageStat.isFile() ||
+          prePublishStageStat.nlink !== 1n ||
+          prePublishStageStat.dev !== writtenStat.dev ||
+          prePublishStageStat.ino !== writtenStat.ino ||
+          prePublishStageStat.size !== writtenStat.size
+        ) {
+          throw new Error('Native Fork staged file changed before atomic publication.')
+        }
+
+        // Publish exclusively via atomic no-replace link inside the verified parent directory
+        // (EEXIST if target already exists). Fail closed if atomic no-replace is unavailable;
+        // NEVER fall back to lstat-then-rename.
+        try {
+          await link(stagingPath, targetPath)
+        } catch (error) {
+          const code = error instanceof Error ? Reflect.get(error, 'code') : undefined
+          if (code === 'EEXIST') {
+            throw Object.assign(new Error('Native Fork target already exists.'), {
+              code: 'EEXIST',
+            })
+          }
+          throw Object.assign(
+            new Error(
+              `Atomic no-replace publication for Native Fork is unavailable (${String(code ?? 'unknown')}).`,
+            ),
+            { code: typeof code === 'string' ? code : 'EIO' },
+          )
+        }
+        const publishedStat = await lstat(targetPath, { bigint: true })
+        if (
+          publishedStat.isSymbolicLink() ||
+          !publishedStat.isFile() ||
+          publishedStat.dev !== writtenStat.dev ||
+          publishedStat.ino !== writtenStat.ino ||
+          publishedStat.size !== writtenStat.size
+        ) {
+          throw new Error('Native Fork published target identity mismatch.')
+        }
+        await unlink(stagingPath)
+        stagingPublishedOrRemoved = true
+
+        if (dirHandle) {
+          await dirHandle.sync()
+        }
+        const readback = await records(targetPath, root, undefined, MAX_RECORDS, false)
+        const afterReadbackStat = await lstat(targetPath, { bigint: true })
+        if (
+          afterReadbackStat.isSymbolicLink() ||
+          afterReadbackStat.dev !== writtenStat.dev ||
+          afterReadbackStat.ino !== writtenStat.ino ||
+          afterReadbackStat.size !== writtenStat.size
+        ) {
+          throw new Error('Native Fork published file changed during readback verification.')
+        }
+        Object.assign(result, {
+          rawHash: readback.rawHash,
+          rawBytes: readback.rawBytes,
+          rawRecords: readback.rawRecords,
+        })
+      } finally {
+        if (!stagingPublishedOrRemoved && stageFdStat) {
+          try {
+            const currentStage = await lstat(stagingPath, { bigint: true })
+            if (
+              !currentStage.isSymbolicLink() &&
+              currentStage.dev === stageFdStat.dev &&
+              currentStage.ino === stageFdStat.ino
+            ) {
+              await unlink(stagingPath)
+            }
+          } catch {
+            /* Best-effort cleanup of owned staging file. */
+          }
+        }
+        if (dirHandle) {
+          await dirHandle.close().catch(() => undefined)
+        }
+      }
     },
   }
   await forkSession(input.nativeSessionId, {
@@ -2456,123 +2616,6 @@ async function codex(input: NativeForkFileInput): Promise<NativeForkFileResult> 
   }
 }
 
-async function agy(
-  input: NativeForkFileInput,
-): Promise<
-  | NativeForkFileResult
-  | AgyRebuildSeedResult
-  | AgyRebuildInitializationWitness
-  | AgyColdInspectionResult
-  | NativeSessionExistenceResult
-> {
-  return withAgyTempStagingRoot(input.tempStagingDir, async () => {
-    if (input.action === 'exists') {
-      const inspected = inspectAgyTrajectory({
-        cwd: input.cwd,
-        nativeSessionId: input.nativeSessionId,
-        ...(input.storageRoot ? { storageRoot: input.storageRoot } : {}),
-      })
-      return { nativeSessionId: input.nativeSessionId, exists: inspected.exists }
-    }
-    if (input.action === 'inspect-agy-run') {
-      return inspectAgyTrajectory({
-        cwd: input.cwd,
-        nativeSessionId: input.nativeSessionId,
-        ...(input.storageRoot ? { storageRoot: input.storageRoot } : {}),
-        ...(input.nativeTurnId ? { nativeTurnId: input.nativeTurnId } : {}),
-        ...(input.nativeInputIds ? { nativeInputIds: input.nativeInputIds } : {}),
-        ...(input.includePlan !== undefined ? { includePlan: input.includePlan } : {}),
-      })
-    }
-    if (input.action === 'rebuild_seed') {
-      return writeAgyRebuildSeed({
-        cwd: input.cwd,
-        nativeSessionId: input.nativeSessionId,
-        ...(input.storageRoot ? { storageRoot: input.storageRoot } : {}),
-        rebuildId: input.rebuildId!,
-        ...(input.sourceHash !== undefined ? { sourceHash: input.sourceHash } : {}),
-        chunks: input.rebuildChunks!,
-        ...(input.rebuildImages ? { images: input.rebuildImages } : {}),
-      })
-    }
-    if (input.action === 'confirm-agy-rebuild-cold-load') {
-      return confirmAgyRebuildColdLoad({
-        cwd: input.cwd,
-        nativeSessionId: input.nativeSessionId,
-        ...(input.storageRoot ? { storageRoot: input.storageRoot } : {}),
-        sourceHash: input.sourceHash!,
-        pbSha256: input.pbSha256!,
-        pbBytes: input.pbBytes!,
-        stepCount: 2,
-      })
-    }
-    if (input.action === 'verify-agy-seed') {
-      return verifyAgyRebuildSeed({
-        cwd: input.cwd,
-        nativeSessionId: input.nativeSessionId,
-        ...(input.storageRoot ? { storageRoot: input.storageRoot } : {}),
-        rebuildId: input.rebuildId!,
-        ...(input.sourceHash !== undefined ? { sourceHash: input.sourceHash } : {}),
-        chunks: input.rebuildChunks!,
-        ...(input.rebuildImages ? { images: input.rebuildImages } : {}),
-        ...(input.expectedSeedHash ? { expectedSeedHash: input.expectedSeedHash } : {}),
-        ...(input.expectedTrajectoryId ? { expectedTrajectoryId: input.expectedTrajectoryId } : {}),
-        ...(input.expectedPbSha256 ? { expectedPbSha256: input.expectedPbSha256 } : {}),
-        ...(input.expectedPbBytes !== undefined ? { expectedPbBytes: input.expectedPbBytes } : {}),
-        ...(input.expectedVerifiedPrefixSha256
-          ? { expectedVerifiedPrefixSha256: input.expectedVerifiedPrefixSha256 }
-          : {}),
-        ...(input.expectedVerifiedPrefixBytes !== undefined
-          ? { expectedVerifiedPrefixBytes: input.expectedVerifiedPrefixBytes }
-          : {}),
-        ...(input.expectedRecordCount !== undefined
-          ? { expectedRecordCount: input.expectedRecordCount }
-          : {}),
-        ...(input.rejectAdditionalWork !== undefined
-          ? { rejectAdditionalWork: input.rejectAdditionalWork }
-          : {}),
-      })
-    }
-    const forkInput = {
-      cwd: input.cwd,
-      nativeSessionId: input.nativeSessionId,
-      ...(input.candidateNativeSessionId
-        ? { candidateNativeSessionId: input.candidateNativeSessionId }
-        : {}),
-      ...(input.nativeTurnId ? { nativeTurnId: input.nativeTurnId } : {}),
-      ...(input.nativeInputIds ? { nativeInputIds: input.nativeInputIds } : {}),
-      ...(input.responseHash ? { responseHash: input.responseHash } : {}),
-      ...(input.lastDispatchedPhase ? { lastDispatchedPhase: input.lastDispatchedPhase } : {}),
-      ...(input.source ? { source: input.source } : {}),
-      ...(input.witness ? { witness: input.witness } : {}),
-      ...(input.storageRoot ? { storageRoot: input.storageRoot } : {}),
-    }
-    if (input.action === 'prepare') return prepareAgyFork(forkInput)
-    if (input.action === 'inspect') return inspectAgyFork(forkInput)
-    if (input.action === 'read') {
-      return input.witness ? inspectAgyFork(forkInput) : prepareAgyFork(forkInput)
-    }
-    if (input.action === 'fork') {
-      return executeAgyFork(
-        forkInput,
-        input.awaitCandidateCommit
-          ? async (candidate) => {
-              await postReply({ type: 'candidate', result: candidate })
-              await new Promise<void>((resolve, reject) =>
-                parentPort!.once('message', (message) =>
-                  message?.type === 'candidate_committed'
-                    ? resolve()
-                    : reject(new Error('Candidate persistence was not acknowledged.')),
-                ),
-              )
-            }
-          : undefined,
-      )
-    }
-    throw new Error('Unsupported Antigravity native Fork worker action.')
-  })
-}
-
 const measureTraffic =
   workerData !== null && typeof workerData === 'object' && workerData.measure === true
 async function postReply(reply: Record<string, unknown>): Promise<void> {
@@ -2585,13 +2628,7 @@ async function postReply(reply: Record<string, unknown>): Promise<void> {
 if (parentPort) {
   const input: unknown = measureTraffic ? workerData.input : workerData
   if (!isInput(input)) throw new Error('Invalid native Fork worker input.')
-  void (
-    input.provider === 'claude'
-      ? claude(input)
-      : input.provider === 'agy'
-        ? agy(input)
-        : codex(input)
-  ).then(
+  void (input.provider === 'claude' ? claude(input) : codex(input)).then(
     (result) => postReply({ type: 'result', result }),
     (error: unknown) =>
       postReply({

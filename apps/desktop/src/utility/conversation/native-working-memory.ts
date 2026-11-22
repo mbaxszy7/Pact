@@ -4,7 +4,7 @@ import {
   type NativeMemoryCapacities,
 } from '@pact/contracts'
 
-import { AgentExecutionError } from './agent-execution-error'
+import { AgentExecutionError, NativeCapacityError } from './agent-execution-error'
 
 export const NATIVE_OWNER_WORKING_BYTES = 128 * 1024 * 1024
 export const NATIVE_APP_WORKING_BYTES = 512 * 1024 * 1024
@@ -141,11 +141,7 @@ export class DecisionMemoryLease implements NativeMemoryAllocator {
 
   reserve(initialBytes: number): NativeMemoryReservation {
     if (this.released || this.items >= 64)
-      throw new AgentExecutionError(
-        'runtime_incompatible',
-        'Decision working capacity is full.',
-        false,
-      )
+      throw new NativeCapacityError('Decision working capacity is full.')
     let bytes = 0,
       released = false
     const resize = (next: number) => {
@@ -156,11 +152,7 @@ export class DecisionMemoryLease implements NativeMemoryAllocator {
           false,
         )
       if (this.held + next - bytes > DECISION_WORKING_BYTES)
-        throw new AgentExecutionError(
-          'runtime_incompatible',
-          'Decision working capacity is full.',
-          false,
-        )
+        throw new NativeCapacityError('Decision working capacity is full.')
       this.held += next - bytes
       bytes = next
       this.peak = Math.max(this.peak, this.held)
@@ -233,11 +225,7 @@ export class NativeWorkingMemory {
         )
       const delta = next - bytes
       if (this.heldBytes + delta > this.ownerLimit || this.pool.heldBytes + delta > this.pool.limit)
-        throw new AgentExecutionError(
-          'runtime_incompatible',
-          'Native working capacity is full.',
-          false,
-        )
+        throw new NativeCapacityError('Native working capacity is full.')
       this.heldBytes += delta
       this.pool.heldBytes += delta
       observeChange(this.observations, this.heldBytes, delta, initialized ? 0 : 1)

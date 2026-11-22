@@ -4,6 +4,7 @@ import { isAbsolute } from 'node:path'
 import {
   directoryFileOperationInputSchema,
   directoryFileOperationResultSchema,
+  MAX_DIRECTORY_REQUEST_BYTES,
   PROJECT_FILE_PREVIEW_TIMEOUT_MS,
   WORKSPACE_OPERATION_TIMEOUT_MS,
   type DirectoryFileOperationInput,
@@ -13,7 +14,6 @@ import {
 import type { LogicalIpcTrafficCollector } from '../../shared/logical-ipc-traffic'
 
 const MAX_DIRECTORY_WORKERS = 5
-const MAX_DIRECTORY_REQUEST_BYTES = 64 * 1024
 const KILL_GRACE_MS = 2_000
 const FORCE_EXIT_CONFIRM_MS = 1_000
 interface DirectoryWorker {

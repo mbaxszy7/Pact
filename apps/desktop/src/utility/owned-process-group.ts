@@ -118,6 +118,12 @@ const sameIdentity = (known: Identity, row: Identity | undefined): boolean =>
 const same = (known: Identity, row: Identity | undefined): boolean =>
   Boolean(row && !/^[ZX]/u.test(row.state) && sameIdentity(known, row))
 const pause = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+function createUnconfirmedProcessError(message: string, cause?: unknown): Error {
+  return Object.assign(new Error(message, cause !== undefined ? { cause } : undefined), {
+    code: 'unconfirmed_process' as const,
+    retryable: true as const,
+  })
+}
 const errorCode = (error: unknown): unknown =>
   typeof error === 'object' && error !== null ? Reflect.get(error, 'code') : undefined
 const observeZero = (pid: number | undefined): IdentityDiagnostic['pidZero'] => {
@@ -145,6 +151,8 @@ export class OwnedProcessGroup {
   private resolvedRoot: Identity | undefined = undefined
   private readonly ignoreChildError = (): void => undefined
   private didRelease = false
+  private readonly releasedWaiter = Promise.withResolvers<void>()
+  private readonly releaseListeners = new Set<() => void>()
   private readonly signal: AbortSignal | undefined
   private readonly onCloseInput: (() => void | Promise<void>) | undefined
   private readonly startupObservationMs: number
@@ -183,19 +191,61 @@ export class OwnedProcessGroup {
     return this.didRelease
   }
 
+  /** Subscribe to confirmed physical release, including late Windows convergence after close timeout. */
+  onReleased(listener: () => void): () => void {
+    if (this.didRelease) {
+      try {
+        listener()
+      } catch {
+        // Release observers cannot block or undo confirmed physical release.
+      }
+      return () => undefined
+    }
+    this.releaseListeners.add(listener)
+    return () => {
+      this.releaseListeners.delete(listener)
+    }
+  }
+
+  /** Resolves once physical release is confirmed (including late Windows convergence). */
+  whenReleased(): Promise<void> {
+    return this.releasedWaiter.promise
+  }
+
   /** Report whether a close-timed-out group has since finished releasing cleanly. */
   settledAfterCloseTimeout(): boolean {
     if (this.didRelease) return true
     if (!this.closing || !this.inputClosed) return false
-    if (this.windows) return this.windows.released
-    if (!this.child) return true
-    if (!this.childClosed || !this.resolvedRoot) return false
-    if (this.resolvedRoot.pid === 0) return true
+    if (this.windows) {
+      if (!this.windows.released) return false
+      this.markReleased()
+      return true
+    }
+    if (!this.child) {
+      this.markReleased()
+      return true
+    }
+    if (!this.childClosed) return false
+    if (!this.resolvedRoot) {
+      try {
+        if (this.child.pid && !this.groupGone(this.child.pid)) return false
+      } catch {
+        return false
+      }
+      this.markReleased()
+      return true
+    }
+    if (this.resolvedRoot.pid === 0) {
+      this.markReleased()
+      return true
+    }
     try {
-      return this.groupGone(this.resolvedRoot.pgid)
+      if (!this.groupGone(this.resolvedRoot.pgid)) return false
     } catch {
       return false
     }
+    this.markReleased()
+    return true
   }
 
   spawn(command: string, args: string[], options: Options = {}): ChildProcessWithoutNullStreams {
@@ -203,6 +253,9 @@ export class OwnedProcessGroup {
       throw new Error('This owned process scope cannot start another child.')
     if (process.platform === 'win32') {
       this.windows = new WindowsOwnedProcess(command, args, options, this.windowsOptions)
+      this.windows.onReleased(() => {
+        this.syncWindowsLateRelease()
+      })
       this.child = this.windows.child
       this.child.once('close', () => {
         this.childClosed = true
@@ -464,7 +517,7 @@ export class OwnedProcessGroup {
       // XNU can report EPERM while only zombies remain. It proves neither
       // release nor permission to signal; wait for child.close and ESRCH.
       if (errorCode(error) === 'EPERM') return false
-      throw new Error('Process group release could not be confirmed.', { cause: error })
+      throw createUnconfirmedProcessError('Process group release could not be confirmed.', error)
     }
   }
 
@@ -507,7 +560,7 @@ export class OwnedProcessGroup {
         void closeInput.catch(() => undefined)
         await this.windows.close(deadline)
         await this.withDeadline(closeInput, deadline)
-        this.didRelease = this.windows.released
+        if (this.windows.released) this.markReleased()
         return
       }
       const child = this.child
@@ -519,7 +572,7 @@ export class OwnedProcessGroup {
       if (!child) {
         closeInput = this.startClosingInput()
         await this.withDeadline(closeInput, deadline)
-        this.didRelease = true
+        this.markReleased()
         return
       }
       let root: Identity
@@ -543,7 +596,7 @@ export class OwnedProcessGroup {
         if (this.childClosed && (!child.pid || this.groupGone(child.pid))) {
           closeInput = this.startClosingInput()
           await this.withDeadline(closeInput, deadline)
-          this.didRelease = true
+          this.markReleased()
           return
         }
         throw error
@@ -558,7 +611,7 @@ export class OwnedProcessGroup {
         if (this.childClosed && gone) {
           // oxlint-disable-next-line no-await-in-loop -- Physical release is the gate for this one scope's input cleanup.
           await this.withDeadline(closeInput, deadline)
-          this.didRelease = true
+          this.markReleased()
           return
         }
         if (!killed && Date.now() >= killAt) {
@@ -571,7 +624,9 @@ export class OwnedProcessGroup {
         // oxlint-disable-next-line no-await-in-loop -- One cleanup owner observes its fixed deadline; there is no retry or work queue.
         await pause(Math.min(25, Math.max(1, deadline - Date.now())))
       }
-      throw new Error('The owned process scope did not release before its deadline.')
+      throw createUnconfirmedProcessError(
+        'The owned process scope did not release before its deadline.',
+      )
     } finally {
       this.signal?.removeEventListener('abort', this.abort)
       // SDK cancellation is also required after an ownership-observation failure.
@@ -583,11 +638,35 @@ export class OwnedProcessGroup {
     }
   }
 
+  private markReleased(): void {
+    if (this.didRelease) return
+    this.didRelease = true
+    this.identities.clear()
+    this.releasedWaiter.resolve()
+    const listeners = [...this.releaseListeners]
+    this.releaseListeners.clear()
+    for (const listener of listeners) {
+      try {
+        listener()
+      } catch {
+        // Release observers cannot block or undo confirmed physical release.
+      }
+    }
+  }
+
+  private syncWindowsLateRelease(): void {
+    if (this.didRelease) return
+    if (this.closing && this.inputClosed && this.windows?.released) {
+      this.markReleased()
+    }
+  }
+
   private startClosingInput(): Promise<void> {
     this.inputCloseTask ??= Promise.resolve()
       .then(() => this.onCloseInput?.())
       .then(() => {
         this.inputClosed = true
+        this.syncWindowsLateRelease()
         return undefined
       })
     void this.inputCloseTask.catch(() => undefined)
@@ -614,7 +693,9 @@ export class OwnedProcessGroup {
 
   private assertDeadline(deadline: number): void {
     if (Date.now() >= deadline)
-      throw new Error('The owned process scope did not release before its deadline.')
+      throw createUnconfirmedProcessError(
+        'The owned process scope did not release before its deadline.',
+      )
   }
 
   private async withDeadline<T>(work: Promise<T>, deadline: number): Promise<T> {
@@ -626,7 +707,12 @@ export class OwnedProcessGroup {
         work,
         new Promise<never>((_, reject) => {
           timer = setTimeout(
-            () => reject(new Error('The owned process scope did not release before its deadline.')),
+            () =>
+              reject(
+                createUnconfirmedProcessError(
+                  'The owned process scope did not release before its deadline.',
+                ),
+              ),
             Math.max(1, deadline - Date.now()),
           )
         }),

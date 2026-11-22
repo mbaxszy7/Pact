@@ -9,7 +9,7 @@
   "scripts": {
     "brand": "node build/generate-brand-assets.mjs",
     "brand:win": "node build/generate-brand-assets.mjs --installer-artwork",
-    "build": "pnpm brand && pnpm typecheck && electron-vite build",
+    "build": "node ../../scripts/build-agy-sqlite-file.mjs && pnpm brand && pnpm typecheck && electron-vite build",
     "dev": "pnpm brand && node build/launch-development.mjs dev",
     "dist:mac": "node ../../scripts/build-distribution.mjs --profile production-local --channel stable --platform darwin",
     "dist:win": "node ../../scripts/build-distribution.mjs --profile production-local --channel stable --platform win32",

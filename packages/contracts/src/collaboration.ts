@@ -63,8 +63,121 @@ export type CollaborationStage = z.infer<typeof collaborationStageSchema>
 export const collaborationWorkStageSchema = collaborationStageSchema.exclude(['reply'])
 
 const utf8Bytes = (value: string): number => new TextEncoder().encode(value).byteLength
+
+const SHA256_K = new Uint32Array([
+  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+])
+
+function sha256HexUtf8(value: string): string {
+  const bytes = new TextEncoder().encode(value)
+  const bitLen = bytes.length * 8
+  const paddedLen = Math.ceil((bytes.length + 9) / 64) * 64
+  const padded = new Uint8Array(paddedLen)
+  padded.set(bytes)
+  padded[bytes.length] = 0x80
+  const view = new DataView(padded.buffer)
+  view.setUint32(paddedLen - 8, Math.floor(bitLen / 0x100000000), false)
+  view.setUint32(paddedLen - 4, bitLen >>> 0, false)
+
+  let h0 = 0x6a09e667
+  let h1 = 0xbb67ae85
+  let h2 = 0x3c6ef372
+  let h3 = 0xa54ff53a
+  let h4 = 0x510e527f
+  let h5 = 0x9b05688c
+  let h6 = 0x1f83d9ab
+  let h7 = 0x5be0cd19
+  const w = new Uint32Array(64)
+
+  for (let offset = 0; offset < paddedLen; offset += 64) {
+    for (let i = 0; i < 16; i += 1) {
+      w[i] = view.getUint32(offset + i * 4, false)
+    }
+    for (let i = 16; i < 64; i += 1) {
+      const w15 = w[i - 15]!
+      const w2 = w[i - 2]!
+      const s0 = ((w15 >>> 7) | (w15 << 25)) ^ ((w15 >>> 18) | (w15 << 14)) ^ (w15 >>> 3)
+      const s1 = ((w2 >>> 17) | (w2 << 15)) ^ ((w2 >>> 19) | (w2 << 13)) ^ (w2 >>> 10)
+      w[i] = (w[i - 16]! + s0 + w[i - 7]! + s1) >>> 0
+    }
+    let a = h0
+    let b = h1
+    let c = h2
+    let d = h3
+    let e = h4
+    let f = h5
+    let g = h6
+    let h = h7
+    for (let i = 0; i < 64; i += 1) {
+      const S1 = ((e >>> 6) | (e << 26)) ^ ((e >>> 11) | (e << 21)) ^ ((e >>> 25) | (e << 7))
+      const ch = (e & f) ^ (~e & g)
+      const temp1 = (h + S1 + ch + SHA256_K[i]! + w[i]!) >>> 0
+      const S0 = ((a >>> 2) | (a << 30)) ^ ((a >>> 13) | (a << 19)) ^ ((a >>> 22) | (a << 10))
+      const maj = (a & b) ^ (a & c) ^ (b & c)
+      const temp2 = (S0 + maj) >>> 0
+      h = g
+      g = f
+      f = e
+      e = (d + temp1) >>> 0
+      d = c
+      c = b
+      b = a
+      a = (temp1 + temp2) >>> 0
+    }
+    h0 = (h0 + a) >>> 0
+    h1 = (h1 + b) >>> 0
+    h2 = (h2 + c) >>> 0
+    h3 = (h3 + d) >>> 0
+    h4 = (h4 + e) >>> 0
+    h5 = (h5 + f) >>> 0
+    h6 = (h6 + g) >>> 0
+    h7 = (h7 + h) >>> 0
+  }
+  return [h0, h1, h2, h3, h4, h5, h6, h7].map((word) => word.toString(16).padStart(8, '0')).join('')
+}
+
+export const COLLABORATION_BOUNDED_IDENTITY_MAX_CHARS = 256
+export const COLLABORATION_NATIVE_PLAN_ID_MAX_CHARS = 1024
+
+/** Deterministic bounded encoding shared by adapter admission, persistence, and cold recovery. */
+export function encodeBoundedCollaborationIdentity(
+  raw: string,
+  maxChars = COLLABORATION_BOUNDED_IDENTITY_MAX_CHARS,
+): string {
+  if (raw.length <= maxChars) return raw
+  const digest = sha256HexUtf8(raw)
+  const suffix = `:sha256:${digest}`
+  const prefixLimit = Math.max(0, maxChars - suffix.length)
+  return `${raw.slice(0, prefixLimit)}${suffix}`
+}
+
+export function encodeBoundedOpenPlanCallKey(rawCallKey: string): string {
+  return encodeBoundedCollaborationIdentity(rawCallKey, COLLABORATION_BOUNDED_IDENTITY_MAX_CHARS)
+}
+
+export function encodeBoundedOpenPlanProgressToken(rawToken: string): string {
+  return encodeBoundedCollaborationIdentity(rawToken, COLLABORATION_BOUNDED_IDENTITY_MAX_CHARS)
+}
+
+/** Single canonical native Plan ID shared by live promotion and cold Open-mode recovery. */
+export function buildBoundedNativePlanId(nativeSessionId: string, suffixId: string): string {
+  const direct = `${nativeSessionId}:${suffixId}`
+  if (direct.length <= COLLABORATION_NATIVE_PLAN_ID_MAX_CHARS) return direct
+  const digest = sha256HexUtf8(`${nativeSessionId}\0${suffixId}`)
+  return `${nativeSessionId.slice(0, 480)}:sha256:${digest}`
+}
+
 export const COLLABORATION_PLAN_CHUNK_BYTES = 48 * 1024
 export const COLLABORATION_PUBLISHED_PLAN_MAX_BYTES = 2 * 1024 * 1024
+export const COLLABORATION_PLAN_SYNC_FAILURE_NOTICE =
+  'The latest plan has not been synced to Pact. Restore its saved native source before continuing.'
 export const collaborationPublishPlanInputShape = {
   text: z
     .string()
@@ -83,6 +196,44 @@ export const collaborationPublishPlanInputSchema = z
     'Provide non-empty plan text.',
   )
 export type CollaborationPublishPlanInput = z.infer<typeof collaborationPublishPlanInputSchema>
+
+export const collaborationOpenPlanFinalIntentInputSchema = z.strictObject({
+  executionId: z.string().min(1).max(COLLABORATION_BOUNDED_IDENTITY_MAX_CHARS).optional(),
+  callKey: z.string().min(1).max(COLLABORATION_BOUNDED_IDENTITY_MAX_CHARS),
+  progressToken: z.string().min(1).max(COLLABORATION_BOUNDED_IDENTITY_MAX_CHARS).optional(),
+  nativePlanId: z.string().min(1).max(COLLABORATION_NATIVE_PLAN_ID_MAX_CHARS).optional(),
+  candidateMarkdown: z
+    .string()
+    .min(1)
+    .refine((value) => Boolean(value.trim()), 'Provide non-empty plan markdown.')
+    .refine(
+      (value) => utf8Bytes(value) <= COLLABORATION_PUBLISHED_PLAN_MAX_BYTES,
+      'Candidate plan exceeds 2 MiB.',
+    ),
+})
+export type CollaborationOpenPlanFinalIntentInput = z.infer<
+  typeof collaborationOpenPlanFinalIntentInputSchema
+>
+
+/** Durable journal fact for an accepted open-mode final publish_plan call; never advances planVersion. */
+export const collaborationOpenPlanPublishIntentSchema = z
+  .strictObject({
+    runId: z.string().uuid(),
+    executionId: z.string().min(1).max(COLLABORATION_BOUNDED_IDENTITY_MAX_CHARS).optional(),
+    actor: agent,
+    callKey: z.string().min(1).max(COLLABORATION_BOUNDED_IDENTITY_MAX_CHARS),
+    progressToken: z.string().min(1).max(COLLABORATION_BOUNDED_IDENTITY_MAX_CHARS).optional(),
+    nativePlanId: z.string().min(1).max(COLLABORATION_NATIVE_PLAN_ID_MAX_CHARS).optional(),
+    document: collaborationDocumentSchema,
+  })
+  .refine(
+    (value) =>
+      value.document.bytes > 0 && value.document.bytes <= COLLABORATION_PUBLISHED_PLAN_MAX_BYTES,
+    'Open-mode plan publish intent document must be non-empty and within 2 MiB.',
+  )
+export type CollaborationOpenPlanPublishIntent = z.infer<
+  typeof collaborationOpenPlanPublishIntentSchema
+>
 
 export const taskStageRolesSchema = z
   .strictObject({
@@ -663,6 +814,8 @@ export const collaborationTaskSchema = z
     reviewCycles: z.number().int().nonnegative(),
     repairAttempts: z.number().int().nonnegative(),
     notice: z.string().max(512).optional(),
+    /** Tracks whether the current pause was established specifically by a Plan-sync failure. */
+    planSyncPaused: z.boolean().optional(),
     openMode: z.boolean().optional(),
     planAuthor: agent.optional(),
     unreviewedCodeActor: agent.optional(),
@@ -1132,7 +1285,8 @@ export function collaborationInputGate(
   )
     return 'incomplete'
   if (!input.pending) return input.decision ? 'needs_reply' : undefined
-  if (task.status === 'failed') return open ? undefined : 'incomplete'
+  if (task.status === 'failed')
+    return open ? (input.decision ? 'needs_reply' : undefined) : 'incomplete'
   if ((task.stage === 'reply' || task.stage === 'collaborate') && task.status === 'running')
     return 'processing'
   return 'queued'
@@ -1734,7 +1888,7 @@ export type CollaborationStageSettlement =
     }
   | { kind: 'reply' }
   | { kind: 'recovered_reply' }
-  | { kind: 'recovered_plan' }
+  | { kind: 'recovered_plan'; actor?: AgentId }
   | {
       kind: 'plan'
       authorization: CollaborationTurnAuthorization
@@ -1757,12 +1911,15 @@ export type CollaborationStageSettlement =
       authorization: CollaborationWorkAuthorization
       hasCodeChanges?: boolean
       hasPublishedPlan?: boolean
+      planCaptureFailed?: boolean
+      decision?: CollaborationSettlementDecision
     }
   | {
       kind: 'collaborate'
       authorization: CollaborationTurnAuthorization
       hasCodeChanges: boolean
       hasPublishedPlan: boolean
+      planCaptureFailed?: boolean
       decision?: CollaborationSettlementDecision
     }
   | { kind: 'input_processed'; runId: string; inputSequence: number }
@@ -1770,6 +1927,16 @@ export type CollaborationStageSettlement =
   | { kind: 'input_needs_user'; decision: CollaborationSettlementDecision }
   | { kind: 'input_unconfirmed' }
   | { kind: 'input_plan_withdrawn' }
+
+function preservedExplicitPauseReason(
+  task: Pick<CollaborationTask, 'automation' | 'pauseReason'>,
+): CollaborationTask['pauseReason'] | undefined {
+  return task.automation === 'paused' &&
+    task.pauseReason !== undefined &&
+    task.pauseReason !== 'failure'
+    ? task.pauseReason
+    : undefined
+}
 
 /** Apply only host-verified facts. Does not authorize work, persist, or increment revision. */
 export function settleCollaborationStage(
@@ -1802,6 +1969,7 @@ export function settleCollaborationStage(
       next.status = 'failed'
       next.automation = 'paused'
       next.pauseReason = settlement.stopped ? 'stopped' : 'failure'
+      delete next.planSyncPaused
       next.notice = settlement.stopped ? undefined : settlement.notice?.slice(0, 512)
       if (legacyStage) {
         next.openMode = next.codeRunId ? false : undefined
@@ -1842,10 +2010,29 @@ export function settleCollaborationStage(
       break
     }
     case 'recovered_plan': {
-      next.status = 'waiting'
-      next.nextStage = isCollaborationOpenMode(next) ? undefined : 'plan_review'
-      next.notice = undefined
-      if (next.pauseReason === 'failure') next.pauseReason = 'user'
+      if (isCollaborationOpenMode(next)) {
+        const decision = collaborationInputProcessing(next).decision
+        next.status = decision && decision.runId === next.runId ? 'questions' : 'waiting'
+        next.nextStage = undefined
+        const pausedByPlanSync =
+          next.planSyncPaused === true ||
+          (next.pauseReason === 'failure' && next.notice === COLLABORATION_PLAN_SYNC_FAILURE_NOTICE)
+        if (pausedByPlanSync && next.pauseReason === 'failure') {
+          next.automation = 'active'
+          next.pauseReason = undefined
+          next.notice = undefined
+        } else if (next.notice === COLLABORATION_PLAN_SYNC_FAILURE_NOTICE) {
+          next.notice = undefined
+        }
+        delete next.planSyncPaused
+        if (settlement.actor) next.unreviewedPlanActor = settlement.actor
+      } else {
+        next.status = 'waiting'
+        next.nextStage = 'plan_review'
+        next.notice = undefined
+        delete next.planSyncPaused
+        if (next.pauseReason === 'failure') next.pauseReason = 'user'
+      }
       break
     }
     case 'plan': {
@@ -1961,20 +2148,51 @@ export function settleCollaborationStage(
       break
     }
     case 'work': {
+      const auth = settlement.authorization
+      const priorInput = collaborationInputProcessing(next)
+      const newerPending =
+        priorInput.pending && priorInput.pending.inputSequence > auth.inputSequence
+          ? priorInput.pending
+          : undefined
+      const incomingExplicitPauseReason = preservedExplicitPauseReason(task)
       next.openMode = true
-      next.automation = 'active'
-      next.pauseReason = undefined
-      next.status = 'waiting'
+      if (incomingExplicitPauseReason) {
+        next.automation = 'paused'
+        next.pauseReason = incomingExplicitPauseReason
+      } else {
+        next.automation = 'active'
+        next.pauseReason = undefined
+      }
+      delete next.planSyncPaused
+      next.status = settlement.decision ? 'questions' : 'waiting'
       next.nextStage = undefined
       next.pendingWork = undefined
       next.notice = undefined
-      next.lastCodeActor = settlement.authorization.actor
+      if (settlement.decision) {
+        next.inputProcessing = {
+          ...priorInput,
+          pending: newerPending,
+          decision: settlement.decision,
+        }
+      }
+      next.lastCodeActor = auth.actor
       if (settlement.hasCodeChanges !== false) {
-        next.codeRunId = settlement.authorization.runId
-        next.unreviewedCodeActor = settlement.authorization.actor
+        next.codeRunId = auth.runId
+        next.unreviewedCodeActor = auth.actor
       }
       if (settlement.hasPublishedPlan) {
-        next.unreviewedPlanActor = settlement.authorization.actor
+        next.unreviewedPlanActor = auth.actor
+      } else if (settlement.planCaptureFailed) {
+        if (!settlement.decision) next.status = 'failed'
+        next.automation = 'paused'
+        if (incomingExplicitPauseReason) {
+          next.pauseReason = incomingExplicitPauseReason
+          delete next.planSyncPaused
+        } else {
+          next.pauseReason = 'failure'
+          next.planSyncPaused = true
+        }
+        next.notice = COLLABORATION_PLAN_SYNC_FAILURE_NOTICE
       }
       break
     }
@@ -1985,9 +2203,16 @@ export function settleCollaborationStage(
         priorInput.pending && priorInput.pending.inputSequence > auth.inputSequence
           ? priorInput.pending
           : undefined
+      const incomingExplicitPauseReason = preservedExplicitPauseReason(task)
       next.openMode = true
-      next.automation = 'active'
-      next.pauseReason = undefined
+      if (incomingExplicitPauseReason) {
+        next.automation = 'paused'
+        next.pauseReason = incomingExplicitPauseReason
+      } else {
+        next.automation = 'active'
+        next.pauseReason = undefined
+      }
+      delete next.planSyncPaused
       next.pendingWork = undefined
       next.nextStage = undefined
       next.notice = undefined
@@ -2004,14 +2229,25 @@ export function settleCollaborationStage(
           ...(newerPending ? { pending: newerPending } : {}),
           settled: { runId: auth.runId, inputSequence: auth.inputSequence },
         }
-        if (settlement.hasCodeChanges) {
-          next.codeRunId = auth.runId
-          next.lastCodeActor = auth.actor
-          next.unreviewedCodeActor = auth.actor
+      }
+      if (settlement.hasCodeChanges) {
+        next.codeRunId = auth.runId
+        next.lastCodeActor = auth.actor
+        next.unreviewedCodeActor = auth.actor
+      }
+      if (settlement.hasPublishedPlan) {
+        next.unreviewedPlanActor = auth.actor
+      } else if (settlement.planCaptureFailed) {
+        if (!settlement.decision) next.status = 'failed'
+        next.automation = 'paused'
+        if (incomingExplicitPauseReason) {
+          next.pauseReason = incomingExplicitPauseReason
+          delete next.planSyncPaused
+        } else {
+          next.pauseReason = 'failure'
+          next.planSyncPaused = true
         }
-        if (settlement.hasPublishedPlan) {
-          next.unreviewedPlanActor = auth.actor
-        }
+        next.notice = COLLABORATION_PLAN_SYNC_FAILURE_NOTICE
       }
       break
     }

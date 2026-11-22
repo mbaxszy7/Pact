@@ -239,6 +239,63 @@ describe('MessageMarkdown local file navigation', () => {
   })
 })
 
+describe('MessageMarkdown code surfaces and typography', () => {
+  it('applies distinct semantic code tokens, stacked line-height spacing, and pre > code reset', () => {
+    const content = [
+      'Inline `alphaToken` in a paragraph.',
+      '',
+      '- List `betaToken` entry.',
+      '',
+      '```',
+      'bare_fenced_line()',
+      '```',
+      '',
+      '```ts',
+      'const typed = 1',
+      '```',
+      '',
+      '| Col A | Col B |',
+      '| --- | --- |',
+      '| `cell` | ok |',
+    ].join('\n')
+
+    const { container } = render(
+      <MessageMarkdown content={content} onOpenProjectFile={() => undefined} />,
+    )
+
+    const paragraph = container.querySelector('p')
+    expect(paragraph?.className).toContain('leading-[1.65]')
+    const listItem = container.querySelector('li')
+    expect(listItem?.className).toContain('leading-[1.65]')
+
+    const inlineCode = Array.from(container.querySelectorAll('code')).find(
+      (node) => !node.closest('pre') && node.textContent === 'alphaToken',
+    )
+    expect(inlineCode).toBeDefined()
+    expect(inlineCode?.className).toContain('bg-code-surface')
+    expect(inlineCode?.className).toContain('text-code-foreground')
+    expect(inlineCode?.className).toContain('ring-code-border')
+    expect(inlineCode?.className).toContain('rounded-[5px]')
+    expect(inlineCode?.className).toContain('box-decoration-clone')
+    expect(inlineCode?.className).not.toContain('bg-surface-raised')
+
+    const pres = Array.from(container.querySelectorAll('pre'))
+    expect(pres).toHaveLength(2)
+    for (const pre of pres) {
+      expect(pre.className).toContain('bg-code-block-surface')
+      expect(pre.className).toContain('border-code-border')
+      expect(pre.className).toContain('[&>code]:bg-transparent')
+      expect(pre.className).toContain('[&>code]:p-0')
+      expect(pre.className).toContain('[&>code]:ring-0')
+      expect(pre.className).toContain('[&>code]:text-[1em]')
+    }
+    expect(pres[1]?.querySelector('code')?.className).toContain('language-ts')
+
+    const th = container.querySelector('th')
+    expect(th?.className).toContain('bg-code-surface')
+  })
+})
+
 function installRangeGeometry(range: Range): void {
   Object.defineProperties(range, {
     getClientRects: {

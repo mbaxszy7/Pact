@@ -1,11 +1,10 @@
 import { expect, type ElectronApplication } from '@playwright/test'
 import { createHash } from 'node:crypto'
-import { chmod, copyFile, lstat, mkdir, realpath, rm } from 'node:fs/promises'
+import { chmod, copyFile, lstat, mkdir, readdir, realpath, rm } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { delimiter, isAbsolute, join, resolve } from 'node:path'
 
-import type { DesktopBridge } from '../../packages/contracts/src/index.js'
-
+import { collaborationTaskSchema, type DesktopBridge } from '../../packages/contracts/src/index.js'
 import { PactDatabase } from '../../packages/persistence/src/index.js'
 import { quitPact } from './native-quit.js'
 import { ReadonlyFixtureDatabase } from './readonly-fixture-database.js'
@@ -698,6 +697,403 @@ test(
         throw new Error(
           sanitizeError(
             cleanupError instanceof Error ? cleanupError.message : 'Real smoke cleanup failed',
+          ),
+        )
+      }
+    }
+  },
+)
+
+/**
+ * Reads `step_count` from an isolated copy of `conversation_summaries.db` without touching
+ * or creating sidecars in the live Antigravity directory.
+ */
+async function readSummaryStepCountCopy(
+  fixtureDir: string,
+  summariesDbPath: string,
+  nativeSessionId: string,
+  label: string,
+): Promise<number | null> {
+  const scratchDir = join(fixtureDir, 'readonly-sqlite-copies', `summary-${label}-${Date.now()}`)
+  await mkdir(scratchDir, { recursive: true, mode: 0o700 })
+  await chmod(scratchDir, 0o700)
+  const copyDbPath = join(scratchDir, 'conversation_summaries.db')
+  try {
+    await copyFile(summariesDbPath, copyDbPath)
+    for (const suffix of ['-wal', '-shm']) {
+      // oxlint-disable-next-line eslint/no-await-in-loop -- Copy optional SQLite sidecars sequentially before opening read-only.
+      if (await hasRegularNonSymlinkFile(`${summariesDbPath}${suffix}`)) {
+        // oxlint-disable-next-line eslint/no-await-in-loop -- Bounded SQLite sidecar copy.
+        await copyFile(`${summariesDbPath}${suffix}`, `${copyDbPath}${suffix}`)
+      }
+    }
+    const db = openReadonlySqlite(copyDbPath)
+    try {
+      const row = db
+        .prepare('SELECT step_count FROM "conversation_summaries" WHERE "conversation_id" = ?')
+        .all(nativeSessionId)
+        .find(isPlainRecord)
+      return row && typeof row['step_count'] === 'number' ? row['step_count'] : null
+    } finally {
+      db.close()
+    }
+  } finally {
+    await rm(scratchDir, { recursive: true, force: true })
+  }
+}
+
+async function assertIsolatedConversationsHygiene(conversationsDir: string): Promise<string[]> {
+  const entries = (await readdir(conversationsDir)).toSorted()
+  for (const entry of entries) {
+    expect(
+      entry,
+      `Unexpected non-standard file in isolated Antigravity conversations directory: ${entry}`,
+    ).toMatch(/^[0-9a-f-]+\.db(?:-wal|-shm)?$/iu)
+  }
+  return entries
+}
+
+test(
+  'opt-in local real Antigravity CLI completes 2-turn plan_review on same binding with gemini-pro-orchestrator and ask permissionMode',
+  { tag: ['@real', '@real-extended'] },
+  async ({ browserName: _browserName }, testInfo) => {
+    if (!isRealAgySmokeAuthorized(process.env)) {
+      test.skip(
+        true,
+        'Opt-in paid real Antigravity 2-turn plan_review requires PACT_E2E_REAL_AGY=1.',
+      )
+      return
+    }
+    test.setTimeout(240_000)
+
+    expect(testInfo.project.name).toBe('real')
+    expect(testInfo.project.use.trace).toBe('off')
+    expect(testInfo.project.use.screenshot).toBe('off')
+    expect(testInfo.project.use.video).toBe('off')
+
+    requireExplicitAgyAuthDir(process.env)
+    const agyExecutable = await resolveRealAgyExecutable(process.env)
+
+    let authManifest: CopiedAgyAuthManifest | undefined
+    const sanitizeError = (message: string): string =>
+      authManifest ? authManifest.redact(message) : redactRealAgyText(message)
+
+    const fixture = await createRuntimeFixture({
+      mode: 'deterministic',
+      realProviderProtection: true,
+      redactText: sanitizeError,
+      firstUse: true,
+      claude: 'ready',
+      codex: 'ready',
+      codexAppServer: 'fork_complete',
+      ...(process.platform === 'darwin' && process.env.PACT_E2E_AGY_NATIVE_CREDENTIAL_STORE === '1'
+        ? { nativeCredentialStore: true }
+        : {}),
+    })
+    let app: ElectronApplication | undefined
+
+    try {
+      const isolatedHome = join(fixture.directory, 'home')
+      authManifest = await copyIsolatedAgyAuthConfig(isolatedHome, process.env)
+
+      const projectName = 'real-agy-plan-review-2turn'
+      const projectDirectory = await fixture.createProjectDirectory(projectName)
+      await verifyAgyMinimumVersion(agyExecutable, process.env, {
+        cwd: projectDirectory,
+        isolatedRoot: isolatedHome,
+        minimumVersion: '1.5.13',
+      })
+
+      const db = await PactDatabase.open({ filePath: fixture.databaseFile, migrationsFolder })
+      try {
+        db.runtimePreparationRepository.saveSelectedExecutablePath('agy', agyExecutable)
+        db.defaultSessionSettingsRepository.save({
+          primaryAgentId: 'codex',
+          secondaryAgentId: 'agy',
+          agents: {
+            claude: { model: null, effort: null, speed: 'native' },
+            codex: { model: null, effort: null, speed: 'native' },
+            agy: { model: 'gemini-pro-orchestrator', effort: null, speed: 'native' },
+          },
+          maxDiscussionRounds: 4,
+          maxReviewCycles: 2,
+          maxRepairAttempts: 2,
+        })
+      } finally {
+        db.close()
+      }
+
+      app = await fixture.launch()
+      await app.evaluate(({ BrowserWindow }) => {
+        BrowserWindow.getAllWindows()[0]?.setSize(1440, 920)
+      })
+      const window = await app.firstWindow()
+      await expect(window.getByRole('button', { name: 'Add project', exact: true })).toBeVisible({
+        timeout: 30_000,
+      })
+
+      await expect
+        .poll(
+          async () =>
+            window.evaluate(async () => {
+              const bridge: DesktopBridge = Reflect.get(globalThis, 'pact')
+              const state = await bridge.getRuntimePreparation()
+              if (!state.ok) return 'error'
+              return state.value.agents.find((a) => a.agentId === 'agy')?.state ?? 'missing'
+            }),
+          { timeout: 30_000, intervals: [500, 1000, 2000] },
+        )
+        .toBe('ready')
+      await window.evaluate(() => {
+        globalThis.dispatchEvent(new Event('focus'))
+      })
+
+      await app.evaluate(({ dialog }, selectedPath) => {
+        Reflect.set(dialog, 'showOpenDialog', async () => ({
+          canceled: false,
+          filePaths: [selectedPath],
+        }))
+      }, projectDirectory)
+      await window.getByRole('button', { name: 'Add project', exact: true }).click()
+      await expect(
+        window.getByRole('button', { name: `Rename Project ${projectName}`, exact: true }),
+      ).toBeVisible({ timeout: 15_000 })
+      await window.getByRole('button', { name: `New Session in ${projectName}` }).focus()
+      await window.getByRole('button', { name: `New Session in ${projectName}` }).click()
+      const createSessionButton = window.getByRole('button', {
+        name: 'Create Session',
+        exact: true,
+      })
+      await expect(createSessionButton).toBeEnabled({ timeout: 30_000 })
+      await createSessionButton.click()
+
+      const mainWorkspace = window.getByRole('region', { name: 'Workspace', exact: true })
+      const composer = mainWorkspace.getByRole('combobox', { name: 'Message' })
+      await expect(composer).toBeVisible({ timeout: 30_000 })
+      await expect(composer).toBeEnabled({ timeout: 15_000 })
+
+      const activeSessionId = await window.evaluate(async () => {
+        const bridge: DesktopBridge = Reflect.get(globalThis, 'pact')
+        const projects = await bridge.getProjectCatalog()
+        if (!projects.ok || projects.value.projects.length === 0) {
+          throw new Error('Project catalog unavailable')
+        }
+        const sessions = await bridge.getSessionCatalog(projects.value.projects[0]!.id)
+        if (!sessions.ok || sessions.value.sessions.length === 0) {
+          throw new Error('Session catalog unavailable')
+        }
+        return sessions.value.sessions[0]!.id
+      })
+
+      // Verify configured model, permissionMode='ask', and zero prior Antigravity trajectory steps before Turn 1:
+      const isolatedAgyRoot = join(isolatedHome, '.gemini', 'antigravity-cli')
+      const isolatedConversationsDir = join(isolatedAgyRoot, 'conversations')
+      const summariesDbPath = join(isolatedAgyRoot, 'conversation_summaries.db')
+      const initialSettings = (() => {
+        const readDb = ReadonlyFixtureDatabase.open(fixture)
+        try {
+          const session = readDb.sessionRepository.find(activeSessionId)
+          const snapshot = readDb.conversationRepository.read(activeSessionId)
+          return {
+            agyModel: session?.settings.agents.agy.model ?? null,
+            agyPermissionMode: session?.settings.permissionModes?.agy ?? null,
+            existingAgyContext: snapshot.nativeContexts.find((c) => c.agentId === 'agy'),
+          }
+        } finally {
+          readDb.close()
+        }
+      })()
+      expect(initialSettings.agyModel).toBe('gemini-pro-orchestrator')
+      expect(initialSettings.agyPermissionMode).toBe('ask')
+      expect(initialSettings.existingAgyContext).toBeUndefined()
+      const initialConversationEntries =
+        await assertIsolatedConversationsHygiene(isolatedConversationsDir)
+      expect(initialConversationEntries.filter((entry) => entry.endsWith('.db'))).toEqual([])
+
+      const readCollaborationState = () => {
+        const readDb = ReadonlyFixtureDatabase.open(fixture)
+        try {
+          const snapshot = readDb.conversationRepository.read(activeSessionId)
+          const taskRow = readDb.drizzle.query.collaborationTasks
+            .findFirst({
+              where: (table, { eq }) => eq(table.sessionId, activeSessionId),
+            })
+            .sync()
+          const task = taskRow ? collaborationTaskSchema.parse(JSON.parse(taskRow.stateJson)) : null
+          const agyPlanReviewRuns = snapshot.runs.filter(
+            (run) => run.agentId === 'agy' && run.collaboration?.stage === 'plan_review',
+          )
+          const agyContext = snapshot.nativeContexts.find((c) => c.agentId === 'agy')
+          const permissionEvents = readDb.drizzle.query.agentEventJournal
+            .findMany({
+              where: (table, { and, eq }) =>
+                and(
+                  eq(table.sessionId, activeSessionId),
+                  eq(table.eventType, 'native.permission.requested'),
+                ),
+            })
+            .sync()
+          return {
+            task,
+            agyPlanReviewRuns,
+            agyContext,
+            permissionEventsCount: permissionEvents.length,
+          }
+        } finally {
+          readDb.close()
+        }
+      }
+
+      // Turn 1: Start /plan -> deterministic Codex publishes Plan v1 -> real Antigravity reviews (fresh binding, stepCount=0 prior to Turn 1)
+      await composer.click()
+      await composer.fill(
+        '/plan Review the 3-step cancellation ownership and restart verification plan. All requirements are fixed; call submit_review directly without editing files or running shell commands.',
+      )
+      await mainWorkspace.getByRole('button', { name: 'Send message', exact: true }).click()
+
+      await expect
+        .poll(
+          () => {
+            const state = readCollaborationState()
+            if (state.task?.status === 'failed') {
+              throw new Error('Turn 1 real Antigravity plan_review failed.')
+            }
+            const completedAgyReviews = state.agyPlanReviewRuns.filter(
+              (run) => run.status === 'completed',
+            )
+            return completedAgyReviews.length >= 1 && state.task?.status !== 'running'
+          },
+          { timeout: 120_000, intervals: [500, 1000, 2000] },
+        )
+        .toBe(true)
+
+      const afterTurn1 = readCollaborationState()
+      expect(afterTurn1.agyContext?.nativeSessionId).toBeDefined()
+      const nativeSid = afterTurn1.agyContext!.nativeSessionId
+      const bindingGeneration = afterTurn1.agyContext!.bindingGeneration
+      expect(afterTurn1.permissionEventsCount).toBe(0)
+      await expect(
+        mainWorkspace.getByRole('region', { name: 'Antigravity permission request' }),
+      ).toHaveCount(0)
+
+      const isolatedDbPath = join(isolatedConversationsDir, `${nativeSid}.db`)
+      const turn1Trajectory = await readTrajectorySummaryCopy(
+        fixture.directory,
+        isolatedDbPath,
+        'plan-review-turn1',
+      )
+      expect(turn1Trajectory.stepCount).toBeGreaterThanOrEqual(2)
+      expect(turn1Trajectory.userSteps.length).toBeGreaterThanOrEqual(1)
+      expect(turn1Trajectory.plannerSteps.length).toBeGreaterThanOrEqual(1)
+      expect(turn1Trajectory.terminalPlannerStep?.status).toBe(CORTEX_STEP_STATUS_DONE)
+      await assertIsolatedConversationsHygiene(isolatedConversationsDir)
+
+      // Turn 2: If Turn 1 accepted, request a plan revision so deterministic Codex publishes Plan v2
+      // and real Antigravity resumes Turn 2 plan_review on the EXACT SAME binding!
+      const completedAfterTurn1Count = afterTurn1.agyPlanReviewRuns.filter(
+        (run) => run.status === 'completed',
+      ).length
+      if (completedAfterTurn1Count < 2) {
+        await expect(composer).toBeEnabled({ timeout: 30_000 })
+        await composer.click()
+        await composer.fill(
+          '@codex Update the plan to explicitly state idempotent repeat cancellation and republish for a second review.',
+        )
+        await mainWorkspace.getByRole('button', { name: 'Send message', exact: true }).click()
+      }
+
+      await expect
+        .poll(
+          () => {
+            const state = readCollaborationState()
+            if (state.task?.status === 'failed') {
+              throw new Error('Turn 2 real Antigravity plan_review failed.')
+            }
+            const completedAgyReviews = state.agyPlanReviewRuns.filter(
+              (run) => run.status === 'completed',
+            )
+            return completedAgyReviews.length >= 2 && state.task?.status !== 'running'
+          },
+          { timeout: 120_000, intervals: [500, 1000, 2000] },
+        )
+        .toBe(true)
+
+      const afterTurn2 = readCollaborationState()
+      expect(afterTurn2.agyContext?.nativeSessionId).toBe(nativeSid)
+      expect(afterTurn2.agyContext?.bindingGeneration).toBe(bindingGeneration)
+      expect(
+        afterTurn2.agyPlanReviewRuns.filter((run) => run.status === 'completed').length,
+      ).toBeGreaterThanOrEqual(2)
+      expect(afterTurn2.permissionEventsCount).toBe(0)
+      await expect(
+        mainWorkspace.getByRole('region', { name: 'Antigravity permission request' }),
+      ).toHaveCount(0)
+
+      expect(afterTurn2.task).not.toBeNull()
+      expect(afterTurn2.task!.status).not.toBe('failed')
+      expect(afterTurn2.task!.pauseReason).not.toBe('failure')
+      expect(afterTurn2.task!.planReference).toBeDefined()
+      expect(afterTurn2.task!.review?.actor).toBe('agy')
+      expect(['accepted', 'changes_requested']).toContain(afterTurn2.task!.review?.verdict)
+      const collaborationView = await window.evaluate(async (sid) => {
+        const bridge: DesktopBridge = Reflect.get(globalThis, 'pact')
+        const result = await bridge.getConversation({ scope: 'collaboration', sessionId: sid })
+        if (!result.ok || result.value.scope !== 'collaboration') {
+          throw new Error('Collaboration view unavailable')
+        }
+        return { planSync: result.value.view.planSync, accepted: result.value.view.accepted }
+      }, activeSessionId)
+      expect(collaborationView.planSync).not.toBe('recovery_required')
+
+      const turn2Trajectory = await readTrajectorySummaryCopy(
+        fixture.directory,
+        isolatedDbPath,
+        'plan-review-turn2',
+      )
+      expect(turn2Trajectory.stepCount).toBeGreaterThanOrEqual(4)
+      if (completedAfterTurn1Count < 2) {
+        expect(turn2Trajectory.stepCount).toBeGreaterThan(turn1Trajectory.stepCount)
+      }
+      expect(turn2Trajectory.userSteps.length).toBeGreaterThanOrEqual(2)
+      expect(turn2Trajectory.plannerSteps.length).toBeGreaterThanOrEqual(2)
+      expect(turn2Trajectory.terminalPlannerStep?.status).toBe(CORTEX_STEP_STATUS_DONE)
+
+      const summaryStepCount = await readSummaryStepCountCopy(
+        fixture.directory,
+        summariesDbPath,
+        nativeSid,
+        'plan-review-turn2',
+      )
+      expect(summaryStepCount).toBe(turn2Trajectory.stepCount)
+      await assertIsolatedConversationsHygiene(isolatedConversationsDir)
+    } catch (error) {
+      // oxlint-disable-next-line eslint/preserve-caught-error -- Sanitize real-provider error text without retaining credential-bearing causes.
+      throw new Error(
+        sanitizeError(error instanceof Error ? error.message : 'Real 2-turn plan_review failed'),
+      )
+    } finally {
+      let cleanupError: unknown
+      for (const cleanupStep of [
+        async () => {
+          if (app) await quitPact(app)
+        },
+        async () => fixture.dispose(),
+        async () => authManifest?.assertSourceIntegrity(),
+      ]) {
+        try {
+          // oxlint-disable-next-line eslint/no-await-in-loop -- Settle app shutdown, fixture disposal, and source integrity in order without skipping later steps.
+          await cleanupStep()
+        } catch (stepError) {
+          cleanupError ??= stepError
+        }
+      }
+      if (cleanupError !== undefined) {
+        // oxlint-disable-next-line eslint/no-unsafe-finally -- Surface redacted cleanup or integrity failure rather than masking leaked resources.
+        throw new Error(
+          sanitizeError(
+            cleanupError instanceof Error
+              ? cleanupError.message
+              : 'Real 2-turn plan_review cleanup failed',
           ),
         )
       }

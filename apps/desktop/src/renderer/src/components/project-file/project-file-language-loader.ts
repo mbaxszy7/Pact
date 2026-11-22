@@ -34,12 +34,21 @@ const basicLanguages: Readonly<Record<string, LanguageLoader>> = {
   yaml: () => import('monaco-editor/languages/definitions/yaml/register.js'),
 }
 
+export interface ProjectFileLanguageLoadOptions {
+  beforeEnableJson?: ((createWorker: () => Worker) => void) | undefined
+  afterDisableJson?: (() => void) | undefined
+}
+
 export async function loadProjectFileLanguage(
   language: string,
+  options?: ProjectFileLanguageLoadOptions,
 ): Promise<ProjectFileLanguageSupport | undefined> {
   if (language === 'json') {
     const module = await import('./project-json-support')
-    return module.acquireJsonSupport()
+    return module.acquireJsonSupport({
+      beforeEnable: options?.beforeEnableJson,
+      afterDisable: options?.afterDisableJson,
+    })
   }
   await basicLanguages[language]?.()
   return undefined

@@ -13,6 +13,7 @@ const harness = vi.hoisted(() => ({
   windows: new Map<object, unknown>(),
 }))
 vi.mock('electron', () => ({
+  app: { isPackaged: false },
   BrowserWindow: { fromWebContents: (sender: object) => harness.windows.get(sender) },
   ipcMain: {
     handle: (channel: string, handler: (...args: unknown[]) => unknown) =>

@@ -1,7 +1,9 @@
 import { defaultRangeExtractor, useVirtualizer } from '@tanstack/react-virtual'
 import { ChevronLeft, ChevronRight, MessagesSquare, Plus, RefreshCw, X } from 'lucide-react'
 import {
+  createContext,
   useCallback,
+  useContext,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -27,12 +29,15 @@ type VirtualListRow =
   | { kind: 'item'; key: string; item: SideChatSummary; itemIndex: number }
   | { kind: 'bottom-boundary'; key: string }
 
-interface SideChatsPanelProps {
+export const SideChatsInspectorContext = createContext(false)
+
+export interface SideChatsPanelProps {
   parentSessionId: string
   activeSideChatId?: string | undefined
   activeSideChatTitle?: string | undefined
   sideChats: SideChatsController
   panelOpen: boolean
+  embeddedInInspector?: boolean | undefined
   creatingSideChat?: boolean | undefined
   onNewSideChat?: (() => void) | undefined
   onSelectSideChat: (sideChatId: string) => void
@@ -60,6 +65,7 @@ function SideChatsListView({
   sideChats,
   scrollTopsRef,
   revealAllowed,
+  embeddedInInspector = false,
   creatingSideChat = false,
   onInitialRevealDone,
   onNewSideChat,
@@ -70,6 +76,7 @@ function SideChatsListView({
   sideChats: SideChatsController
   scrollTopsRef: React.RefObject<Map<string, number>>
   revealAllowed: boolean
+  embeddedInInspector?: boolean | undefined
   creatingSideChat?: boolean | undefined
   onInitialRevealDone: () => void
   onNewSideChat?: (() => void) | undefined
@@ -253,39 +260,66 @@ function SideChatsListView({
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <header className="flex min-h-14 shrink-0 items-center justify-between gap-2 border-b border-border px-4">
-        <div className="flex min-w-0 items-center gap-2">
-          <MessagesSquare
-            aria-hidden="true"
-            className="size-4 shrink-0 text-secondary"
-            strokeWidth={1.75}
-          />
-          <h2 className="truncate text-body font-medium text-primary">Side chats</h2>
-        </div>
-        <div className="flex shrink-0 items-center gap-1">
+      {embeddedInInspector ? (
+        <div className="flex shrink-0 items-center justify-end gap-1 border-b border-border/70 px-2.5 py-1.5">
           {onNewSideChat ? (
             <button
               type="button"
               disabled={creatingSideChat}
-              className="inline-flex size-8 shrink-0 items-center justify-center rounded-control text-secondary transition-colors hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus disabled:cursor-default disabled:opacity-45"
+              className="pact-pressable inline-flex h-7 shrink-0 cursor-pointer items-center gap-1.5 rounded-lg px-2 text-caption font-medium text-secondary transition-colors hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus disabled:cursor-default disabled:opacity-45"
               aria-label="New side chat"
               title="New side chat"
               onClick={onNewSideChat}
             >
-              <Plus aria-hidden="true" className="size-4" strokeWidth={1.75} />
+              <Plus aria-hidden="true" className="size-3.5 shrink-0" strokeWidth={1.75} />
+              <span>New side chat</span>
             </button>
           ) : null}
           <button
             type="button"
-            className="inline-flex size-8 shrink-0 items-center justify-center rounded-control text-secondary transition-colors hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus"
+            className="pact-pressable inline-flex size-7 shrink-0 cursor-pointer items-center justify-center rounded-lg text-secondary transition-colors hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus"
             aria-label="Close side chats"
             title="Close side chats"
             onClick={onClose}
           >
-            <X aria-hidden="true" className="size-4" strokeWidth={1.75} />
+            <X aria-hidden="true" className="size-3.5" strokeWidth={1.75} />
           </button>
         </div>
-      </header>
+      ) : (
+        <header className="flex min-h-14 shrink-0 items-center justify-between gap-2 border-b border-border px-4">
+          <div className="flex min-w-0 items-center gap-2">
+            <MessagesSquare
+              aria-hidden="true"
+              className="size-4 shrink-0 text-secondary"
+              strokeWidth={1.75}
+            />
+            <h2 className="truncate text-body font-medium text-primary">Side chats</h2>
+          </div>
+          <div className="flex shrink-0 items-center gap-1">
+            {onNewSideChat ? (
+              <button
+                type="button"
+                disabled={creatingSideChat}
+                className="inline-flex size-8 shrink-0 items-center justify-center rounded-control text-secondary transition-colors hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus disabled:cursor-default disabled:opacity-45"
+                aria-label="New side chat"
+                title="New side chat"
+                onClick={onNewSideChat}
+              >
+                <Plus aria-hidden="true" className="size-4" strokeWidth={1.75} />
+              </button>
+            ) : null}
+            <button
+              type="button"
+              className="inline-flex size-8 shrink-0 items-center justify-center rounded-control text-secondary transition-colors hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus"
+              aria-label="Close side chats"
+              title="Close side chats"
+              onClick={onClose}
+            >
+              <X aria-hidden="true" className="size-4" strokeWidth={1.75} />
+            </button>
+          </div>
+        </header>
+      )}
 
       <div
         ref={scrollRef}
@@ -454,6 +488,7 @@ export function SideChatsPanel({
   activeSideChatTitle,
   sideChats,
   panelOpen,
+  embeddedInInspector,
   creatingSideChat,
   onNewSideChat,
   onSelectSideChat,
@@ -461,6 +496,8 @@ export function SideChatsPanel({
   onClose,
   renderDetail,
 }: SideChatsPanelProps): React.JSX.Element {
+  const inInspectorContext = useContext(SideChatsInspectorContext)
+  const isEmbedded = embeddedInInspector ?? inInspectorContext
   const scrollTopsRef = useRef(new Map<string, number>())
   const [revealState, setRevealState] = useState({
     parentSessionId,
@@ -482,7 +519,7 @@ export function SideChatsPanel({
   const depth = activeSideChatId ? 1 : 0
 
   return (
-    <section className="flex h-full min-h-0 flex-col bg-surface-raised" aria-label="Side chats">
+    <section className="flex h-full min-h-0 flex-col bg-surface" aria-label="Side chats">
       <SideChatStage stageKey={stageKey} depth={depth}>
         {activeSideChatId ? (
           <div className="flex h-full min-h-0 flex-col">
@@ -521,6 +558,7 @@ export function SideChatsPanel({
             sideChats={sideChats}
             scrollTopsRef={scrollTopsRef}
             revealAllowed={panelOpen && revealState.pending}
+            embeddedInInspector={isEmbedded}
             creatingSideChat={creatingSideChat}
             onInitialRevealDone={markRevealDone}
             onNewSideChat={onNewSideChat}

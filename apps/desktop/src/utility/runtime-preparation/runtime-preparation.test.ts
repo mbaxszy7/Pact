@@ -20,7 +20,7 @@ import type { RuntimePreparationRepository } from '@pact/persistence'
 
 import { OwnedProcessGroup } from '../owned-process-group.js'
 import { isSafeAgyProbeSessionId, isUnsafeWindowsCmdPath } from './agy-acp-probe.js'
-import { RuntimePreparation } from './runtime-preparation.js'
+import { type AgyReadinessSessionHook, RuntimePreparation } from './runtime-preparation.js'
 
 const temporaryDirectories: string[] = []
 const activePreparations: RuntimePreparation[] = []
@@ -41,7 +41,9 @@ interface AgyMockOptions {
     | 'close_error'
     | 'create_nonempty_probe_db'
     | 'create_foreign_workspace_probe_db'
+    | 'lock_probe_root'
   probeSessionId?: string
+  lockOnceFlagPath?: string
 }
 
 const DYNAMIC_PROBE_CWD_PLACEHOLDER = '__PACT_DYNAMIC_PROBE_CWD_URI_SLOT__'.padEnd(256, '\0')
@@ -163,6 +165,7 @@ async function agyExecutable(options: AgyMockOptions = {}): Promise<{
   const acpVersion = options.acpVersion ?? '1.5.11'
   const behavior = options.behavior ?? 'ready'
   const probeSessionId = options.probeSessionId ?? '550e8400-e29b-41d4-a716-446655440000'
+  const lockOnceFlagPath = options.lockOnceFlagPath ?? null
   const zeroStepDbHex =
     behavior === 'create_probe_db' ||
     behavior === 'close_error' ||
@@ -191,13 +194,14 @@ async function agyExecutable(options: AgyMockOptions = {}): Promise<{
   await writeFile(
     scriptPath,
     `#!${process.execPath}
-import { appendFileSync, mkdirSync, readdirSync, statSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
 import { createInterface } from 'node:readline'
 import { pathToFileURL } from 'node:url'
 
 const factsPath = ${JSON.stringify(factsPath)}
 const probeDbHex = ${JSON.stringify(zeroStepDbHex)}
+const lockOnceFlagPath = ${JSON.stringify(lockOnceFlagPath)}
 const placeholderSlot = Buffer.from(${JSON.stringify(DYNAMIC_PROBE_CWD_PLACEHOLDER)}, 'utf8')
 const record = (entry) => appendFileSync(factsPath, JSON.stringify({ pid: process.pid, ...entry }) + '\\n')
 const args = process.argv.slice(2)
@@ -242,21 +246,36 @@ if (args[0] === 'acp') {
         } else {
           const sid = ${JSON.stringify(probeSessionId)}
           record({ event: 'probe_cwd_entries_at_session_new', entries: readdirSync(process.cwd()) })
-          if (probeDbHex && process.env.ANTIGRAVITY_GEMINI_DIR) {
-            const convDir = join(process.env.ANTIGRAVITY_GEMINI_DIR, 'antigravity-cli', 'conversations')
+          const geminiIdx = args.indexOf('--gemini-dir')
+          const appDataIdx = args.indexOf('--app-data-dir')
+          const logFileIdx = args.indexOf('--log-file')
+          const effectiveGeminiDir = geminiIdx >= 0 ? args[geminiIdx + 1] : process.env.ANTIGRAVITY_GEMINI_DIR
+          const effectiveAppDataDir = appDataIdx >= 0 ? args[appDataIdx + 1] : 'antigravity-cli'
+          const logFilePath = logFileIdx >= 0 ? args[logFileIdx + 1] : null
+          if (logFilePath) {
+            mkdirSync(dirname(logFilePath), { recursive: true })
+            writeFileSync(logFilePath, 'acp-probe-log\\n')
+          }
+          if (effectiveGeminiDir && effectiveAppDataDir) {
+            const baseAgyDir = join(effectiveGeminiDir, effectiveAppDataDir)
+            const convDir = join(baseAgyDir, 'conversations')
+            const brainDir = join(baseAgyDir, 'brain', sid, 'scratch')
             mkdirSync(convDir, { recursive: true })
-            const dbBuf = Buffer.from(probeDbHex, 'hex')
-            const slotIdx = dbBuf.indexOf(placeholderSlot)
-            if (slotIdx >= 0 && typeof msg.params?.cwd === 'string') {
-              const replacement = Buffer.from(pathToFileURL(msg.params.cwd).href.padEnd(256, '\\0'), 'utf8')
-              replacement.copy(dbBuf, slotIdx, 0, 256)
-            }
-            writeFileSync(join(convDir, sid + '.db'), dbBuf)
-            if (behavior === 'create_probe_db') {
-              writeFileSync(join(convDir, sid + '.db-wal'), Buffer.alloc(0))
-              writeFileSync(join(convDir, sid + '.db-shm'), 'probe-shm')
-            } else if (behavior === 'create_probe_db_with_journal') {
-              writeFileSync(join(convDir, sid + '.db-journal'), 'active-rollback-journal')
+            mkdirSync(brainDir, { recursive: true })
+            if (probeDbHex) {
+              const dbBuf = Buffer.from(probeDbHex, 'hex')
+              const slotIdx = dbBuf.indexOf(placeholderSlot)
+              if (slotIdx >= 0 && typeof msg.params?.cwd === 'string') {
+                const replacement = Buffer.from(pathToFileURL(msg.params.cwd).href.padEnd(256, '\\0'), 'utf8')
+                replacement.copy(dbBuf, slotIdx, 0, 256)
+              }
+              writeFileSync(join(convDir, sid + '.db'), dbBuf)
+              if (behavior === 'create_probe_db') {
+                writeFileSync(join(convDir, sid + '.db-wal'), Buffer.alloc(0))
+                writeFileSync(join(convDir, sid + '.db-shm'), 'probe-shm')
+              } else if (behavior === 'create_probe_db_with_journal') {
+                writeFileSync(join(convDir, sid + '.db-journal'), 'active-rollback-journal')
+              }
             }
           }
           process.stdout.write(JSON.stringify({
@@ -266,6 +285,14 @@ if (args[0] === 'acp') {
           }) + '\\n')
         }
       } else if (msg.method === 'session/close') {
+        if (behavior === 'lock_probe_root' && (!lockOnceFlagPath || !existsSync(lockOnceFlagPath))) {
+          const probeRootDir = dirname(process.cwd())
+          writeFileSync(join(probeRootDir, 'locked-sentinel'), 'retain')
+          if (lockOnceFlagPath) {
+            writeFileSync(lockOnceFlagPath, 'locked')
+          }
+          chmodSync(probeRootDir, 0o500)
+        }
         if (behavior === 'close_error') {
           process.stdout.write(JSON.stringify({
             jsonrpc: '2.0',
@@ -412,7 +439,7 @@ describe.skipIf(process.platform === 'win32')('Runtime preparation utility', () 
     })
   })
 
-  it('probes claude, codex, and agy in parallel without sending a model prompt, recording CLI version separately from ACP agentInfo.version and cleaning up only the exact probe sessionId DB', async () => {
+  it('probes claude, codex, and agy in parallel without sending a model prompt, recording CLI version separately from ACP agentInfo.version and isolating agy storage in probeRoot', async () => {
     const { env, geminiDir } = await createIsolatedEnv()
     const probeSid = '550e8400-e29b-41d4-a716-446655440000'
     const userSid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
@@ -460,9 +487,17 @@ describe.skipIf(process.platform === 'win32')('Runtime preparation utility', () 
       .map((line) => parseAgyFactLine(line))
 
     const spawnFact = agyFacts.find((fact) => fact.event === 'acp_spawn')
-    expect(spawnFact?.args).toEqual(['acp', '--disable-telemetry'])
+    const probeRootFromCwd = dirname(spawnFact!.cwd!)
+    expect(spawnFact?.args?.slice(0, 3)).toEqual(['acp', '--disable-telemetry', '--gemini-dir'])
+    expect(spawnFact?.args?.[3]?.replace(/^\/private/u, '')).toBe(
+      join(probeRootFromCwd, 'gemini').replace(/^\/private/u, ''),
+    )
+    expect(spawnFact?.args?.slice(4, 7)).toEqual(['--app-data-dir', 'probe', '--log-file'])
+    expect(spawnFact?.args?.[7]?.replace(/^\/private/u, '')).toBe(
+      join(probeRootFromCwd, 'acp-probe.log').replace(/^\/private/u, ''),
+    )
     expect(spawnFact?.cwdMode).toBe(0o700)
-    expect(await exists(spawnFact!.cwd!)).toBe(false)
+    expect(await exists(probeRootFromCwd)).toBe(false)
 
     const methods = agyFacts.filter((fact) => fact.method).map((fact) => fact.method)
     expect(methods).toEqual(['initialize', 'session/new', 'session/close'])
@@ -474,7 +509,7 @@ describe.skipIf(process.platform === 'win32')('Runtime preparation utility', () 
     )
     expect(() => process.kill(spawnFact!.pid, 0)).toThrow(/ESRCH/u)
 
-    // Probe sessionId DB + WAL + SHM are deleted, while user conversation DBs remain untouched.
+    // Probe sessionId DB + WAL + SHM stayed inside isolated probeRoot and were deleted; shared user DBs remain untouched.
     expect(await exists(join(conversationsDir, `${probeSid}.db`))).toBe(false)
     expect(await exists(join(conversationsDir, `${probeSid}.db-wal`))).toBe(false)
     expect(await exists(join(conversationsDir, `${probeSid}.db-shm`))).toBe(false)
@@ -685,6 +720,125 @@ describe.skipIf(process.platform === 'win32')('Runtime preparation utility', () 
       expect(() => process.kill(spawnPid!, 0)).toThrow(/ESRCH/u)
     },
   )
+
+  it('fails closed to cannot_verify without spawning ACP when the agy --version probe close is unconfirmed', async () => {
+    const { env } = await createIsolatedEnv()
+    const [claude, codex, agy] = await Promise.all([
+      executable('claude', 0, 0),
+      executable('codex', 0, 0),
+      agyExecutable({ cliVersion: '1.5.9' }),
+    ])
+    const runtime = trackPreparation(
+      new RuntimePreparation(repository({ claude, codex, agy: agy.path }), { env }),
+    )
+    const origClose = Reflect.get(OwnedProcessGroup.prototype, 'close')
+    let failVersionCloseOnce = true
+    vi.spyOn(OwnedProcessGroup.prototype, 'close').mockImplementation(async function (
+      this: OwnedProcessGroup,
+      deadline?: number,
+    ) {
+      await origClose.call(this, deadline)
+      if (failVersionCloseOnce && Reflect.get(this, 'onCloseInput') === undefined) {
+        failVersionCloseOnce = false
+        throw new Error('Synthetic --version close failure')
+      }
+    })
+
+    const result = await runtime.inspectProviderReadiness('agy')
+    expect(result).toMatchObject({
+      ok: true,
+      value: {
+        agentId: 'agy',
+        state: 'cannot_verify',
+        detail: expect.stringContaining('could not be confirmed'),
+      },
+    })
+    expect(await exists(agy.factsPath)).toBe(false)
+  })
+
+  it('tracks unconfirmed agy probeRoot directories across dispose rejection and subsequent admission cleanup retry', async () => {
+    const { env } = await createIsolatedEnv()
+    const [claude, codex] = await Promise.all([
+      executable('claude', 0, 0),
+      executable('codex', 0, 0),
+    ])
+
+    // Part 1: Failed probeRoot deletion causes dispose() to reject cleanly instead of leaking silently.
+    const lockedAgy = await agyExecutable({ behavior: 'lock_probe_root' })
+    const runtimeA = trackPreparation(
+      new RuntimePreparation(repository({ claude, codex, agy: lockedAgy.path }), { env }),
+    )
+    let lockedRootA: string | undefined
+    try {
+      expect(await runtimeA.inspectProviderReadiness('agy')).toMatchObject({
+        ok: true,
+        value: { agentId: 'agy', state: 'ready', version: '1.5.9' },
+      })
+      const factsA = (await readFile(lockedAgy.factsPath, 'utf8'))
+        .trim()
+        .split('\n')
+        .map((line) => parseAgyFactLine(line))
+      lockedRootA = dirname(factsA.find((fact) => fact.event === 'acp_spawn')!.cwd!)
+      expect(await exists(lockedRootA)).toBe(true)
+      await expect(runtimeA.dispose()).rejects.toThrow(/probes were not released/u)
+    } finally {
+      if (lockedRootA) {
+        await chmod(lockedRootA, 0o700).catch(() => undefined)
+        await rm(lockedRootA, { recursive: true, force: true }).catch(() => undefined)
+      }
+    }
+
+    // Part 2: Subsequent admission retries cleanup once the directory is removable and dispose() then succeeds.
+    const flagDir = await mkdtemp(join(tmpdir(), 'pact-runtime-lock-flag-'))
+    temporaryDirectories.push(flagDir)
+    const lockOnceFlagPath = join(flagDir, 'locked-once')
+    const retryAgy = await agyExecutable({ behavior: 'lock_probe_root', lockOnceFlagPath })
+    const runtimeB = trackPreparation(
+      new RuntimePreparation(repository({ claude, codex, agy: retryAgy.path }), { env }),
+    )
+    let lockedRootB: string | undefined
+    let secondRootB: string | undefined
+    try {
+      expect(await runtimeB.inspectProviderReadiness('agy')).toMatchObject({
+        ok: true,
+        value: { agentId: 'agy', state: 'ready', version: '1.5.9' },
+      })
+      const firstFacts = (await readFile(retryAgy.factsPath, 'utf8'))
+        .trim()
+        .split('\n')
+        .map((line) => parseAgyFactLine(line))
+      const firstSpawn = firstFacts.find((fact) => fact.event === 'acp_spawn')
+      lockedRootB = dirname(firstSpawn!.cwd!)
+      expect(await exists(lockedRootB)).toBe(true)
+
+      await chmod(lockedRootB, 0o700)
+
+      expect(await runtimeB.inspectProviderReadiness('agy')).toMatchObject({
+        ok: true,
+        value: { agentId: 'agy', state: 'ready', version: '1.5.9' },
+      })
+      const secondFacts = (await readFile(retryAgy.factsPath, 'utf8'))
+        .trim()
+        .split('\n')
+        .map((line) => parseAgyFactLine(line))
+      const spawnsSecond = secondFacts.filter((fact) => fact.event === 'acp_spawn')
+      secondRootB = spawnsSecond[1]?.cwd ? dirname(spawnsSecond[1].cwd) : undefined
+
+      expect(await exists(lockedRootB)).toBe(false)
+      expect(secondRootB).toBeDefined()
+      expect(await exists(secondRootB!)).toBe(false)
+      await expect(runtimeB.dispose()).resolves.toBeUndefined()
+    } finally {
+      if (lockedRootB) {
+        await chmod(lockedRootB, 0o700).catch(() => undefined)
+        await rm(lockedRootB, { recursive: true, force: true }).catch(() => undefined)
+      }
+      if (secondRootB) {
+        await chmod(secondRootB, 0o700).catch(() => undefined)
+        await rm(secondRootB, { recursive: true, force: true }).catch(() => undefined)
+      }
+    }
+  })
 })
 
 describe.runIf(process.platform === 'win32')('Windows Runtime Preparation', () => {
@@ -875,21 +1029,62 @@ describe('Runtime version compatibility through real CLI probes', () => {
     })
   })
 
-  it('retains agy session DBs with zero sidefiles and keeps ready separate from bounded cleanup notes when ownership is unproven', async () => {
+  it('isolates agy probes away from shared conversation_summaries.db and pre-existing user DBs with zero sidefiles while handling session/close errors cleanly', async () => {
     const { env, geminiDir } = await createIsolatedEnv()
     const appDataDir = join(geminiDir, 'antigravity-cli')
     const conversationsDir = join(appDataDir, 'conversations')
     await mkdir(conversationsDir, { recursive: true })
-    // Unreadable/non-SQLite conversation_summaries.db proves probe cleanup NEVER reads or copies global conversation_summaries.db!
+    // Unreadable/non-SQLite conversation_summaries.db proves probes NEVER read or copy global conversation_summaries.db!
     const summariesPath = join(appDataDir, 'conversation_summaries.db')
     await writeFile(summariesPath, 'do-not-touch-global-summaries', { mode: 0o000 })
+
+    // Seed pre-existing shared DB fixtures (matching UUID, non-empty steps, rollback journal, foreign workspace).
+    const preExistingSid = '22222222-3333-4444-8555-666666666666'
+    const nonEmptySid = '33333333-4444-4555-8666-777777777777'
+    const foreignSid = '44444444-5555-4666-8777-888888888888'
+    const journalSid = '77777777-8888-4999-8aaa-bbbbbbbbbbbb'
+    const preExistingDbPath = join(conversationsDir, `${preExistingSid}.db`)
+    const nonEmptyDbPath = join(conversationsDir, `${nonEmptySid}.db`)
+    const foreignDbPath = join(conversationsDir, `${foreignSid}.db`)
+    const journalDbPath = join(conversationsDir, `${journalSid}.db`)
+    const journalRollbackPath = join(conversationsDir, `${journalSid}.db-journal`)
+
+    await writeFile(preExistingDbPath, 'pre-existing-user-db')
+    await writeFile(
+      nonEmptyDbPath,
+      Buffer.from(
+        await buildProbeSqliteBytes({
+          sessionId: nonEmptySid,
+          stepCount: 1,
+          dynamicProbeCwd: true,
+        }),
+        'hex',
+      ),
+    )
+    await writeFile(
+      foreignDbPath,
+      Buffer.from(
+        await buildProbeSqliteBytes({
+          sessionId: foreignSid,
+          stepCount: 0,
+          workspaceUri: pathToFileURL('/foreign/user/workspace').href,
+        }),
+        'hex',
+      ),
+    )
+    await writeFile(journalDbPath, 'user-db-with-journal')
+    await writeFile(journalRollbackPath, 'active-rollback-journal')
+    const pastDate = new Date(Date.now() - 10_000)
+    await utimes(preExistingDbPath, pastDate, pastDate)
+    const preExistingStatBefore = await stat(preExistingDbPath)
+    const entriesBefore = (await readdir(conversationsDir)).toSorted()
 
     const [claude, codex] = await Promise.all([
       versionExecutable('claude', '2.1.272 (Claude Code)'),
       versionExecutable('codex', 'codex-cli 0.159.2'),
     ])
 
-    // (a) session/close fails -> retain DB untouched and keep state='ready' with bounded cleanup note
+    // (a) session/close error still leaves agy ready and deletes isolated probeRoot.
     const closeFailSid = '11111111-2222-4333-8444-555555555555'
     const closeFailAgy = await agyExecutable({
       behavior: 'close_error',
@@ -904,147 +1099,51 @@ describe('Runtime version compatibility through real CLI probes', () => {
         agents: [
           { agentId: 'claude', state: 'ready' },
           { agentId: 'codex', state: 'ready' },
-          {
-            agentId: 'agy',
-            state: 'ready',
-            detail: expect.stringContaining('retained'),
-          },
+          { agentId: 'agy', state: 'ready' },
         ],
       },
     })
-    expect(await exists(join(conversationsDir, `${closeFailSid}.db`))).toBe(true)
+    const closeFailFacts = (await readFile(closeFailAgy.factsPath, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => parseAgyFactLine(line))
+    const closeFailRoot = dirname(closeFailFacts.find((fact) => fact.event === 'acp_spawn')!.cwd!)
+    expect(await exists(closeFailRoot)).toBe(false)
 
-    // (b) pre-existing <sessionId>.db older than probe window -> retain DB without readdir and keep state='ready' with note
-    const preExistingSid = '22222222-3333-4444-8555-666666666666'
-    const preExistingDbPath = join(conversationsDir, `${preExistingSid}.db`)
-    await writeFile(preExistingDbPath, 'pre-existing-user-db')
-    const pastDate = new Date(Date.now() - 10_000)
-    await utimes(preExistingDbPath, pastDate, pastDate)
-    const preExistingAgy = await agyExecutable({
-      behavior: 'ready',
+    // (b) Running a probe configured with the same sessionId as a shared user DB never touches shared DBs.
+    const sameSidAgy = await agyExecutable({
+      behavior: 'create_probe_db',
       probeSessionId: preExistingSid,
     })
-    const preExistingResult = await trackPreparation(
-      new RuntimePreparation(repository({ claude, codex, agy: preExistingAgy.path }), { env }),
+    const sameSidResult = await trackPreparation(
+      new RuntimePreparation(repository({ claude, codex, agy: sameSidAgy.path }), { env }),
     ).inspectReadiness()
-    expect(preExistingResult).toMatchObject({
+    expect(sameSidResult).toMatchObject({
       ok: true,
       value: {
         agents: [
           { agentId: 'claude', state: 'ready' },
           { agentId: 'codex', state: 'ready' },
-          {
-            agentId: 'agy',
-            state: 'ready',
-            detail: expect.stringContaining('retained'),
-          },
+          { agentId: 'agy', state: 'ready' },
         ],
       },
     })
+    const sameSidFacts = (await readFile(sameSidAgy.factsPath, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => parseAgyFactLine(line))
+    expect(
+      await exists(dirname(sameSidFacts.find((fact) => fact.event === 'acp_spawn')!.cwd!)),
+    ).toBe(false)
+
+    // Shared conversationsDir and pre-existing DBs + mtime + rollback journal remain completely untouched.
+    expect((await readdir(conversationsDir)).toSorted()).toEqual(entriesBefore)
     expect(await readFile(preExistingDbPath, 'utf8')).toBe('pre-existing-user-db')
-
-    // (c1) steps count > 0 -> retain DB with zero sidefiles in conversations/ and keep state='ready' with note
-    const nonEmptySid = '33333333-4444-4555-8666-777777777777'
-    const nonEmptyAgy = await agyExecutable({
-      behavior: 'create_nonempty_probe_db',
-      probeSessionId: nonEmptySid,
-    })
-    const nonEmptyResult = await trackPreparation(
-      new RuntimePreparation(repository({ claude, codex, agy: nonEmptyAgy.path }), { env }),
-    ).inspectReadiness()
-    expect(nonEmptyResult).toMatchObject({
-      ok: true,
-      value: {
-        agents: [
-          { agentId: 'claude', state: 'ready' },
-          { agentId: 'codex', state: 'ready' },
-          {
-            agentId: 'agy',
-            state: 'ready',
-            detail: expect.stringContaining('retained'),
-          },
-        ],
-      },
-    })
-    expect(await exists(join(conversationsDir, `${nonEmptySid}.db`))).toBe(true)
-    const dirEntriesAfterNonEmpty = await readdir(conversationsDir)
-    expect(dirEntriesAfterNonEmpty).not.toContain(`${nonEmptySid}.db-wal`)
-    expect(dirEntriesAfterNonEmpty).not.toContain(`${nonEmptySid}.db-shm`)
-
-    // (c2) missing file:// metadata in <sessionId>.db -> retain DB (never assume ownership without positive file:// match!)
-    const noUriSid = '66666666-7777-4888-8999-aaaaaaaaaaaa'
-    const noUriAgy = await agyExecutable({
-      behavior: 'create_probe_db_no_workspace_uri',
-      probeSessionId: noUriSid,
-    })
-    const noUriResult = await trackPreparation(
-      new RuntimePreparation(repository({ claude, codex, agy: noUriAgy.path }), { env }),
-    ).inspectReadiness()
-    expect(noUriResult).toMatchObject({
-      ok: true,
-      value: {
-        agents: [
-          { agentId: 'claude', state: 'ready' },
-          { agentId: 'codex', state: 'ready' },
-          {
-            agentId: 'agy',
-            state: 'ready',
-            detail: expect.stringContaining('retained'),
-          },
-        ],
-      },
-    })
-    expect(await exists(join(conversationsDir, `${noUriSid}.db`))).toBe(true)
-
-    // (c3) active <sessionId>.db-journal rollback file -> retain DB untouched
-    const journalSid = '77777777-8888-4999-8aaa-bbbbbbbbbbbb'
-    const journalAgy = await agyExecutable({
-      behavior: 'create_probe_db_with_journal',
-      probeSessionId: journalSid,
-    })
-    const journalResult = await trackPreparation(
-      new RuntimePreparation(repository({ claude, codex, agy: journalAgy.path }), { env }),
-    ).inspectReadiness()
-    expect(journalResult).toMatchObject({
-      ok: true,
-      value: {
-        agents: [
-          { agentId: 'claude', state: 'ready' },
-          { agentId: 'codex', state: 'ready' },
-          {
-            agentId: 'agy',
-            state: 'ready',
-            detail: expect.stringContaining('retained'),
-          },
-        ],
-      },
-    })
-    expect(await exists(join(conversationsDir, `${journalSid}.db`))).toBe(true)
-
-    // (c4) foreign workspace recorded in trajectory_metadata_blob -> retain DB and keep state='ready' with note
-    const foreignSid = '44444444-5555-4666-8777-888888888888'
-    const foreignAgy = await agyExecutable({
-      behavior: 'create_foreign_workspace_probe_db',
-      probeSessionId: foreignSid,
-    })
-    const foreignResult = await trackPreparation(
-      new RuntimePreparation(repository({ claude, codex, agy: foreignAgy.path }), { env }),
-    ).inspectReadiness()
-    expect(foreignResult).toMatchObject({
-      ok: true,
-      value: {
-        agents: [
-          { agentId: 'claude', state: 'ready' },
-          { agentId: 'codex', state: 'ready' },
-          {
-            agentId: 'agy',
-            state: 'ready',
-            detail: expect.stringContaining('retained'),
-          },
-        ],
-      },
-    })
-    expect(await exists(join(conversationsDir, `${foreignSid}.db`))).toBe(true)
+    expect((await stat(preExistingDbPath)).mtimeMs).toBe(preExistingStatBefore.mtimeMs)
+    expect(await exists(nonEmptyDbPath)).toBe(true)
+    expect(await exists(foreignDbPath)).toBe(true)
+    expect(await exists(journalDbPath)).toBe(true)
+    expect(await exists(journalRollbackPath)).toBe(true)
     await chmod(summariesPath, 0o600)
   })
 
@@ -1109,4 +1208,320 @@ describe('Runtime version compatibility through real CLI probes', () => {
     expect(await exists(join(dirname(codex), 'auth-called'))).toBe(false)
     expect(await exists(agy.factsPath)).toBe(true)
   })
+
+  it(
+    'runs coalesced agySessionHook calls on 1 agy acp probe, detaches aborted subscriber hooks, and isolates hook errors from readiness',
+    { timeout: 15_000 },
+    async () => {
+      const { env } = await createIsolatedEnv()
+      const hookDir = await mkdtemp(join(tmpdir(), 'pact-agy-hook-test-'))
+      temporaryDirectories.push(hookDir)
+      const factsPath = join(hookDir, 'agy-hook-facts.jsonl')
+      const gateFile = join(hookDir, 'gate')
+      const agyHookScript = join(hookDir, 'agy-hook-bin.mjs')
+      await writeFile(
+        agyHookScript,
+        `#!${process.execPath}
+import { appendFileSync, existsSync } from 'node:fs'
+import { createInterface } from 'node:readline'
+const factsPath = ${JSON.stringify(factsPath)}
+const gateFile = ${JSON.stringify(gateFile)}
+const record = (entry) => appendFileSync(factsPath, JSON.stringify({ pid: process.pid, ...entry }) + '\\n')
+const args = process.argv.slice(2)
+if (args[0] === '--version') {
+  process.stdout.write('1.5.13\\n')
+  process.exit(0)
+}
+if (args[0] === 'acp') {
+  record({ event: 'acp_spawn' })
+  const rl = createInterface({ input: process.stdin })
+  rl.on('line', (line) => {
+    const msg = JSON.parse(line)
+    record({ method: msg.method, id: msg.id })
+    if (msg.method === 'initialize') {
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1, agentInfo: { name: 'Antigravity ACP Server', version: '1.5.13' } } }) + '\\n')
+    } else if (msg.method === 'session/new') {
+      const reply = () => {
+        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee' } }) + '\\n')
+      }
+      if (!existsSync(gateFile)) reply()
+      else {
+        const timer = setInterval(() => {
+          if (!existsSync(gateFile)) {
+            clearInterval(timer)
+            reply()
+          }
+        }, 15)
+      }
+    } else if (msg.method === 'hook/ping') {
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { echoed: msg.params?.tag } }) + '\\n')
+    } else if (msg.method === 'session/close') {
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: {} }) + '\\n')
+    }
+  })
+  rl.on('close', () => process.exit(0))
+}
+`,
+        { mode: 0o755 },
+      )
+      await chmod(agyHookScript, 0o755)
+      const [claude, codex] = await Promise.all([
+        versionExecutable('claude', '2.1.272 (Claude Code)'),
+        versionExecutable('codex', 'codex-cli 0.159.2'),
+      ])
+      const prep = trackPreparation(
+        new RuntimePreparation(repository({ claude, codex, agy: agyHookScript }), { env }),
+      )
+
+      // Hold session/new so a throwing hook, an aborted subscriber hook, and a healthy concurrent hook coalesce cleanly.
+      await writeFile(gateFile, 'hold', 'utf8')
+      let thrownHookCalled = false
+      let abortedHookCalled = false
+      const healthyPayloads: Array<{
+        sessionId: string
+        cliVersion: string | undefined
+        echoed: unknown
+      }> = []
+
+      const abortController = new AbortController()
+      const throwingHook: AgyReadinessSessionHook = {
+        inspectSession: async () => {
+          thrownHookCalled = true
+          throw new Error('Hook boom should not block readiness')
+        },
+      }
+      const abortedHook: AgyReadinessSessionHook = {
+        inspectSession: async () => {
+          abortedHookCalled = true
+        },
+      }
+      const healthyHook: AgyReadinessSessionHook = {
+        inspectSession: async ({ sessionId, transport }, cliVersion) => {
+          const reply = await transport.request('hook/ping', { tag: 'coalesced' })
+          healthyPayloads.push({
+            sessionId,
+            cliVersion,
+            echoed:
+              typeof reply === 'object' && reply !== null
+                ? Reflect.get(reply, 'echoed')
+                : undefined,
+          })
+        },
+      }
+
+      const firstPromise = prep.inspectReadiness(undefined, ['agy'], Date.now() + 38_000, {
+        agySessionHook: throwingHook,
+      })
+      await expect
+        .poll(
+          async () => {
+            const text = await readFile(factsPath, 'utf8').catch(() => '')
+            return text.includes('"session/new"')
+          },
+          { timeout: 5_000 },
+        )
+        .toBe(true)
+
+      const secondPromise = prep.inspectReadiness(
+        abortController.signal,
+        ['agy'],
+        Date.now() + 38_000,
+        {
+          agySessionHook: abortedHook,
+        },
+      )
+      const thirdPromise = prep.inspectReadiness(undefined, ['agy'], Date.now() + 38_000, {
+        agySessionHook: healthyHook,
+      })
+      await new Promise((r) => setTimeout(r, 20))
+      abortController.abort()
+      await rm(gateFile, { force: true })
+
+      const [firstRes, secondRes, thirdRes] = await Promise.all([
+        firstPromise,
+        secondPromise,
+        thirdPromise,
+      ])
+      expect(firstRes).toMatchObject({
+        ok: true,
+        value: { agents: [{ agentId: 'agy', state: 'ready', version: '1.5.13' }] },
+      })
+      expect(secondRes).toMatchObject({ ok: false })
+      expect(thirdRes).toMatchObject({
+        ok: true,
+        value: { agents: [{ agentId: 'agy', state: 'ready', version: '1.5.13' }] },
+      })
+      expect(thrownHookCalled).toBe(true)
+      expect(abortedHookCalled).toBe(false)
+      expect(healthyPayloads).toEqual([
+        {
+          sessionId: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+          cliVersion: '1.5.13',
+          echoed: 'coalesced',
+        },
+      ])
+
+      const facts = (await readFile(factsPath, 'utf8'))
+        .trim()
+        .split('\n')
+        .map((l) => parseAgyFactLine(l))
+      expect(facts.filter((f) => f.event === 'acp_spawn')).toHaveLength(1)
+    },
+  )
+
+  it(
+    'caches positive readiness with executable fingerprint & generation checks, bypasses cache on forceRefresh/invalidation, and absorbs only 1 returning-user agy probe timeout',
+    { timeout: 25_000 },
+    async () => {
+      const { env } = await createIsolatedEnv()
+      const dir = await mkdtemp(join(tmpdir(), 'pact-agy-cache-test-'))
+      temporaryDirectories.push(dir)
+      const modeFile = join(dir, 'agy-mode.txt')
+      const factsPath = join(dir, 'agy-cache-facts.jsonl')
+      const agyBin = join(dir, 'agy-dynamic.mjs')
+      await writeFile(modeFile, 'ready', 'utf8')
+      await writeFile(
+        agyBin,
+        `#!${process.execPath}
+import { appendFileSync, readFileSync } from 'node:fs'
+import { createInterface } from 'node:readline'
+const modeFile = ${JSON.stringify(modeFile)}
+const factsPath = ${JSON.stringify(factsPath)}
+const args = process.argv.slice(2)
+const readMode = () => readFileSync(modeFile, 'utf8').trim()
+if (args[0] === '--version') {
+  const mode = readMode()
+  if (mode === 'outdated') {
+    process.stdout.write('1.5.8\\n')
+  } else {
+    process.stdout.write('1.5.14\\n')
+  }
+  process.exit(0)
+}
+if (args[0] === 'acp') {
+  appendFileSync(factsPath, JSON.stringify({ event: 'acp_spawn' }) + '\\n')
+  const mode = readMode()
+  if (mode === 'timeout') {
+    setInterval(() => {}, 1000)
+  } else {
+    const rl = createInterface({ input: process.stdin })
+    rl.on('line', (line) => {
+      const msg = JSON.parse(line)
+      if (msg.method === 'initialize') {
+        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1, agentInfo: { name: 'Antigravity ACP Server', version: '1.5.14' } } }) + '\\n')
+      } else if (msg.method === 'session/new') {
+        if (mode === 'unauthenticated') {
+          process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, error: { code: -32000, message: 'Authentication required' } }) + '\\n')
+        } else {
+          process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee' } }) + '\\n')
+        }
+      } else if (msg.method === 'session/close') {
+        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: {} }) + '\\n')
+      }
+    })
+    rl.on('close', () => process.exit(0))
+  }
+}
+`,
+        { mode: 0o755 },
+      )
+      await chmod(agyBin, 0o755)
+      const [claude, codex] = await Promise.all([
+        versionExecutable('claude', '2.1.272 (Claude Code)'),
+        versionExecutable('codex', 'codex-cli 0.159.2'),
+      ])
+      const returningRepo: RuntimePreparationRepository = {
+        ...repository({ claude, codex, agy: agyBin }),
+        hasCompletedFirstUseSetup: () => true,
+      }
+      const prep = trackPreparation(new RuntimePreparation(returningRepo, { env }))
+
+      let virtualNow = 1_700_000_000_000
+      vi.spyOn(Date, 'now').mockImplementation(() => virtualNow)
+
+      // 1. Initial probe spawns once; subsequent reads within TTL hit positive cache with zero extra spawns.
+      expect(await prep.inspectProviderReadiness('agy')).toMatchObject({
+        ok: true,
+        value: { agentId: 'agy', state: 'ready', version: '1.5.14' },
+      })
+      expect(await prep.inspectProviderReadiness('agy')).toMatchObject({
+        ok: true,
+        value: { agentId: 'agy', state: 'ready', version: '1.5.14' },
+      })
+      const readSpawnCount = async (): Promise<number> => {
+        const text = await readFile(factsPath, 'utf8').catch(() => '')
+        return text.trim().split('\n').filter(Boolean).length
+      }
+      expect(await readSpawnCount()).toBe(1)
+
+      // 2. forceRefresh bypasses cache; explicit invalidation clears cache.
+      expect(
+        await prep.inspectProviderReadiness('agy', undefined, { forceRefresh: true }),
+      ).toMatchObject({
+        ok: true,
+        value: { agentId: 'agy', state: 'ready', version: '1.5.14' },
+      })
+      expect(await readSpawnCount()).toBe(2)
+
+      prep.invalidateAgentReadiness('agy')
+      expect(await prep.inspectProviderReadiness('agy')).toMatchObject({
+        ok: true,
+        value: { agentId: 'agy', state: 'ready', version: '1.5.14' },
+      })
+      expect(await readSpawnCount()).toBe(3)
+
+      // 3. Past 180s positive TTL, 1 transient agy timeout is absorbed once (returning prior ready),
+      //    expires positive cache so the next check probes fresh, and a 2nd consecutive timeout surfaces startup_failed!
+      virtualNow += 181_000
+      await writeFile(modeFile, 'timeout', 'utf8')
+      expect(await prep.inspectProviderReadiness('agy')).toMatchObject({
+        ok: true,
+        value: { agentId: 'agy', state: 'ready', version: '1.5.14' },
+      })
+      expect(await readSpawnCount()).toBe(4)
+
+      expect(await prep.inspectProviderReadiness('agy')).toMatchObject({
+        ok: true,
+        value: {
+          agentId: 'agy',
+          state: 'startup_failed',
+          detail: 'Authentication check timed out.',
+        },
+      })
+      expect(await readSpawnCount()).toBe(5)
+
+      // 4. Re-warm ready cache, then fail with authentication_required -> NEVER absorbed!
+      await writeFile(modeFile, 'ready', 'utf8')
+      expect(await prep.inspectProviderReadiness('agy')).toMatchObject({
+        ok: true,
+        value: { agentId: 'agy', state: 'ready' },
+      })
+      expect(await readSpawnCount()).toBe(6)
+
+      virtualNow += 181_000
+      await writeFile(modeFile, 'unauthenticated', 'utf8')
+      expect(await prep.inspectProviderReadiness('agy')).toMatchObject({
+        ok: true,
+        value: { agentId: 'agy', state: 'authentication_required' },
+      })
+      expect(await readSpawnCount()).toBe(7)
+
+      // 5. Re-warm ready cache, then modify the on-disk executable -> stat fingerprint change invalidates cache even inside TTL!
+      await writeFile(modeFile, 'ready', 'utf8')
+      expect(await prep.inspectProviderReadiness('agy')).toMatchObject({
+        ok: true,
+        value: { agentId: 'agy', state: 'ready' },
+      })
+      expect(await readSpawnCount()).toBe(8)
+
+      const oldText = await readFile(agyBin, 'utf8')
+      await writeFile(agyBin, `${oldText}\n// bumped binary\n`, { mode: 0o755 })
+      await writeFile(modeFile, 'outdated', 'utf8')
+      expect(await prep.inspectProviderReadiness('agy')).toMatchObject({
+        ok: true,
+        value: { agentId: 'agy', state: 'unsupported_version', version: '1.5.8' },
+      })
+      expect(await readSpawnCount()).toBe(8)
+    },
+  )
 })

@@ -633,4 +633,99 @@ describe('Owned physical process groups', () => {
     expect(fixture.child.listenerCount('error')).toBe(0)
     expect(timeoutCount()).toBeLessThanOrEqual(timersBeforeClose)
   })
+
+  it.skipIf(process.platform === 'win32')(
+    'confirms late POSIX group release via settledAfterCloseTimeout() after initial identity capture fails before child close',
+    async () => {
+      const directory = await mkdtemp(join(tmpdir(), 'pact-catalog-late-no-root-'))
+      directories.push(directory)
+      const program = join(directory, 'owned-probe.cjs')
+      await writeFile(program, fixtureProgram)
+      let child!: ChildProcessWithoutNullStreams
+      const closeInput = vi.fn<() => void>(() => {
+        child.stdin.end()
+      })
+      const owner = new OwnedProcessGroup({ onCloseInput: closeInput })
+      child = owner.spawn(process.execPath, [program, 'late-held-helper', directory], {
+        cwd: directory,
+      })
+      child.stdout.resume()
+      child.stderr.resume()
+      const closed = new Promise<void>((resolve) => child.once('close', () => resolve()))
+      fixtures.push({ directory, owner, child, closed, identities: [] })
+
+      // Close with an already-tight 1ms deadline immediately after spawn so initial identity
+      // observation fails before `resolvedRoot` can be established and before `child` closes.
+      const closing = owner.close(Date.now() + 1)
+      await expect(closing).rejects.toMatchObject({
+        message: 'The owned process scope did not release before its deadline.',
+        code: 'unconfirmed_process',
+        retryable: true,
+      })
+      expect(owner.released).toBe(false)
+      expect(owner.settledAfterCloseTimeout()).toBe(false)
+
+      // `onCloseInput` sent EOF, causing the root to spawn `held-helper` in its own group and exit.
+      const helperPid = await readReadyPid(directory, 'helper')
+      const helperIdentity = readIdentity(helperPid)
+      assert(helperIdentity, 'The held helper must be alive in the owned group.')
+      assert.equal(helperIdentity.groupId, child.pid)
+      fixtures.at(-1)!.identities.push(helperIdentity)
+      await closed
+
+      // Root has closed, but the same-group helper is still alive -> must stay false.
+      expect(groupGone(child.pid!)).toBe(false)
+      expect(owner.settledAfterCloseTimeout()).toBe(false)
+      expect(owner.released).toBe(false)
+
+      // Once the helper exits and the entire group reports ESRCH, settledAfterCloseTimeout() flips true and sets released.
+      const observer = vi.fn<() => void>()
+      const removedObserver = vi.fn<() => void>()
+      const unsubscribe = owner.onReleased(removedObserver)
+      unsubscribe()
+      owner.onReleased(observer)
+      let whenReleasedSettled = false
+      const whenReleased = owner.whenReleased().then(() => {
+        whenReleasedSettled = true
+        return undefined
+      })
+
+      await writeFile(join(directory, 'release'), '')
+      await expect.poll(() => groupGone(child.pid!)).toBe(true)
+      expect(owner.settledAfterCloseTimeout()).toBe(true)
+      expect(owner.released).toBe(true)
+      await whenReleased
+      expect(whenReleasedSettled).toBe(true)
+      expect(observer).toHaveBeenCalledOnce()
+      expect(removedObserver).not.toHaveBeenCalled()
+      expect(owner.close()).toBe(closing)
+      expect(closeInput).toHaveBeenCalledOnce()
+    },
+  )
+
+  it('resolves whenReleased() and notifies onReleased() observers once on normal close', async () => {
+    const fixture = await createFixture('normal')
+    const observer = vi.fn<() => void>()
+    const lateObserver = vi.fn<() => void>()
+    const throwingObserver = vi.fn<() => void>(() => {
+      throw new Error('Observer failure must not break release notification')
+    })
+    fixture.owner.onReleased(throwingObserver)
+    fixture.owner.onReleased(observer)
+    let resolved = false
+    const released = fixture.owner.whenReleased().then(() => {
+      resolved = true
+      return undefined
+    })
+    expect(resolved).toBe(false)
+    await fixture.owner.close()
+    await released
+    expect(resolved).toBe(true)
+    expect(throwingObserver).toHaveBeenCalledOnce()
+    expect(observer).toHaveBeenCalledOnce()
+    // Subscribing after release invokes immediately once.
+    fixture.owner.onReleased(lateObserver)
+    expect(lateObserver).toHaveBeenCalledOnce()
+    await expectReleased(fixture)
+  })
 })

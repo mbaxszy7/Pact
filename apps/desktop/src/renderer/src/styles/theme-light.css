@@ -8,55 +8,85 @@
   --pact-font-mono:
     'JetBrains Mono Variable', 'SFMono-Regular', Consolas, 'Liberation Mono', monospace;
 
+  /* Warm Porcelain Atelier — Light */
   --pact-canvas: #ebf5ff;
   --pact-surface: #fafdff;
   --pact-surface-muted: #f0f7fc;
   --pact-surface-raised: #ffffff;
+  --pact-code-surface: #e7f0f8;
+  --pact-code-block-surface: #edf4fa;
+  --pact-code-foreground: #101b29;
+  --pact-code-border: rgb(15 23 42 / 12%);
   --pact-menu-surface: #ffffff;
-  --pact-surface-inverse: #181d27;
+  --pact-surface-inverse: #171b24;
+  --pact-row-hover: rgb(15 23 42 / 3.8%);
   --pact-text-primary: #0a0d12;
-  --pact-text-secondary: #535862;
-  --pact-text-tertiary: #69707c;
+  --pact-text-secondary: #525b6b;
+  --pact-text-tertiary: #636c7c;
   --pact-text-inverse: #ffffff;
-  --pact-border: #d6e1e9;
-  --pact-border-strong: #9eadba;
+  --pact-border: rgb(15 23 42 / 8%);
+  --pact-border-strong: rgb(15 23 42 / 15%);
   --pact-focus: #0069e0;
+  --pact-accent-soft: rgb(0 105 224 / 9%);
   --pact-selection: rgb(0 105 224 / 20%);
   --pact-navigation-selected: rgb(34 68 96 / 8%);
 
   --pact-status-ready: #16883f;
   --pact-status-ready-muted: #e6f6ec;
   --pact-status-ready-foreground: #0d6b32;
-  --pact-status-warning: #946200;
-  --pact-status-warning-muted: #fff6dc;
-  --pact-status-warning-foreground: #946200;
+  --pact-status-warning: #b4690e;
+  --pact-status-warning-muted: #fef5e4;
+  --pact-status-warning-foreground: #8c510a;
   --pact-status-danger: #b42318;
   --pact-status-danger-muted: #fff0ee;
-  --pact-status-danger-foreground: #b42318;
+  --pact-status-danger-foreground: #a6261e;
   --pact-status-info: #0069e0;
   --pact-status-info-muted: #e5f1ff;
   --pact-status-info-foreground: #005fca;
   --pact-danger: #b42318;
   --pact-danger-muted: #fff0ee;
 
+  /* User lavender pill & 3-agent speaker crest + guide tokens */
   --pact-speaker-user: #f1e6ff;
   --pact-speaker-claude: #fff2eb;
+  --pact-speaker-claude-fg: #b5471c;
+  --pact-speaker-claude-line: rgb(217 102 54 / 30%);
   --pact-speaker-codex: #d3f6e3;
-  --pact-speaker-agy: #def4fa;
-  --pact-diff-added: #e5f8ed;
-  --pact-diff-added-foreground: #176637;
-  --pact-diff-removed: #fff0ee;
-  --pact-diff-removed-foreground: #97251c;
+  --pact-speaker-codex-fg: #137043;
+  --pact-speaker-codex-line: rgb(22 136 82 / 30%);
+  --pact-speaker-agy: #e6f4fa;
+  --pact-speaker-agy-fg: #155e75;
+  --pact-speaker-agy-line: rgb(14 116 144 / 30%);
 
-  --pact-shadow-popover: 0 14px 34px rgb(30 67 92 / 14%);
-  --pact-shadow-dialog: 0 24px 60px rgb(30 67 92 / 20%);
+  --pact-diff-added: #e5f8ed;
+  --pact-diff-added-gutter: #dcf3e5;
+  --pact-diff-added-foreground: #156d3b;
+  --pact-diff-removed: #fff0ee;
+  --pact-diff-removed-gutter: #fde4e1;
+  --pact-diff-removed-foreground: #a6261e;
+
+  --pact-shadow-sheet: 0 2px 14px rgb(15 23 42 / 4%), 0 1px 2px rgb(15 23 42 / 3%);
+  --pact-shadow-island: 0 10px 30px rgb(15 23 42 / 7%), 0 1px 3px rgb(15 23 42 / 4%);
+  --pact-shadow-popover: 0 12px 32px rgb(15 23 42 / 12%), 0 2px 6px rgb(15 23 42 / 5%);
+  --pact-shadow-dialog: 0 24px 60px rgb(15 23 42 / 18%), 0 4px 12px rgb(15 23 42 / 6%);
+
+  --pact-scrollbar-thumb: rgb(100 116 139 / 24%);
+  --pact-scrollbar-thumb-hover: rgb(100 116 139 / 42%);
 
   --pact-material-canvas: rgb(235 245 255 / var(--pact-material-navigation-alpha));
   --pact-material-navigation: rgb(246 251 255 / calc(var(--pact-material-chat-alpha) - 0.07));
   --pact-material-chat: rgb(250 253 255 / var(--pact-material-chat-alpha));
-  --pact-material-code: rgb(255 255 255 / var(--pact-material-code-alpha));
+  --pact-material-code: rgb(237 244 250 / var(--pact-material-code-alpha));
   --pact-material-user: rgb(241 230 255 / var(--pact-material-message-alpha));
   --pact-material-claude: rgb(255 242 235 / var(--pact-material-message-alpha));
   --pact-material-codex: rgb(211 246 227 / var(--pact-material-message-alpha));
-  --pact-material-agy: rgb(222 244 250 / var(--pact-material-message-alpha));
+  --pact-material-agy: rgb(230 244 250 / var(--pact-material-message-alpha));
+  --pact-material-sheet-border: rgb(15 23 42 / 14%);
+}
+
+:root[data-material='translucent'],
+[data-theme='light'][data-material='translucent'] {
+  --pact-code-surface: rgb(231 240 248 / var(--pact-material-code-alpha));
+  --pact-code-block-surface: var(--pact-material-code);
+  --pact-code-border: rgb(15 23 42 / 15%);
 }

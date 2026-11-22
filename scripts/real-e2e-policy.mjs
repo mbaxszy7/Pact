@@ -482,6 +482,14 @@ export const realCases = [
     optIn: 'PACT_E2E_REAL_AGY',
     scenario: 'additional-regression',
   },
+  {
+    path: 'tests/e2e/agy-real-provider.spec.ts',
+    title:
+      'opt-in local real Antigravity CLI completes 2-turn plan_review on same binding with gemini-pro-orchestrator and ask permissionMode',
+    tier: 'extended',
+    optIn: 'PACT_E2E_REAL_AGY',
+    scenario: 'additional-regression',
+  },
 ]
 
 export const realPolicyHash = createHash('sha256').update(JSON.stringify(realCases)).digest('hex')

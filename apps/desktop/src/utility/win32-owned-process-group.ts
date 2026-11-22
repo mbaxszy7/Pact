@@ -1,7 +1,7 @@
 import { ChildProcess, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { constants } from 'node:fs'
-import { lstat, mkdir, open, opendir, realpath, unlink, type FileHandle } from 'node:fs/promises'
+import { lstat, mkdir, open, opendir, realpath, type FileHandle } from 'node:fs/promises'
 import { isAbsolute, join, resolve as resolvePath } from 'node:path'
 import { Duplex, PassThrough } from 'node:stream'
 
@@ -89,6 +89,11 @@ function configured(value?: WindowsOwnedProcessConfiguration) {
   return selected
 }
 const failure = () => Error('Windows process ownership could not be confirmed.')
+const unconfirmedReleaseFailure = (): Error =>
+  Object.assign(new Error('Windows process ownership could not be confirmed.'), {
+    code: 'unconfirmed_process' as const,
+    retryable: true as const,
+  })
 const ignoreHelperInputError = () => undefined
 const remaining = (deadline: number) => Math.max(0, Math.floor(deadline - Date.now()))
 async function within<T>(work: Promise<T>, deadline: number): Promise<T> {
@@ -320,7 +325,7 @@ function requirePipedChild(child: ChildProcess): asserts child is ChildProcessWi
 }
 function startHelper(
   config: WindowsOwnedProcessConfiguration,
-  mode: 'prepare' | 'run' | 'prove' | 'retire' | 'verify',
+  mode: 'prepare' | 'run' | 'prove' | 'retire' | 'verify' | 'abort-allocated',
   file: FileHandle | undefined,
   options: SpawnOptions,
   facts: (frame: Buffer) => boolean,
@@ -422,17 +427,23 @@ export class WindowsOwnedProcess {
   private readonly preparationDeadline: number
   private readonly durable: boolean
   private receipt: FileHandle | undefined
+  private receiptAllocated = false
   private witness: DecisionWindowsPhysicalWitness | undefined
   private helper: Helper | undefined
   private initialization: Promise<void>
   private closing: Promise<void> | undefined
+  private physicalFinalization: Promise<void> | undefined
+  private receiptClosePromise: Promise<void> | undefined
   private stopRequested = false
   private cleanupDeadline: number | undefined
   private empty = false
   private rootExited = false
   private startupError: Error | undefined
-  private nativeWasStarted = false
+  private helperProcessStarted = false
+  private startFrameWritten = false
   private didRelease = false
+  private readonly releasedWaiter = Promise.withResolvers<void>()
+  private readonly releaseListeners = new Set<() => void>()
   private facadeClosed = false
   private rootExitCode: number | null = null
   private killed = false
@@ -501,6 +512,27 @@ export class WindowsOwnedProcess {
     return this.didRelease
   }
 
+  /** Subscribe to confirmed physical release, including late convergence after close(deadline) timeout. */
+  onReleased(listener: () => void): () => void {
+    if (this.didRelease) {
+      try {
+        listener()
+      } catch {
+        // Release observers cannot block or undo confirmed physical release.
+      }
+      return () => undefined
+    }
+    this.releaseListeners.add(listener)
+    return () => {
+      this.releaseListeners.delete(listener)
+    }
+  }
+
+  /** Resolves once physical release is confirmed and the workspace reservation has been freed. */
+  whenReleased(): Promise<void> {
+    return this.releasedWaiter.promise
+  }
+
   async physicalWitness(ownerId: string): Promise<DecisionWindowsPhysicalWitness> {
     await within(this.initialization, this.preparationDeadline)
     if (
@@ -527,7 +559,7 @@ export class WindowsOwnedProcess {
     this.input.end()
     const helper = this.helper
     if (helper && !helper.closedFact) {
-      if (this.nativeWasStarted) {
+      if (this.startFrameWritten) {
         helper.control?.stop(this.cleanupDeadline)
       } else helper.control?.end()
     }
@@ -566,6 +598,7 @@ export class WindowsOwnedProcess {
     )
       throw failure()
     this.receipt = await allocateReceipt(this.config, this.receiptId)
+    this.receiptAllocated = true
     this.checkStarting()
     const prepare = startHelper(
       this.config,
@@ -618,7 +651,7 @@ export class WindowsOwnedProcess {
       () => this.requestStop(),
     )
     this.helper = helper
-    this.nativeWasStarted = true
+    this.helperProcessStarted = true
     await within(helper.startup, this.preparationDeadline)
     this.checkStarting()
     const control = controlOf(helper)
@@ -639,7 +672,10 @@ export class WindowsOwnedProcess {
     start.text(command)
     start.u32(args.length)
     for (const argument of args) start.text(argument)
-    await within(control.write(start.finish()), this.preparationDeadline)
+    const startFrame = start.finish()
+    this.checkStarting()
+    this.startFrameWritten = true
+    await within(control.write(startFrame), this.preparationDeadline)
     const actual = await within(contained, this.preparationDeadline)
     if (actual.length !== 25) throw failure()
     const bridgeBirth = readBirth(actual, 1),
@@ -699,15 +735,78 @@ export class WindowsOwnedProcess {
   }
 
   private async release(deadline: number): Promise<void> {
+    if (this.didRelease) return
+    const finalization = this.ensurePhysicalFinalization()
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      await Promise.race([
+        finalization,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () => reject(unconfirmedReleaseFailure()),
+            Math.max(1, remaining(deadline)),
+          )
+        }),
+      ])
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  private ensurePhysicalFinalization(): Promise<void> {
+    if (!this.physicalFinalization) {
+      this.physicalFinalization = this.runPhysicalFinalization()
+      void this.physicalFinalization.catch(() => undefined)
+    }
+    return this.physicalFinalization
+  }
+
+  private async closeReceipt(): Promise<void> {
+    if (!this.receipt) return
+    const handle = this.receipt
+    this.receiptClosePromise ??= handle.close().then(() => {
+      if (this.receipt === handle) this.receipt = undefined
+      return undefined
+    })
+    await this.receiptClosePromise
+  }
+
+  private markReleased(): void {
+    if (this.didRelease) return
+    this.didRelease = true
+    this.reservation.release()
+    this.releasedWaiter.resolve()
+    const listeners = [...this.releaseListeners]
+    this.releaseListeners.clear()
+    for (const listener of listeners) {
+      try {
+        listener()
+      } catch {
+        // Release observers cannot block or undo confirmed physical release.
+      }
+    }
+  }
+
+  private async runPhysicalFinalization(): Promise<void> {
+    if (this.didRelease) return
     // Late persistence completion can never reopen the start gate.
-    await within(
-      this.initialization.catch(() => undefined),
-      deadline,
-    )
+    await this.initialization.catch(() => undefined)
     const helper = this.helper
-    if (helper) await within(helper.closed, deadline)
+    if (helper && !helper.closedFact) {
+      if (this.startFrameWritten) {
+        helper.control?.stop(this.cleanupDeadline ?? Date.now() + CLEANUP_MS)
+      } else {
+        helper.control?.end()
+      }
+    }
+    if (helper) await helper.closed
+    if (this.didRelease) return
+
+    const stepDeadline = (): number => Date.now() + CLEANUP_MS
+
     if (
-      this.nativeWasStarted &&
+      this.helperProcessStarted &&
+      this.startFrameWritten &&
       !this.empty &&
       (helper?.spawned || helper?.process.pid !== undefined)
     ) {
@@ -719,42 +818,56 @@ export class WindowsOwnedProcess {
           this.witness,
           this.config,
           'verify',
-          deadline,
+          stepDeadline(),
+          undefined,
+          true,
           undefined,
           true,
         )) !== 'verified'
       )
-        throw failure()
+        throw unconfirmedReleaseFailure()
       this.empty = true
     }
-    if (this.receipt) {
-      await within(this.receipt.close(), deadline)
-      this.receipt = undefined
+
+    if (!this.witness && !this.startFrameWritten) {
+      if (this.receiptAllocated) {
+        if (!this.receipt) throw unconfirmedReleaseFailure()
+        const abortResult = await runAbortAllocatedOperation(
+          this.ownerId,
+          this.generation,
+          this.receiptId,
+          this.receipt,
+          this.config,
+          stepDeadline(),
+          this.requestBuffer,
+        )
+        if (abortResult !== 'removed' && abortResult !== 'already_absent') {
+          await this.closeReceipt().catch(() => undefined)
+          throw unconfirmedReleaseFailure()
+        }
+        await this.closeReceipt()
+      }
+    } else {
+      await this.closeReceipt()
+      if (!this.durable && this.witness) {
+        const result = await runReceiptOperation(
+          this.witness,
+          this.config,
+          'retire',
+          stepDeadline(),
+          undefined,
+          true,
+          undefined,
+          true,
+        )
+        if (result !== 'removed' && result !== 'already_absent') throw unconfirmedReleaseFailure()
+      }
     }
-    if (!this.durable && this.witness) {
-      const result = await runReceiptOperation(
-        this.witness,
-        this.config,
-        'retire',
-        deadline,
-        undefined,
-        true,
-      )
-      if (result !== 'removed' && result !== 'already_absent') throw failure()
-    } else if (!this.witness && !this.nativeWasStarted) {
-      await within(
-        unlink(receiptPath(this.config, this.receiptId)).catch((error: unknown) => {
-          if (!error || typeof error !== 'object' || Reflect.get(error, 'code') !== 'ENOENT')
-            throw error
-        }),
-        deadline,
-      )
-    }
+
     this.closeFacade()
     this.input.off('error', this.ignoreFacadeError)
     this.child.off('error', this.ignoreFacadeError)
-    this.didRelease = true
-    this.reservation.release()
+    this.markReleased()
   }
 }
 
@@ -784,6 +897,78 @@ export async function proveWindowsPhysicalRelease(
   return result === 'verified'
 }
 
+async function runAbortAllocatedOperation(
+  ownerId: string,
+  generation: string,
+  receiptId: string,
+  receipt: FileHandle,
+  config: WindowsOwnedProcessConfiguration,
+  deadline: number,
+  requestBuffer: Buffer,
+): Promise<PhysicalReceiptRetirementResult> {
+  if (remaining(deadline) <= 0 || receipt.fd < 0) return 'unconfirmed'
+  let helper: Helper | undefined
+  let expired = false
+  let result: PhysicalReceiptRetirementResult = 'unconfirmed'
+  let write: Promise<void> | undefined, answer: Promise<Buffer> | undefined
+  const expire = () => {
+    expired = true
+    helper?.control?.end()
+  }
+  const timer = setTimeout(expire, remaining(deadline))
+  const checkCurrent = () => {
+    if (remaining(deadline) <= 0) expire()
+    if (expired) throw failure()
+  }
+  try {
+    checkCurrent()
+    const executable = await lstat(config.windowsBridgeExecutable)
+    checkCurrent()
+    if (!executable.isFile() || executable.isSymbolicLink()) throw failure()
+    const canonical = await realpath(config.windowsBridgeExecutable)
+    checkCurrent()
+    if (canonical.toLowerCase() !== config.windowsBridgeExecutable.toLowerCase()) throw failure()
+    if (receipt.fd < 0) throw failure()
+    checkCurrent()
+    helper = startHelper(
+      config,
+      'abort-allocated',
+      receipt,
+      {},
+      () => false,
+      () => undefined,
+    )
+    checkCurrent()
+    const control = controlOf(helper)
+    answer = control.expect(17)
+    const request = baseRequest(
+      ownerId,
+      generation,
+      receiptId,
+      receiptPath(config, receiptId),
+      process.pid,
+      requestBuffer,
+    )
+    write = control.write(request.finish())
+    await write
+    const response = await answer
+    await helper.closed
+    if (response.length === 2 && helper.process.exitCode === 0) {
+      if (response[1] === 1) result = 'removed'
+      else if (response[1] === 2) result = 'already_absent'
+    }
+  } catch {
+    result = 'unconfirmed'
+  } finally {
+    helper?.control?.end()
+    await helper?.closed
+    helper?.control?.dispose()
+    await Promise.allSettled([write, answer].filter((entry) => entry !== undefined))
+    clearTimeout(timer)
+  }
+  return result
+}
+
 async function runReceiptOperation(
   witness: DecisionWindowsPhysicalWitness,
   config: WindowsOwnedProcessConfiguration,
@@ -792,6 +977,7 @@ async function runReceiptOperation(
   memory?: NativeMemoryAllocator,
   workspaceAlreadyReserved = false,
   signal?: AbortSignal,
+  acceptLateStartedResult = false,
 ): Promise<ReceiptOperationResult> {
   if (remaining(deadline) <= 0 || signal?.aborted) return 'unconfirmed'
   const reservation = workspaceAlreadyReserved
@@ -891,7 +1077,7 @@ async function runReceiptOperation(
     signal?.removeEventListener('abort', expire)
     reservation?.release()
   }
-  return expired ? 'unconfirmed' : result
+  return expired && !acceptLateStartedResult ? 'unconfirmed' : result
 }
 
 /** Post-commit cleanup, never physical proof: the Repository must have committed

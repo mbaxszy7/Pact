@@ -30,6 +30,11 @@ mac:
   entitlements: build/entitlements.mac.plist
   entitlementsInherit: build/entitlements.mac.plist
   notarize: false
+  extraResources:
+    - from: out/native/agy-sqlite-file-darwin-${arch}.node
+      to: native/agy-sqlite-file-darwin-${arch}.node
+    - from: out/native/agy-sqlite-file-darwin-${arch}.node.json
+      to: native/agy-sqlite-file-darwin-${arch}.node.json
   target:
     - target: dmg
       arch:
@@ -45,6 +50,10 @@ win:
       to: native/owned-process-group-win32-${arch}.exe
     - from: out/native/owned-process-group-win32-${arch}.exe.json
       to: native/owned-process-group-win32-${arch}.exe.json
+    - from: out/native/agy-sqlite-file-win32-${arch}.node
+      to: native/agy-sqlite-file-win32-${arch}.node
+    - from: out/native/agy-sqlite-file-win32-${arch}.node.json
+      to: native/agy-sqlite-file-win32-${arch}.node.json
   extraFiles:
     - from: build/icon.ico
       to: uninstallerIcon.ico

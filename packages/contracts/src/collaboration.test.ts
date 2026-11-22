@@ -4,7 +4,12 @@ import { describe, expect, it } from 'vitest'
 import {
   advanceAutomaticCollaboration,
   advanceCollaboration,
+  buildBoundedNativePlanId,
+  COLLABORATION_PLAN_SYNC_FAILURE_NOTICE,
+  COLLABORATION_PUBLISHED_PLAN_MAX_BYTES,
   collaborationActor,
+  encodeBoundedOpenPlanCallKey,
+  encodeBoundedOpenPlanProgressToken,
   collaborationActionBasisSchema,
   collaborationActionInputSchema,
   bindCollaborationQuestions,
@@ -15,6 +20,8 @@ import {
   collaborationInputProcessing,
   collaborationInputResultSchema,
   collaborationNextStage,
+  collaborationOpenPlanFinalIntentInputSchema,
+  collaborationOpenPlanPublishIntentSchema,
   collaborationPlanAccepted,
   collaborationPlanRetentionAllowed,
   collaborationPlanRetentionInputSchema,
@@ -1800,5 +1807,510 @@ describe('2-of-3 active agent pair invariants', () => {
       expect(reviewing.actor).toBe(roles.codeReviewer)
       expect(reviewing.stage).toBe('code_review')
     }
+  })
+
+  it('validates open-mode plan publish intent schemas and rejects blank or oversized payloads', () => {
+    const validInput = {
+      executionId: 'exec-open-1',
+      callKey: 'call-1',
+      progressToken: 'tok-1',
+      candidateMarkdown: '# Revised Plan\n\n- Step 1',
+    }
+    expect(collaborationOpenPlanFinalIntentInputSchema.parse(validInput)).toEqual(validInput)
+    expect(
+      collaborationOpenPlanFinalIntentInputSchema.safeParse({
+        ...validInput,
+        candidateMarkdown: '   \n  ',
+      }).success,
+    ).toBe(false)
+    expect(
+      collaborationOpenPlanFinalIntentInputSchema.safeParse({
+        ...validInput,
+        candidateMarkdown: 'a'.repeat(COLLABORATION_PUBLISHED_PLAN_MAX_BYTES + 1),
+      }).success,
+    ).toBe(false)
+    expect(
+      collaborationOpenPlanFinalIntentInputSchema.safeParse({
+        ...validInput,
+        extra: true,
+      }).success,
+    ).toBe(false)
+
+    const doc = document()
+    const validFact = {
+      runId: randomUUID(),
+      executionId: 'exec-open-1',
+      actor: 'agy' as const,
+      callKey: 'call-1',
+      progressToken: 'tok-1',
+      document: doc,
+    }
+    expect(collaborationOpenPlanPublishIntentSchema.parse(validFact)).toEqual(validFact)
+    expect(
+      collaborationOpenPlanPublishIntentSchema.safeParse({
+        ...validFact,
+        document: { ...doc, bytes: 0 },
+      }).success,
+    ).toBe(false)
+    expect(
+      collaborationOpenPlanPublishIntentSchema.safeParse({
+        ...validFact,
+        document: { ...doc, bytes: COLLABORATION_PUBLISHED_PLAN_MAX_BYTES + 1 },
+      }).success,
+    ).toBe(false)
+  })
+
+  it('settles collaborate and work turns preserving decision, newerPending, code changes, and planCaptureFailed together', () => {
+    const runId = randomUUID()
+    const pendingInputId = randomUUID()
+    const priorPlan = plan()
+    const openTask = task({
+      openMode: true,
+      stage: 'collaborate',
+      actor: 'agy',
+      owner: 'claude',
+      reviewer: 'agy',
+      rolePolicy: 'split-stages-v1',
+      stageRoles: defaultTaskStageRoles('claude', 'agy'),
+      status: 'running',
+      runId,
+      inputSequence: 2,
+      handledInputSequence: 1,
+      planVersion: 1,
+      planReference: priorPlan,
+      inputProcessing: {
+        pending: { inputId: pendingInputId, inputSequence: 3 },
+      },
+    })
+    const auth: CollaborationTurnAuthorization = {
+      runId,
+      taskId: openTask.id,
+      taskRevision: openTask.revision,
+      actor: 'agy',
+      stage: 'collaborate',
+      inputSequence: 2,
+      planReference: priorPlan,
+    }
+    const decision = {
+      runId,
+      inputSequence: 2,
+      actor: 'agy' as const,
+    }
+
+    // decision + hasCodeChanges + planCaptureFailed + newerPending
+    const settledColab = settleCollaborationStage(openTask, {
+      kind: 'collaborate',
+      authorization: auth,
+      hasCodeChanges: true,
+      hasPublishedPlan: false,
+      planCaptureFailed: true,
+      decision,
+    })
+    expect(settledColab).toMatchObject({
+      openMode: true,
+      status: 'questions',
+      automation: 'paused',
+      pauseReason: 'failure',
+      notice: COLLABORATION_PLAN_SYNC_FAILURE_NOTICE,
+      codeRunId: runId,
+      lastCodeActor: 'agy',
+      unreviewedCodeActor: 'agy',
+      planVersion: 1,
+      planReference: priorPlan,
+      inputProcessing: {
+        pending: { inputId: pendingInputId, inputSequence: 3 },
+        decision,
+      },
+    })
+    expect(collaborationInputGate(settledColab)).toBe('queued')
+    expect(collaborationAvailableActions(settledColab)).toEqual([])
+
+    // Even if status is failed while both pending and decision exist in open mode, input gate stays active.
+    expect(collaborationInputGate({ ...settledColab, status: 'failed' })).toBe('needs_reply')
+
+    // decision + hasCodeChanges without planCaptureFailed still records codeRunId/lastCodeActor/unreviewedCodeActor.
+    const settledDecisionOnly = settleCollaborationStage(openTask, {
+      kind: 'collaborate',
+      authorization: auth,
+      hasCodeChanges: true,
+      hasPublishedPlan: false,
+      decision,
+    })
+    expect(settledDecisionOnly).toMatchObject({
+      status: 'questions',
+      automation: 'active',
+      pauseReason: undefined,
+      notice: undefined,
+      codeRunId: runId,
+      lastCodeActor: 'agy',
+      unreviewedCodeActor: 'agy',
+    })
+
+    // work stage with decision + planCaptureFailed + hasCodeChanges
+    const workAuth = { ...auth, stage: 'implement' as const }
+    const settledWork = settleCollaborationStage(
+      { ...openTask, stage: 'implement' },
+      {
+        kind: 'work',
+        authorization: workAuth,
+        hasCodeChanges: true,
+        hasPublishedPlan: false,
+        planCaptureFailed: true,
+        decision,
+      },
+    )
+    expect(settledWork).toMatchObject({
+      status: 'questions',
+      automation: 'paused',
+      pauseReason: 'failure',
+      notice: COLLABORATION_PLAN_SYNC_FAILURE_NOTICE,
+      codeRunId: runId,
+      lastCodeActor: 'agy',
+      unreviewedCodeActor: 'agy',
+      inputProcessing: {
+        pending: { inputId: pendingInputId, inputSequence: 3 },
+        decision,
+      },
+    })
+  })
+
+  it('clears open-mode plan failure state on recovered_plan while preserving code facts and unrelated pauses', () => {
+    const runId = randomUUID()
+    const failedOpen = task({
+      openMode: true,
+      stage: 'collaborate',
+      actor: 'agy',
+      owner: 'claude',
+      reviewer: 'agy',
+      rolePolicy: 'split-stages-v1',
+      stageRoles: defaultTaskStageRoles('claude', 'agy'),
+      status: 'failed',
+      automation: 'paused',
+      pauseReason: 'failure',
+      notice: COLLABORATION_PLAN_SYNC_FAILURE_NOTICE,
+      runId,
+      codeRunId: runId,
+      lastCodeActor: 'agy',
+      unreviewedCodeActor: 'agy',
+      planVersion: 2,
+      planReference: { ...plan(), version: 2, sourceRunId: runId },
+    })
+
+    const recovered = settleCollaborationStage(failedOpen, {
+      kind: 'recovered_plan',
+      actor: 'agy',
+    })
+    expect(recovered).toMatchObject({
+      openMode: true,
+      status: 'waiting',
+      automation: 'active',
+      pauseReason: undefined,
+      notice: undefined,
+      nextStage: undefined,
+      unreviewedPlanActor: 'agy',
+      unreviewedCodeActor: 'agy',
+      codeRunId: runId,
+      lastCodeActor: 'agy',
+    })
+    expect(collaborationAvailableActions(recovered)).toEqual(['review_plan', 'review_code'])
+
+    // Unrelated user pause is preserved while plan failure notice is cleared.
+    const userPaused = {
+      ...failedOpen,
+      status: 'waiting' as const,
+      pauseReason: 'user' as const,
+      notice: 'User paused for review.',
+    }
+    const recoveredPaused = settleCollaborationStage(userPaused, {
+      kind: 'recovered_plan',
+      actor: 'agy',
+    })
+    expect(recoveredPaused).toMatchObject({
+      status: 'waiting',
+      automation: 'paused',
+      pauseReason: 'user',
+      notice: 'User paused for review.',
+      unreviewedPlanActor: 'agy',
+    })
+
+    // Phase-1 recovered_plan keeps automation paused with pauseReason: 'user' and nextStage: 'plan_review'.
+    const failedPhase1 = task({
+      status: 'failed',
+      automation: 'paused',
+      pauseReason: 'failure',
+      notice: 'The latest plan hasn’t finished syncing to Pact.',
+      planVersion: 1,
+      planReference: plan(),
+    })
+    const recoveredPhase1 = settleCollaborationStage(failedPhase1, { kind: 'recovered_plan' })
+    expect(recoveredPhase1).toMatchObject({
+      status: 'waiting',
+      nextStage: 'plan_review',
+      automation: 'paused',
+      pauseReason: 'user',
+      notice: undefined,
+    })
+  })
+
+  it('tracks planSyncPaused separately so recovered_plan clears only Plan-sync failure pauses', () => {
+    const runId = randomUUID()
+    const baseOpen = task({
+      openMode: true,
+      stage: 'collaborate',
+      actor: 'agy',
+      owner: 'claude',
+      reviewer: 'agy',
+      rolePolicy: 'split-stages-v1',
+      stageRoles: defaultTaskStageRoles('claude', 'agy'),
+      status: 'failed',
+      automation: 'paused',
+      pauseReason: 'failure',
+      planSyncPaused: true,
+      notice: COLLABORATION_PLAN_SYNC_FAILURE_NOTICE,
+      runId,
+      planVersion: 2,
+      planReference: { ...plan(), version: 2, sourceRunId: runId },
+    })
+
+    // 1. Plan-sync failure pause with planSyncPaused: true -> cleared to active on recovered_plan.
+    const cleared = settleCollaborationStage(baseOpen, { kind: 'recovered_plan', actor: 'agy' })
+    expect(cleared).toMatchObject({
+      status: 'waiting',
+      automation: 'active',
+      pauseReason: undefined,
+      notice: undefined,
+    })
+    expect(cleared.planSyncPaused).toBeUndefined()
+
+    // 2. Explicit user pause with failure status/notice (planSyncPaused unset) -> stays paused with pauseReason: 'user'.
+    const explicitUserPause = {
+      ...baseOpen,
+      pauseReason: 'user' as const,
+      planSyncPaused: undefined,
+    }
+    const keptUserPause = settleCollaborationStage(explicitUserPause, {
+      kind: 'recovered_plan',
+      actor: 'agy',
+    })
+    expect(keptUserPause).toMatchObject({
+      status: 'waiting',
+      automation: 'paused',
+      pauseReason: 'user',
+      notice: undefined,
+    })
+    expect(keptUserPause.planSyncPaused).toBeUndefined()
+
+    // 3. Explicit stop pause -> stays paused with pauseReason: 'stopped'.
+    const explicitStopPause = {
+      ...baseOpen,
+      pauseReason: 'stopped' as const,
+      planSyncPaused: undefined,
+    }
+    const keptStopPause = settleCollaborationStage(explicitStopPause, {
+      kind: 'recovered_plan',
+      actor: 'agy',
+    })
+    expect(keptStopPause).toMatchObject({
+      status: 'waiting',
+      automation: 'paused',
+      pauseReason: 'stopped',
+      notice: undefined,
+    })
+    expect(keptStopPause.planSyncPaused).toBeUndefined()
+  })
+
+  it('encodes bounded open-plan callKey, progressToken, and nativePlanId deterministically across long IDs', () => {
+    const shortCall = 'call:tc-123'
+    expect(encodeBoundedOpenPlanCallKey(shortCall)).toBe(shortCall)
+    expect(encodeBoundedOpenPlanProgressToken('traj-1:42')).toBe('traj-1:42')
+    expect(buildBoundedNativePlanId('sess-1', 'tc-123')).toBe('sess-1:tc-123')
+
+    const longSuffixA = `${'a'.repeat(300)}-A`
+    const longSuffixB = `${'a'.repeat(300)}-B`
+    const boundedKeyA = encodeBoundedOpenPlanCallKey(`call:${longSuffixA}`)
+    const boundedKeyB = encodeBoundedOpenPlanCallKey(`call:${longSuffixB}`)
+    expect(boundedKeyA.length).toBeLessThanOrEqual(256)
+    expect(boundedKeyB.length).toBeLessThanOrEqual(256)
+    expect(boundedKeyA).not.toBe(boundedKeyB)
+    expect(boundedKeyA).toBe(encodeBoundedOpenPlanCallKey(`call:${longSuffixA}`))
+    expect(boundedKeyA.startsWith('call:')).toBe(true)
+
+    const boundedTokenA = encodeBoundedOpenPlanProgressToken(`${'t'.repeat(280)}:1`)
+    const boundedTokenB = encodeBoundedOpenPlanProgressToken(`${'t'.repeat(280)}:2`)
+    expect(boundedTokenA.length).toBeLessThanOrEqual(256)
+    expect(boundedTokenB.length).toBeLessThanOrEqual(256)
+    expect(boundedTokenA).not.toBe(boundedTokenB)
+
+    const veryLongSuffixA = `${'p'.repeat(1100)}-A`
+    const veryLongSuffixB = `${'p'.repeat(1100)}-B`
+    const boundedPlanIdA = buildBoundedNativePlanId('sess-long', veryLongSuffixA)
+    const boundedPlanIdB = buildBoundedNativePlanId('sess-long', veryLongSuffixB)
+    expect(boundedPlanIdA.length).toBeLessThanOrEqual(1024)
+    expect(boundedPlanIdB.length).toBeLessThanOrEqual(1024)
+    expect(boundedPlanIdA).not.toBe(boundedPlanIdB)
+
+    // Verify bounded values pass strict contract schemas.
+    const parsed = collaborationOpenPlanFinalIntentInputSchema.safeParse({
+      callKey: boundedKeyA,
+      progressToken: boundedTokenA,
+      nativePlanId: boundedPlanIdA,
+      candidateMarkdown: '# Bounded Plan\nValid body.',
+    })
+    expect(parsed.success).toBe(true)
+  })
+
+  it('Wave 6: settleCollaborationStage(work/collaborate) preserves explicit pauseReason (stopped/user) across both normal completion and planCaptureFailed without setting planSyncPaused', () => {
+    const baseRunId = randomUUID()
+    const baseRunning = collaborationTaskSchema.parse({
+      id: randomUUID(),
+      sessionId: randomUUID(),
+      kind: 'plan',
+      revision: 9,
+      protocol: 'native-workflow-v1',
+      owner: 'agy',
+      reviewer: 'codex',
+      rolePolicy: 'split-stages-v1',
+      automation: 'paused',
+      pauseReason: 'stopped',
+      openMode: true,
+      inputSequence: 2,
+      handledInputSequence: 2,
+      task: 'Continue implementing Open Mode task',
+      taskMessageId: randomUUID(),
+      stage: 'collaborate',
+      actor: 'agy',
+      status: 'running',
+      runId: baseRunId,
+      planVersion: 2,
+      discussionRounds: 1,
+      reviewCycles: 0,
+      repairAttempts: 0,
+    })
+    const collabAuth = {
+      version: 1 as const,
+      taskId: baseRunning.id,
+      sessionId: baseRunning.sessionId,
+      runId: baseRunId,
+      taskRevision: baseRunning.revision,
+      stage: 'collaborate' as const,
+      actor: 'agy' as const,
+      inputSequence: baseRunning.inputSequence,
+      reviewCycles: baseRunning.reviewCycles,
+      repairAttempts: baseRunning.repairAttempts,
+      discussionRounds: baseRunning.discussionRounds,
+      planVersion: baseRunning.planVersion,
+    }
+
+    for (const explicitPauseReason of ['stopped', 'user'] as const) {
+      // 1. Open Mode `collaborate` settling while explicitly paused + planCaptureFailed:
+      //    MUST preserve explicit pauseReason and leave planSyncPaused undefined so Recover Plan never unpauses!
+      const pausedCollaborate = { ...baseRunning, pauseReason: explicitPauseReason }
+      const settledCollabFailed = settleCollaborationStage(pausedCollaborate, {
+        kind: 'collaborate',
+        authorization: collabAuth,
+        hasCodeChanges: false,
+        hasPublishedPlan: false,
+        planCaptureFailed: true,
+      })
+      expect(settledCollabFailed).toMatchObject({
+        status: 'failed',
+        automation: 'paused',
+        pauseReason: explicitPauseReason,
+        notice: COLLABORATION_PLAN_SYNC_FAILURE_NOTICE,
+      })
+      expect(settledCollabFailed.planSyncPaused).toBeUndefined()
+
+      // Subsequent recovered_plan clears failure notice and restores waiting, keeping explicit pause!
+      const recoveredCollab = settleCollaborationStage(settledCollabFailed, {
+        kind: 'recovered_plan',
+        actor: 'agy',
+      })
+      expect(recoveredCollab).toMatchObject({
+        status: 'waiting',
+        automation: 'paused',
+        pauseReason: explicitPauseReason,
+        notice: undefined,
+      })
+      expect(recoveredCollab.planSyncPaused).toBeUndefined()
+
+      // Normal collaborate completion while explicitly paused also preserves explicit pauseReason!
+      const settledCollabOk = settleCollaborationStage(pausedCollaborate, {
+        kind: 'collaborate',
+        authorization: collabAuth,
+        hasCodeChanges: false,
+        hasPublishedPlan: false,
+      })
+      expect(settledCollabOk).toMatchObject({
+        status: 'waiting',
+        automation: 'paused',
+        pauseReason: explicitPauseReason,
+      })
+      expect(settledCollabOk.planSyncPaused).toBeUndefined()
+
+      // 2. `work` stage (implement/repair) settling while explicitly paused + planCaptureFailed:
+      const pausedWork = {
+        ...baseRunning,
+        openMode: false,
+        stage: 'implement' as const,
+        pauseReason: explicitPauseReason,
+      }
+      const settledWorkFailed = settleCollaborationStage(pausedWork, {
+        kind: 'work',
+        authorization: { ...collabAuth, stage: 'implement' },
+        planCaptureFailed: true,
+      })
+      expect(settledWorkFailed).toMatchObject({
+        status: 'failed',
+        automation: 'paused',
+        pauseReason: explicitPauseReason,
+        notice: COLLABORATION_PLAN_SYNC_FAILURE_NOTICE,
+      })
+      expect(settledWorkFailed.planSyncPaused).toBeUndefined()
+
+      const recoveredWork = settleCollaborationStage(settledWorkFailed, {
+        kind: 'recovered_plan',
+        actor: 'agy',
+      })
+      expect(recoveredWork).toMatchObject({
+        status: 'waiting',
+        automation: 'paused',
+        pauseReason: explicitPauseReason,
+        notice: undefined,
+      })
+      expect(recoveredWork.planSyncPaused).toBeUndefined()
+    }
+
+    // 3. Contrast: when NOT explicitly paused (`automation: 'active'`), planCaptureFailed DOES pause with
+    //    `pauseReason: 'failure'` and `planSyncPaused: true`, so recovered_plan restores `automation: 'active'`.
+    const activeCollaborate = {
+      ...baseRunning,
+      automation: 'active' as const,
+      pauseReason: undefined,
+    }
+    const activeFailed = settleCollaborationStage(activeCollaborate, {
+      kind: 'collaborate',
+      authorization: collabAuth,
+      hasCodeChanges: false,
+      hasPublishedPlan: false,
+      planCaptureFailed: true,
+    })
+    expect(activeFailed).toMatchObject({
+      status: 'failed',
+      automation: 'paused',
+      pauseReason: 'failure',
+      planSyncPaused: true,
+      notice: COLLABORATION_PLAN_SYNC_FAILURE_NOTICE,
+    })
+    const activeRecovered = settleCollaborationStage(activeFailed, {
+      kind: 'recovered_plan',
+      actor: 'agy',
+    })
+    expect(activeRecovered).toMatchObject({
+      status: 'waiting',
+      automation: 'active',
+      pauseReason: undefined,
+      notice: undefined,
+    })
+    expect(activeRecovered.planSyncPaused).toBeUndefined()
   })
 })

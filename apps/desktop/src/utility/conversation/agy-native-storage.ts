@@ -1,20 +1,21 @@
 import Database from 'better-sqlite3'
-import { createHash, randomBytes } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import {
-  chmodSync,
   closeSync,
   constants,
+  fstatSync,
   fsyncSync,
+  linkSync,
   lstatSync,
   mkdirSync,
-  mkdtempSync,
   openSync,
   readFileSync,
   readSync,
   realpathSync,
   renameSync,
+  rmdirSync,
   rmSync,
-  fstatSync,
+  unlinkSync,
   writeFileSync,
   writeSync,
   type BigIntStats,
@@ -32,13 +33,68 @@ import type {
 import type { ConversationImage } from '@pact/contracts/images'
 
 import {
+  AGY_STORAGE_MAX_RECORDS,
+  COLLABORATION_PUBLISHED_PLAN_MAX_BYTES,
   agyRebuildInitializationWitnessSchema,
+  buildBoundedNativePlanId,
+  collaborationPublishPlanInputSchema,
+  encodeBoundedCollaborationIdentity,
+  encodeBoundedOpenPlanCallKey,
+  encodeBoundedOpenPlanProgressToken,
   type NativeContextRebuildChunk,
 } from '@pact/contracts'
 
 import { AgentExecutionError } from './agent-execution-error'
+import {
+  AgyNativeLoaderError,
+  checkSameVolume,
+  identitiesExactMatch,
+  openAnchoredLockedSqliteView,
+  publishCandidateAtomically,
+  verifyCandidateEmptyUnlocked,
+  type AgySqliteFileIdentity,
+} from './agy-sqlite-file'
+import {
+  AgyHotRollbackJournalError,
+  AgyIdentityBudgetExceededError,
+  AgyIdentityFallbackError,
+  AgyInvalidSqliteImageError,
+  AgyOperationalStorageError,
+  AgyStorageMissingError,
+  AgyTransientIdentityChurnError,
+  AgyUnexpectedEofError,
+  MAX_FALLBACK_SNAPSHOT_TOTAL_BYTES,
+  MAX_FALLBACK_TABLE_DDL_BYTES,
+  SQLITE_WAL_INDEX_HEADER_BYTES,
+  assembleSqliteLeafPayload,
+  assertIdentityNotCancelledOrExpired,
+  decodeSqliteRecord,
+  decodeSqliteRecordHeader,
+  decodeSqliteVarint,
+  isIdentityAbortOrTimeoutError,
+  isOperationalFsError,
+  isOperationalSqliteError,
+  isSqliteBusyOrLockedError,
+  isTransientFileLockError,
+  withAgyReadImage,
+  wrapOperationalStagingError,
+  type AgyCommittedReadImage,
+  type AgyPreScannedSqliteProof,
+  type AgySchemaCatalogBudget,
+  type AgyWalShrinkBudget,
+} from './agy-sqlite-image'
 import { projectCollaborationAnswer } from './collaboration-answer'
 import { requireNativeImageReference } from './native-image-content'
+
+export {
+  AgyHotRollbackJournalError,
+  AgyIdentityBudgetExceededError,
+  AgyOperationalStorageError,
+  AgyTransientIdentityChurnError,
+  withAgyReadImage,
+  type AgySchemaCatalogBudget,
+  type AgyWalShrinkBudget,
+}
 
 export const AGY_TEXT_BUDGET_BYTES = 8 * 1024 * 1024
 export const AGY_MAX_HISTORY_BYTES = 32 * 1024 * 1024
@@ -84,7 +140,11 @@ export const EXECUTOR_TERMINATION_REASON_MAX_TOKEN_BUDGET_EXCEEDED = 11
 
 const MAX_PROTOBUF_FIELD_NUMBER = (1 << 29) - 1
 const UUID_PATTERN = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/iu
-const SAFE_ID_PATTERN = /^[0-9a-z_.:-]{1,256}$/iu
+export const AGY_TRAJECTORY_ID_PATTERN = /^[A-Za-z0-9_.:-]{1,256}$/u
+export function isValidAgyTrajectoryId(value: unknown): value is string {
+  return typeof value === 'string' && AGY_TRAJECTORY_ID_PATTERN.test(value)
+}
+const SAFE_ID_PATTERN = AGY_TRAJECTORY_ID_PATTERN
 const SAFE_UPLOAD_NAME_PATTERN = /^[0-9a-z_.-]{1,255}$/iu
 const SAFE_SQL_IDENTIFIER_PATTERN = /^[a-z_][a-z0-9_]{0,63}$/iu
 
@@ -226,6 +286,7 @@ export interface AgyIdentityRemap {
   sourceCascadeId: string
   targetCascadeId: string
   canonicalAppDataDir: string
+  configuredAppDataDir?: string
 }
 
 export interface AgyMediaCopyPlan {
@@ -272,6 +333,9 @@ export interface AgyRebuildSeedInput {
   sourceHash?: string
   chunks: readonly AgyRebuildSeedChunk[]
   images?: readonly AgentPromptImage[]
+  stagingLeafName?: string
+  signal?: AbortSignal
+  deadlineAt?: number
 }
 
 export interface AgyRebuildSeedVerificationInput extends AgyRebuildSeedInput {
@@ -310,6 +374,8 @@ export interface AgyConfirmRebuildColdLoadInput {
   pbSha256: string
   pbBytes: number
   stepCount: 2
+  signal?: AbortSignal
+  deadlineAt?: number
 }
 
 export interface AgyConsumedInputReceipt {
@@ -328,6 +394,15 @@ export interface AgyColdInspectionInput {
   nativeTurnId?: string
   nativeInputIds?: readonly string[]
   includePlan?: boolean
+  signal?: AbortSignal
+  deadlineAt?: number
+}
+
+export interface AgyCompletedPactPublishPlanCall {
+  readonly serverName: string
+  readonly callId?: string
+  readonly progressToken?: string
+  readonly stepId?: string
 }
 
 export interface AgyColdInspectionResult {
@@ -348,6 +423,9 @@ export interface AgyColdInspectionResult {
     responseHash: string
     plan?: { nativeId: string; text: string }
     planUnavailable?: true
+    hasCompletedPactPublishPlan?: boolean
+    completedPactPublishPlanTokens?: readonly string[]
+    completedPactPublishPlanCalls?: readonly AgyCompletedPactPublishPlanCall[]
   }
 }
 
@@ -381,6 +459,10 @@ export interface AgyForkInput {
   lastDispatchedPhase?: 'fork' | 'initialize'
   source?: AgentNativeForkBoundary
   witness?: AgentNativeForkWitness
+  stagingLeafName?: string
+  signal?: AbortSignal
+  deadlineAt?: number
+  beforePublish?: (candidate: AgyForkOperationResult) => Promise<void> | void
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -1115,12 +1197,94 @@ export function encodeAgyPlannerResponseStep(input: {
   ])
 }
 
+function readExactBoundedBytesFromFd(fd: number, expectedBytes: number): Buffer {
+  const buf = Buffer.allocUnsafe(expectedBytes)
+  let totalRead = 0
+  while (totalRead < expectedBytes) {
+    const n = readSync(fd, buf, totalRead, expectedBytes - totalRead, totalRead)
+    if (n <= 0) {
+      throw new Error('Unexpected EOF while reading bounded Antigravity file.')
+    }
+    totalRead += n
+  }
+  const extraProbe = Buffer.allocUnsafe(1)
+  const extraRead = readSync(fd, extraProbe, 0, 1, expectedBytes)
+  if (extraRead !== 0) {
+    throw new Error('Antigravity file grew beyond its verified byte length during read.')
+  }
+  return buf
+}
+
+function parseLocalFileUriOrPath(rawPathOrUri: string):
+  | {
+      readonly rawPath: string
+      readonly hasFileScheme: boolean
+    }
+  | undefined {
+  if (!rawPathOrUri || rawPathOrUri.includes('\0')) return undefined
+  const lower = rawPathOrUri.toLowerCase()
+  const hasFileScheme = lower.startsWith('file://')
+  let rawPath = rawPathOrUri
+  if (hasFileScheme) {
+    try {
+      const parsed = new URL(rawPathOrUri)
+      if (parsed.protocol !== 'file:') return undefined
+      if (
+        parsed.username !== '' ||
+        parsed.password !== '' ||
+        parsed.port !== '' ||
+        (parsed.hostname !== '' && parsed.hostname.toLowerCase() !== 'localhost')
+      ) {
+        return undefined
+      }
+      rawPath = decodeURIComponent(parsed.pathname)
+      if (rawPath.includes('\0')) return undefined
+      if (process.platform === 'win32' && /^\/[a-zA-Z]:\//u.test(rawPath)) {
+        rawPath = rawPath.slice(1)
+      }
+    } catch {
+      return undefined
+    }
+  } else if (
+    /^[a-zA-Z][a-zA-Z0-9+.-]*:/u.test(rawPathOrUri) &&
+    !/^[a-zA-Z]:[\\/]/u.test(rawPathOrUri)
+  ) {
+    return undefined
+  }
+
+  // Reject UNC, remote share, and Windows extended/device paths BEFORE any filesystem call.
+  if (rawPath.startsWith('\\\\') || rawPath.startsWith('//')) {
+    return undefined
+  }
+  if (!isAbsolute(rawPath)) return undefined
+  return { rawPath, hasFileScheme }
+}
+
+function collectAllowedAppDataRoots(
+  canonicalAppDataDir: string,
+  configuredAppDataDir?: string,
+): string[] {
+  const roots = new Set<string>([canonicalAppDataDir])
+  if (configuredAppDataDir && isAbsolute(configuredAppDataDir)) {
+    roots.add(resolve(configuredAppDataDir))
+  }
+  if (
+    process.platform === 'darwin' &&
+    (canonicalAppDataDir.startsWith('/private/var/') ||
+      canonicalAppDataDir.startsWith('/private/tmp/'))
+  ) {
+    roots.add(canonicalAppDataDir.slice('/private'.length))
+  }
+  return [...roots]
+}
+
 function verifySafeDirectoryChainIfPresent(
   canonicalAppDataDir: string,
   relativeParts: readonly string[],
   label = 'Antigravity brain',
-): { exists: true; canonicalDir: string } | { exists: false } {
+): { exists: true; canonicalDir: string; stat: BigIntStats } | { exists: false } {
   let cursor = canonicalAppDataDir
+  let lastStat: BigIntStats | undefined
   for (const segment of relativeParts) {
     cursor = join(cursor, segment)
     let stat: BigIntStats
@@ -1139,8 +1303,13 @@ function verifySafeDirectoryChainIfPresent(
     if (realCursor !== cursor || !isInsideDirectory(canonicalAppDataDir, realCursor)) {
       throw new Error(`${label} directory escaped its storage root.`)
     }
+    lastStat = stat
   }
-  return { exists: true, canonicalDir: cursor }
+  return {
+    exists: true,
+    canonicalDir: cursor,
+    stat: lastStat ?? lstatSync(cursor, { bigint: true }),
+  }
 }
 
 function readVerifiedUploadedMediaFile(
@@ -1195,7 +1364,7 @@ function readVerifiedUploadedMediaFile(
     ) {
       throw new Error('Antigravity source uploaded media changed while opening.')
     }
-    const mediaBytes = readFileSync(fd)
+    const mediaBytes = readExactBoundedBytesFromFd(fd, Number(stat.size))
     const afterRead = fstatSync(fd, { bigint: true })
     if (BigInt(mediaBytes.byteLength) !== stat.size || !statsMatch(stat, afterRead)) {
       throw new Error('Antigravity source uploaded media changed while reading.')
@@ -1211,75 +1380,48 @@ function parseMediaUriToUploadedFile(
   canonicalAppDataDir: string,
   sourceCascadeId: string,
   targetCascadeId: string,
+  configuredAppDataDir?: string,
 ): Omit<AgyMediaCopyPlan, 'inlineData'> | undefined {
-  if (!uri) return undefined
-  const hasFileScheme = uri.startsWith('file://')
-  let rawPath = uri
-  if (hasFileScheme) {
-    try {
-      const parsed = new URL(uri)
-      if (parsed.protocol !== 'file:') return undefined
-      rawPath = decodeURIComponent(parsed.pathname)
-      if (process.platform === 'win32' && /^\/[a-zA-Z]:\//u.test(rawPath)) {
-        rawPath = rawPath.slice(1)
-      }
-    } catch {
-      return undefined
-    }
-  }
-  if (!isAbsolute(rawPath)) return undefined
+  const parsedPath = parseLocalFileUriOrPath(uri)
+  if (!parsedPath) return undefined
+  const { rawPath, hasFileScheme } = parsedPath
+
+  // Confinement check is purely lexical against authorized app-data roots BEFORE any FS call.
   const resolvedRaw = resolve(rawPath)
-  const sourceBrainRoot = join(canonicalAppDataDir, 'brain', sourceCascadeId)
-  const sourceUploadedRoot = join(sourceBrainRoot, '.user_uploaded')
   const normalizedDir = dirname(resolvedRaw)
   const fileName = basename(resolvedRaw)
+  const allowedRoots = collectAllowedAppDataRoots(canonicalAppDataDir, configuredAppDataDir)
 
-  // Always walk and lstat + realpath-verify brain/<sourceCascadeId>/.user_uploaded (never skipping when string-equal!).
-  const verifiedAncestors = verifySafeDirectoryChainIfPresent(
-    canonicalAppDataDir,
-    ['brain', sourceCascadeId, '.user_uploaded'],
-    'Antigravity uploaded media',
-  )
-
-  let matchesSourceUploaded = false
-  if (verifiedAncestors.exists) {
-    try {
-      const dirStat = lstatSync(dirname(rawPath), { bigint: true })
-      if (dirStat.isSymbolicLink() || !dirStat.isDirectory()) {
-        if (
-          normalizedDir === sourceUploadedRoot ||
-          isInsideDirectory(sourceBrainRoot, resolvedRaw)
-        ) {
-          throw new Error(
-            'Antigravity uploaded media directory is a symbolic link or non-directory.',
-          )
-        }
-        return undefined
-      }
-      const realDir = realpathSync(dirname(rawPath))
-      matchesSourceUploaded = realDir === verifiedAncestors.canonicalDir
-    } catch (error) {
-      if (
-        error instanceof Error &&
-        Reflect.get(error, 'code') !== 'ENOENT' &&
-        (normalizedDir === sourceUploadedRoot || isInsideDirectory(sourceBrainRoot, resolvedRaw))
-      ) {
-        throw error
-      }
-      matchesSourceUploaded = false
+  let matchedUploadedLexically = false
+  let insideSourceBrainLexically = false
+  for (const root of allowedRoots) {
+    const brainRoot = join(root, 'brain', sourceCascadeId)
+    const uploadedRoot = join(brainRoot, '.user_uploaded')
+    if (normalizedDir === uploadedRoot) {
+      matchedUploadedLexically = true
+      break
     }
-  } else {
-    matchesSourceUploaded = normalizedDir === sourceUploadedRoot
+    if (resolvedRaw === brainRoot || isInsideDirectory(brainRoot, resolvedRaw)) {
+      insideSourceBrainLexically = true
+    }
   }
 
-  if (!matchesSourceUploaded) {
-    if (isInsideDirectory(sourceBrainRoot, resolvedRaw) || resolvedRaw === sourceBrainRoot) {
+  if (!matchedUploadedLexically) {
+    if (insideSourceBrainLexically) {
       throw new Error(
         'Antigravity step media references a non-upload path inside the source brain directory.',
       )
     }
     return undefined
   }
+
+  // Always walk and lstat + realpath-verify canonicalAppDataDir/brain/<sourceCascadeId>/.user_uploaded.
+  verifySafeDirectoryChainIfPresent(
+    canonicalAppDataDir,
+    ['brain', sourceCascadeId, '.user_uploaded'],
+    'Antigravity uploaded media',
+  )
+
   if (
     !SAFE_UPLOAD_NAME_PATTERN.test(fileName) ||
     fileName === '.' ||
@@ -1289,7 +1431,13 @@ function parseMediaUriToUploadedFile(
   ) {
     throw new Error('Antigravity uploaded media filename is unsafe.')
   }
-  const sourceFilePath = join(sourceUploadedRoot, fileName)
+  const sourceFilePath = join(
+    canonicalAppDataDir,
+    'brain',
+    sourceCascadeId,
+    '.user_uploaded',
+    fileName,
+  )
   const targetFilePath = join(
     canonicalAppDataDir,
     'brain',
@@ -1334,6 +1482,7 @@ function remapUserInputBytes(
           remap.canonicalAppDataDir,
           remap.sourceCascadeId,
           remap.targetCascadeId,
+          remap.configuredAppDataDir,
         )
         if (plan) {
           copiedMedia.push({
@@ -1653,7 +1802,7 @@ export function resolveAgyAppDataDir(env: NodeJS.ProcessEnv = process.env): stri
   return resolve(join(home, '.gemini', 'antigravity-cli'))
 }
 
-function resolveStorageRoot(storageRoot?: string): string {
+export function resolveStorageRoot(storageRoot?: string): string {
   const configured =
     storageRoot?.trim() ||
     process.env['PACT_AGY_APP_DATA_DIR']?.trim() ||
@@ -1683,13 +1832,6 @@ function statsMatch(left: BigIntStats, right: BigIntStats): boolean {
     left.mtimeNs === right.mtimeNs &&
     left.ctimeNs === right.ctimeNs
   )
-}
-
-class AgyHotRollbackJournalError extends Error {
-  constructor(message: string) {
-    super(message)
-    this.name = 'AgyHotRollbackJournalError'
-  }
 }
 
 let activeAgyTempStagingRoot: string | undefined
@@ -1723,215 +1865,20 @@ function writeAllSync(
   }
 }
 
-function assertNoRollbackJournal(dbPath: string, phase: 'before' | 'after'): void {
-  const journalPath = `${dbPath}-journal`
-  try {
-    lstatSync(journalPath, { bigint: true })
-  } catch (error) {
-    if (error instanceof Error && Reflect.get(error, 'code') === 'ENOENT') {
-      return
-    }
-    throw error
-  }
-  throw new AgyHotRollbackJournalError(
-    `Antigravity SQLite rollback journal (${basename(journalPath)}) is present ${phase} snapshot; trajectory state is unconfirmed.`,
-  )
-}
-
-interface SqliteFileIdentitySnapshot {
-  dbPath: string
-  canonicalRoot: string
-  canonicalDbPath: string
-  dbStats: BigIntStats
-  walStats: BigIntStats | null
-  shmStats: BigIntStats | null
-}
-
-function captureOptionalSidefileStats(
-  filePath: string,
-  canonicalRoot: string,
-  label: 'WAL' | 'SHM',
-): BigIntStats | null {
-  try {
-    const stat = lstatSync(filePath, { bigint: true })
-    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1n) {
-      throw new Error(`Antigravity ${label} file is linked or unsupported.`)
-    }
-    const realSide = realpathSync(filePath)
-    if (!isInsideDirectory(canonicalRoot, realSide)) {
-      throw new Error(`Antigravity ${label} file escaped its storage root.`)
-    }
-    return stat
-  } catch (error) {
-    if (error instanceof Error && Reflect.get(error, 'code') === 'ENOENT') return null
-    throw error
-  }
-}
-
-function captureOptionalWalStats(walPath: string, canonicalRoot: string): BigIntStats | null {
-  return captureOptionalSidefileStats(walPath, canonicalRoot, 'WAL')
-}
-
-function captureSqliteIdentity(
-  dbPath: string,
-  canonicalRoot: string,
-  maxBytes = AGY_MAX_HISTORY_BYTES * 2,
-): SqliteFileIdentitySnapshot {
-  assertNoRollbackJournal(dbPath, 'before')
-  const before = lstatSync(dbPath, { bigint: true })
-  if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n) {
-    throw new Error('Antigravity trajectory database must be one ordinary non-linked file.')
-  }
-  const canonicalDbPath = realpathSync(dbPath)
-  if (!isInsideDirectory(canonicalRoot, canonicalDbPath)) {
-    throw new Error('Antigravity trajectory database escaped its effective storage root.')
-  }
-  const fd = openSync(dbPath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
-  try {
-    const opened = fstatSync(fd, { bigint: true })
-    if (!statsMatch(before, opened) || realpathSync(dbPath) !== canonicalDbPath) {
-      throw new Error('Antigravity trajectory database identity changed while opening.')
-    }
-  } finally {
-    closeSync(fd)
-  }
-  const walStats = captureOptionalSidefileStats(`${dbPath}-wal`, canonicalRoot, 'WAL')
-  const shmStats = captureOptionalSidefileStats(`${dbPath}-shm`, canonicalRoot, 'SHM')
-  assertNoRollbackJournal(dbPath, 'before')
-  const totalBytes = before.size + (walStats?.size ?? 0n)
-  if (totalBytes > BigInt(maxBytes)) {
-    throw new AgentExecutionError(
-      'response_too_large',
-      'Antigravity trajectory database exceeds its read byte budget.',
-      false,
-    )
-  }
-  return { dbPath, canonicalRoot, canonicalDbPath, dbStats: before, walStats, shmStats }
-}
-
-const SQLITE_HEADER_MAGIC = Buffer.from('SQLite format 3\0', 'ascii')
-
-function copyVerifiedFileToStaging(
-  sourcePath: string,
-  expectedCanonicalSource: string,
-  expectedStats: BigIntStats,
-  targetPath: string,
-  patchWalHeaderToDelete: boolean,
-): string {
-  const srcFd = openSync(sourcePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
-  try {
-    const opened = fstatSync(srcFd, { bigint: true })
-    if (
-      !statsMatch(expectedStats, opened) ||
-      realpathSync(sourcePath) !== expectedCanonicalSource
-    ) {
-      throw new Error('Antigravity SQLite file changed while opening for staged snapshot.')
-    }
-    const dstFd = openSync(
-      targetPath,
-      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0),
-      0o600,
-    )
-    const hasher = createHash('sha256')
-    const chunk = Buffer.allocUnsafe(64 * 1024)
-    let copied = 0n
-    let firstChunk = true
-    try {
-      while (copied < expectedStats.size) {
-        const toRead = Number(
-          expectedStats.size - copied < BigInt(chunk.byteLength)
-            ? expectedStats.size - copied
-            : BigInt(chunk.byteLength),
-        )
-        const n = readSync(srcFd, chunk, 0, toRead, Number(copied))
-        if (n <= 0) break
-        const slice = chunk.subarray(0, n)
-        hasher.update(slice)
-        if (firstChunk) {
-          firstChunk = false
-          if (
-            patchWalHeaderToDelete &&
-            n >= 20 &&
-            slice.subarray(0, 16).equals(SQLITE_HEADER_MAGIC) &&
-            (slice[18] === 2 || slice[19] === 2)
-          ) {
-            const patched = Buffer.from(slice)
-            patched[18] = 1
-            patched[19] = 1
-            writeAllSync(dstFd, patched, 0, n)
-          } else {
-            writeAllSync(dstFd, slice, 0, n)
-          }
-        } else {
-          writeAllSync(dstFd, slice, 0, n)
-        }
-        copied += BigInt(n)
-      }
-      const dstStat = fstatSync(dstFd, { bigint: true })
-      if (dstStat.size !== expectedStats.size) {
-        throw new Error('Staged Antigravity SQLite copy byte length did not match expected size.')
-      }
-    } finally {
-      closeSync(dstFd)
-    }
-    const afterFd = fstatSync(srcFd, { bigint: true })
-    if (copied !== expectedStats.size || !statsMatch(expectedStats, afterFd)) {
-      throw new Error('Antigravity SQLite file changed while copying staged snapshot.')
-    }
-    return hasher.digest('hex')
-  } finally {
-    closeSync(srcFd)
-  }
-}
-
-function hashFileVerifiedReadOnly(
-  sourcePath: string,
-  expectedCanonicalSource: string,
-  expectedStats: BigIntStats,
-): string {
-  const srcFd = openSync(sourcePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
-  try {
-    const opened = fstatSync(srcFd, { bigint: true })
-    if (
-      !statsMatch(expectedStats, opened) ||
-      realpathSync(sourcePath) !== expectedCanonicalSource
-    ) {
-      throw new Error('Antigravity SQLite file changed after staged snapshot.')
-    }
-    const hasher = createHash('sha256')
-    const chunk = Buffer.allocUnsafe(64 * 1024)
-    let offset = 0n
-    while (offset < expectedStats.size) {
-      const toRead = Number(
-        expectedStats.size - offset < BigInt(chunk.byteLength)
-          ? expectedStats.size - offset
-          : BigInt(chunk.byteLength),
-      )
-      const n = readSync(srcFd, chunk, 0, toRead, Number(offset))
-      if (n <= 0) break
-      hasher.update(chunk.subarray(0, n))
-      offset += BigInt(n)
-    }
-    const afterFd = fstatSync(srcFd, { bigint: true })
-    if (offset !== expectedStats.size || !statsMatch(expectedStats, afterFd)) {
-      throw new Error('Antigravity SQLite file changed during post-stage digest check.')
-    }
-    return hasher.digest('hex')
-  } finally {
-    closeSync(srcFd)
-  }
-}
-
-/**
- * Stages `<sid>.db` (and `<sid>.db-wal` if present) into an isolated `0o700` temp directory
- * before opening SQLite so SQLite Unix VFS NEVER creates `-shm` or `-wal` sidefiles in `conversations/`.
- */
 function resolveSnapshotParentTempDir(): string {
   if (activeAgyTempStagingRoot !== undefined) {
     if (!isAbsolute(activeAgyTempStagingRoot)) {
       throw new Error('Antigravity caller-owned temp staging directory must be an absolute path.')
     }
-    const stat = lstatSync(activeAgyTempStagingRoot, { bigint: true })
+    let stat: BigIntStats
+    try {
+      stat = lstatSync(activeAgyTempStagingRoot, { bigint: true })
+    } catch (error) {
+      throw wrapOperationalStagingError(
+        error,
+        'Failed to access Antigravity caller-owned temp staging directory',
+      )
+    }
     if (!stat.isDirectory() || stat.isSymbolicLink()) {
       throw new Error(
         'Antigravity caller-owned temp staging directory must be a non-linked directory.',
@@ -1942,155 +1889,628 @@ function resolveSnapshotParentTempDir(): string {
   return tmpdir()
 }
 
-function openReadOnlySqliteSnapshot(
-  snapshot: SqliteFileIdentitySnapshot,
-  originalStorageRoot: string,
-): Database.Database {
-  const tempDir = mkdtempSync(join(resolveSnapshotParentTempDir(), 'pact-agy-ro-'))
-  chmodSync(tempDir, 0o700)
-  try {
-    const stagedDbPath = join(tempDir, 'snapshot.db')
-    const hasActiveWal = snapshot.walStats !== null && snapshot.walStats.size > 0n
-    const dbHash = copyVerifiedFileToStaging(
-      snapshot.dbPath,
-      snapshot.canonicalDbPath,
-      snapshot.dbStats,
-      stagedDbPath,
-      !hasActiveWal,
-    )
-    let walHash: string | undefined
-    let canonicalWalPath: string | undefined
-    if (snapshot.walStats !== null) {
-      const srcWalPath = `${snapshot.dbPath}-wal`
-      canonicalWalPath = realpathSync(srcWalPath)
-      walHash = copyVerifiedFileToStaging(
-        srcWalPath,
-        canonicalWalPath,
-        snapshot.walStats,
-        `${stagedDbPath}-wal`,
-        false,
-      )
-    }
+interface CommittedSqliteSnapshotHandle {
+  readonly db: Database.Database
+  readonly proof: AgyPreScannedSqliteProof
+  readonly fileIdentity: AgySqliteFileIdentity
+  readonly walIdentity: AgySqliteFileIdentity | null
+  readonly committedImageDigest: string
+  readonly canonicalDbPath: string
+  close(): void
+}
 
-    assertSqliteIdentityUnchanged(snapshot, originalStorageRoot)
-    // Verify pre/post digest consistency across `.db` and `.db-wal` so torn concurrent WAL/DB checkpoints cannot slip through!
-    if (
-      hashFileVerifiedReadOnly(snapshot.dbPath, snapshot.canonicalDbPath, snapshot.dbStats) !==
-      dbHash
-    ) {
-      throw new Error('Antigravity SQLite database bytes changed while staging WAL snapshot.')
-    }
-    if (
-      snapshot.walStats !== null &&
-      canonicalWalPath !== undefined &&
-      hashFileVerifiedReadOnly(`${snapshot.dbPath}-wal`, canonicalWalPath, snapshot.walStats) !==
-        walHash
-    ) {
-      throw new Error('Antigravity SQLite WAL bytes changed while staging snapshot.')
-    }
-    assertSqliteIdentityUnchanged(snapshot, originalStorageRoot)
-
-    // When `hasActiveWal` is true and `-shm` was missing, SQLite requires write access on our disposable
-    // staged copy to recover the WAL without `SQLITE_READONLY_RECOVERY`; we then lock `query_only = ON`.
-    const db = hasActiveWal
-      ? new Database(stagedDbPath, { fileMustExist: true })
-      : new Database(stagedDbPath, { readonly: true, fileMustExist: true })
-    if (hasActiveWal) {
-      db.pragma('query_only = ON')
-    }
-    const origClose = db.close.bind(db)
-    let cleaned = false
-    db.close = (): Database.Database => {
-      try {
-        return origClose()
-      } finally {
-        if (!cleaned) {
-          cleaned = true
-          try {
-            rmSync(tempDir, { recursive: true, force: true })
-          } catch {
-            /* Best-effort cleanup of private temp snapshot directory. */
-          }
-        }
+function openCommittedSqliteSnapshot(input: {
+  readonly rootDir: string
+  readonly canonicalRoot: string
+  readonly parentSegments: readonly string[]
+  readonly leafName: string
+  readonly maxSnapshotBytes?: number
+  readonly schemaCatalogBudget?: AgySchemaCatalogBudget
+  readonly signal?: AbortSignal
+  readonly deadlineAt?: number
+}): CommittedSqliteSnapshotHandle {
+  const { rootDir, canonicalRoot, parentSegments, leafName } = input
+  const maxSnapshotBytes = input.maxSnapshotBytes ?? AGY_MAX_HISTORY_BYTES * 2
+  const canonicalDbPath = join(canonicalRoot, ...parentSegments, leafName)
+  const materialized = withAgyReadImage(
+    { rootDir, parentSegments, leafName },
+    {
+      maxSnapshotBytes,
+      snapshotParentTempDir: resolveSnapshotParentTempDir(),
+      ...(input.schemaCatalogBudget !== undefined
+        ? { schemaCatalogBudget: input.schemaCatalogBudget }
+        : {}),
+    },
+    {
+      ...(input.signal !== undefined ? { signal: input.signal } : {}),
+      ...(input.deadlineAt !== undefined ? { deadlineAt: input.deadlineAt } : {}),
+    },
+    (image) => {
+      const snap = image.materializePrivateSnapshot({
+        maxSnapshotBytes,
+        snapshotParentTempDir: resolveSnapshotParentTempDir(),
+        ...(input.schemaCatalogBudget !== undefined
+          ? { schemaCatalogBudget: input.schemaCatalogBudget }
+          : {}),
+      })
+      return {
+        snap,
+        fileIdentity: image.fileIdentity,
+        walIdentity: image.walIdentity,
+        committedImageDigest: image.committedImageDigest,
       }
-    }
-    return db
+    },
+  )
+
+  let db: Database.Database
+  try {
+    db = materialized.snap.openReadOnlyDatabase()
   } catch (error) {
-    try {
-      rmSync(tempDir, { recursive: true, force: true })
-    } catch {
-      /* Best-effort cleanup on failed open. */
+    materialized.snap.cleanup()
+    throw error
+  }
+  return {
+    db,
+    proof: materialized.snap.proof,
+    fileIdentity: materialized.fileIdentity,
+    walIdentity: materialized.walIdentity,
+    committedImageDigest: materialized.committedImageDigest,
+    canonicalDbPath,
+    close: () => {
+      db.close()
+    },
+  }
+}
+
+function assertAnchoredSourceUnchanged(input: {
+  readonly rootDir: string
+  readonly canonicalRoot: string
+  readonly parentSegments: readonly string[]
+  readonly leafName: string
+  readonly expectedIdentity: AgySqliteFileIdentity
+  readonly expectedCommittedImageDigest: string
+  readonly signal?: AbortSignal
+  readonly deadlineAt?: number
+}): void {
+  if (realpathSync(input.rootDir) !== input.canonicalRoot) {
+    throw new Error('Antigravity storage root changed during inspection.')
+  }
+  withAgyReadImage(
+    {
+      rootDir: input.rootDir,
+      parentSegments: input.parentSegments,
+      leafName: input.leafName,
+    },
+    { maxSnapshotBytes: MAX_FALLBACK_SNAPSHOT_TOTAL_BYTES },
+    {
+      ...(input.signal !== undefined ? { signal: input.signal } : {}),
+      ...(input.deadlineAt !== undefined ? { deadlineAt: input.deadlineAt } : {}),
+    },
+    (image) => {
+      if (
+        !identitiesExactMatch(image.fileIdentity, input.expectedIdentity) ||
+        image.committedImageDigest !== input.expectedCommittedImageDigest
+      ) {
+        throw new Error('Antigravity trajectory database changed during inspection.')
+      }
+      image.verifyUnchanged()
+    },
+  )
+}
+
+/**
+ * Verifies a closed zero-step empty candidate DB using the anchored native file module WITHOUT
+ * ever opening a writable SQLite handle or creating sidefiles in `conversations/`.
+ * If an active SQLite lock or uncleaned `-wal`/`-shm`/`-journal` remains, preserves the candidate
+ * & original binding and throws an explicit `UNCERTAIN` error.
+ */
+function hasBlockingCandidateArtifacts(
+  check: ReturnType<typeof verifyCandidateEmptyUnlocked>,
+): boolean {
+  if (check.hasActiveLock || check.hasJournal) return true
+  if (check.hasWal && check.walByteLength !== 0) return true
+  if (check.hasShm && !check.hasWal) return true
+  return false
+}
+
+const STAGING_LEAF_NAME_PATTERN = /^\.pact-stage-[a-zA-Z0-9._-]{1,96}\.db$/u
+
+function publishStagedCandidateOrThrow(input: {
+  readonly canonicalRoot: string
+  readonly candidateSessionId: string
+  readonly stagedLeafName: string
+  readonly expectedTargetIdentity: AgySqliteFileIdentity
+  readonly expectedStagedIdentity: AgySqliteFileIdentity
+}): void {
+  const result = publishCandidateAtomically({
+    rootDir: input.canonicalRoot,
+    targetParentSegments: ['conversations'],
+    targetLeafName: `${input.candidateSessionId}.db`,
+    stagedParentSegments: ['brain', input.candidateSessionId],
+    stagedLeafName: input.stagedLeafName,
+    expectedTargetIdentity: input.expectedTargetIdentity,
+    expectedStagedIdentity: input.expectedStagedIdentity,
+  })
+  if (result.status === 'published') {
+    return
+  }
+  if (result.status === 'exdev') {
+    throw Object.assign(
+      new Error(
+        `Antigravity candidate staging and conversations directories are on different volumes (${result.reason}).`,
+      ),
+      { code: 'EXDEV' },
+    )
+  }
+  throw Object.assign(
+    new Error(
+      `Antigravity candidate database could not be safely published (${result.reason}); publication is UNCERTAIN.`,
+    ),
+    { code: 'UNCERTAIN' },
+  )
+}
+
+function openCandidateShellSnapshotOrThrowUncertain(input: {
+  readonly rootDir: string
+  readonly canonicalRoot: string
+  readonly candidateSessionId: string
+  readonly maxSnapshotBytes: number
+  readonly signal?: AbortSignal
+  readonly deadlineAt?: number
+}): CommittedSqliteSnapshotHandle {
+  try {
+    return openCommittedSqliteSnapshot({
+      rootDir: input.rootDir,
+      canonicalRoot: input.canonicalRoot,
+      parentSegments: ['conversations'],
+      leafName: `${input.candidateSessionId}.db`,
+      maxSnapshotBytes: input.maxSnapshotBytes,
+      ...(input.signal !== undefined ? { signal: input.signal } : {}),
+      ...(input.deadlineAt !== undefined ? { deadlineAt: input.deadlineAt } : {}),
+    })
+  } catch (error) {
+    if (
+      error instanceof AgyTransientIdentityChurnError ||
+      error instanceof AgyHotRollbackJournalError ||
+      error instanceof AgyInvalidSqliteImageError
+    ) {
+      let check: ReturnType<typeof verifyCandidateEmptyUnlocked> | undefined
+      try {
+        check = verifyCandidateEmptyUnlocked(
+          input.canonicalRoot,
+          ['conversations'],
+          `${input.candidateSessionId}.db`,
+        )
+      } catch {
+        check = undefined
+      }
+      if (check && hasBlockingCandidateArtifacts(check)) {
+        throw Object.assign(
+          new Error(
+            'Antigravity candidate database retains an active lock or uncleaned WAL/SHM/journal sidefile; publication is UNCERTAIN.',
+          ),
+          { code: 'UNCERTAIN' },
+        )
+      }
     }
     throw error
   }
 }
 
-function assertSqliteIdentityUnchanged(
-  snapshot: SqliteFileIdentitySnapshot,
-  originalStorageRoot: string,
-): void {
-  if (realpathSync(originalStorageRoot) !== snapshot.canonicalRoot) {
-    throw new Error('Antigravity storage root changed during inspection.')
+interface SameVolumeCandidateStage {
+  readonly stagingPath: string
+  readonly stagingLeafName: string
+  readonly createdAnchoredIdentity: AgySqliteFileIdentity
+  assertStagingBound(options?: { readonly expectedSize?: bigint }): BigIntStats
+  fsyncVerifiedStaging(expectedSize: bigint): void
+  assertAnchoredIdentityMatchesCreated(identity: AgySqliteFileIdentity, expectedSize: bigint): void
+  cleanup(): void
+}
+
+/**
+ * Allocates a same-volume private SQLite staging file under
+ * `<canonicalRoot>/brain/<candidateSessionId>/.pact-stage-<uuid>.db` (`0o600`, `DELETE` journal mode)
+ * and binds both the staging directory and exclusively created file identity across SQLite
+ * initialization, mutation, verification, fsync, publication, and cleanup.
+ */
+function createSameVolumeCandidateStagingDb(
+  canonicalRoot: string,
+  candidateSessionId: string,
+  requestedStagingLeafName?: string,
+): SameVolumeCandidateStage {
+  const stagingLeafName = requestedStagingLeafName ?? `.pact-stage-${randomUUID()}.db`
+  if (!STAGING_LEAF_NAME_PATTERN.test(stagingLeafName)) {
+    throw new Error('Invalid Antigravity candidate staging filename.')
   }
-  const currentDb = lstatSync(snapshot.dbPath, { bigint: true })
-  if (
-    !currentDb.isFile() ||
-    currentDb.isSymbolicLink() ||
-    currentDb.nlink !== 1n ||
-    !statsMatch(snapshot.dbStats, currentDb) ||
-    realpathSync(snapshot.dbPath) !== snapshot.canonicalDbPath
-  ) {
-    throw new Error('Antigravity trajectory database changed during inspection.')
-  }
-  const currentWal = captureOptionalSidefileStats(
-    `${snapshot.dbPath}-wal`,
-    snapshot.canonicalRoot,
-    'WAL',
-  )
-  const currentShm = captureOptionalSidefileStats(
-    `${snapshot.dbPath}-shm`,
-    snapshot.canonicalRoot,
-    'SHM',
-  )
-  if (snapshot.walStats === null) {
-    if (currentWal !== null) {
-      throw new Error('Antigravity trajectory WAL appeared during inspection.')
+  const brainCandidatePath = join(canonicalRoot, 'brain', candidateSessionId)
+  let existedBefore = false
+  try {
+    const st = lstatSync(brainCandidatePath, { bigint: true })
+    if (!st.isDirectory() || st.isSymbolicLink()) {
+      throw new Error('Antigravity candidate brain staging directory is linked or invalid.')
     }
-  } else if (currentWal === null || !statsMatch(snapshot.walStats, currentWal)) {
-    throw new Error('Antigravity trajectory WAL changed during inspection.')
+    existedBefore = true
+  } catch (error) {
+    if (!(error instanceof Error) || Reflect.get(error, 'code') !== 'ENOENT') {
+      throw error
+    }
   }
-  if (snapshot.shmStats === null && currentShm !== null) {
-    throw new Error('Antigravity trajectory SHM appeared during inspection.')
+  const safeBrainDir = ensureSafeDirectoryChain(canonicalRoot, ['brain', candidateSessionId])
+  const brainDirStat = lstatSync(safeBrainDir, { bigint: true })
+  if (
+    !brainDirStat.isDirectory() ||
+    brainDirStat.isSymbolicLink() ||
+    realpathSync(safeBrainDir) !== safeBrainDir
+  ) {
+    throw new Error('Antigravity candidate brain staging directory is linked or invalid.')
   }
-  assertNoRollbackJournal(snapshot.dbPath, 'after')
+  let brainDirFd: number | undefined
+  if (process.platform !== 'win32') {
+    brainDirFd = openSync(
+      safeBrainDir,
+      constants.O_RDONLY | (constants.O_DIRECTORY ?? 0) | (constants.O_NOFOLLOW ?? 0),
+    )
+    const pinnedDirStat = fstatSync(brainDirFd, { bigint: true })
+    if (
+      !pinnedDirStat.isDirectory() ||
+      pinnedDirStat.dev !== brainDirStat.dev ||
+      pinnedDirStat.ino !== brainDirStat.ino
+    ) {
+      closeSync(brainDirFd)
+      brainDirFd = undefined
+      throw new Error('Antigravity candidate brain staging directory changed while opening.')
+    }
+  }
+  const closeBrainDirFd = (): void => {
+    if (brainDirFd !== undefined) {
+      try {
+        closeSync(brainDirFd)
+      } catch {
+        /* Best-effort close of pinned staging directory handle. */
+      }
+      brainDirFd = undefined
+    }
+  }
+  const removeEmptyBrainDirIfCreated = (): void => {
+    if (!existedBefore) {
+      try {
+        rmdirSync(safeBrainDir)
+      } catch {
+        /* Candidate brain directory may legitimately hold uploaded media or receipts. */
+      }
+    }
+  }
+
+  let sameVolume: boolean
+  try {
+    sameVolume = checkSameVolume(canonicalRoot, ['conversations'], ['brain', candidateSessionId])
+  } catch (error) {
+    closeBrainDirFd()
+    removeEmptyBrainDirIfCreated()
+    throw error
+  }
+  if (!sameVolume) {
+    closeBrainDirFd()
+    removeEmptyBrainDirIfCreated()
+    throw Object.assign(
+      new Error(
+        'Antigravity candidate brain staging directory and conversations directory are on different volumes.',
+      ),
+      { code: 'EXDEV' },
+    )
+  }
+
+  const assertStagingDirUnchanged = (): void => {
+    if (realpathSync(canonicalRoot) !== canonicalRoot) {
+      throw new Error('Antigravity storage root changed during candidate staging.')
+    }
+    const currentDirStat = lstatSync(safeBrainDir, { bigint: true })
+    if (
+      !currentDirStat.isDirectory() ||
+      currentDirStat.isSymbolicLink() ||
+      currentDirStat.dev !== brainDirStat.dev ||
+      currentDirStat.ino !== brainDirStat.ino ||
+      realpathSync(safeBrainDir) !== safeBrainDir ||
+      !isInsideDirectory(canonicalRoot, safeBrainDir)
+    ) {
+      throw new Error('Antigravity candidate brain staging directory changed during staging.')
+    }
+    if (brainDirFd !== undefined) {
+      const pinnedDirStat = fstatSync(brainDirFd, { bigint: true })
+      if (
+        !pinnedDirStat.isDirectory() ||
+        pinnedDirStat.dev !== brainDirStat.dev ||
+        pinnedDirStat.ino !== brainDirStat.ino
+      ) {
+        throw new Error('Antigravity candidate pinned brain directory identity changed.')
+      }
+    }
+  }
+
+  const stagingPath = join(safeBrainDir, stagingLeafName)
+  let fd: number
+  try {
+    assertStagingDirUnchanged()
+    fd = openSync(
+      stagingPath,
+      constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | (constants.O_NOFOLLOW ?? 0),
+      0o600,
+    )
+  } catch (error) {
+    closeBrainDirFd()
+    removeEmptyBrainDirIfCreated()
+    throw error
+  }
+  let createdStat: BigIntStats
+  try {
+    createdStat = fstatSync(fd, { bigint: true })
+    if (
+      !createdStat.isFile() ||
+      createdStat.nlink !== 1n ||
+      createdStat.size !== 0n ||
+      createdStat.dev !== brainDirStat.dev
+    ) {
+      throw new Error('Antigravity candidate staging descriptor identity is invalid.')
+    }
+    assertStagingDirUnchanged()
+    const liveCreatedStat = lstatSync(stagingPath, { bigint: true })
+    if (
+      !liveCreatedStat.isFile() ||
+      liveCreatedStat.isSymbolicLink() ||
+      liveCreatedStat.nlink !== 1n ||
+      liveCreatedStat.dev !== createdStat.dev ||
+      liveCreatedStat.ino !== createdStat.ino ||
+      realpathSync(stagingPath) !== stagingPath
+    ) {
+      throw new Error('Antigravity candidate staging path changed immediately after creation.')
+    }
+  } catch (error) {
+    closeSync(fd)
+    try {
+      const current = lstatSync(stagingPath, { bigint: true })
+      if (!current.isSymbolicLink() && current.dev === brainDirStat.dev) {
+        unlinkSync(stagingPath)
+      }
+    } catch {
+      /* Best-effort cleanup of failed staging creation. */
+    }
+    closeBrainDirFd()
+    removeEmptyBrainDirIfCreated()
+    throw error
+  }
+  closeSync(fd)
+
+  let createdAnchoredIdentity: AgySqliteFileIdentity
+  try {
+    createdAnchoredIdentity = readAnchoredFileIdentity(
+      canonicalRoot,
+      ['brain', candidateSessionId],
+      stagingLeafName,
+    )
+    if (
+      createdAnchoredIdentity.size !== '0' ||
+      (process.platform !== 'win32' &&
+        (createdAnchoredIdentity.dev !== String(createdStat.dev) ||
+          createdAnchoredIdentity.ino !== String(createdStat.ino)))
+    ) {
+      throw new Error('Antigravity candidate staging anchored identity mismatch after creation.')
+    }
+  } catch (error) {
+    try {
+      const current = lstatSync(stagingPath, { bigint: true })
+      if (
+        !current.isSymbolicLink() &&
+        current.dev === createdStat.dev &&
+        current.ino === createdStat.ino
+      ) {
+        unlinkSync(stagingPath)
+      }
+    } catch {
+      /* Best-effort cleanup of unverified staging file. */
+    }
+    closeBrainDirFd()
+    removeEmptyBrainDirIfCreated()
+    throw error
+  }
+
+  const assertStagingBound = (options?: { readonly expectedSize?: bigint }): BigIntStats => {
+    assertStagingDirUnchanged()
+    const current = lstatSync(stagingPath, { bigint: true })
+    if (
+      !current.isFile() ||
+      current.isSymbolicLink() ||
+      current.nlink !== 1n ||
+      current.dev !== createdStat.dev ||
+      current.ino !== createdStat.ino ||
+      realpathSync(stagingPath) !== stagingPath
+    ) {
+      throw new Error('Antigravity candidate staging file identity drifted during staging.')
+    }
+    if (options?.expectedSize !== undefined && current.size !== options.expectedSize) {
+      throw new Error('Antigravity candidate staging file size drifted during staging.')
+    }
+    return current
+  }
+
+  const fsyncVerifiedStaging = (expectedSize: bigint): void => {
+    assertStagingBound({ expectedSize })
+    const syncFd = openSync(stagingPath, constants.O_RDWR | (constants.O_NOFOLLOW ?? 0))
+    try {
+      const opened = fstatSync(syncFd, { bigint: true })
+      if (
+        !opened.isFile() ||
+        opened.nlink !== 1n ||
+        opened.dev !== createdStat.dev ||
+        opened.ino !== createdStat.ino ||
+        opened.size !== expectedSize
+      ) {
+        throw new Error('Antigravity candidate staging file changed while opening for fsync.')
+      }
+      assertStagingBound({ expectedSize })
+      fsyncSync(syncFd)
+      const afterSync = fstatSync(syncFd, { bigint: true })
+      if (
+        !afterSync.isFile() ||
+        afterSync.nlink !== 1n ||
+        afterSync.dev !== createdStat.dev ||
+        afterSync.ino !== createdStat.ino ||
+        afterSync.size !== expectedSize
+      ) {
+        throw new Error('Antigravity candidate staging file changed during fsync.')
+      }
+    } finally {
+      closeSync(syncFd)
+    }
+  }
+
+  const assertAnchoredIdentityMatchesCreated = (
+    identity: AgySqliteFileIdentity,
+    expectedSize: bigint,
+  ): void => {
+    if (
+      identity.dev !== createdAnchoredIdentity.dev ||
+      identity.ino !== createdAnchoredIdentity.ino ||
+      identity.size !== String(expectedSize)
+    ) {
+      throw new Error('Antigravity candidate staging anchored identity drifted before publication.')
+    }
+  }
+
+  return {
+    stagingPath,
+    stagingLeafName,
+    createdAnchoredIdentity,
+    assertStagingBound,
+    fsyncVerifiedStaging,
+    assertAnchoredIdentityMatchesCreated,
+    cleanup: () => {
+      try {
+        const current = lstatSync(stagingPath, { bigint: true })
+        if (
+          !current.isSymbolicLink() &&
+          current.isFile() &&
+          current.dev === createdStat.dev &&
+          current.ino === createdStat.ino
+        ) {
+          unlinkSync(stagingPath)
+        }
+      } catch {
+        /* Staging file was already published or absent. */
+      }
+      for (const suffix of ['-wal', '-shm', '-journal']) {
+        try {
+          const sidePath = `${stagingPath}${suffix}`
+          const sideStat = lstatSync(sidePath, { bigint: true })
+          if (
+            !sideStat.isSymbolicLink() &&
+            sideStat.isFile() &&
+            sideStat.nlink === 1n &&
+            sideStat.dev === createdStat.dev
+          ) {
+            unlinkSync(sidePath)
+          }
+        } catch {
+          /* Best-effort cleanup of verified staging sidefiles. */
+        }
+      }
+      closeBrainDirFd()
+      removeEmptyBrainDirIfCreated()
+    },
+  }
+}
+
+function readAnchoredFileIdentity(
+  canonicalRoot: string,
+  parentSegments: readonly string[],
+  leafName: string,
+): AgySqliteFileIdentity {
+  const view = openAnchoredLockedSqliteView(canonicalRoot, parentSegments, leafName, {
+    acquireSharedLock: false,
+    openWal: false,
+    openShm: false,
+    checkJournal: false,
+  })
+  try {
+    return view.fileIdentity
+  } finally {
+    view.close()
+  }
 }
 
 function computePhysicalDbDigest(
-  dbPath: string,
   canonicalRoot: string,
+  sessionId: string,
   originalStorageRoot: string,
+  expectedFileIdentity?: AgySqliteFileIdentity,
+  expectedWalIdentity?: AgySqliteFileIdentity | null,
 ): { rawHash: string; rawBytes: number } {
-  const snapshot = captureSqliteIdentity(dbPath, canonicalRoot, AGY_MAX_HISTORY_BYTES)
-  const hasher = createHash('sha256')
-  hasher.update('pact-agy-sqlite-physical-v1\0')
-  const chunk = Buffer.allocUnsafe(64 * 1024)
-  let totalBytes = 0
+  if (realpathSync(originalStorageRoot) !== canonicalRoot) {
+    throw new Error('Antigravity storage root changed during digest computation.')
+  }
+  const view = openAnchoredLockedSqliteView(canonicalRoot, ['conversations'], `${sessionId}.db`, {
+    acquireSharedLock: true,
+    openWal: true,
+    openShm: true,
+    checkJournal: true,
+  })
+  try {
+    if (expectedFileIdentity && !identitiesExactMatch(view.fileIdentity, expectedFileIdentity)) {
+      throw new Error('Antigravity database file changed while opening physical digest.')
+    }
+    if (expectedWalIdentity !== undefined) {
+      const walMatches =
+        (expectedWalIdentity === null && view.walIdentity === null) ||
+        (expectedWalIdentity !== null &&
+          view.walIdentity !== null &&
+          identitiesExactMatch(view.walIdentity, expectedWalIdentity))
+      if (!walMatches) {
+        throw new Error('Antigravity WAL file changed while opening physical digest.')
+      }
+    }
+    if (view.hasJournal) {
+      throw new AgyHotRollbackJournalError(
+        `Antigravity SQLite rollback journal (${sessionId}.db-journal) is present during physical digest.`,
+      )
+    }
+    const readShmHeader = (): Buffer => {
+      try {
+        return view.readShmAt(0, SQLITE_WAL_INDEX_HEADER_BYTES)
+      } catch (error) {
+        if (error instanceof Error && Reflect.get(error, 'code') === 'ERR_UNEXPECTED_EOF') {
+          throw new AgyTransientIdentityChurnError(
+            'Antigravity SQLite wal-index header truncated during physical digest.',
+          )
+        }
+        throw error
+      }
+    }
+    let shmBefore: Buffer | undefined
+    if (view.hasShm) {
+      if (view.shmByteLength < SQLITE_WAL_INDEX_HEADER_BYTES) {
+        throw new AgyTransientIdentityChurnError(
+          'Antigravity SQLite wal-index file is still initializing during physical digest.',
+        )
+      }
+      shmBefore = readShmHeader()
+    }
+    const hasher = createHash('sha256')
+    hasher.update('pact-agy-sqlite-physical-v1\0')
+    let totalBytes = 0
+    const chunkSize = 64 * 1024
 
-  const hashFile = (filePath: string, expectedSize: bigint): void => {
-    const fd = openSync(filePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
-    try {
-      const opened = fstatSync(fd, { bigint: true })
-      if (!opened.isFile() || opened.size !== expectedSize) {
-        throw new Error('Antigravity database file size changed while hashing.')
+    const hashStream = (
+      targetBytes: number,
+      readFn: (off: number, len: number) => Buffer,
+    ): void => {
+      if (!Number.isSafeInteger(targetBytes) || targetBytes < 0) {
+        throw new Error('Antigravity database file size exceeds safe integer bounds.')
       }
       let offset = 0
-      const target = Number(expectedSize)
-      while (offset < target) {
-        const toRead = Math.min(chunk.length, target - offset)
-        const bytesRead = readSync(fd, chunk, 0, toRead, offset)
-        if (bytesRead <= 0) break
-        offset += bytesRead
-        totalBytes += bytesRead
+      while (offset < targetBytes) {
+        const toRead = Math.min(chunkSize, targetBytes - offset)
+        const buf = readFn(offset, toRead)
+        offset += buf.byteLength
+        totalBytes += buf.byteLength
         if (totalBytes > AGY_MAX_HISTORY_BYTES) {
           throw new AgentExecutionError(
             'response_too_large',
@@ -2098,37 +2518,51 @@ function computePhysicalDbDigest(
             false,
           )
         }
-        hasher.update(chunk.subarray(0, bytesRead))
+        hasher.update(buf)
       }
-      if (offset !== target) {
+      if (offset !== targetBytes) {
         throw new Error('Antigravity database read ended before expected EOF.')
       }
-    } finally {
-      closeSync(fd)
     }
-  }
 
-  hasher.update('main\0')
-  hashFile(dbPath, snapshot.dbStats.size)
-  if (snapshot.walStats && snapshot.walStats.size > 0n) {
-    hasher.update('\0wal\0')
-    hashFile(`${dbPath}-wal`, snapshot.walStats.size)
+    hasher.update('main\0')
+    hashStream(view.byteLength, (off, len) => view.readAt(off, len))
+    if (view.hasWal && view.walByteLength > 0) {
+      hasher.update('\0wal\0')
+      hashStream(view.walByteLength, (off, len) => view.readWalAt(off, len))
+    }
+    const verify = view.verifyUnchanged()
+    if (!verify.unchanged) {
+      if (verify.reason === 'journal_appeared') {
+        throw new AgyHotRollbackJournalError(
+          'Antigravity SQLite rollback journal appeared during physical digest.',
+        )
+      }
+      throw new AgyTransientIdentityChurnError(
+        `Antigravity database changed while computing physical digest (${verify.reason ?? 'unknown'}).`,
+      )
+    }
+    if (shmBefore !== undefined) {
+      const shmAfter = readShmHeader()
+      if (!shmAfter.equals(shmBefore)) {
+        throw new AgyTransientIdentityChurnError(
+          'Antigravity SQLite wal-index header changed during physical digest.',
+        )
+      }
+    }
+    if (realpathSync(originalStorageRoot) !== canonicalRoot) {
+      throw new Error('Antigravity storage root changed during digest computation.')
+    }
+    return { rawHash: hasher.digest('hex'), rawBytes: totalBytes }
+  } finally {
+    view.close()
   }
-  assertSqliteIdentityUnchanged(snapshot, originalStorageRoot)
-  return { rawHash: hasher.digest('hex'), rawBytes: totalBytes }
 }
 
 interface SqliteMasterRow {
   name: string
   type: string
   sql: string | null
-}
-
-interface TableColumnInfo {
-  name: string
-  type: string
-  notnull: number
-  pk: number
 }
 
 interface ValidatedTrajectorySchema {
@@ -2164,22 +2598,303 @@ function optionalBufferField(row: Record<string, unknown>, field: string): Buffe
   return value
 }
 
+interface TableXColumnInfo {
+  name: string
+  type: string
+  notnull: number
+  pk: number
+  hidden: number
+}
+
 function readTableColumns(db: Database.Database, tableName: string): string[] {
   const rows = db
-    .prepare<[], TableColumnInfo>(`PRAGMA table_info(${quoteSqlIdentifier(tableName)})`)
+    .prepare<[], TableXColumnInfo>(`PRAGMA table_xinfo(${quoteSqlIdentifier(tableName)})`)
     .all()
-  const names = rows.map((row) => row.name)
-  for (const name of names) quoteSqlIdentifier(name)
+  const names: string[] = []
+  for (const row of rows) {
+    if (row.hidden !== 0) {
+      throw new Error(
+        `Unsupported generated or hidden column (${row.name}) in Antigravity table ${tableName}.`,
+      )
+    }
+    quoteSqlIdentifier(row.name)
+    names.push(row.name)
+  }
   return names
+}
+
+function assertProofHasOrdinaryTables(
+  proof: AgyPreScannedSqliteProof,
+  requiredTables: readonly string[],
+): void {
+  for (const entry of proof.tables.values()) {
+    if (entry.name.startsWith('sqlite_')) continue
+    if (entry.isVirtual || entry.rootPage < 2) {
+      throw new Error(`Unsupported virtual SQLite table (${entry.name}) in Antigravity trajectory.`)
+    }
+  }
+  for (const tableName of requiredTables) {
+    const entry = proof.tables.get(tableName)
+    if (!entry || entry.isVirtual || entry.rootPage < 2) {
+      throw new Error(`Missing required Antigravity table: ${tableName}.`)
+    }
+  }
+}
+
+function measureTableColumnsTotalBytes(
+  db: Database.Database,
+  tableName: string,
+  columns: readonly string[],
+  whereClause?: { readonly sql: string; readonly params: readonly unknown[] },
+): number {
+  if (columns.length === 0) return 0
+  const expr = columns
+    .map((col) => `COALESCE(octet_length(${quoteSqlIdentifier(col)}), 0)`)
+    .join(' + ')
+  const sql = whereClause
+    ? `SELECT COALESCE(SUM(${expr}), 0) AS totalBytes FROM ${quoteSqlIdentifier(tableName)} WHERE ${whereClause.sql}`
+    : `SELECT COALESCE(SUM(${expr}), 0) AS totalBytes FROM ${quoteSqlIdentifier(tableName)}`
+  const stmt = db.prepare<unknown[], { totalBytes: number | bigint | null }>(sql)
+  const row = whereClause ? stmt.get(...whereClause.params) : stmt.get()
+  const raw = row?.totalBytes ?? 0
+  const bytes = typeof raw === 'bigint' ? Number(raw) : raw
+  if (!Number.isSafeInteger(bytes) || bytes < 0) {
+    return Number.MAX_SAFE_INTEGER
+  }
+  return bytes
+}
+
+interface BoundedTableXInfoRow {
+  name: string
+  hidden: number
+}
+
+const MAX_FALLBACK_VDBE_OPS = 160
+const ALLOWED_FALLBACK_SCALAR_FUNCTIONS = new Set(['typeof(1)', 'octet_length(1)'])
+const ALLOWED_FALLBACK_AGG_FUNCTIONS = new Set(['count(0)', 'sum(1)', 'max(1)'])
+const DISALLOWED_FALLBACK_VDBE_OPCODES = new Set([
+  'Concat',
+  'Cast',
+  'Blob',
+  'SorterOpen',
+  'OpenEphemeral',
+  'OpenAutoindex',
+  'MakeRecord',
+  'RealAffinity',
+  'VOpen',
+  'VFilter',
+  'VColumn',
+  'VNext',
+  'VBegin',
+  'VCreate',
+  'VDestroy',
+  'VUpdate',
+  'VRename',
+])
+const CONDITIONAL_GUARD_JUMP_OPCODES = new Set(['Lt', 'Gt', 'Le', 'Ge', 'Ne'])
+const SQLITE_OPFLAG_LENGTHARG = 0x40
+const SQLITE_OPFLAG_TYPEOFARG = 0x80
+const SQLITE_OPFLAG_BYTELENARG = SQLITE_OPFLAG_LENGTHARG | SQLITE_OPFLAG_TYPEOFARG
+
+export interface SqliteExplainRow {
+  readonly addr: number
+  readonly opcode: string
+  readonly p1: number
+  readonly p2: number
+  readonly p3: number
+  readonly p4: unknown
+  readonly p5: number
+}
+
+function quoteArbitrarySqlIdentifier(identifier: string): string {
+  if (identifier.length === 0 || identifier.length > 256 || hasNonPrintableAscii(identifier)) {
+    throw new AgyIdentityBudgetExceededError(
+      'Antigravity SQLite identifier exceeds safe bounded inspection rules.',
+    )
+  }
+  return `"${identifier.replaceAll('"', '""')}"`
+}
+
+function readBoundedIdentityTableColumns(
+  db: Database.Database,
+  tableName: 'trajectory_meta' | 'steps',
+  requiredColumns: readonly string[],
+): Map<string, number> {
+  const placeholders = requiredColumns.map(() => '?').join(', ')
+  const rows = db
+    .prepare<string[], BoundedTableXInfoRow>(
+      `SELECT name, hidden FROM pragma_table_xinfo(?) WHERE hidden IN (0, 2, 3) AND name IN (${placeholders})`,
+    )
+    .all(tableName, ...requiredColumns)
+  const result = new Map<string, number>()
+  for (const row of rows) {
+    result.set(row.name, row.hidden)
+  }
+  return result
+}
+
+function findStoredTableColumnName(
+  db: Database.Database,
+  tableName: 'trajectory_meta' | 'steps',
+  candidateName: string,
+): string | undefined {
+  const row = db
+    .prepare<[string, string], BoundedTableXInfoRow>(
+      `SELECT name, hidden FROM pragma_table_xinfo(?) WHERE hidden IN (0, 3) AND lower(name) = lower(?) LIMIT 1`,
+    )
+    .get(tableName, candidateName)
+  return row?.name
+}
+
+export function verifyBoundedFallbackVdbeOps(
+  ops: readonly SqliteExplainRow[],
+  options?: { readonly allowGuardedVirtualEval?: boolean },
+): void {
+  if (ops.length === 0 || ops.length > MAX_FALLBACK_VDBE_OPS) {
+    throw new AgyIdentityBudgetExceededError(
+      'Antigravity fallback SQLite query plan exceeded bounded instruction limit.',
+    )
+  }
+  const verifiedGuardRanges: Array<{
+    readonly cursor: number
+    readonly colIdx: number
+    readonly fromAddr: number
+    readonly untilAddr: number
+  }> = []
+
+  for (let i = 0; i < ops.length; i += 1) {
+    const op = ops[i]!
+    if (DISALLOWED_FALLBACK_VDBE_OPCODES.has(op.opcode)) {
+      throw new AgyIdentityBudgetExceededError(
+        `Antigravity fallback SQLite query plan uses unbounded opcode (${op.opcode}).`,
+      )
+    }
+    if (op.opcode === 'Function' || op.opcode === 'PureFunc') {
+      if (typeof op.p4 !== 'string' || !ALLOWED_FALLBACK_SCALAR_FUNCTIONS.has(op.p4)) {
+        throw new AgyIdentityBudgetExceededError(
+          'Antigravity fallback SQLite query plan invokes an unbounded scalar function.',
+        )
+      }
+      const isOctetLength = op.p4 === 'octet_length(1)'
+      const argReg = op.p2
+      const prev = i > 0 ? ops[i - 1] : undefined
+      let provenMetadataOnly = false
+      let metadataSource: { readonly cursor: number; readonly colIdx: number } | undefined
+
+      const columnFlagsProven = (p5: number): boolean =>
+        isOctetLength
+          ? (p5 & SQLITE_OPFLAG_BYTELENARG) === SQLITE_OPFLAG_BYTELENARG
+          : (p5 & SQLITE_OPFLAG_TYPEOFARG) === SQLITE_OPFLAG_TYPEOFARG
+
+      if (prev && prev.opcode === 'Rowid' && prev.p2 === argReg) {
+        provenMetadataOnly = true
+      } else if (
+        prev &&
+        prev.opcode === 'Column' &&
+        prev.p3 === argReg &&
+        columnFlagsProven(prev.p5)
+      ) {
+        provenMetadataOnly = true
+        metadataSource = { cursor: prev.p1, colIdx: prev.p2 }
+      } else if (
+        options?.allowGuardedVirtualEval &&
+        i >= 3 &&
+        prev &&
+        prev.opcode === 'Affinity' &&
+        prev.p1 === argReg &&
+        prev.p2 === 1
+      ) {
+        const producer = ops[i - 2]!
+        const guardNullRow = ops[i - 3]!
+        if (producer.opcode === 'Rowid' && producer.p2 === argReg) {
+          provenMetadataOnly = true
+        } else if (
+          producer.opcode === 'Column' &&
+          producer.p3 === argReg &&
+          guardNullRow.opcode === 'IfNullRow' &&
+          guardNullRow.p1 === producer.p1 &&
+          guardNullRow.p2 === op.addr &&
+          verifiedGuardRanges.some(
+            (range) =>
+              range.cursor === producer.p1 &&
+              range.colIdx === producer.p2 &&
+              range.fromAddr < guardNullRow.addr &&
+              range.untilAddr > op.addr,
+          )
+        ) {
+          provenMetadataOnly = true
+        }
+      }
+
+      if (!provenMetadataOnly) {
+        throw new AgyIdentityBudgetExceededError(
+          `Antigravity fallback SQLite query plan cannot prove metadata-only column access before ${op.p4}.`,
+        )
+      }
+
+      if (metadataSource !== undefined) {
+        for (let j = i + 1; j < Math.min(ops.length, i + 4); j += 1) {
+          const jumpOp = ops[j]!
+          if (!CONDITIONAL_GUARD_JUMP_OPCODES.has(jumpOp.opcode)) break
+          if (jumpOp.p2 > op.addr) {
+            verifiedGuardRanges.push({
+              cursor: metadataSource.cursor,
+              colIdx: metadataSource.colIdx,
+              fromAddr: op.addr,
+              untilAddr: jumpOp.p2,
+            })
+          }
+        }
+      }
+    } else if (op.opcode === 'AggStep' || op.opcode === 'AggStep1' || op.opcode === 'AggFinal') {
+      if (typeof op.p4 !== 'string' || !ALLOWED_FALLBACK_AGG_FUNCTIONS.has(op.p4)) {
+        throw new AgyIdentityBudgetExceededError(
+          'Antigravity fallback SQLite query plan invokes an unbounded aggregate function.',
+        )
+      }
+    } else if (op.opcode === 'String8') {
+      if (typeof op.p4 === 'string' && Buffer.byteLength(op.p4, 'utf8') > 1024) {
+        throw new AgyIdentityBudgetExceededError(
+          'Antigravity fallback SQLite query plan embeds an oversized string literal.',
+        )
+      }
+    }
+  }
+}
+
+function readBoundedExplainOps(db: Database.Database, sql: string): SqliteExplainRow[] {
+  const stmt = db.prepare<[], SqliteExplainRow>(`EXPLAIN ${sql}`)
+  const ops: SqliteExplainRow[] = []
+  for (const op of stmt.iterate()) {
+    ops.push(op)
+    if (ops.length > MAX_FALLBACK_VDBE_OPS) {
+      break
+    }
+  }
+  return ops
+}
+
+function assertBoundedFallbackQueryPlan(
+  db: Database.Database,
+  sql: string,
+  options?: { readonly allowGuardedVirtualEval?: boolean },
+): void {
+  const ops = readBoundedExplainOps(db, sql)
+  verifyBoundedFallbackVdbeOps(ops, options)
 }
 
 function validateTrajectoryDatabase(
   db: Database.Database,
   expectedSessionId: string,
+  proof?: AgyPreScannedSqliteProof,
 ): ValidatedTrajectorySchema {
+  if (proof) {
+    assertProofHasOrdinaryTables(proof, REQUIRED_TRAJECTORY_TABLES)
+  }
+
   const masterRows = db
-    .prepare<[], SqliteMasterRow>(
-      `SELECT name, type, sql FROM sqlite_master WHERE type IN ('table', 'index', 'view', 'trigger') AND name NOT LIKE 'sqlite_%' ORDER BY type DESC, name ASC`,
+    .prepare<[], SqliteMasterRow & { rootpage: number }>(
+      `SELECT name, type, rootpage, sql FROM sqlite_master WHERE type IN ('table', 'index', 'view', 'trigger') AND substr(name, 1, 7) != 'sqlite_' ORDER BY type DESC, name ASC`,
     )
     .all()
 
@@ -2190,6 +2905,9 @@ function validateTrajectoryDatabase(
       throw new Error(`Unsupported SQLite ${row.type} (${row.name}) in Antigravity trajectory.`)
     }
     if (row.type === 'table') {
+      if (row.rootpage === 0 || (row.sql && /^\s*CREATE\s+VIRTUAL\s+TABLE\b/iu.test(row.sql))) {
+        throw new Error(`Unsupported virtual SQLite table (${row.name}) in Antigravity trajectory.`)
+      }
       quoteSqlIdentifier(row.name)
       tables.set(row.name, row)
     } else if (row.type === 'index' && row.sql) {
@@ -2235,8 +2953,22 @@ function validateTrajectoryDatabase(
   if (!metaColumns.includes('trajectory_id') || !metaColumns.includes('cascade_id')) {
     throw new Error('Antigravity trajectory_meta is missing trajectory_id or cascade_id columns.')
   }
+  const metaRowCount = db
+    .prepare<[], { count: number }>('SELECT COUNT(*) AS count FROM "trajectory_meta"')
+    .get()
+  if (!metaRowCount || metaRowCount.count !== 1) {
+    throw new Error('Antigravity trajectory_meta must contain exactly one row.')
+  }
+  if (measureTableColumnsTotalBytes(db, 'trajectory_meta', metaColumns) > AGY_TEXT_BUDGET_BYTES) {
+    throw new AgentExecutionError(
+      'response_too_large',
+      'Antigravity trajectory_meta exceeds 8 MiB.',
+      false,
+    )
+  }
+  const metaSelectList = metaColumns.map(quoteSqlIdentifier).join(', ')
   const metaRows = db
-    .prepare<[], Record<string, unknown>>('SELECT * FROM "trajectory_meta" LIMIT 2')
+    .prepare<[], Record<string, unknown>>(`SELECT ${metaSelectList} FROM "trajectory_meta" LIMIT 2`)
     .all()
   if (metaRows.length !== 1) {
     throw new Error('Antigravity trajectory_meta must contain exactly one row.')
@@ -2291,9 +3023,31 @@ function validateTrajectoryDatabase(
 
   let trajectoryMetadataRows: Array<Record<string, unknown>> = []
   if (tables.has('trajectory_metadata_blob')) {
-    trajectoryMetadataRows = db
-      .prepare<[], Record<string, unknown>>('SELECT * FROM "trajectory_metadata_blob" LIMIT 2')
-      .all()
+    const blobColumns = readTableColumns(db, 'trajectory_metadata_blob')
+    const blobCountRow = db
+      .prepare<[], { count: number }>('SELECT COUNT(*) AS count FROM "trajectory_metadata_blob"')
+      .get()
+    if (blobCountRow && blobCountRow.count > 1) {
+      throw new Error('Antigravity trajectory_metadata_blob has multiple rows.')
+    }
+    if (blobCountRow && blobCountRow.count === 1) {
+      if (
+        measureTableColumnsTotalBytes(db, 'trajectory_metadata_blob', blobColumns) >
+        AGY_TEXT_BUDGET_BYTES
+      ) {
+        throw new AgentExecutionError(
+          'response_too_large',
+          'Antigravity trajectory_metadata_blob exceeds 8 MiB.',
+          false,
+        )
+      }
+      const blobSelectList = blobColumns.map(quoteSqlIdentifier).join(', ')
+      trajectoryMetadataRows = db
+        .prepare<[], Record<string, unknown>>(
+          `SELECT ${blobSelectList} FROM "trajectory_metadata_blob" LIMIT 2`,
+        )
+        .all()
+    }
     if (trajectoryMetadataRows.length > 1) {
       throw new Error('Antigravity trajectory_metadata_blob has multiple rows.')
     }
@@ -2492,37 +3246,38 @@ function resolveBrainMarkdownPath(
   rawPathOrUri: string,
   canonicalAppDataDir: string,
   sessionId: string,
+  configuredAppDataDir?: string,
 ): string | undefined {
-  if (!rawPathOrUri) return undefined
-  let candidatePath = rawPathOrUri
-  if (candidatePath.startsWith('file://')) {
-    try {
-      const url = new URL(candidatePath)
-      if (url.protocol !== 'file:') return undefined
-      candidatePath = decodeURIComponent(url.pathname)
-      if (process.platform === 'win32' && /^\/[a-zA-Z]:\//u.test(candidatePath)) {
-        candidatePath = candidatePath.slice(1)
-      }
-    } catch {
-      return undefined
-    }
-  }
-  if (!isAbsolute(candidatePath)) return undefined
-  const brainDir = join(canonicalAppDataDir, 'brain', sessionId)
-  const dir = dirname(candidatePath)
-  const name = basename(candidatePath)
-  if (!name.toLowerCase().endsWith('.md') || name.startsWith('.') || name.length > 255) {
+  const parsedPath = parseLocalFileUriOrPath(rawPathOrUri)
+  if (!parsedPath) return undefined
+  const resolvedCandidate = resolve(parsedPath.rawPath)
+  const dir = dirname(resolvedCandidate)
+  const name = basename(resolvedCandidate)
+  if (
+    !name.toLowerCase().endsWith('.md') ||
+    name.startsWith('.') ||
+    name.length > 255 ||
+    name.includes('/') ||
+    name.includes('\\') ||
+    name.includes('\0')
+  ) {
     return undefined
   }
-  let inBrainDir = dir === brainDir
-  if (!inBrainDir) {
-    try {
-      inBrainDir = realpathSync(dir) === brainDir
-    } catch {
-      inBrainDir = false
-    }
+  const allowedRoots = collectAllowedAppDataRoots(canonicalAppDataDir, configuredAppDataDir)
+  const matchesSessionBrainLexically = allowedRoots.some(
+    (root) => dir === join(root, 'brain', sessionId),
+  )
+  if (!matchesSessionBrainLexically) {
+    return undefined
   }
-  return inBrainDir ? join(brainDir, name) : undefined
+  // Always walk and lstat + realpath-verify brain/<sessionId> (never skipping via lexical shortcut).
+  const verifiedBrain = verifySafeDirectoryChainIfPresent(
+    canonicalAppDataDir,
+    ['brain', sessionId],
+    'Antigravity brain',
+  )
+  if (!verifiedBrain.exists) return undefined
+  return join(verifiedBrain.canonicalDir, name)
 }
 
 function parseArtifactOperationFromStep(
@@ -2532,6 +3287,7 @@ function parseArtifactOperationFromStep(
   meta: DecodedCortexStepMetadata,
   canonicalAppDataDir: string,
   sessionId: string,
+  configuredAppDataDir?: string,
 ): ParsedArtifactStepOp | undefined {
   const call = meta.modifiedToolCall ?? meta.toolCall
   let toolName: string | undefined = call?.name
@@ -2558,10 +3314,17 @@ function parseArtifactOperationFromStep(
   const rawPath =
     (typeof argsRecord?.['Path'] === 'string' ? argsRecord['Path'] : undefined) ??
     (typeof argsRecord?.['path'] === 'string' ? argsRecord['path'] : undefined) ??
+    (typeof argsRecord?.['TargetFile'] === 'string' ? argsRecord['TargetFile'] : undefined) ??
+    (typeof argsRecord?.['targetFile'] === 'string' ? argsRecord['targetFile'] : undefined) ??
     decodedStep.writeToFileUri
   if (!rawPath) return undefined
 
-  const resolvedBrainMd = resolveBrainMarkdownPath(rawPath, canonicalAppDataDir, sessionId)
+  const resolvedBrainMd = resolveBrainMarkdownPath(
+    rawPath,
+    canonicalAppDataDir,
+    sessionId,
+    configuredAppDataDir,
+  )
   if (!resolvedBrainMd) return undefined
 
   const rawArtifactMeta =
@@ -2587,7 +3350,8 @@ function parseArtifactOperationFromStep(
     !decodedStep.hasError &&
     !decodedStep.genericHasError
 
-  const nativeId = call?.id || meta.stepId || `step:${stepIndex}`
+  const rawPlanSuffixId = call?.id || meta.stepId || `step:${stepIndex}`
+  const nativeId = buildBoundedNativePlanId(sessionId, rawPlanSuffixId)
   const content =
     typeof argsRecord?.['Content'] === 'string'
       ? argsRecord['Content']
@@ -2603,13 +3367,21 @@ function parseArtifactOperationFromStep(
       ? argsRecord['Target']
       : typeof argsRecord?.['target'] === 'string'
         ? argsRecord['target']
-        : undefined
+        : typeof argsRecord?.['TargetContent'] === 'string'
+          ? argsRecord['TargetContent']
+          : typeof argsRecord?.['targetContent'] === 'string'
+            ? argsRecord['targetContent']
+            : undefined
   const replacement =
     typeof argsRecord?.['Replacement'] === 'string'
       ? argsRecord['Replacement']
       : typeof argsRecord?.['replacement'] === 'string'
         ? argsRecord['replacement']
-        : undefined
+        : typeof argsRecord?.['ReplacementContent'] === 'string'
+          ? argsRecord['ReplacementContent']
+          : typeof argsRecord?.['replacementContent'] === 'string'
+            ? argsRecord['replacementContent']
+            : undefined
 
   return {
     stepIndex,
@@ -2626,8 +3398,33 @@ function parseArtifactOperationFromStep(
   }
 }
 
-function readVerifiedBrainMarkdownFile(filePath: string, canonicalAppDataDir: string): string {
-  const before = lstatSync(filePath, { bigint: true })
+function readVerifiedBrainMarkdownFile(
+  filePath: string,
+  canonicalAppDataDir: string,
+  sessionId: string,
+): string {
+  const verifiedBrainBefore = verifySafeDirectoryChainIfPresent(
+    canonicalAppDataDir,
+    ['brain', sessionId],
+    'Antigravity brain',
+  )
+  if (!verifiedBrainBefore.exists) {
+    throw Object.assign(new Error('Antigravity session brain directory is missing.'), {
+      code: 'ENOENT',
+    })
+  }
+  const leafName = basename(filePath)
+  const expectedPath = join(verifiedBrainBefore.canonicalDir, leafName)
+  if (
+    resolve(filePath) !== expectedPath ||
+    leafName === '.' ||
+    leafName === '..' ||
+    leafName.includes('/') ||
+    leafName.includes('\\')
+  ) {
+    throw new Error('Antigravity plan artifact escaped its pinned session brain directory.')
+  }
+  const before = lstatSync(expectedPath, { bigint: true })
   if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n) {
     throw new Error('Antigravity plan artifact is linked or not an ordinary file.')
   }
@@ -2638,19 +3435,36 @@ function readVerifiedBrainMarkdownFile(filePath: string, canonicalAppDataDir: st
       false,
     )
   }
-  const canonicalPath = realpathSync(filePath)
-  if (!isInsideDirectory(canonicalAppDataDir, canonicalPath)) {
-    throw new Error('Antigravity plan artifact escaped its storage root.')
+  const canonicalPath = realpathSync(expectedPath)
+  if (
+    canonicalPath !== expectedPath ||
+    !isInsideDirectory(verifiedBrainBefore.canonicalDir, canonicalPath)
+  ) {
+    throw new Error('Antigravity plan artifact escaped its pinned session brain directory.')
   }
-  const fd = openSync(filePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
+  const fd = openSync(expectedPath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
   try {
     const opened = fstatSync(fd, { bigint: true })
-    if (!statsMatch(before, opened) || realpathSync(filePath) !== canonicalPath) {
+    const verifiedBrainAfter = verifySafeDirectoryChainIfPresent(
+      canonicalAppDataDir,
+      ['brain', sessionId],
+      'Antigravity brain',
+    )
+    if (
+      !verifiedBrainAfter.exists ||
+      verifiedBrainAfter.canonicalDir !== verifiedBrainBefore.canonicalDir ||
+      verifiedBrainAfter.stat.dev !== verifiedBrainBefore.stat.dev ||
+      verifiedBrainAfter.stat.ino !== verifiedBrainBefore.stat.ino ||
+      !opened.isFile() ||
+      opened.nlink !== 1n ||
+      !statsMatch(before, opened) ||
+      realpathSync(expectedPath) !== expectedPath
+    ) {
       throw new Error('Antigravity plan artifact changed while opening.')
     }
-    const bytes = readFileSync(fd)
+    const bytes = readExactBoundedBytesFromFd(fd, Number(opened.size))
     const after = fstatSync(fd, { bigint: true })
-    const namedAfter = lstatSync(filePath, { bigint: true })
+    const namedAfter = lstatSync(expectedPath, { bigint: true })
     if (
       BigInt(bytes.byteLength) !== before.size ||
       !statsMatch(before, after) ||
@@ -2668,9 +3482,10 @@ function evaluateColdPlanArtifact(
   ops: readonly ParsedArtifactStepOp[],
   targetExecutionId: string,
   canonicalAppDataDir: string,
+  sessionId: string,
 ): { plan?: { nativeId: string; text: string }; planUnavailable?: true } {
   const boundPaths = new Set<string>()
-  const simulatedBodies = new Map<string, { text: string; complete: boolean }>()
+  const simulatedBodies = new Map<string, { text: string; byteLength: number; complete: boolean }>()
 
   const targetOps: ParsedArtifactStepOp[] = []
   const postTargetTouchedPaths = new Set<string>()
@@ -2680,7 +3495,11 @@ function evaluateColdPlanArtifact(
     const isTarget = op.executionId === targetExecutionId
     if (isTarget) seenTargetExecution = true
 
-    const bindsArtifact = op.hasArtifactMetadata || boundPaths.has(op.filePath)
+    const bindsArtifact =
+      op.hasArtifactMetadata ||
+      boundPaths.has(op.filePath) ||
+      (op.toolName === 'edit_file' &&
+        basename(op.filePath).toLowerCase() === 'implementation_plan.md')
     if (!bindsArtifact) continue
     boundPaths.add(op.filePath)
 
@@ -2692,41 +3511,83 @@ function evaluateColdPlanArtifact(
     if (isTarget) targetOps.push(op)
 
     if (!op.completed) {
-      simulatedBodies.set(op.filePath, { text: '', complete: false })
+      simulatedBodies.set(op.filePath, { text: '', byteLength: 0, complete: false })
       continue
     }
 
     if (op.toolName === 'write_file') {
       if (op.content === undefined) {
-        simulatedBodies.set(op.filePath, { text: '', complete: false })
+        simulatedBodies.set(op.filePath, { text: '', byteLength: 0, complete: false })
       } else if (op.append) {
         const previous = simulatedBodies.get(op.filePath)
-        if (!previous || !previous.complete) {
-          simulatedBodies.set(op.filePath, { text: '', complete: false })
+        const contentBytes = Buffer.byteLength(op.content, 'utf8')
+        if (
+          !previous ||
+          !previous.complete ||
+          previous.byteLength + contentBytes > COLLABORATION_PUBLISHED_PLAN_MAX_BYTES
+        ) {
+          simulatedBodies.set(op.filePath, { text: '', byteLength: 0, complete: false })
+        } else {
+          const nextText = `${previous.text}${op.content}`
+          const nextBytes = Buffer.byteLength(nextText, 'utf8')
+          if (nextBytes > COLLABORATION_PUBLISHED_PLAN_MAX_BYTES) {
+            simulatedBodies.set(op.filePath, { text: '', byteLength: 0, complete: false })
+          } else {
+            simulatedBodies.set(op.filePath, {
+              text: nextText,
+              byteLength: nextBytes,
+              complete: true,
+            })
+          }
+        }
+      } else {
+        const contentBytes = Buffer.byteLength(op.content, 'utf8')
+        if (contentBytes > COLLABORATION_PUBLISHED_PLAN_MAX_BYTES) {
+          simulatedBodies.set(op.filePath, { text: '', byteLength: 0, complete: false })
         } else {
           simulatedBodies.set(op.filePath, {
-            text: `${previous.text}${op.content}`,
+            text: op.content,
+            byteLength: contentBytes,
             complete: true,
           })
         }
-      } else {
-        simulatedBodies.set(op.filePath, { text: op.content, complete: true })
       }
     } else {
       const previous = simulatedBodies.get(op.filePath)
-      if (
-        !previous ||
-        !previous.complete ||
-        !op.target ||
-        op.replacement === undefined ||
-        !previous.text.includes(op.target)
-      ) {
-        simulatedBodies.set(op.filePath, { text: '', complete: false })
+      if (!previous || !previous.complete || !op.target || op.replacement === undefined) {
+        simulatedBodies.set(op.filePath, { text: '', byteLength: 0, complete: false })
       } else {
-        simulatedBodies.set(op.filePath, {
-          text: previous.text.replaceAll(op.target, op.replacement),
-          complete: true,
-        })
+        let matchCount = 0
+        let searchFrom = 0
+        for (;;) {
+          const found = previous.text.indexOf(op.target, searchFrom)
+          if (found < 0) break
+          matchCount += 1
+          searchFrom = found + op.target.length
+        }
+        const targetBytes = Buffer.byteLength(op.target, 'utf8')
+        const replacementBytes = Buffer.byteLength(op.replacement, 'utf8')
+        const projectedBytes = previous.byteLength + matchCount * (replacementBytes - targetBytes)
+        if (
+          matchCount === 0 ||
+          projectedBytes < 0 ||
+          projectedBytes > COLLABORATION_PUBLISHED_PLAN_MAX_BYTES
+        ) {
+          simulatedBodies.set(op.filePath, { text: '', byteLength: 0, complete: false })
+        } else {
+          const literalReplacement = op.replacement
+          const nextText = previous.text.replaceAll(op.target, () => literalReplacement)
+          const nextBytes = Buffer.byteLength(nextText, 'utf8')
+          if (nextBytes > COLLABORATION_PUBLISHED_PLAN_MAX_BYTES) {
+            simulatedBodies.set(op.filePath, { text: '', byteLength: 0, complete: false })
+          } else {
+            simulatedBodies.set(op.filePath, {
+              text: nextText,
+              byteLength: nextBytes,
+              complete: true,
+            })
+          }
+        }
       }
     }
   }
@@ -2740,21 +3601,22 @@ function evaluateColdPlanArtifact(
   const lastOp = targetOps.at(-1)!
   if (postTargetTouchedPaths.has(lastOp.filePath)) return { planUnavailable: true }
 
+  // Require a completely replayable baseline (no partial/substring or empty-replacement bypass).
+  const simulated = simulatedBodies.get(lastOp.filePath)
+  if (!simulated?.complete || simulated.byteLength > COLLABORATION_PUBLISHED_PLAN_MAX_BYTES) {
+    return { planUnavailable: true }
+  }
+
   let diskText: string
   try {
-    diskText = readVerifiedBrainMarkdownFile(lastOp.filePath, canonicalAppDataDir)
+    diskText = readVerifiedBrainMarkdownFile(lastOp.filePath, canonicalAppDataDir, sessionId)
   } catch {
     return { planUnavailable: true }
   }
-  if (!diskText) return { planUnavailable: true }
-
-  const simulated = simulatedBodies.get(lastOp.filePath)
-  if (simulated?.complete) {
-    if (diskText !== simulated.text) return { planUnavailable: true }
-  } else if (
-    lastOp.toolName === 'edit_file' &&
-    lastOp.replacement &&
-    !diskText.includes(lastOp.replacement)
+  if (
+    !diskText ||
+    Buffer.byteLength(diskText, 'utf8') > COLLABORATION_PUBLISHED_PLAN_MAX_BYTES ||
+    diskText !== simulated.text
   ) {
     return { planUnavailable: true }
   }
@@ -2762,7 +3624,110 @@ function evaluateColdPlanArtifact(
   return { plan: { nativeId: lastOp.nativeId, text: diskText } }
 }
 
+const PACT_PUBLISH_PLAN_NAME_RE =
+  /^(?:mcp_(pact_peer_[a-f0-9]{16,32})_|mcp__(pact_peer_[a-f0-9]{16,32})__|(pact_peer_[a-f0-9]{16,32})\/)publish_plan$/u
+const MAX_PACT_PUBLISH_PLAN_RAW_ID_BYTES = 1024
+
+function normalizePublishPlanRawId(raw: unknown): string | undefined {
+  const normalized =
+    typeof raw === 'string'
+      ? raw.trim()
+      : typeof raw === 'number' && Number.isSafeInteger(raw)
+        ? String(raw)
+        : ''
+  if (
+    normalized.length === 0 ||
+    Buffer.byteLength(normalized, 'utf8') > MAX_PACT_PUBLISH_PLAN_RAW_ID_BYTES
+  ) {
+    return undefined
+  }
+  return normalized
+}
+
+function extractCompletedPactPublishPlanStepCall(
+  meta: DecodedCortexStepMetadata,
+  rowStatus: number,
+  decodedStep: DecodedAgyStep,
+  columnPayloadMatches: boolean,
+): { readonly call: AgyCompletedPactPublishPlanCall; readonly legacyTokens: string[] } | undefined {
+  if (
+    !columnPayloadMatches ||
+    rowStatus !== CORTEX_STEP_STATUS_DONE ||
+    decodedStep.status !== CORTEX_STEP_STATUS_DONE ||
+    decodedStep.hasError ||
+    decodedStep.genericHasError
+  ) {
+    return undefined
+  }
+  const call = meta.modifiedToolCall ?? meta.toolCall
+  if (!call?.name) {
+    return undefined
+  }
+  const nameMatch = PACT_PUBLISH_PLAN_NAME_RE.exec(call.name)
+  const serverName = nameMatch?.[1] ?? nameMatch?.[2] ?? nameMatch?.[3]
+  if (!serverName) {
+    return undefined
+  }
+  if (!call.argumentsJson) {
+    return undefined
+  }
+  let argsRecord: Record<string, unknown>
+  try {
+    const parsed: unknown = JSON.parse(call.argumentsJson)
+    if (!isPlainObject(parsed)) return undefined
+    argsRecord = parsed
+  } catch {
+    return undefined
+  }
+  const nestedMeta = argsRecord['_meta']
+  const { _meta: _ignoredMeta, ...toolArgs } = argsRecord
+  const parsedArgs = collaborationPublishPlanInputSchema.safeParse(toolArgs)
+  if (!parsedArgs.success) {
+    return undefined
+  }
+  const complete = parsedArgs.data.complete ?? parsedArgs.data.offset === undefined
+  if (!complete) {
+    return undefined
+  }
+
+  const rawCallId = normalizePublishPlanRawId(call.id)
+  const rawProgressToken = isPlainObject(nestedMeta)
+    ? normalizePublishPlanRawId(nestedMeta['progressToken'])
+    : undefined
+  const rawStepId = normalizePublishPlanRawId(meta.stepId)
+
+  const callId =
+    rawCallId !== undefined ? encodeBoundedOpenPlanCallKey(`call:${rawCallId}`) : undefined
+  const progressToken =
+    rawProgressToken !== undefined
+      ? encodeBoundedOpenPlanProgressToken(rawProgressToken)
+      : undefined
+  const stepId = rawStepId !== undefined ? encodeBoundedCollaborationIdentity(rawStepId) : undefined
+
+  const legacyTokens: string[] = []
+  const pushLegacyToken = (token: string | undefined): void => {
+    if (!token || legacyTokens.includes(token)) return
+    legacyTokens.push(token)
+  }
+  if (rawCallId !== undefined) {
+    pushLegacyToken(rawCallId.length <= 256 ? rawCallId : callId)
+  }
+  pushLegacyToken(progressToken)
+  pushLegacyToken(stepId)
+
+  return {
+    call: {
+      serverName,
+      ...(callId !== undefined ? { callId } : {}),
+      ...(progressToken !== undefined ? { progressToken } : {}),
+      ...(stepId !== undefined ? { stepId } : {}),
+    },
+    legacyTokens,
+  }
+}
+
 export function inspectAgyTrajectory(input: AgyColdInspectionInput): AgyColdInspectionResult {
+  assertIdentityNotCancelledOrExpired(input.signal, input.deadlineAt)
   assertValidSessionUuid(input.nativeSessionId)
   const configuredRoot = resolveStorageRoot(input.storageRoot)
   const defaultPath = join(configuredRoot, 'conversations', `${input.nativeSessionId}.db`)
@@ -2788,10 +3753,19 @@ export function inspectAgyTrajectory(input: AgyColdInspectionInput): AgyColdInsp
   }
 
   const dbPath = join(canonicalRoot, 'conversations', `${input.nativeSessionId}.db`)
+  let snapshotHandle: CommittedSqliteSnapshotHandle
   try {
-    lstatSync(dbPath, { bigint: true })
+    snapshotHandle = openCommittedSqliteSnapshot({
+      rootDir: configuredRoot,
+      canonicalRoot,
+      parentSegments: ['conversations'],
+      leafName: `${input.nativeSessionId}.db`,
+      maxSnapshotBytes: AGY_MAX_HISTORY_BYTES,
+      ...(input.signal !== undefined ? { signal: input.signal } : {}),
+      ...(input.deadlineAt !== undefined ? { deadlineAt: input.deadlineAt } : {}),
+    })
   } catch (error) {
-    if (error instanceof Error && Reflect.get(error, 'code') === 'ENOENT') {
+    if (error instanceof AgyStorageMissingError) {
       return {
         exists: false,
         nativeSessionId: input.nativeSessionId,
@@ -2800,16 +3774,10 @@ export function inspectAgyTrajectory(input: AgyColdInspectionInput): AgyColdInsp
         stepCount: 0,
       }
     }
-    throw error
-  }
-
-  let snapshot: SqliteFileIdentitySnapshot
-  let db: Database.Database
-  try {
-    snapshot = captureSqliteIdentity(dbPath, canonicalRoot, AGY_MAX_HISTORY_BYTES)
-    db = openReadOnlySqliteSnapshot(snapshot, configuredRoot)
-  } catch (error) {
-    if (error instanceof AgyHotRollbackJournalError) {
+    if (
+      error instanceof AgyHotRollbackJournalError ||
+      error instanceof AgyTransientIdentityChurnError
+    ) {
       return {
         exists: true,
         nativeSessionId: input.nativeSessionId,
@@ -2820,8 +3788,9 @@ export function inspectAgyTrajectory(input: AgyColdInspectionInput): AgyColdInsp
     }
     throw error
   }
+  const db = snapshotHandle.db
   try {
-    const schema = validateTrajectoryDatabase(db, input.nativeSessionId)
+    const schema = validateTrajectoryDatabase(db, input.nativeSessionId, snapshotHandle.proof)
 
     const counts = db
       .prepare<[], { stepCount: number; genCount: number; execCount: number }>(
@@ -2841,13 +3810,12 @@ export function inspectAgyTrajectory(input: AgyColdInspectionInput): AgyColdInsp
     }
 
     if (!input.nativeTurnId) {
-      assertSqliteIdentityUnchanged(snapshot, configuredRoot)
       return {
         exists: true,
         nativeSessionId: input.nativeSessionId,
         trajectoryId: schema.trajectoryId,
         nativeStorageRoot: canonicalRoot,
-        nativePath: snapshot.canonicalDbPath,
+        nativePath: snapshotHandle.canonicalDbPath,
         stepCount: counts.stepCount,
       }
     }
@@ -2856,15 +3824,34 @@ export function inspectAgyTrajectory(input: AgyColdInspectionInput): AgyColdInsp
       throw new Error('Invalid Antigravity execution_id.')
     }
 
+    // Enforce BLOB byte budgets BEFORE full row hydration!
+    const preflightExecBytes = measureTableColumnsTotalBytes(db, 'executor_metadata', ['data'])
+    if (preflightExecBytes > AGY_MAX_HISTORY_BYTES) {
+      throw new AgentExecutionError(
+        'response_too_large',
+        'Antigravity executor_metadata exceeds read budget.',
+        false,
+      )
+    }
+    const preflightStepBytes = measureTableColumnsTotalBytes(db, 'steps', [
+      'metadata',
+      schema.stepPayloadColumn,
+    ])
+    if (preflightExecBytes + preflightStepBytes > AGY_MAX_HISTORY_BYTES) {
+      throw new AgentExecutionError(
+        'response_too_large',
+        'Antigravity steps exceed the 32 MiB history budget.',
+        false,
+      )
+    }
+
     let totalBlobBytes = 0
     let imageBytes = 0
-    const execRows = db
-      .prepare<[], { idx: number; data: Buffer }>(
-        'SELECT idx, data FROM "executor_metadata" ORDER BY idx ASC',
-      )
-      .all()
+    const execStmt = db.prepare<[], { idx: number; data: Buffer }>(
+      'SELECT idx, data FROM "executor_metadata" ORDER BY idx ASC',
+    )
     const execByExecutionId = new Map<string, DecodedExecutorMetadata>()
-    for (const row of execRows) {
+    for (const row of execStmt.iterate()) {
       if (!Buffer.isBuffer(row.data)) throw new Error('Invalid executor_metadata.data BLOB.')
       totalBlobBytes += row.data.byteLength
       if (totalBlobBytes > AGY_MAX_HISTORY_BYTES) {
@@ -2887,20 +3874,18 @@ export function inspectAgyTrajectory(input: AgyColdInspectionInput): AgyColdInsp
     const stepSelectSql = schema.hasStepFormatColumn
       ? `SELECT idx, step_type, status, has_subtrajectory, metadata, ${stepPayloadSql} AS step_blob, step_format FROM "steps" ORDER BY idx ASC`
       : `SELECT idx, step_type, status, has_subtrajectory, metadata, ${stepPayloadSql} AS step_blob FROM "steps" ORDER BY idx ASC`
-    const stepRows = db
-      .prepare<
-        [],
-        {
-          idx: number
-          step_type: number
-          status: number
-          has_subtrajectory: number
-          metadata: Buffer | null
-          step_blob: Buffer | null
-          step_format?: unknown
-        }
-      >(stepSelectSql)
-      .all()
+    const stepStmt = db.prepare<
+      [],
+      {
+        idx: number
+        step_type: number
+        status: number
+        has_subtrajectory: number
+        metadata: Buffer | null
+        step_blob: Buffer | null
+        step_format?: unknown
+      }
+    >(stepSelectSql)
 
     const artifactOps: ParsedArtifactStepOp[] = []
     const seenStepExecutionIds = new Set<string>()
@@ -2916,7 +3901,11 @@ export function inspectAgyTrajectory(input: AgyColdInspectionInput): AgyColdInsp
       pactIdentity?: ExtractedPactPromptIdentity
     }> = []
 
-    for (const [expectedIdx, row] of stepRows.entries()) {
+    let expectedIdx = 0
+    for (const row of stepStmt.iterate()) {
+      if ((expectedIdx & 0x3f) === 0) {
+        assertIdentityNotCancelledOrExpired(input.signal, input.deadlineAt)
+      }
       if (row.idx !== expectedIdx) {
         throw new Error('Antigravity steps table has a non-contiguous step index gap.')
       }
@@ -2962,6 +3951,7 @@ export function inspectAgyTrajectory(input: AgyColdInspectionInput): AgyColdInsp
           meta,
           canonicalRoot,
           input.nativeSessionId,
+          configuredRoot,
         )
         if (parsedOp) artifactOps.push(parsedOp)
       }
@@ -2992,21 +3982,7 @@ export function inspectAgyTrajectory(input: AgyColdInspectionInput): AgyColdInsp
         meta,
         ...(pactIdentity ? { pactIdentity } : {}),
       })
-    }
-
-    try {
-      assertSqliteIdentityUnchanged(snapshot, configuredRoot)
-    } catch (error) {
-      if (error instanceof AgyHotRollbackJournalError) {
-        return {
-          exists: true,
-          nativeSessionId: input.nativeSessionId,
-          nativeStorageRoot: canonicalRoot,
-          nativePath: dbPath,
-          stepCount: 0,
-        }
-      }
-      throw error
+      expectedIdx += 1
     }
 
     if (pactRunMatchedExecutions.size > 1) {
@@ -3031,7 +4007,7 @@ export function inspectAgyTrajectory(input: AgyColdInspectionInput): AgyColdInsp
         nativeSessionId: input.nativeSessionId,
         trajectoryId: schema.trajectoryId,
         nativeStorageRoot: canonicalRoot,
-        nativePath: snapshot.canonicalDbPath,
+        nativePath: snapshotHandle.canonicalDbPath,
         stepCount: counts.stepCount,
       }
     }
@@ -3039,6 +4015,9 @@ export function inspectAgyTrajectory(input: AgyColdInspectionInput): AgyColdInsp
     const matchedExec = execByExecutionId.get(resolvedExecutionId)
     const consumedInputs: AgyConsumedInputReceipt[] = []
     const plannerItems: Array<{ id: string; text: string }> = []
+    let hasCompletedPactPublishPlan = false
+    const completedPactPublishPlanTokens: string[] = []
+    const completedPactPublishPlanCalls: AgyCompletedPactPublishPlanCall[] = []
     let seenExecutionSteps = 0
     let maxSeenExecutionStepIdx = -1
     let hasActiveStep = false
@@ -3050,6 +4029,40 @@ export function inspectAgyTrajectory(input: AgyColdInspectionInput): AgyColdInsp
       if (step.meta.executionId !== resolvedExecutionId) continue
       seenExecutionSteps += 1
       if (step.idx > maxSeenExecutionStepIdx) maxSeenExecutionStepIdx = step.idx
+
+      const publishPlanEntry = extractCompletedPactPublishPlanStepCall(
+        step.meta,
+        step.status,
+        step.decodedStep,
+        step.columnPayloadMatches,
+      )
+      if (publishPlanEntry !== undefined) {
+        hasCompletedPactPublishPlan = true
+        const existingCallIdx = completedPactPublishPlanCalls.findIndex(
+          (entry) =>
+            entry.serverName === publishPlanEntry.call.serverName &&
+            entry.callId === publishPlanEntry.call.callId &&
+            entry.progressToken === publishPlanEntry.call.progressToken &&
+            entry.stepId === publishPlanEntry.call.stepId,
+        )
+        if (existingCallIdx >= 0) {
+          completedPactPublishPlanCalls.splice(existingCallIdx, 1)
+        }
+        completedPactPublishPlanCalls.push(publishPlanEntry.call)
+        if (completedPactPublishPlanCalls.length > 256) {
+          completedPactPublishPlanCalls.splice(0, completedPactPublishPlanCalls.length - 256)
+        }
+        for (const token of publishPlanEntry.legacyTokens) {
+          const existingIdx = completedPactPublishPlanTokens.indexOf(token)
+          if (existingIdx >= 0) {
+            completedPactPublishPlanTokens.splice(existingIdx, 1)
+          }
+          completedPactPublishPlanTokens.push(token)
+        }
+        if (completedPactPublishPlanTokens.length > 256) {
+          completedPactPublishPlanTokens.splice(0, completedPactPublishPlanTokens.length - 256)
+        }
+      }
 
       if (!step.columnPayloadMatches) {
         hasMetadataContradiction = true
@@ -3118,7 +4131,7 @@ export function inspectAgyTrajectory(input: AgyColdInspectionInput): AgyColdInsp
         nativeSessionId: input.nativeSessionId,
         trajectoryId: schema.trajectoryId,
         nativeStorageRoot: canonicalRoot,
-        nativePath: snapshot.canonicalDbPath,
+        nativePath: snapshotHandle.canonicalDbPath,
         stepCount: counts.stepCount,
       }
     }
@@ -3168,7 +4181,12 @@ export function inspectAgyTrajectory(input: AgyColdInspectionInput): AgyColdInsp
     const answer = projectCollaborationAnswer(plannerItems)
     const responseHash = sha256Hex(answer)
     const planOutcome = input.includePlan
-      ? evaluateColdPlanArtifact(artifactOps, resolvedExecutionId, canonicalRoot)
+      ? evaluateColdPlanArtifact(
+          artifactOps,
+          resolvedExecutionId,
+          canonicalRoot,
+          input.nativeSessionId,
+        )
       : {}
 
     const consumedInputStepIds = consumedInputs.map(
@@ -3185,7 +4203,7 @@ export function inspectAgyTrajectory(input: AgyColdInspectionInput): AgyColdInsp
       nativeSessionId: input.nativeSessionId,
       trajectoryId: schema.trajectoryId,
       nativeStorageRoot: canonicalRoot,
-      nativePath: snapshot.canonicalDbPath,
+      nativePath: snapshotHandle.canonicalDbPath,
       stepCount: counts.stepCount,
       terminalState: {
         executionId: resolvedExecutionId,
@@ -3198,10 +4216,17 @@ export function inspectAgyTrajectory(input: AgyColdInspectionInput): AgyColdInsp
         responseHash,
         ...(planOutcome.plan ? { plan: planOutcome.plan } : {}),
         ...(planOutcome.planUnavailable ? { planUnavailable: true } : {}),
+        ...(hasCompletedPactPublishPlan
+          ? {
+              hasCompletedPactPublishPlan: true,
+              completedPactPublishPlanTokens,
+              completedPactPublishPlanCalls,
+            }
+          : {}),
       },
     }
   } finally {
-    db.close()
+    snapshotHandle.close()
   }
 }
 
@@ -3312,41 +4337,410 @@ function ensureSafeDirectoryChain(
   return cursor
 }
 
+function deterministicMediaStagingLeafName(targetLeafName: string, expectedSha256: string): string {
+  return `.pact-media-${sha256Hex(`${targetLeafName}\0${expectedSha256}`).slice(0, 32)}.tmp`
+}
+
+function readExactVerifiedSha256FromPath(
+  filePath: string,
+  expectedStat: {
+    readonly dev: bigint
+    readonly ino: bigint
+    readonly size: bigint
+    readonly nlink: bigint
+  },
+  expectedByteLength: number,
+  expectedSha256: string,
+): boolean {
+  const fd = openSync(filePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
+  try {
+    const opened = fstatSync(fd, { bigint: true })
+    if (
+      !opened.isFile() ||
+      opened.dev !== expectedStat.dev ||
+      opened.ino !== expectedStat.ino ||
+      opened.size !== expectedStat.size ||
+      opened.nlink !== expectedStat.nlink
+    ) {
+      return false
+    }
+    const content = readExactBoundedBytesFromFd(fd, expectedByteLength)
+    const afterRead = fstatSync(fd, { bigint: true })
+    if (
+      !statsMatch(opened, afterRead) ||
+      afterRead.nlink !== expectedStat.nlink ||
+      content.byteLength !== expectedByteLength
+    ) {
+      return false
+    }
+    return sha256Hex(content) === expectedSha256
+  } finally {
+    closeSync(fd)
+  }
+}
+
 function writeIdempotentPrivateFile(
   targetPath: string,
   canonicalAppDataDir: string,
   bytes: Buffer,
   expectedSha256: string,
 ): void {
-  try {
-    const fd = openSync(
-      targetPath,
-      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0),
-      0o600,
+  const parentDir = dirname(targetPath)
+  const parentBefore = lstatSync(parentDir, { bigint: true })
+  if (!parentBefore.isDirectory() || parentBefore.isSymbolicLink()) {
+    throw new Error('Antigravity uploaded media parent directory is linked or invalid.')
+  }
+  const canonicalParent = realpathSync(parentDir)
+  if (canonicalParent !== parentDir || !isInsideDirectory(canonicalAppDataDir, canonicalParent)) {
+    throw new Error('Antigravity uploaded media parent directory escaped its storage root.')
+  }
+
+  let parentDirFd: number | undefined
+  if (process.platform !== 'win32') {
+    parentDirFd = openSync(
+      canonicalParent,
+      constants.O_RDONLY | (constants.O_DIRECTORY ?? 0) | (constants.O_NOFOLLOW ?? 0),
     )
-    try {
-      writeAllSync(fd, bytes, 0, bytes.byteLength)
-      if (fstatSync(fd, { bigint: true }).size !== BigInt(bytes.byteLength)) {
-        throw new Error('Antigravity private file byte length did not match expected size.')
-      }
-      fsyncSync(fd)
-    } finally {
-      closeSync(fd)
+    const pinnedDirStat = fstatSync(parentDirFd, { bigint: true })
+    if (
+      !pinnedDirStat.isDirectory() ||
+      pinnedDirStat.dev !== parentBefore.dev ||
+      pinnedDirStat.ino !== parentBefore.ino
+    ) {
+      closeSync(parentDirFd)
+      throw new Error('Antigravity uploaded media parent directory changed while opening.')
     }
-    return
-  } catch (error) {
-    if (!(error instanceof Error) || Reflect.get(error, 'code') !== 'EEXIST') throw error
   }
-  const existing = lstatSync(targetPath, { bigint: true })
-  if (!existing.isFile() || existing.isSymbolicLink() || existing.nlink !== 1n) {
-    throw new Error('Existing Antigravity uploaded media target is linked or unsupported.')
+
+  const assertParentUnchanged = (phase: string): void => {
+    const parentNow = lstatSync(canonicalParent, { bigint: true })
+    if (
+      !parentNow.isDirectory() ||
+      parentNow.isSymbolicLink() ||
+      parentNow.dev !== parentBefore.dev ||
+      parentNow.ino !== parentBefore.ino ||
+      realpathSync(canonicalParent) !== canonicalParent ||
+      !isInsideDirectory(canonicalAppDataDir, canonicalParent)
+    ) {
+      throw new Error(`Antigravity uploaded media parent directory changed ${phase}.`)
+    }
+    if (parentDirFd !== undefined) {
+      const pinnedDirStat = fstatSync(parentDirFd, { bigint: true })
+      if (
+        !pinnedDirStat.isDirectory() ||
+        pinnedDirStat.dev !== parentBefore.dev ||
+        pinnedDirStat.ino !== parentBefore.ino
+      ) {
+        throw new Error(`Antigravity uploaded media pinned parent directory changed ${phase}.`)
+      }
+    }
   }
-  if (!isInsideDirectory(canonicalAppDataDir, realpathSync(targetPath))) {
-    throw new Error('Existing Antigravity uploaded media target escaped its storage root.')
+
+  const targetLeaf = basename(targetPath)
+  const tmpPath = join(
+    canonicalParent,
+    deterministicMediaStagingLeafName(targetLeaf, expectedSha256),
+  )
+  let tmpCreated = false
+  let stageStat: BigIntStats | undefined
+  let existed = false
+  try {
+    // Deterministic crash recovery: if a prior attempt crashed between linkSync and unlinkSync
+    // (leaving target + deterministic staging file at nlink === 2 with identical inode, size, and
+    // sha256) or right before linkSync (verified exact-digest nlink === 1 staging file), recover
+    // cleanly without ever deleting an unrelated file.
+    let existingTmpStat: BigIntStats | undefined
+    try {
+      existingTmpStat = lstatSync(tmpPath, { bigint: true })
+    } catch (error) {
+      if (!(error instanceof Error) || Reflect.get(error, 'code') !== 'ENOENT') {
+        throw error
+      }
+    }
+
+    if (existingTmpStat !== undefined) {
+      assertParentUnchanged('during crash recovery')
+      if (
+        !existingTmpStat.isFile() ||
+        existingTmpStat.isSymbolicLink() ||
+        realpathSync(tmpPath) !== tmpPath
+      ) {
+        throw new Error(
+          'Refusing to overwrite or delete unverified entry at Antigravity media staging path.',
+        )
+      }
+      let existingTargetStat: BigIntStats | undefined
+      try {
+        existingTargetStat = lstatSync(targetPath, { bigint: true })
+      } catch (error) {
+        if (!(error instanceof Error) || Reflect.get(error, 'code') !== 'ENOENT') {
+          throw error
+        }
+      }
+
+      if (
+        existingTargetStat !== undefined &&
+        existingTargetStat.isFile() &&
+        !existingTargetStat.isSymbolicLink() &&
+        existingTargetStat.nlink === 2n &&
+        existingTmpStat.nlink === 2n &&
+        existingTargetStat.dev === existingTmpStat.dev &&
+        existingTargetStat.ino === existingTmpStat.ino &&
+        existingTargetStat.size === BigInt(bytes.byteLength) &&
+        realpathSync(targetPath) === targetPath &&
+        readExactVerifiedSha256FromPath(
+          targetPath,
+          existingTargetStat,
+          bytes.byteLength,
+          expectedSha256,
+        ) &&
+        readExactVerifiedSha256FromPath(tmpPath, existingTmpStat, bytes.byteLength, expectedSha256)
+      ) {
+        assertParentUnchanged('before unlinking recovered media staging link')
+        const tmpBeforeUnlink = lstatSync(tmpPath, { bigint: true })
+        if (
+          tmpBeforeUnlink.isSymbolicLink() ||
+          !tmpBeforeUnlink.isFile() ||
+          tmpBeforeUnlink.nlink !== 2n ||
+          tmpBeforeUnlink.dev !== existingTmpStat.dev ||
+          tmpBeforeUnlink.ino !== existingTmpStat.ino
+        ) {
+          throw new Error('Antigravity media staging link changed during crash recovery.')
+        }
+        unlinkSync(tmpPath)
+        if (parentDirFd !== undefined) {
+          fsyncSync(parentDirFd)
+        }
+        const targetAfterRecovery = lstatSync(targetPath, { bigint: true })
+        if (
+          targetAfterRecovery.isSymbolicLink() ||
+          !targetAfterRecovery.isFile() ||
+          targetAfterRecovery.nlink !== 1n ||
+          targetAfterRecovery.dev !== existingTargetStat.dev ||
+          targetAfterRecovery.ino !== existingTargetStat.ino ||
+          targetAfterRecovery.size !== existingTargetStat.size
+        ) {
+          throw new Error('Antigravity media target did not settle to single link after recovery.')
+        }
+        return
+      }
+
+      if (
+        existingTargetStat === undefined &&
+        existingTmpStat.nlink === 1n &&
+        existingTmpStat.size === BigInt(bytes.byteLength) &&
+        readExactVerifiedSha256FromPath(tmpPath, existingTmpStat, bytes.byteLength, expectedSha256)
+      ) {
+        const recoverSyncFd = openSync(tmpPath, constants.O_RDWR | (constants.O_NOFOLLOW ?? 0))
+        try {
+          const opened = fstatSync(recoverSyncFd, { bigint: true })
+          if (
+            !opened.isFile() ||
+            opened.nlink !== 1n ||
+            opened.dev !== existingTmpStat.dev ||
+            opened.ino !== existingTmpStat.ino ||
+            opened.size !== existingTmpStat.size
+          ) {
+            throw new Error('Antigravity recovered media staging file changed before fsync.')
+          }
+          fsyncSync(recoverSyncFd)
+        } finally {
+          closeSync(recoverSyncFd)
+        }
+        assertParentUnchanged('before publishing recovered media staging file')
+        let linkedRecovered = false
+        try {
+          linkSync(tmpPath, targetPath)
+          linkedRecovered = true
+        } catch (error) {
+          const code = error instanceof Error ? Reflect.get(error, 'code') : undefined
+          if (code === 'EEXIST') {
+            existed = true
+          } else {
+            throw Object.assign(
+              new Error(
+                `Atomic no-replace publication for Antigravity media is unavailable (${String(code ?? 'unknown')}).`,
+              ),
+              { code: typeof code === 'string' ? code : 'EIO' },
+            )
+          }
+        }
+        if (linkedRecovered) {
+          const linkedTargetStat = lstatSync(targetPath, { bigint: true })
+          if (
+            linkedTargetStat.isSymbolicLink() ||
+            !linkedTargetStat.isFile() ||
+            linkedTargetStat.dev !== existingTmpStat.dev ||
+            linkedTargetStat.ino !== existingTmpStat.ino ||
+            linkedTargetStat.size !== existingTmpStat.size
+          ) {
+            throw new Error('Antigravity recovered media target identity mismatch after link.')
+          }
+          unlinkSync(tmpPath)
+          if (parentDirFd !== undefined) {
+            fsyncSync(parentDirFd)
+          }
+          return
+        }
+      } else {
+        throw new Error(
+          'Refusing to overwrite or delete unverified file at Antigravity media staging path.',
+        )
+      }
+    }
+
+    if (!existed) {
+      assertParentUnchanged('before creating media staging file')
+      const fd = openSync(
+        tmpPath,
+        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0),
+        0o600,
+      )
+      tmpCreated = true
+      let writtenStat: BigIntStats
+      try {
+        stageStat = fstatSync(fd, { bigint: true })
+        if (
+          !stageStat.isFile() ||
+          stageStat.nlink !== 1n ||
+          stageStat.size !== 0n ||
+          stageStat.dev !== parentBefore.dev
+        ) {
+          throw new Error('Antigravity uploaded media staging descriptor identity is invalid.')
+        }
+        assertParentUnchanged('before write')
+        const liveStageStat = lstatSync(tmpPath, { bigint: true })
+        if (
+          liveStageStat.isSymbolicLink() ||
+          !liveStageStat.isFile() ||
+          liveStageStat.nlink !== 1n ||
+          liveStageStat.dev !== stageStat.dev ||
+          liveStageStat.ino !== stageStat.ino ||
+          realpathSync(tmpPath) !== tmpPath
+        ) {
+          throw new Error('Antigravity uploaded media staging path changed before write.')
+        }
+        writeAllSync(fd, bytes, 0, bytes.byteLength)
+        writtenStat = fstatSync(fd, { bigint: true })
+        if (
+          writtenStat.dev !== stageStat.dev ||
+          writtenStat.ino !== stageStat.ino ||
+          writtenStat.size !== BigInt(bytes.byteLength)
+        ) {
+          throw new Error('Antigravity private file byte length did not match expected size.')
+        }
+        fsyncSync(fd)
+      } finally {
+        closeSync(fd)
+      }
+
+      assertParentUnchanged('before publish')
+      const prePublishStageStat = lstatSync(tmpPath, { bigint: true })
+      if (
+        prePublishStageStat.isSymbolicLink() ||
+        !prePublishStageStat.isFile() ||
+        prePublishStageStat.nlink !== 1n ||
+        prePublishStageStat.dev !== writtenStat.dev ||
+        prePublishStageStat.ino !== writtenStat.ino ||
+        prePublishStageStat.size !== writtenStat.size
+      ) {
+        throw new Error('Antigravity uploaded media staging file changed before atomic publish.')
+      }
+
+      let linkedFresh = false
+      try {
+        linkSync(tmpPath, targetPath)
+        linkedFresh = true
+      } catch (error) {
+        const code = error instanceof Error ? Reflect.get(error, 'code') : undefined
+        if (code === 'EEXIST') {
+          existed = true
+        } else {
+          throw Object.assign(
+            new Error(
+              `Atomic no-replace publication for Antigravity media is unavailable (${String(code ?? 'unknown')}).`,
+            ),
+            { code: typeof code === 'string' ? code : 'EIO' },
+          )
+        }
+      }
+      if (linkedFresh) {
+        const publishedStat = lstatSync(targetPath, { bigint: true })
+        if (
+          publishedStat.isSymbolicLink() ||
+          !publishedStat.isFile() ||
+          publishedStat.dev !== writtenStat.dev ||
+          publishedStat.ino !== writtenStat.ino ||
+          publishedStat.size !== writtenStat.size
+        ) {
+          throw new Error('Antigravity uploaded media published target identity mismatch.')
+        }
+        unlinkSync(tmpPath)
+        tmpCreated = false
+        if (parentDirFd !== undefined) {
+          fsyncSync(parentDirFd)
+        }
+        return
+      }
+    }
+  } finally {
+    if (tmpCreated && stageStat) {
+      try {
+        const currentTmp = lstatSync(tmpPath, { bigint: true })
+        if (
+          !currentTmp.isSymbolicLink() &&
+          currentTmp.isFile() &&
+          currentTmp.dev === stageStat.dev &&
+          currentTmp.ino === stageStat.ino
+        ) {
+          unlinkSync(tmpPath)
+        }
+      } catch {
+        /* Best-effort cleanup of owned temp media file. */
+      }
+    }
+    if (parentDirFd !== undefined) {
+      try {
+        closeSync(parentDirFd)
+      } catch {
+        /* Best-effort close of pinned media parent directory handle. */
+      }
+    }
   }
-  const currentBytes = readFileSync(targetPath)
-  if (currentBytes.byteLength !== bytes.byteLength || sha256Hex(currentBytes) !== expectedSha256) {
-    throw new Error('Existing Antigravity uploaded media target differs from its expected content.')
+
+  if (!existed) return
+  const existingFd = openSync(targetPath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
+  try {
+    const opened = fstatSync(existingFd, { bigint: true })
+    if (!opened.isFile() || opened.nlink !== 1n) {
+      throw new Error('Existing Antigravity uploaded media target is linked or unsupported.')
+    }
+    const parentAfter = lstatSync(canonicalParent, { bigint: true })
+    if (
+      parentAfter.dev !== parentBefore.dev ||
+      parentAfter.ino !== parentBefore.ino ||
+      !isInsideDirectory(canonicalParent, realpathSync(targetPath))
+    ) {
+      throw new Error('Existing Antigravity uploaded media target escaped its storage root.')
+    }
+    if (opened.size !== BigInt(bytes.byteLength)) {
+      throw new Error(
+        'Existing Antigravity uploaded media target differs from its expected content.',
+      )
+    }
+    const currentBytes = readExactBoundedBytesFromFd(existingFd, bytes.byteLength)
+    const afterRead = fstatSync(existingFd, { bigint: true })
+    if (
+      !statsMatch(opened, afterRead) ||
+      currentBytes.byteLength !== bytes.byteLength ||
+      sha256Hex(currentBytes) !== expectedSha256
+    ) {
+      throw new Error(
+        'Existing Antigravity uploaded media target differs from its expected content.',
+      )
+    }
+  } finally {
+    closeSync(existingFd)
   }
 }
 
@@ -3440,23 +4834,40 @@ function verifySummaryRowExistsReadOnly(
   requireEmptyFreshSummary: boolean,
   expectedTrajectoryId?: string,
 ): { stepCount: number } {
-  const summariesPath = join(canonicalAppDataDir, 'conversation_summaries.db')
-  const snapshot = captureSqliteIdentity(summariesPath, canonicalAppDataDir, AGY_MAX_HISTORY_BYTES)
-  const db = openReadOnlySqliteSnapshot(snapshot, canonicalAppDataDir)
+  const snapshotHandle = openCommittedSqliteSnapshot({
+    rootDir: canonicalAppDataDir,
+    canonicalRoot: canonicalAppDataDir,
+    parentSegments: [],
+    leafName: 'conversation_summaries.db',
+    maxSnapshotBytes: AGY_MAX_HISTORY_BYTES,
+  })
+  const db = snapshotHandle.db
   try {
+    assertProofHasOrdinaryTables(snapshotHandle.proof, ['conversation_summaries'])
     const cols = readTableColumns(db, 'conversation_summaries')
     if (!cols.includes('conversation_id') || !cols.includes('step_count')) {
       throw new Error('Antigravity conversation_summaries table is missing required columns.')
     }
-    const selectCols = [
+    const selectColsList = [
       'conversation_id',
       'step_count',
       ...(cols.includes('title') ? ['title'] : []),
       ...(cols.includes('raw_summary') ? ['raw_summary'] : []),
       ...(cols.includes('parent_conversation_id') ? ['parent_conversation_id'] : []),
     ]
-      .map(quoteSqlIdentifier)
-      .join(', ')
+    if (
+      measureTableColumnsTotalBytes(db, 'conversation_summaries', selectColsList, {
+        sql: '"conversation_id" = ?',
+        params: [sessionId],
+      }) > AGY_TEXT_BUDGET_BYTES
+    ) {
+      throw new AgentExecutionError(
+        'response_too_large',
+        'Antigravity conversation_summaries row exceeds 8 MiB.',
+        false,
+      )
+    }
+    const selectCols = selectColsList.map(quoteSqlIdentifier).join(', ')
     const row = db
       .prepare<[string], Record<string, unknown>>(
         `SELECT ${selectCols} FROM "conversation_summaries" WHERE "conversation_id" = ?`,
@@ -3494,10 +4905,9 @@ function verifySummaryRowExistsReadOnly(
         }
       }
     }
-    assertSqliteIdentityUnchanged(snapshot, canonicalAppDataDir)
     return { stepCount }
   } finally {
-    db.close()
+    snapshotHandle.close()
   }
 }
 
@@ -3523,6 +4933,18 @@ function ensureSummaryStepCountCas(
   })
   try {
     db.pragma(`busy_timeout = ${AGY_SUMMARIES_BUSY_TIMEOUT_MS}`)
+    const summaryTableRow = db
+      .prepare<[], { rootpage: number; sql: string | null }>(
+        `SELECT rootpage, sql FROM sqlite_master WHERE type = 'table' AND name = 'conversation_summaries' LIMIT 1`,
+      )
+      .get()
+    if (
+      !summaryTableRow ||
+      summaryTableRow.rootpage < 2 ||
+      (summaryTableRow.sql && /^\s*CREATE\s+VIRTUAL\s+TABLE\b/iu.test(summaryTableRow.sql))
+    ) {
+      throw new Error('Antigravity conversation_summaries is missing or not an ordinary table.')
+    }
     const cols = readTableColumns(db, 'conversation_summaries')
     if (!cols.includes('conversation_id') || !cols.includes('step_count')) {
       throw new Error('Antigravity conversation_summaries table is missing required columns.')
@@ -3641,38 +5063,6 @@ function ensureSummaryStepCountCas(
   }
 }
 
-function clearEmptyShellWalBeforePublish(
-  candidateDbPath: string,
-  canonicalAppDataDir: string,
-): void {
-  const hasWal = captureOptionalWalStats(`${candidateDbPath}-wal`, canonicalAppDataDir) !== null
-  let hasShm = false
-  try {
-    lstatSync(`${candidateDbPath}-shm`, { bigint: true })
-    hasShm = true
-  } catch (error) {
-    if (!(error instanceof Error) || Reflect.get(error, 'code') !== 'ENOENT') throw error
-  }
-  if (!hasWal && !hasShm) return
-
-  const shellDb = new Database(candidateDbPath, { fileMustExist: true, timeout: 0 })
-  try {
-    const countRow = shellDb
-      .prepare<[], { count: number }>('SELECT COUNT(*) AS count FROM "steps"')
-      .get()!
-    if (countRow.count !== 0) {
-      throw new Error('Antigravity candidate database changed before atomic publication.')
-    }
-    shellDb.pragma('wal_checkpoint(TRUNCATE)')
-    shellDb.pragma('journal_mode = DELETE')
-  } finally {
-    shellDb.close()
-  }
-  if (captureOptionalWalStats(`${candidateDbPath}-wal`, canonicalAppDataDir) !== null) {
-    throw new Error('Antigravity candidate WAL could not be cleared before atomic publication.')
-  }
-}
-
 function initializeStagingFromShell(
   stagingDb: Database.Database,
   shellDb: Database.Database,
@@ -3735,14 +5125,18 @@ function verifySqliteIntegrityOk(db: Database.Database): void {
   }
 }
 
-function removeStagingArtifactsBestEffort(stagingPath: string): void {
-  for (const suffix of ['', '-journal', '-wal', '-shm']) {
-    try {
-      rmSync(`${stagingPath}${suffix}`, { force: true })
-    } catch {
-      /* Cleanup best effort on error path. */
-    }
+function measureOpenSqliteExpectedBytes(db: Database.Database): bigint {
+  const pageCount = Number(db.pragma('page_count', { simple: true }) || 0)
+  const pageSize = Number(db.pragma('page_size', { simple: true }) || 0)
+  if (
+    !Number.isSafeInteger(pageCount) ||
+    pageCount <= 0 ||
+    !Number.isSafeInteger(pageSize) ||
+    pageSize <= 0
+  ) {
+    throw new Error('Antigravity staged SQLite database has invalid page geometry.')
   }
+  return BigInt(pageCount) * BigInt(pageSize)
 }
 
 const AGY_REBUILD_RECEIPT_FILENAME = '.pact-rebuild-verified-v1.json'
@@ -3855,12 +5249,29 @@ export function confirmAgyRebuildColdLoad(
     throw new Error('Antigravity native storage root must be an ordinary directory.')
   }
   const canonicalRoot = realpathSync(configuredRoot)
-  const dbPath = join(canonicalRoot, 'conversations', `${input.nativeSessionId}.db`)
 
-  const snapshot = captureSqliteIdentity(dbPath, canonicalRoot, AGY_MAX_HISTORY_BYTES)
-  const db = openReadOnlySqliteSnapshot(snapshot, configuredRoot)
+  const snapshotHandle = openCommittedSqliteSnapshot({
+    rootDir: configuredRoot,
+    canonicalRoot,
+    parentSegments: ['conversations'],
+    leafName: `${input.nativeSessionId}.db`,
+    maxSnapshotBytes: AGY_MAX_HISTORY_BYTES,
+    ...(input.signal !== undefined ? { signal: input.signal } : {}),
+    ...(input.deadlineAt !== undefined ? { deadlineAt: input.deadlineAt } : {}),
+  })
+  const db = snapshotHandle.db
   try {
-    const schema = validateTrajectoryDatabase(db, input.nativeSessionId)
+    const schema = validateTrajectoryDatabase(db, input.nativeSessionId, snapshotHandle.proof)
+    const preflightBytes =
+      measureTableColumnsTotalBytes(db, 'steps', ['metadata', schema.stepPayloadColumn]) +
+      measureTableColumnsTotalBytes(db, 'executor_metadata', ['data'])
+    if (preflightBytes > AGY_MAX_HISTORY_BYTES) {
+      throw new AgentExecutionError(
+        'response_too_large',
+        'Antigravity rebuild database exceeds the 32 MiB history budget.',
+        false,
+      )
+    }
     const stepPayloadSql = quoteSqlIdentifier(schema.stepPayloadColumn)
     const stepSelectSql = schema.hasStepFormatColumn
       ? `SELECT idx, step_type, status, has_subtrajectory, metadata, ${stepPayloadSql} AS step_blob, step_format FROM "steps" ORDER BY idx ASC`
@@ -3954,13 +5365,22 @@ export function confirmAgyRebuildColdLoad(
       throw new Error('Antigravity rebuild Protobuf seed digest mismatch during cold-load confirm.')
     }
 
-    assertSqliteIdentityUnchanged(snapshot, configuredRoot)
+    assertAnchoredSourceUnchanged({
+      rootDir: configuredRoot,
+      canonicalRoot,
+      parentSegments: ['conversations'],
+      leafName: `${input.nativeSessionId}.db`,
+      expectedIdentity: snapshotHandle.fileIdentity,
+      expectedCommittedImageDigest: snapshotHandle.committedImageDigest,
+      ...(input.signal !== undefined ? { signal: input.signal } : {}),
+      ...(input.deadlineAt !== undefined ? { deadlineAt: input.deadlineAt } : {}),
+    })
     const summary = verifySummaryRowExistsReadOnly(canonicalRoot, input.nativeSessionId, false)
     if (summary.stepCount !== 2) {
       throw new Error('Antigravity conversation_summaries.step_count is not synchronized.')
     }
   } finally {
-    db.close()
+    snapshotHandle.close()
   }
 
   const existingReceipt = readRebuildColdLoadReceiptIfPresent(
@@ -3995,7 +5415,7 @@ export function confirmAgyRebuildColdLoad(
     stepCount: 2 as const,
     coldLoadVerifiedAt,
   })
-  const tmpReceiptPath = `${receiptPath}.tmp-${randomBytes(12).toString('hex')}`
+  const tmpReceiptPath = `${receiptPath}.tmp-${randomUUID()}`
   try {
     const fd = openSync(
       tmpReceiptPath,
@@ -4045,7 +5465,6 @@ function verifyAgyRebuildSeedInternal(
     throw new Error('Antigravity native storage root must be an ordinary directory.')
   }
   const canonicalRoot = realpathSync(configuredRoot)
-  const dbPath = join(canonicalRoot, 'conversations', `${input.nativeSessionId}.db`)
 
   const serialized = serializeAgyRebuildSeed({
     rebuildId: input.rebuildId,
@@ -4060,12 +5479,30 @@ function verifyAgyRebuildSeedInternal(
     (chunk): chunk is Extract<AgyRebuildSeedChunk, { kind: 'image' }> => chunk.kind === 'image',
   )
 
-  const snapshot = captureSqliteIdentity(dbPath, canonicalRoot, AGY_MAX_HISTORY_BYTES)
-  const db = openReadOnlySqliteSnapshot(snapshot, configuredRoot)
+  const snapshotHandle = openCommittedSqliteSnapshot({
+    rootDir: configuredRoot,
+    canonicalRoot,
+    parentSegments: ['conversations'],
+    leafName: `${input.nativeSessionId}.db`,
+    maxSnapshotBytes: AGY_MAX_HISTORY_BYTES,
+    ...(input.signal !== undefined ? { signal: input.signal } : {}),
+    ...(input.deadlineAt !== undefined ? { deadlineAt: input.deadlineAt } : {}),
+  })
+  const db = snapshotHandle.db
   try {
-    const schema = validateTrajectoryDatabase(db, input.nativeSessionId)
+    const schema = validateTrajectoryDatabase(db, input.nativeSessionId, snapshotHandle.proof)
     if (input.expectedTrajectoryId && schema.trajectoryId !== input.expectedTrajectoryId) {
       throw new Error('Antigravity rebuild trajectory_id changed.')
+    }
+    const preflightSeedBytes =
+      measureTableColumnsTotalBytes(db, 'steps', ['metadata', schema.stepPayloadColumn]) +
+      measureTableColumnsTotalBytes(db, 'executor_metadata', ['data'])
+    if (preflightSeedBytes > AGY_MAX_HISTORY_BYTES) {
+      throw new AgentExecutionError(
+        'response_too_large',
+        'Antigravity rebuild database exceeds the 32 MiB history budget.',
+        false,
+      )
     }
 
     const stepPayloadSql = quoteSqlIdentifier(schema.stepPayloadColumn)
@@ -4165,6 +5602,7 @@ function verifyAgyRebuildSeedInternal(
         canonicalRoot,
         input.nativeSessionId,
         input.nativeSessionId,
+        configuredRoot,
       )
       if (!plan) {
         throw new Error('Antigravity rebuild media URI is outside candidate .user_uploaded.')
@@ -4209,7 +5647,16 @@ function verifyAgyRebuildSeedInternal(
       throw new Error('Antigravity rebuild executor_metadata[0] linkage mismatch.')
     }
 
-    assertSqliteIdentityUnchanged(snapshot, configuredRoot)
+    assertAnchoredSourceUnchanged({
+      rootDir: configuredRoot,
+      canonicalRoot,
+      parentSegments: ['conversations'],
+      leafName: `${input.nativeSessionId}.db`,
+      expectedIdentity: snapshotHandle.fileIdentity,
+      expectedCommittedImageDigest: snapshotHandle.committedImageDigest,
+      ...(input.signal !== undefined ? { signal: input.signal } : {}),
+      ...(input.deadlineAt !== undefined ? { deadlineAt: input.deadlineAt } : {}),
+    })
 
     if (options.checkSummarySynchronized) {
       const summary = verifySummaryRowExistsReadOnly(canonicalRoot, input.nativeSessionId, false)
@@ -4235,7 +5682,13 @@ function verifyAgyRebuildSeedInternal(
       throw new Error('Antigravity rebuild Protobuf seed digest mismatch.')
     }
 
-    const physical = computePhysicalDbDigest(dbPath, canonicalRoot, configuredRoot)
+    const physical = computePhysicalDbDigest(
+      canonicalRoot,
+      input.nativeSessionId,
+      configuredRoot,
+      snapshotHandle.fileIdentity,
+      snapshotHandle.walIdentity,
+    )
     const recordCount = stepRows.length + genCountRow.count + execRows.length
     if (
       options.requireNoAdditionalWork &&
@@ -4278,11 +5731,11 @@ function verifyAgyRebuildSeedInternal(
       verifiedPrefixSha256: physical.rawHash,
       recordCount,
       nativeStorageRoot: canonicalRoot,
-      nativePath: snapshot.canonicalDbPath,
+      nativePath: snapshotHandle.canonicalDbPath,
       ...(initializationWitness ? { initializationWitness } : {}),
     }
   } finally {
-    db.close()
+    snapshotHandle.close()
   }
 }
 
@@ -4307,7 +5760,6 @@ export function writeAgyRebuildSeed(input: AgyRebuildSeedInput): AgyRebuildSeedR
   if (!convStat.isDirectory() || convStat.isSymbolicLink()) {
     throw new Error('Antigravity conversations directory must be an ordinary directory.')
   }
-  const candidateDbPath = join(conversationsDir, `${input.nativeSessionId}.db`)
 
   const serialized = serializeAgyRebuildSeed({
     rebuildId: input.rebuildId,
@@ -4330,6 +5782,17 @@ export function writeAgyRebuildSeed(input: AgyRebuildSeedInput): AgyRebuildSeedR
   let imageById = new Map<string, AgentPromptImage>()
   for (const img of providedImages) imageById.set(img.id, img)
 
+  const userTextBytes = Buffer.byteLength(serialized.expectedUserText, 'utf8')
+  const assistantTextBytes = Buffer.byteLength(serialized.expectedAssistantText, 'utf8')
+  // Preflight accounts for BOTH user_response and items (2x expectedUserText) plus assistant text & images.
+  if (userTextBytes * 2 + assistantTextBytes > AGY_MAX_HISTORY_BYTES) {
+    throw new AgentExecutionError(
+      'response_too_large',
+      'Antigravity rebuild encoded text exceeds the 32 MiB history budget.',
+      false,
+    )
+  }
+
   let totalMediaBytes = 0
   const verifiedMediaPayloads: Array<{
     chunkImage: ConversationImage
@@ -4348,10 +5811,7 @@ export function writeAgyRebuildSeed(input: AgyRebuildSeedInput): AgyRebuildSeedR
     requireNativeImageReference(resolved, imgChunk.image)
     const bytes = readVerifiedImmutableImage(resolved)
     totalMediaBytes += bytes.byteLength
-    if (
-      Buffer.byteLength(serialized.expectedUserText, 'utf8') + totalMediaBytes >
-      AGY_MAX_HISTORY_BYTES
-    ) {
+    if (userTextBytes * 2 + assistantTextBytes + totalMediaBytes > AGY_MAX_HISTORY_BYTES) {
       throw new AgentExecutionError(
         'response_too_large',
         'Antigravity rebuild text and images exceed the 32 MiB history budget.',
@@ -4367,13 +5827,24 @@ export function writeAgyRebuildSeed(input: AgyRebuildSeedInput): AgyRebuildSeedR
     verifiedMediaPayloads.push({ chunkImage: imgChunk.image, bytes, ext })
   }
 
-  const shellSnapshot = captureSqliteIdentity(candidateDbPath, canonicalRoot, AGY_MAX_HISTORY_BYTES)
+  const shellHandle = openCandidateShellSnapshotOrThrowUncertain({
+    rootDir: configuredRoot,
+    canonicalRoot,
+    candidateSessionId: input.nativeSessionId,
+    maxSnapshotBytes: AGY_MAX_HISTORY_BYTES,
+    ...(input.signal !== undefined ? { signal: input.signal } : {}),
+    ...(input.deadlineAt !== undefined ? { deadlineAt: input.deadlineAt } : {}),
+  })
+  const shellIdentity = shellHandle.fileIdentity
   let alreadySeeded = false
   let shellSchema: ValidatedTrajectorySchema
-  const shellDb = openReadOnlySqliteSnapshot(shellSnapshot, configuredRoot)
   try {
-    shellSchema = validateTrajectoryDatabase(shellDb, input.nativeSessionId)
-    const counts = shellDb
+    shellSchema = validateTrajectoryDatabase(
+      shellHandle.db,
+      input.nativeSessionId,
+      shellHandle.proof,
+    )
+    const counts = shellHandle.db
       .prepare<[], { stepCount: number; genCount: number; execCount: number }>(
         `SELECT
           (SELECT COUNT(*) FROM "steps") AS stepCount,
@@ -4388,7 +5859,7 @@ export function writeAgyRebuildSeed(input: AgyRebuildSeedInput): AgyRebuildSeedR
       throw new Error('Antigravity rebuild candidate database is not an empty zero-Turn shell.')
     }
   } finally {
-    shellDb.close()
+    shellHandle.close()
   }
 
   if (alreadySeeded) {
@@ -4406,6 +5877,7 @@ export function writeAgyRebuildSeed(input: AgyRebuildSeedInput): AgyRebuildSeedR
         omitWitness: true,
       },
     )
+    assertIdentityNotCancelledOrExpired(input.signal, input.deadlineAt)
     ensureSummaryStepCountCas(canonicalRoot, input.nativeSessionId, 2, 0, shellSchema.trajectoryId)
     return verifyAgyRebuildSeedInternal(
       {
@@ -4429,152 +5901,282 @@ export function writeAgyRebuildSeed(input: AgyRebuildSeedInput): AgyRebuildSeedR
     shellSchema.trajectoryId,
   )
 
-  const mediaItems: Array<{ mimeType: string; inlineData: Buffer; uri: string }> = []
-  if (verifiedMediaPayloads.length > 0) {
-    const uploadedDir = ensureSafeDirectoryChain(canonicalRoot, [
-      'brain',
-      input.nativeSessionId,
-      '.user_uploaded',
-    ])
-    for (const [idx, item] of verifiedMediaPayloads.entries()) {
-      const fileName = `${idx}-${item.chunkImage.id}.${item.ext}`
-      const targetMediaPath = join(uploadedDir, fileName)
-      writeIdempotentPrivateFile(targetMediaPath, canonicalRoot, item.bytes, item.chunkImage.sha256)
-      mediaItems.push({
-        mimeType: item.chunkImage.mediaType,
-        inlineData: item.bytes,
-        uri: targetMediaPath,
-      })
+  const expectedUploadedDir = join(canonicalRoot, 'brain', input.nativeSessionId, '.user_uploaded')
+  const plannedMediaItems: Array<{
+    mimeType: string
+    inlineData: Buffer
+    uri: string
+    fileName: string
+    sha256: string
+  }> = verifiedMediaPayloads.map((item, idx) => {
+    const fileName = `${idx}-${item.chunkImage.id}.${item.ext}`
+    const targetMediaPath = join(expectedUploadedDir, fileName)
+    return {
+      mimeType: item.chunkImage.mediaType,
+      inlineData: item.bytes,
+      uri: targetMediaPath,
+      fileName,
+      sha256: item.chunkImage.sha256,
     }
-    fsyncDirectoryBestEffort(uploadedDir)
+  })
+
+  // Pre-encode exact Protobuf payloads (including BOTH user_response and items) BEFORE writing media or staging SQLite!
+  const seedTimestampSec = 1_700_000_000n
+  const userMetadata = encodeCortexStepMetadata({
+    createdAtSeconds: seedTimestampSec,
+    source: 1,
+    executionId: serialized.seedExecutionId,
+    trajectoryId: shellSchema.trajectoryId,
+    stepIndex: 0,
+    cascadeId: input.nativeSessionId,
+    stepId: serialized.userStepId,
+  })
+  const userData = encodeAgyUserInputStep({
+    metadata: userMetadata,
+    text: serialized.expectedUserText,
+    media: plannedMediaItems,
+  })
+  const assistantMetadata = encodeCortexStepMetadata({
+    createdAtSeconds: seedTimestampSec,
+    createdAtNanos: 1_000_000,
+    source: 2,
+    executionId: serialized.seedExecutionId,
+    trajectoryId: shellSchema.trajectoryId,
+    stepIndex: 1,
+    cascadeId: input.nativeSessionId,
+    stepId: serialized.assistantStepId,
+  })
+  const assistantData = encodeAgyPlannerResponseStep({
+    metadata: assistantMetadata,
+    response: serialized.expectedAssistantText,
+  })
+  const execData = encodeExecutorMetadata({
+    terminationReason: EXECUTOR_TERMINATION_REASON_NO_TOOL_CALL,
+    numGeneratorInvocations: 0,
+    lastStepIdx: 1,
+    executionId: serialized.seedExecutionId,
+  })
+  const encodedTotalBytes =
+    userMetadata.byteLength +
+    userData.byteLength +
+    assistantMetadata.byteLength +
+    assistantData.byteLength +
+    execData.byteLength
+  if (encodedTotalBytes > AGY_MAX_HISTORY_BYTES) {
+    throw new AgentExecutionError(
+      'response_too_large',
+      'Antigravity rebuild encoded Protobuf payload exceeds the 32 MiB history budget.',
+      false,
+    )
   }
 
-  const nonce = randomBytes(12).toString('hex')
-  const stagingPath = join(conversationsDir, `${input.nativeSessionId}.db.staging-${nonce}`)
-  const stagingFd = openSync(
-    stagingPath,
-    constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | (constants.O_NOFOLLOW ?? 0),
-    0o600,
+  // Verify same-volume staging (conversations vs brain/<sid>) BEFORE writing any uploaded media!
+  const sameVolumeStage = createSameVolumeCandidateStagingDb(
+    canonicalRoot,
+    input.nativeSessionId,
+    input.stagingLeafName,
   )
-  closeSync(stagingFd)
+  const stagingPath = sameVolumeStage.stagingPath
+  let expectedStagedIdentity: AgySqliteFileIdentity
 
   try {
-    const reopenShellDb = openReadOnlySqliteSnapshot(shellSnapshot, configuredRoot)
-    const stagingDb = new Database(stagingPath, { fileMustExist: true })
-    try {
-      initializeStagingFromShell(stagingDb, reopenShellDb, shellSchema)
-
-      const seedTimestampSec = 1_700_000_000n
-      const userMetadata = encodeCortexStepMetadata({
-        createdAtSeconds: seedTimestampSec,
-        source: 1,
-        executionId: serialized.seedExecutionId,
-        trajectoryId: shellSchema.trajectoryId,
-        stepIndex: 0,
-        cascadeId: input.nativeSessionId,
-        stepId: serialized.userStepId,
-      })
-      const userData = encodeAgyUserInputStep({
-        metadata: userMetadata,
-        text: serialized.expectedUserText,
-        media: mediaItems,
-      })
-
-      const assistantMetadata = encodeCortexStepMetadata({
-        createdAtSeconds: seedTimestampSec,
-        createdAtNanos: 1_000_000,
-        source: 2,
-        executionId: serialized.seedExecutionId,
-        trajectoryId: shellSchema.trajectoryId,
-        stepIndex: 1,
-        cascadeId: input.nativeSessionId,
-        stepId: serialized.assistantStepId,
-      })
-      const assistantData = encodeAgyPlannerResponseStep({
-        metadata: assistantMetadata,
-        response: serialized.expectedAssistantText,
-      })
-
-      const execData = encodeExecutorMetadata({
-        terminationReason: EXECUTOR_TERMINATION_REASON_NO_TOOL_CALL,
-        numGeneratorInvocations: 0,
-        lastStepIdx: 1,
-        executionId: serialized.seedExecutionId,
-      })
-
-      stagingDb.exec('BEGIN IMMEDIATE')
-      try {
-        const hasStepSize = shellSchema.stepColumns.includes('size')
-        const hasStepFormat = shellSchema.hasStepFormatColumn
-        const insertStepCols = [
-          'idx',
-          'step_type',
-          'status',
-          'has_subtrajectory',
-          'metadata',
-          shellSchema.stepPayloadColumn,
-          ...(hasStepFormat ? ['step_format'] : []),
-          ...(hasStepSize ? ['size'] : []),
-        ]
-        const insertStep = stagingDb.prepare(
-          `INSERT INTO "steps" (${insertStepCols.map(quoteSqlIdentifier).join(', ')}) VALUES (${insertStepCols.map(() => '?').join(', ')})`,
-        )
-        insertStep.run(
-          0,
-          CORTEX_STEP_TYPE_USER_INPUT,
-          CORTEX_STEP_STATUS_DONE,
-          0,
-          userMetadata,
-          userData,
-          ...(hasStepFormat ? [0] : []),
-          ...(hasStepSize ? [userData.byteLength] : []),
-        )
-        insertStep.run(
-          1,
-          CORTEX_STEP_TYPE_PLANNER_RESPONSE,
-          CORTEX_STEP_STATUS_DONE,
-          0,
-          assistantMetadata,
-          assistantData,
-          ...(hasStepFormat ? [0] : []),
-          ...(hasStepSize ? [assistantData.byteLength] : []),
-        )
-
-        const hasExecSize = shellSchema.execColumns.includes('size')
-        const insertExecCols = ['idx', 'data', ...(hasExecSize ? ['size'] : [])]
-        stagingDb
-          .prepare(
-            `INSERT INTO "executor_metadata" (${insertExecCols.map(quoteSqlIdentifier).join(', ')}) VALUES (${insertExecCols.map(() => '?').join(', ')})`,
-          )
-          .run(0, execData, ...(hasExecSize ? [execData.byteLength] : []))
-
-        stagingDb.exec('COMMIT')
-      } catch (error) {
-        if (stagingDb.inTransaction) stagingDb.exec('ROLLBACK')
-        throw error
+    if (plannedMediaItems.length > 0) {
+      const uploadedDir = ensureSafeDirectoryChain(canonicalRoot, [
+        'brain',
+        input.nativeSessionId,
+        '.user_uploaded',
+      ])
+      for (const item of plannedMediaItems) {
+        const targetMediaPath = join(uploadedDir, item.fileName)
+        writeIdempotentPrivateFile(targetMediaPath, canonicalRoot, item.inlineData, item.sha256)
       }
-
-      verifySqliteIntegrityOk(stagingDb)
-    } finally {
-      stagingDb.close()
-      reopenShellDb.close()
+      fsyncDirectoryBestEffort(uploadedDir)
     }
 
-    const syncFd = openSync(stagingPath, constants.O_RDWR | (constants.O_NOFOLLOW ?? 0))
+    let expectedDbBytes: bigint
+    const reopenShellHandle = openCommittedSqliteSnapshot({
+      rootDir: configuredRoot,
+      canonicalRoot,
+      parentSegments: ['conversations'],
+      leafName: `${input.nativeSessionId}.db`,
+      maxSnapshotBytes: AGY_MAX_HISTORY_BYTES,
+      ...(input.signal !== undefined ? { signal: input.signal } : {}),
+      ...(input.deadlineAt !== undefined ? { deadlineAt: input.deadlineAt } : {}),
+    })
     try {
-      fsyncSync(syncFd)
+      sameVolumeStage.assertStagingBound({ expectedSize: 0n })
+      const stagingDb = new Database(stagingPath, { fileMustExist: true })
+      try {
+        sameVolumeStage.assertStagingBound({ expectedSize: 0n })
+        initializeStagingFromShell(stagingDb, reopenShellHandle.db, shellSchema)
+
+        stagingDb.exec('BEGIN IMMEDIATE')
+        try {
+          const hasStepSize = shellSchema.stepColumns.includes('size')
+          const hasStepFormat = shellSchema.hasStepFormatColumn
+          const insertStepCols = [
+            'idx',
+            'step_type',
+            'status',
+            'has_subtrajectory',
+            'metadata',
+            shellSchema.stepPayloadColumn,
+            ...(hasStepFormat ? ['step_format'] : []),
+            ...(hasStepSize ? ['size'] : []),
+          ]
+          const insertStep = stagingDb.prepare(
+            `INSERT INTO "steps" (${insertStepCols.map(quoteSqlIdentifier).join(', ')}) VALUES (${insertStepCols.map(() => '?').join(', ')})`,
+          )
+          insertStep.run(
+            0,
+            CORTEX_STEP_TYPE_USER_INPUT,
+            CORTEX_STEP_STATUS_DONE,
+            0,
+            userMetadata,
+            userData,
+            ...(hasStepFormat ? [0] : []),
+            ...(hasStepSize ? [userData.byteLength] : []),
+          )
+          insertStep.run(
+            1,
+            CORTEX_STEP_TYPE_PLANNER_RESPONSE,
+            CORTEX_STEP_STATUS_DONE,
+            0,
+            assistantMetadata,
+            assistantData,
+            ...(hasStepFormat ? [0] : []),
+            ...(hasStepSize ? [assistantData.byteLength] : []),
+          )
+
+          const hasExecSize = shellSchema.execColumns.includes('size')
+          const insertExecCols = ['idx', 'data', ...(hasExecSize ? ['size'] : [])]
+          stagingDb
+            .prepare(
+              `INSERT INTO "executor_metadata" (${insertExecCols.map(quoteSqlIdentifier).join(', ')}) VALUES (${insertExecCols.map(() => '?').join(', ')})`,
+            )
+            .run(0, execData, ...(hasExecSize ? [execData.byteLength] : []))
+
+          stagingDb.exec('COMMIT')
+        } catch (error) {
+          if (stagingDb.inTransaction) stagingDb.exec('ROLLBACK')
+          throw error
+        }
+
+        verifySqliteIntegrityOk(stagingDb)
+        expectedDbBytes = measureOpenSqliteExpectedBytes(stagingDb)
+        sameVolumeStage.assertStagingBound({ expectedSize: expectedDbBytes })
+      } finally {
+        stagingDb.close()
+      }
     } finally {
-      closeSync(syncFd)
+      reopenShellHandle.close()
     }
 
-    assertSqliteIdentityUnchanged(shellSnapshot, configuredRoot)
-    clearEmptyShellWalBeforePublish(candidateDbPath, canonicalRoot)
-    renameSync(stagingPath, candidateDbPath)
+    if (expectedDbBytes > BigInt(AGY_MAX_HISTORY_BYTES)) {
+      throw new AgentExecutionError(
+        'response_too_large',
+        'Antigravity rebuild staged SQLite database exceeds the 32 MiB history budget.',
+        false,
+      )
+    }
+    sameVolumeStage.fsyncVerifiedStaging(expectedDbBytes)
+
+    // Pin expectedStagedIdentity directly from an anchored, locked, integrity-checked snapshot of
+    // the exact inode we created (zero stale pathname re-stat drift after SQLite closes).
+    const stagedSnapshot = openCommittedSqliteSnapshot({
+      rootDir: canonicalRoot,
+      canonicalRoot,
+      parentSegments: ['brain', input.nativeSessionId],
+      leafName: sameVolumeStage.stagingLeafName,
+      maxSnapshotBytes: AGY_MAX_HISTORY_BYTES,
+      ...(input.signal !== undefined ? { signal: input.signal } : {}),
+      ...(input.deadlineAt !== undefined ? { deadlineAt: input.deadlineAt } : {}),
+    })
+    try {
+      sameVolumeStage.assertAnchoredIdentityMatchesCreated(
+        stagedSnapshot.fileIdentity,
+        expectedDbBytes,
+      )
+      verifySqliteIntegrityOk(stagedSnapshot.db)
+      const stagedSchema = validateTrajectoryDatabase(
+        stagedSnapshot.db,
+        input.nativeSessionId,
+        stagedSnapshot.proof,
+      )
+      if (stagedSchema.trajectoryId !== shellSchema.trajectoryId) {
+        throw new Error('Antigravity rebuild staged trajectoryId disagrees with candidate shell.')
+      }
+      const stagedCounts = stagedSnapshot.db
+        .prepare<[], { stepCount: number; genCount: number; execCount: number }>(
+          `SELECT
+            (SELECT COUNT(*) FROM "steps") AS stepCount,
+            (SELECT COUNT(*) FROM "gen_metadata") AS genCount,
+            (SELECT COUNT(*) FROM "executor_metadata") AS execCount`,
+        )
+        .get()!
+      if (
+        stagedCounts.stepCount !== 2 ||
+        stagedCounts.genCount !== 0 ||
+        stagedCounts.execCount !== 1
+      ) {
+        throw new Error('Antigravity rebuild staged database row count failed verification.')
+      }
+      expectedStagedIdentity = stagedSnapshot.fileIdentity
+    } finally {
+      stagedSnapshot.close()
+    }
+
+    const stagedView = openAnchoredLockedSqliteView(
+      canonicalRoot,
+      ['brain', input.nativeSessionId],
+      sameVolumeStage.stagingLeafName,
+      { acquireSharedLock: true, openWal: true, openShm: true, checkJournal: true },
+    )
+    try {
+      if (
+        stagedView.hasWal ||
+        stagedView.hasShm ||
+        stagedView.hasJournal ||
+        !identitiesExactMatch(stagedView.fileIdentity, expectedStagedIdentity)
+      ) {
+        throw new Error(
+          'Antigravity rebuild staged database changed or acquired sidefiles before publication.',
+        )
+      }
+    } finally {
+      stagedView.close()
+    }
+
+    assertIdentityNotCancelledOrExpired(input.signal, input.deadlineAt)
+    publishStagedCandidateOrThrow({
+      canonicalRoot,
+      candidateSessionId: input.nativeSessionId,
+      stagedLeafName: sameVolumeStage.stagingLeafName,
+      expectedTargetIdentity: shellIdentity,
+      expectedStagedIdentity,
+    })
     fsyncDirectoryBestEffort(conversationsDir)
   } finally {
-    removeStagingArtifactsBestEffort(stagingPath)
+    sameVolumeStage.cleanup()
   }
 
+  assertIdentityNotCancelledOrExpired(input.signal, input.deadlineAt)
+  const publishedIdentity = readAnchoredFileIdentity(
+    canonicalRoot,
+    ['conversations'],
+    `${input.nativeSessionId}.db`,
+  )
+  if (
+    publishedIdentity.dev !== expectedStagedIdentity.dev ||
+    publishedIdentity.ino !== expectedStagedIdentity.ino ||
+    publishedIdentity.size !== expectedStagedIdentity.size ||
+    publishedIdentity.mtimeNs !== expectedStagedIdentity.mtimeNs
+  ) {
+    throw Object.assign(
+      new Error('Antigravity rebuild published candidate database changed after atomic rename.'),
+      { code: 'UNCERTAIN' },
+    )
+  }
   ensureSummaryStepCountCas(canonicalRoot, input.nativeSessionId, 2, 0, shellSchema.trajectoryId)
 
   return verifyAgyRebuildSeedInternal(
@@ -4914,17 +6516,40 @@ function deriveVerifiedAgyPrefix(
     nativeInputIds?: readonly string[]
     responseHash?: string
     requireNoPostCutRows?: boolean
+    proof?: AgyPreScannedSqliteProof
+    configuredRoot?: string
   },
 ): DerivedAgyPrefix {
   if (!SAFE_ID_PATTERN.test(nativeTurnId)) {
     throw new Error('Invalid Antigravity nativeTurnId (execution_id).')
   }
 
-  const schema = validateTrajectoryDatabase(db, sessionId)
+  const schema = validateTrajectoryDatabase(db, sessionId, options.proof)
 
+  const execCountRow = db
+    .prepare<[], { count: number }>('SELECT COUNT(*) AS count FROM "executor_metadata"')
+    .get()
+  if (execCountRow && execCountRow.count > AGY_MAX_RECORDS) {
+    throw new AgentExecutionError(
+      'response_too_large',
+      'Antigravity executor_metadata exceeds 10,000 records.',
+      false,
+    )
+  }
+  if (
+    measureTableColumnsTotalBytes(db, 'executor_metadata', schema.execColumns) >
+    AGY_MAX_HISTORY_BYTES
+  ) {
+    throw new AgentExecutionError(
+      'response_too_large',
+      'Antigravity executor_metadata exceeds the 32 MiB history budget.',
+      false,
+    )
+  }
+  const execSelectList = schema.execColumns.map(quoteSqlIdentifier).join(', ')
   const execRows = db
     .prepare<[number], Record<string, unknown>>(
-      'SELECT * FROM "executor_metadata" ORDER BY idx ASC LIMIT ?',
+      `SELECT ${execSelectList} FROM "executor_metadata" ORDER BY idx ASC LIMIT ?`,
     )
     .all(AGY_MAX_RECORDS + 1)
   if (execRows.length > AGY_MAX_RECORDS) {
@@ -5111,9 +6736,29 @@ function deriveVerifiedAgyPrefix(
     )
   }
 
+  const genCountRow = db
+    .prepare<[], { count: number }>('SELECT COUNT(*) AS count FROM "gen_metadata"')
+    .get()
+  if (genCountRow && genCountRow.count > AGY_MAX_RECORDS) {
+    throw new AgentExecutionError(
+      'response_too_large',
+      'Antigravity gen_metadata exceeds 10,000 records.',
+      false,
+    )
+  }
+  if (
+    measureTableColumnsTotalBytes(db, 'gen_metadata', schema.genColumns) > AGY_MAX_HISTORY_BYTES
+  ) {
+    throw new AgentExecutionError(
+      'response_too_large',
+      'Antigravity gen_metadata exceeds the 32 MiB history budget.',
+      false,
+    )
+  }
+  const genSelectList = schema.genColumns.map(quoteSqlIdentifier).join(', ')
   const genRows = db
     .prepare<[number], Record<string, unknown>>(
-      'SELECT * FROM "gen_metadata" ORDER BY idx ASC LIMIT ?',
+      `SELECT ${genSelectList} FROM "gen_metadata" ORDER BY idx ASC LIMIT ?`,
     )
     .all(AGY_MAX_RECORDS + 1)
   if (genRows.length > AGY_MAX_RECORDS) {
@@ -5349,6 +6994,9 @@ function deriveVerifiedAgyPrefix(
     sourceCascadeId: sessionId,
     targetCascadeId: '$cascade',
     canonicalAppDataDir: canonicalRoot,
+    ...(options.configuredRoot !== undefined
+      ? { configuredAppDataDir: options.configuredRoot }
+      : {}),
   }
 
   let prefixBytes = 0
@@ -5383,8 +7031,21 @@ function deriveVerifiedAgyPrefix(
       ].includes(col),
   )
 
+  if (
+    measureTableColumnsTotalBytes(db, 'steps', schema.stepColumns, {
+      sql: 'idx >= 0 AND idx <= ?',
+      params: [cutStep],
+    }) > AGY_MAX_HISTORY_BYTES
+  ) {
+    throw new AgentExecutionError(
+      'response_too_large',
+      'Antigravity Fork prefix exceeds the 32 MiB history budget.',
+      false,
+    )
+  }
+  const stepPrefixSelectList = schema.stepColumns.map(quoteSqlIdentifier).join(', ')
   const stepPrefixStmt = db.prepare<[number], Record<string, unknown>>(
-    'SELECT * FROM "steps" WHERE idx >= 0 AND idx <= ? ORDER BY idx ASC',
+    `SELECT ${stepPrefixSelectList} FROM "steps" WHERE idx >= 0 AND idx <= ? ORDER BY idx ASC`,
   )
   let expectedIdx = 0
   for (const row of stepPrefixStmt.iterate(cutStep)) {
@@ -5749,6 +7410,7 @@ function deriveVerifiedAgyPrefix(
 }
 
 export function prepareAgyFork(input: AgyForkInput): AgyForkOperationResult {
+  assertIdentityNotCancelledOrExpired(input.signal, input.deadlineAt)
   const sourceSessionId = input.source?.nativeSessionId ?? input.nativeSessionId
   const nativeTurnId = input.source?.nativeTurnId ?? input.nativeTurnId
   const effectiveInputIds = input.nativeInputIds ?? input.source?.nativeInputIds
@@ -5766,23 +7428,39 @@ export function prepareAgyFork(input: AgyForkInput): AgyForkOperationResult {
     throw new Error('Antigravity native storage root must be an ordinary directory.')
   }
   const canonicalRoot = realpathSync(configuredRoot)
-  const sourceDbPath = join(canonicalRoot, 'conversations', `${sourceSessionId}.db`)
 
-  const snapshot = captureSqliteIdentity(sourceDbPath, canonicalRoot)
-  const db = openReadOnlySqliteSnapshot(snapshot, configuredRoot)
+  const snapshotHandle = openCommittedSqliteSnapshot({
+    rootDir: configuredRoot,
+    canonicalRoot,
+    parentSegments: ['conversations'],
+    leafName: `${sourceSessionId}.db`,
+    ...(input.signal !== undefined ? { signal: input.signal } : {}),
+    ...(input.deadlineAt !== undefined ? { deadlineAt: input.deadlineAt } : {}),
+  })
   try {
     const derived = deriveVerifiedAgyPrefix(
-      db,
+      snapshotHandle.db,
       sourceSessionId,
       canonicalRoot,
-      snapshot.canonicalDbPath,
+      snapshotHandle.canonicalDbPath,
       nativeTurnId,
       {
+        proof: snapshotHandle.proof,
+        configuredRoot,
         ...(effectiveInputIds !== undefined ? { nativeInputIds: effectiveInputIds } : {}),
         ...(input.responseHash !== undefined ? { responseHash: input.responseHash } : {}),
       },
     )
-    assertSqliteIdentityUnchanged(snapshot, configuredRoot)
+    assertAnchoredSourceUnchanged({
+      rootDir: configuredRoot,
+      canonicalRoot,
+      parentSegments: ['conversations'],
+      leafName: `${sourceSessionId}.db`,
+      expectedIdentity: snapshotHandle.fileIdentity,
+      expectedCommittedImageDigest: snapshotHandle.committedImageDigest,
+      ...(input.signal !== undefined ? { signal: input.signal } : {}),
+      ...(input.deadlineAt !== undefined ? { deadlineAt: input.deadlineAt } : {}),
+    })
 
     if (
       input.source &&
@@ -5807,7 +7485,7 @@ export function prepareAgyFork(input: AgyForkInput): AgyForkOperationResult {
       rawBytes: 0,
       rawRecords: derived.prefixRecords,
       nativeStorageRoot: canonicalRoot,
-      nativePath: snapshot.canonicalDbPath,
+      nativePath: snapshotHandle.canonicalDbPath,
       cutStep: derived.cutStep,
       trajectoryId: derived.schema.trajectoryId,
       sourceTrajectoryId: derived.schema.trajectoryId,
@@ -5818,11 +7496,12 @@ export function prepareAgyFork(input: AgyForkInput): AgyForkOperationResult {
       ),
     }
   } finally {
-    db.close()
+    snapshotHandle.close()
   }
 }
 
 export function inspectAgyFork(input: AgyForkInput): AgyForkOperationResult {
+  assertIdentityNotCancelledOrExpired(input.signal, input.deadlineAt)
   const witness = input.witness
   if (!witness || witness.nativeSessionId !== input.nativeSessionId || !witness.idMap.length) {
     throw new Error('Antigravity Fork witness is missing.')
@@ -5840,7 +7519,6 @@ export function inspectAgyFork(input: AgyForkInput): AgyForkOperationResult {
     throw new Error('The effective Antigravity native storage root changed.')
   }
 
-  const candidateDbPath = join(canonicalRoot, 'conversations', `${input.nativeSessionId}.db`)
   const checkSourceStillValid = (): void => {
     if (!input.source) return
     prepareAgyFork({
@@ -5849,42 +7527,47 @@ export function inspectAgyFork(input: AgyForkInput): AgyForkOperationResult {
       nativeSessionId: input.source.nativeSessionId,
       nativeTurnId: input.source.nativeTurnId,
       source: input.source,
+      ...(input.signal !== undefined ? { signal: input.signal } : {}),
+      ...(input.deadlineAt !== undefined ? { deadlineAt: input.deadlineAt } : {}),
     })
   }
 
-  let candidateExists = true
+  let snapshotHandle: CommittedSqliteSnapshotHandle
   try {
-    lstatSync(candidateDbPath, { bigint: true })
+    snapshotHandle = openCommittedSqliteSnapshot({
+      rootDir: configuredRoot,
+      canonicalRoot,
+      parentSegments: ['conversations'],
+      leafName: `${input.nativeSessionId}.db`,
+      maxSnapshotBytes: AGY_MAX_HISTORY_BYTES,
+      ...(input.signal !== undefined ? { signal: input.signal } : {}),
+      ...(input.deadlineAt !== undefined ? { deadlineAt: input.deadlineAt } : {}),
+    })
   } catch (error) {
-    if (error instanceof Error && Reflect.get(error, 'code') === 'ENOENT') {
-      candidateExists = false
-    } else {
-      throw error
+    if (error instanceof AgyStorageMissingError) {
+      if (input.lastDispatchedPhase === 'fork' && input.source) {
+        checkSourceStillValid()
+        throw Object.assign(
+          new Error(
+            'The recorded Antigravity Fork candidate database is absent; the original source cut remains intact.',
+          ),
+          { code: 'native_file_fork_candidate_missing' },
+        )
+      }
+      throw new Error('Antigravity Fork candidate database does not exist.', { cause: error })
     }
+    throw error
   }
-
-  if (!candidateExists) {
-    if (input.lastDispatchedPhase === 'fork' && input.source) {
-      checkSourceStillValid()
-      throw Object.assign(
-        new Error(
-          'The recorded Antigravity Fork candidate database is absent; the original source cut remains intact.',
-        ),
-        { code: 'native_file_fork_candidate_missing' },
-      )
-    }
-    throw new Error('Antigravity Fork candidate database does not exist.')
-  }
-
-  const snapshot = captureSqliteIdentity(candidateDbPath, canonicalRoot, AGY_MAX_HISTORY_BYTES)
-  if (witness.nativePath && snapshot.canonicalDbPath !== witness.nativePath) {
+  if (witness.nativePath && snapshotHandle.canonicalDbPath !== witness.nativePath) {
+    snapshotHandle.close()
     throw new Error('The recorded Antigravity native Fork path changed.')
   }
 
-  const db = openReadOnlySqliteSnapshot(snapshot, configuredRoot)
   let derived: DerivedAgyPrefix
   try {
-    const counts = db
+    // Proof-first table verification BEFORE preparing ANY SQL on business tables!
+    assertProofHasOrdinaryTables(snapshotHandle.proof, REQUIRED_TRAJECTORY_TABLES)
+    const counts = snapshotHandle.db
       .prepare<[], { stepCount: number; genCount: number; execCount: number }>(
         `SELECT
           (SELECT COUNT(*) FROM "steps") AS stepCount,
@@ -5893,11 +7576,25 @@ export function inspectAgyFork(input: AgyForkInput): AgyForkOperationResult {
       )
       .get()!
     if (counts.stepCount === 0 && counts.genCount === 0 && counts.execCount === 0) {
-      validateTrajectoryDatabase(db, input.nativeSessionId)
-      assertSqliteIdentityUnchanged(snapshot, configuredRoot)
+      validateTrajectoryDatabase(snapshotHandle.db, input.nativeSessionId, snapshotHandle.proof)
+      assertAnchoredSourceUnchanged({
+        rootDir: configuredRoot,
+        canonicalRoot,
+        parentSegments: ['conversations'],
+        leafName: `${input.nativeSessionId}.db`,
+        expectedIdentity: snapshotHandle.fileIdentity,
+        expectedCommittedImageDigest: snapshotHandle.committedImageDigest,
+      })
       if (input.lastDispatchedPhase === 'fork' && input.source) {
         checkSourceStillValid()
-        assertSqliteIdentityUnchanged(snapshot, configuredRoot)
+        assertAnchoredSourceUnchanged({
+          rootDir: configuredRoot,
+          canonicalRoot,
+          parentSegments: ['conversations'],
+          leafName: `${input.nativeSessionId}.db`,
+          expectedIdentity: snapshotHandle.fileIdentity,
+          expectedCommittedImageDigest: snapshotHandle.committedImageDigest,
+        })
         throw Object.assign(
           new Error(
             'Antigravity Fork candidate is still an unpopulated zero-Turn shell; the original source cut remains intact.',
@@ -5911,19 +7608,28 @@ export function inspectAgyFork(input: AgyForkInput): AgyForkOperationResult {
     }
     const inspectInputIds = input.nativeInputIds ?? input.source?.nativeInputIds
     derived = deriveVerifiedAgyPrefix(
-      db,
+      snapshotHandle.db,
       input.nativeSessionId,
       canonicalRoot,
-      snapshot.canonicalDbPath,
+      snapshotHandle.canonicalDbPath,
       witness.sourceCutId,
       {
+        proof: snapshotHandle.proof,
+        configuredRoot,
         requireNoPostCutRows: true,
         ...(inspectInputIds !== undefined ? { nativeInputIds: inspectInputIds } : {}),
       },
     )
-    assertSqliteIdentityUnchanged(snapshot, configuredRoot)
+    assertAnchoredSourceUnchanged({
+      rootDir: configuredRoot,
+      canonicalRoot,
+      parentSegments: ['conversations'],
+      leafName: `${input.nativeSessionId}.db`,
+      expectedIdentity: snapshotHandle.fileIdentity,
+      expectedCommittedImageDigest: snapshotHandle.committedImageDigest,
+    })
   } finally {
-    db.close()
+    snapshotHandle.close()
   }
 
   if (
@@ -5963,7 +7669,14 @@ export function inspectAgyFork(input: AgyForkInput): AgyForkOperationResult {
   if (summary.stepCount !== derived.cutStep + 1) {
     if (summary.stepCount === 0 && input.lastDispatchedPhase === 'fork' && input.source) {
       checkSourceStillValid()
-      assertSqliteIdentityUnchanged(snapshot, configuredRoot)
+      assertAnchoredSourceUnchanged({
+        rootDir: configuredRoot,
+        canonicalRoot,
+        parentSegments: ['conversations'],
+        leafName: `${input.nativeSessionId}.db`,
+        expectedIdentity: snapshotHandle.fileIdentity,
+        expectedCommittedImageDigest: snapshotHandle.committedImageDigest,
+      })
       throw Object.assign(
         new Error(
           'Antigravity Fork candidate summary step_count is still zero; continue Fork to finalize publication.',
@@ -5974,7 +7687,13 @@ export function inspectAgyFork(input: AgyForkInput): AgyForkOperationResult {
     throw new Error('Antigravity Fork candidate summary step_count is not synchronized.')
   }
 
-  const physical = computePhysicalDbDigest(candidateDbPath, canonicalRoot, configuredRoot)
+  const physical = computePhysicalDbDigest(
+    canonicalRoot,
+    input.nativeSessionId,
+    configuredRoot,
+    snapshotHandle.fileIdentity,
+    snapshotHandle.walIdentity,
+  )
   const initializedVerified =
     Boolean(witness.initializedAt) &&
     physical.rawHash === witness.initializedPrefixHash &&
@@ -5993,7 +7712,7 @@ export function inspectAgyFork(input: AgyForkInput): AgyForkOperationResult {
     rawBytes: physical.rawBytes,
     rawRecords: derived.prefixRecords,
     nativeStorageRoot: canonicalRoot,
-    nativePath: snapshot.canonicalDbPath,
+    nativePath: snapshotHandle.canonicalDbPath,
     cutStep: derived.cutStep,
     trajectoryId: derived.schema.trajectoryId,
     agyCut: buildAgyForkCutMetadata(derived.schema.trajectoryId, witness.sourceCutId, derived),
@@ -6002,8 +7721,10 @@ export function inspectAgyFork(input: AgyForkInput): AgyForkOperationResult {
 
 export async function executeAgyFork(
   input: AgyForkInput,
-  onBeforeAtomicPublish?: (candidate: AgyForkOperationResult) => Promise<void>,
+  onBeforeAtomicPublish?: (candidate: AgyForkOperationResult) => Promise<void> | void,
 ): Promise<AgyForkOperationResult> {
+  assertIdentityNotCancelledOrExpired(input.signal, input.deadlineAt)
+  const beforePublishHook = onBeforeAtomicPublish ?? input.beforePublish
   if (!input.source) {
     throw new Error('Antigravity Fork execution requires a prepared AgentNativeForkBoundary.')
   }
@@ -6041,28 +7762,44 @@ export async function executeAgyFork(
     throw new Error('Antigravity conversations directory must be an ordinary directory.')
   }
 
-  const sourceDbPath = join(conversationsDir, `${sourceSessionId}.db`)
-  const candidateDbPath = join(conversationsDir, `${candidateSessionId}.db`)
-
-  const sourceSnapshot = captureSqliteIdentity(sourceDbPath, canonicalRoot)
+  const sourceHandle = openCommittedSqliteSnapshot({
+    rootDir: configuredRoot,
+    canonicalRoot,
+    parentSegments: ['conversations'],
+    leafName: `${sourceSessionId}.db`,
+    ...(input.signal !== undefined ? { signal: input.signal } : {}),
+    ...(input.deadlineAt !== undefined ? { deadlineAt: input.deadlineAt } : {}),
+  })
+  const sourceIdentity = sourceHandle.fileIdentity
+  const sourceCommittedImageDigest = sourceHandle.committedImageDigest
   const effectiveInputIds = input.nativeInputIds ?? input.source.nativeInputIds
   let derived: DerivedAgyPrefix
-  const sourceDb = openReadOnlySqliteSnapshot(sourceSnapshot, configuredRoot)
   try {
     derived = deriveVerifiedAgyPrefix(
-      sourceDb,
+      sourceHandle.db,
       sourceSessionId,
       canonicalRoot,
-      sourceSnapshot.canonicalDbPath,
+      sourceHandle.canonicalDbPath,
       input.source.nativeTurnId,
       {
+        proof: sourceHandle.proof,
+        configuredRoot,
         ...(effectiveInputIds !== undefined ? { nativeInputIds: effectiveInputIds } : {}),
         ...(input.responseHash !== undefined ? { responseHash: input.responseHash } : {}),
       },
     )
-    assertSqliteIdentityUnchanged(sourceSnapshot, configuredRoot)
+    assertAnchoredSourceUnchanged({
+      rootDir: configuredRoot,
+      canonicalRoot,
+      parentSegments: ['conversations'],
+      leafName: `${sourceSessionId}.db`,
+      expectedIdentity: sourceIdentity,
+      expectedCommittedImageDigest: sourceCommittedImageDigest,
+      ...(input.signal !== undefined ? { signal: input.signal } : {}),
+      ...(input.deadlineAt !== undefined ? { deadlineAt: input.deadlineAt } : {}),
+    })
   } finally {
-    sourceDb.close()
+    sourceHandle.close()
   }
 
   if (
@@ -6076,13 +7813,23 @@ export async function executeAgyFork(
     throw new Error('Prepared Antigravity native prefix changed before Fork.')
   }
 
-  const shellSnapshot = captureSqliteIdentity(candidateDbPath, canonicalRoot, AGY_MAX_HISTORY_BYTES)
+  const shellHandle = openCandidateShellSnapshotOrThrowUncertain({
+    rootDir: configuredRoot,
+    canonicalRoot,
+    candidateSessionId,
+    maxSnapshotBytes: AGY_MAX_HISTORY_BYTES,
+    ...(input.signal !== undefined ? { signal: input.signal } : {}),
+    ...(input.deadlineAt !== undefined ? { deadlineAt: input.deadlineAt } : {}),
+  })
+  const shellIdentity = shellHandle.fileIdentity
+  const shellWalIdentity = shellHandle.walIdentity
+  const shellCommittedImageDigest = shellHandle.committedImageDigest
+  const shellCanonicalDbPath = shellHandle.canonicalDbPath
   let shellSchema: ValidatedTrajectorySchema
   let candidateAlreadyPopulated = false
-  const shellDb = openReadOnlySqliteSnapshot(shellSnapshot, configuredRoot)
   try {
-    shellSchema = validateTrajectoryDatabase(shellDb, candidateSessionId)
-    const counts = shellDb
+    shellSchema = validateTrajectoryDatabase(shellHandle.db, candidateSessionId, shellHandle.proof)
+    const counts = shellHandle.db
       .prepare<[], { stepCount: number; genCount: number; execCount: number }>(
         `SELECT
           (SELECT COUNT(*) FROM "steps") AS stepCount,
@@ -6096,12 +7843,14 @@ export async function executeAgyFork(
       counts.execCount === derived.execPrefixRows.length
     ) {
       const existingDerived = deriveVerifiedAgyPrefix(
-        shellDb,
+        shellHandle.db,
         candidateSessionId,
         canonicalRoot,
-        shellSnapshot.canonicalDbPath,
+        shellCanonicalDbPath,
         input.source.nativeCutId,
         {
+          proof: shellHandle.proof,
+          configuredRoot,
           requireNoPostCutRows: true,
           ...(effectiveInputIds !== undefined ? { nativeInputIds: effectiveInputIds } : {}),
         },
@@ -6118,18 +7867,27 @@ export async function executeAgyFork(
       throw new Error('Antigravity Fork candidate database is not a clean zero-Turn shell.')
     }
   } finally {
-    shellDb.close()
+    shellHandle.close()
   }
 
   if (candidateAlreadyPopulated) {
-    ensureSummaryStepCountCas(
+    assertAnchoredSourceUnchanged({
+      rootDir: configuredRoot,
+      canonicalRoot,
+      parentSegments: ['conversations'],
+      leafName: `${candidateSessionId}.db`,
+      expectedIdentity: shellIdentity,
+      expectedCommittedImageDigest: shellCommittedImageDigest,
+      ...(input.signal !== undefined ? { signal: input.signal } : {}),
+      ...(input.deadlineAt !== undefined ? { deadlineAt: input.deadlineAt } : {}),
+    })
+    const physical = computePhysicalDbDigest(
       canonicalRoot,
       candidateSessionId,
-      derived.cutStep + 1,
-      derived.lastUserStepIdx,
-      shellSchema.trajectoryId,
+      configuredRoot,
+      shellIdentity,
+      shellWalIdentity,
     )
-    const physical = computePhysicalDbDigest(candidateDbPath, canonicalRoot, configuredRoot)
     const completedResult: AgyForkOperationResult = {
       nativeSessionId: candidateSessionId,
       nativeCutId: input.source.nativeCutId,
@@ -6141,13 +7899,32 @@ export async function executeAgyFork(
       rawBytes: physical.rawBytes,
       rawRecords: derived.prefixRecords,
       nativeStorageRoot: canonicalRoot,
-      nativePath: shellSnapshot.canonicalDbPath,
+      nativePath: shellCanonicalDbPath,
       cutStep: derived.cutStep,
       trajectoryId: shellSchema.trajectoryId,
       sourceTrajectoryId: derived.schema.trajectoryId,
       agyCut: buildAgyForkCutMetadata(shellSchema.trajectoryId, input.source.nativeCutId, derived),
     }
-    if (onBeforeAtomicPublish) await onBeforeAtomicPublish(completedResult)
+    // Always await witness commit acknowledgement BEFORE mutating conversation_summaries.db!
+    if (beforePublishHook) await beforePublishHook(completedResult)
+    assertIdentityNotCancelledOrExpired(input.signal, input.deadlineAt)
+    assertAnchoredSourceUnchanged({
+      rootDir: configuredRoot,
+      canonicalRoot,
+      parentSegments: ['conversations'],
+      leafName: `${candidateSessionId}.db`,
+      expectedIdentity: shellIdentity,
+      expectedCommittedImageDigest: shellCommittedImageDigest,
+      ...(input.signal !== undefined ? { signal: input.signal } : {}),
+      ...(input.deadlineAt !== undefined ? { deadlineAt: input.deadlineAt } : {}),
+    })
+    ensureSummaryStepCountCas(
+      canonicalRoot,
+      candidateSessionId,
+      derived.cutStep + 1,
+      derived.lastUserStepIdx,
+      shellSchema.trajectoryId,
+    )
     return completedResult
   }
 
@@ -6181,6 +7958,7 @@ export async function executeAgyFork(
     sourceCascadeId: sourceSessionId,
     targetCascadeId: candidateSessionId,
     canonicalAppDataDir: canonicalRoot,
+    configuredAppDataDir: configuredRoot,
   }
 
   const mediaCopies: Array<{ plan: AgyMediaCopyPlan; bytes: Buffer; sha256: string }> = []
@@ -6238,86 +8016,105 @@ export async function executeAgyFork(
     }
   })
 
-  const nonce = randomBytes(12).toString('hex')
-  const stagingPath = join(conversationsDir, `${candidateSessionId}.db.staging-${nonce}`)
-  const stagingFd = openSync(
-    stagingPath,
-    constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | (constants.O_NOFOLLOW ?? 0),
-    0o600,
+  // Verifies same-volume staging (conversations vs brain/<candidateSessionId>) BEFORE any media writes or beforePublishHook!
+  const sameVolumeStage = createSameVolumeCandidateStagingDb(
+    canonicalRoot,
+    candidateSessionId,
+    input.stagingLeafName,
   )
-  closeSync(stagingFd)
+  const stagingPath = sameVolumeStage.stagingPath
+  let expectedStagedIdentity: AgySqliteFileIdentity
+  let stagedPhysical: { rawHash: string; rawBytes: number }
 
   try {
-    const reopenShellDb = openReadOnlySqliteSnapshot(shellSnapshot, configuredRoot)
-    const stagingDb = new Database(stagingPath, { fileMustExist: true })
+    let expectedDbBytes: bigint
+    const reopenShellHandle = openCommittedSqliteSnapshot({
+      rootDir: configuredRoot,
+      canonicalRoot,
+      parentSegments: ['conversations'],
+      leafName: `${candidateSessionId}.db`,
+      maxSnapshotBytes: AGY_MAX_HISTORY_BYTES,
+      ...(input.signal !== undefined ? { signal: input.signal } : {}),
+      ...(input.deadlineAt !== undefined ? { deadlineAt: input.deadlineAt } : {}),
+    })
     try {
-      initializeStagingFromShell(stagingDb, reopenShellDb, shellSchema)
-
-      if (
-        shellSchema.tables.has('trajectory_metadata_blob') &&
-        shellSchema.trajectoryMetadataRows.length === 0 &&
-        derived.schema.trajectoryMetadataRows.length === 1
-      ) {
-        const srcBlobRow = derived.schema.trajectoryMetadataRows[0]!
-        const srcBlob = srcBlobRow['data']
-        if (Buffer.isBuffer(srcBlob)) {
-          const remappedBlob = remapCortexTrajectoryMetadata(srcBlob, remap)
-          const blobCols = readTableColumns(stagingDb, 'trajectory_metadata_blob')
-          const nextBlobRow: Record<string, unknown> = { ...srcBlobRow, data: remappedBlob }
-          stagingDb
-            .prepare(
-              `INSERT INTO "trajectory_metadata_blob" (${blobCols.map(quoteSqlIdentifier).join(', ')}) VALUES (${blobCols.map(() => '?').join(', ')})`,
-            )
-            .run(...blobCols.map((col) => nextBlobRow[col] ?? null))
-        }
-      }
-
-      stagingDb.exec('BEGIN IMMEDIATE')
+      sameVolumeStage.assertStagingBound({ expectedSize: 0n })
+      const stagingDb = new Database(stagingPath, { fileMustExist: true })
       try {
-        const stepCols = shellSchema.stepColumns
-        const insertStep = stagingDb.prepare(
-          `INSERT INTO "steps" (${stepCols.map(quoteSqlIdentifier).join(', ')}) VALUES (${stepCols.map(() => '?').join(', ')})`,
-        )
-        for (const row of remappedSteps) {
-          insertStep.run(...stepCols.map((col) => row[col] ?? null))
-        }
+        sameVolumeStage.assertStagingBound({ expectedSize: 0n })
+        initializeStagingFromShell(stagingDb, reopenShellHandle.db, shellSchema)
 
-        if (remappedGens.length > 0) {
-          const genCols = shellSchema.genColumns
-          const insertGen = stagingDb.prepare(
-            `INSERT INTO "gen_metadata" (${genCols.map(quoteSqlIdentifier).join(', ')}) VALUES (${genCols.map(() => '?').join(', ')})`,
-          )
-          for (const row of remappedGens) {
-            insertGen.run(...genCols.map((col) => row[col] ?? null))
+        if (
+          shellSchema.tables.has('trajectory_metadata_blob') &&
+          shellSchema.trajectoryMetadataRows.length === 0 &&
+          derived.schema.trajectoryMetadataRows.length === 1
+        ) {
+          const srcBlobRow = derived.schema.trajectoryMetadataRows[0]!
+          const srcBlob = srcBlobRow['data']
+          if (Buffer.isBuffer(srcBlob)) {
+            const remappedBlob = remapCortexTrajectoryMetadata(srcBlob, remap)
+            const blobCols = readTableColumns(stagingDb, 'trajectory_metadata_blob')
+            const nextBlobRow: Record<string, unknown> = { ...srcBlobRow, data: remappedBlob }
+            stagingDb
+              .prepare(
+                `INSERT INTO "trajectory_metadata_blob" (${blobCols.map(quoteSqlIdentifier).join(', ')}) VALUES (${blobCols.map(() => '?').join(', ')})`,
+              )
+              .run(...blobCols.map((col) => nextBlobRow[col] ?? null))
           }
         }
 
-        const execCols = shellSchema.execColumns
-        const insertExec = stagingDb.prepare(
-          `INSERT INTO "executor_metadata" (${execCols.map(quoteSqlIdentifier).join(', ')}) VALUES (${execCols.map(() => '?').join(', ')})`,
-        )
-        for (const row of derived.execPrefixRows) {
-          insertExec.run(...execCols.map((col) => row[col] ?? null))
+        stagingDb.exec('BEGIN IMMEDIATE')
+        try {
+          const stepCols = shellSchema.stepColumns
+          const insertStep = stagingDb.prepare(
+            `INSERT INTO "steps" (${stepCols.map(quoteSqlIdentifier).join(', ')}) VALUES (${stepCols.map(() => '?').join(', ')})`,
+          )
+          for (const row of remappedSteps) {
+            insertStep.run(...stepCols.map((col) => row[col] ?? null))
+          }
+
+          if (remappedGens.length > 0) {
+            const genCols = shellSchema.genColumns
+            const insertGen = stagingDb.prepare(
+              `INSERT INTO "gen_metadata" (${genCols.map(quoteSqlIdentifier).join(', ')}) VALUES (${genCols.map(() => '?').join(', ')})`,
+            )
+            for (const row of remappedGens) {
+              insertGen.run(...genCols.map((col) => row[col] ?? null))
+            }
+          }
+
+          const execCols = shellSchema.execColumns
+          const insertExec = stagingDb.prepare(
+            `INSERT INTO "executor_metadata" (${execCols.map(quoteSqlIdentifier).join(', ')}) VALUES (${execCols.map(() => '?').join(', ')})`,
+          )
+          for (const row of derived.execPrefixRows) {
+            insertExec.run(...execCols.map((col) => row[col] ?? null))
+          }
+
+          stagingDb.exec('COMMIT')
+        } catch (error) {
+          if (stagingDb.inTransaction) stagingDb.exec('ROLLBACK')
+          throw error
         }
 
-        stagingDb.exec('COMMIT')
-      } catch (error) {
-        if (stagingDb.inTransaction) stagingDb.exec('ROLLBACK')
-        throw error
+        verifySqliteIntegrityOk(stagingDb)
+        expectedDbBytes = measureOpenSqliteExpectedBytes(stagingDb)
+        sameVolumeStage.assertStagingBound({ expectedSize: expectedDbBytes })
+      } finally {
+        stagingDb.close()
       }
-
-      verifySqliteIntegrityOk(stagingDb)
     } finally {
-      stagingDb.close()
-      reopenShellDb.close()
+      reopenShellHandle.close()
     }
 
-    const syncFd = openSync(stagingPath, constants.O_RDWR | (constants.O_NOFOLLOW ?? 0))
-    try {
-      fsyncSync(syncFd)
-    } finally {
-      closeSync(syncFd)
+    if (expectedDbBytes > BigInt(AGY_MAX_HISTORY_BYTES)) {
+      throw new AgentExecutionError(
+        'response_too_large',
+        'Antigravity Fork staged SQLite database exceeds the 32 MiB history budget.',
+        false,
+      )
     }
+    sameVolumeStage.fsyncVerifiedStaging(expectedDbBytes)
 
     const candidateCutMeta = buildAgyForkCutMetadata(
       shellSchema.trajectoryId,
@@ -6335,7 +8132,7 @@ export async function executeAgyFork(
       rawBytes: 0,
       rawRecords: derived.prefixRecords,
       nativeStorageRoot: canonicalRoot,
-      nativePath: shellSnapshot.canonicalDbPath,
+      nativePath: shellCanonicalDbPath,
       cutStep: derived.cutStep,
       trajectoryId: shellSchema.trajectoryId,
       sourceTrajectoryId: derived.schema.trajectoryId,
@@ -6370,16 +8167,30 @@ export async function executeAgyFork(
       fsyncDirectoryBestEffort(uploadedDir)
     }
 
-    // Verify staged candidate DB produces the exact frozen normalized prefixHash before publishing!
-    const stagedReadOnlyDb = new Database(stagingPath, { readonly: true, fileMustExist: true })
+    // Verify staged candidate DB produces the exact frozen normalized prefixHash AND pin its fileIdentity before publishing!
+    const stagedSnapshot = openCommittedSqliteSnapshot({
+      rootDir: canonicalRoot,
+      canonicalRoot,
+      parentSegments: ['brain', candidateSessionId],
+      leafName: sameVolumeStage.stagingLeafName,
+      maxSnapshotBytes: AGY_MAX_HISTORY_BYTES,
+      ...(input.signal !== undefined ? { signal: input.signal } : {}),
+      ...(input.deadlineAt !== undefined ? { deadlineAt: input.deadlineAt } : {}),
+    })
     try {
+      sameVolumeStage.assertAnchoredIdentityMatchesCreated(
+        stagedSnapshot.fileIdentity,
+        expectedDbBytes,
+      )
       const stagedDerived = deriveVerifiedAgyPrefix(
-        stagedReadOnlyDb,
+        stagedSnapshot.db,
         candidateSessionId,
         canonicalRoot,
-        stagingPath,
+        stagedSnapshot.canonicalDbPath,
         input.source.nativeCutId,
         {
+          proof: stagedSnapshot.proof,
+          configuredRoot,
           requireNoPostCutRows: true,
           ...(effectiveInputIds !== undefined ? { nativeInputIds: effectiveInputIds } : {}),
         },
@@ -6389,23 +8200,108 @@ export async function executeAgyFork(
           'Antigravity Fork staged candidate prefixHash disagrees with frozen source prefixHash.',
         )
       }
+      expectedStagedIdentity = stagedSnapshot.fileIdentity
     } finally {
-      stagedReadOnlyDb.close()
+      stagedSnapshot.close()
     }
 
-    if (onBeforeAtomicPublish) {
-      await onBeforeAtomicPublish(prePublishCandidate)
+    // Compute pinned staged physical digest before rename so post-publish physical digest is strictly bound.
+    const stagedView = openAnchoredLockedSqliteView(
+      canonicalRoot,
+      ['brain', candidateSessionId],
+      sameVolumeStage.stagingLeafName,
+      { acquireSharedLock: true, openWal: true, openShm: true, checkJournal: true },
+    )
+    try {
+      if (
+        stagedView.hasWal ||
+        stagedView.hasShm ||
+        stagedView.hasJournal ||
+        !identitiesExactMatch(stagedView.fileIdentity, expectedStagedIdentity)
+      ) {
+        throw new Error('Antigravity Fork staged database changed before publication.')
+      }
+      const stagedHasher = createHash('sha256')
+      stagedHasher.update('pact-agy-sqlite-physical-v1\0')
+      stagedHasher.update('main\0')
+      let offset = 0
+      while (offset < stagedView.byteLength) {
+        const chunk = stagedView.readAt(offset, Math.min(64 * 1024, stagedView.byteLength - offset))
+        offset += chunk.byteLength
+        stagedHasher.update(chunk)
+      }
+      const verify = stagedView.verifyUnchanged()
+      if (!verify.unchanged) {
+        throw new Error('Antigravity Fork staged database changed during digest verification.')
+      }
+      stagedPhysical = { rawHash: stagedHasher.digest('hex'), rawBytes: stagedView.byteLength }
+    } finally {
+      stagedView.close()
     }
 
-    assertSqliteIdentityUnchanged(sourceSnapshot, configuredRoot)
-    assertSqliteIdentityUnchanged(shellSnapshot, configuredRoot)
-    clearEmptyShellWalBeforePublish(candidateDbPath, canonicalRoot)
-    renameSync(stagingPath, candidateDbPath)
+    if (beforePublishHook) {
+      await beforePublishHook(prePublishCandidate)
+    }
+
+    assertIdentityNotCancelledOrExpired(input.signal, input.deadlineAt)
+    assertAnchoredSourceUnchanged({
+      rootDir: configuredRoot,
+      canonicalRoot,
+      parentSegments: ['conversations'],
+      leafName: `${sourceSessionId}.db`,
+      expectedIdentity: sourceIdentity,
+      expectedCommittedImageDigest: sourceCommittedImageDigest,
+      ...(input.signal !== undefined ? { signal: input.signal } : {}),
+      ...(input.deadlineAt !== undefined ? { deadlineAt: input.deadlineAt } : {}),
+    })
+    publishStagedCandidateOrThrow({
+      canonicalRoot,
+      candidateSessionId,
+      stagedLeafName: sameVolumeStage.stagingLeafName,
+      expectedTargetIdentity: shellIdentity,
+      expectedStagedIdentity,
+    })
     fsyncDirectoryBestEffort(conversationsDir)
   } finally {
-    removeStagingArtifactsBestEffort(stagingPath)
+    sameVolumeStage.cleanup()
   }
 
+  assertIdentityNotCancelledOrExpired(input.signal, input.deadlineAt)
+  // Verify the published file is the exact renamed staged inode (dev/ino/size/mtimeNs; rename may update ctimeNs)
+  // and bind computePhysicalDbDigest strictly to that published identity + exact staged rawHash/rawBytes
+  // BEFORE advancing the summary CAS!
+  const publishedIdentity = readAnchoredFileIdentity(
+    canonicalRoot,
+    ['conversations'],
+    `${candidateSessionId}.db`,
+  )
+  if (
+    publishedIdentity.dev !== expectedStagedIdentity.dev ||
+    publishedIdentity.ino !== expectedStagedIdentity.ino ||
+    publishedIdentity.size !== expectedStagedIdentity.size ||
+    publishedIdentity.mtimeNs !== expectedStagedIdentity.mtimeNs
+  ) {
+    throw Object.assign(
+      new Error('Antigravity Fork published candidate database changed after atomic rename.'),
+      { code: 'UNCERTAIN' },
+    )
+  }
+  const physical = computePhysicalDbDigest(
+    canonicalRoot,
+    candidateSessionId,
+    configuredRoot,
+    publishedIdentity,
+    null,
+  )
+  if (
+    physical.rawHash !== stagedPhysical.rawHash ||
+    physical.rawBytes !== stagedPhysical.rawBytes
+  ) {
+    throw Object.assign(
+      new Error('Antigravity Fork published candidate digest disagrees with verified staging.'),
+      { code: 'UNCERTAIN' },
+    )
+  }
   ensureSummaryStepCountCas(
     canonicalRoot,
     candidateSessionId,
@@ -6413,8 +8309,6 @@ export async function executeAgyFork(
     derived.lastUserStepIdx,
     shellSchema.trajectoryId,
   )
-
-  const physical = computePhysicalDbDigest(candidateDbPath, canonicalRoot, configuredRoot)
   return {
     nativeSessionId: candidateSessionId,
     nativeCutId: input.source.nativeCutId,
@@ -6426,10 +8320,1384 @@ export async function executeAgyFork(
     rawBytes: physical.rawBytes,
     rawRecords: derived.prefixRecords,
     nativeStorageRoot: canonicalRoot,
-    nativePath: shellSnapshot.canonicalDbPath,
+    nativePath: shellCanonicalDbPath,
     cutStep: derived.cutStep,
     trajectoryId: shellSchema.trajectoryId,
     sourceTrajectoryId: derived.schema.trajectoryId,
     agyCut: buildAgyForkCutMetadata(shellSchema.trajectoryId, input.source.nativeCutId, derived),
   }
+}
+
+function isTransientAgySnapshotChurn(error: unknown): boolean {
+  if (error instanceof AgyHotRollbackJournalError) return true
+  if (error instanceof AgyTransientIdentityChurnError) return true
+  if (isTransientFileLockError(error)) return true
+  if (!(error instanceof Error)) return false
+  return (
+    error.message.includes('changed while') ||
+    error.message.includes('changed after') ||
+    error.message.includes('changed during') ||
+    error.message.includes('did not match expected size')
+  )
+}
+
+export type AgyTrajectoryIdentityResult =
+  | {
+      readonly status: 'ok'
+      readonly trajectoryId: string
+      readonly stepCount: number
+    }
+  | {
+      readonly status:
+        | 'no_storage_root'
+        | 'missing'
+        | 'transient_churn'
+        | 'invalid'
+        | 'budget_exceeded'
+      readonly reason?: string
+    }
+
+const MAX_IDENTITY_REASON_BYTES = 512
+const FALLBACK_STEP_SCAN_CHECK_INTERVAL = 256
+
+function boundIdentityReason(reason: string): string {
+  const trimmed = reason.trim()
+  if (!trimmed) return 'Antigravity trajectory identity read exceeded its budget.'
+  const encoded = Buffer.from(trimmed, 'utf8')
+  if (encoded.byteLength <= MAX_IDENTITY_REASON_BYTES) return trimmed
+  let end = trimmed.length
+  while (end > 0 && Buffer.byteLength(trimmed.slice(0, end), 'utf8') > MAX_IDENTITY_REASON_BYTES) {
+    end -= 1
+  }
+  return trimmed.slice(0, end)
+}
+
+function unquoteSqlIdent(token: string): string {
+  const trimmed = token.trim()
+  if (trimmed.length >= 2) {
+    if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
+      return trimmed.slice(1, -1).replaceAll('""', '"')
+    }
+    if (trimmed.startsWith('`') && trimmed.endsWith('`')) {
+      return trimmed.slice(1, -1).replaceAll('``', '`')
+    }
+    if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
+      return trimmed.slice(1, -1)
+    }
+  }
+  return trimmed
+}
+
+const QUOTED_SQL_IDENT_SOURCE = '(?:"(?:[^"]|"")+"|`(?:[^`]|``)+`|\\[[^\\]]+\\])'
+const UNQUOTED_SQL_IDENT_SOURCE = '[a-z_][a-z0-9_$]*(?=$|[\\s,()])'
+const SQL_IDENT_PATTERN_SOURCE = `(?:${QUOTED_SQL_IDENT_SOURCE}|${UNQUOTED_SQL_IDENT_SOURCE})`
+const QUOTED_LEADING_SQL_IDENT_RE = new RegExp(`^${QUOTED_SQL_IDENT_SOURCE}`, 'u')
+const UNQUOTED_LEADING_SQL_IDENT_RE = /^[a-z_][a-z0-9_$]*/iu
+const TABLE_PK_CONSTRAINT_RE = new RegExp(
+  `^(?:CONSTRAINT\\s+${SQL_IDENT_PATTERN_SOURCE}\\s+)?PRIMARY\\s+KEY\\s*\\(([^)]+)\\)(?:\\s+ON\\s+CONFLICT\\s+(?:ROLLBACK|ABORT|FAIL|IGNORE|REPLACE))?$`,
+  'iu',
+)
+const SINGLE_PK_COLUMN_RE = new RegExp(`^(${SQL_IDENT_PATTERN_SOURCE})(?:\\s+ASC)?$`, 'iu')
+const COLUMN_CONSTRAINT_STARTERS = new Set([
+  'CONSTRAINT',
+  'PRIMARY',
+  'NOT',
+  'UNIQUE',
+  'CHECK',
+  'DEFAULT',
+  'COLLATE',
+  'REFERENCES',
+  'GENERATED',
+  'AS',
+])
+const TABLE_CONSTRAINT_STARTERS = new Set(['CONSTRAINT', 'PRIMARY', 'UNIQUE', 'CHECK', 'FOREIGN'])
+
+interface LexedSqlToken {
+  readonly raw: string
+  readonly quoted: boolean
+  readonly value: string
+  readonly nextOffset: number
+}
+
+function lexLeadingSqlToken(text: string): LexedSqlToken | undefined {
+  if (text.length === 0) return undefined
+  const first = text[0]!
+  if (first === '"' || first === '`' || first === '[') {
+    const match = QUOTED_LEADING_SQL_IDENT_RE.exec(text)
+    if (!match) return undefined
+    const raw = match[0]
+    const nextChar = text[raw.length]
+    if (nextChar !== undefined && !/[\s,()]/u.test(nextChar)) {
+      return undefined
+    }
+    return {
+      raw,
+      quoted: true,
+      value: unquoteSqlIdent(raw),
+      nextOffset: raw.length,
+    }
+  }
+  const match = UNQUOTED_LEADING_SQL_IDENT_RE.exec(text)
+  if (!match) return undefined
+  const raw = match[0]
+  const nextChar = text[raw.length]
+  if (nextChar !== undefined && !/[\s,()]/u.test(nextChar)) {
+    return undefined
+  }
+  return {
+    raw,
+    quoted: false,
+    value: raw,
+    nextOffset: raw.length,
+  }
+}
+
+function splitCreateTableBodyParts(
+  strippedSql: string,
+): { readonly parts: string[]; readonly trailing: string } | undefined {
+  const openParen = strippedSql.indexOf('(')
+  if (openParen < 0) return undefined
+  let depth = 0
+  let closeParen = -1
+  let k = openParen
+  const parts: string[] = []
+  let partStart = openParen + 1
+  while (k < strippedSql.length) {
+    const ch = strippedSql[k]!
+    if (ch === "'" || ch === '"' || ch === '`') {
+      const quote = ch
+      k += 1
+      while (k < strippedSql.length) {
+        if (strippedSql[k] === quote) {
+          if (strippedSql[k + 1] === quote) k += 2
+          else {
+            k += 1
+            break
+          }
+        } else {
+          k += 1
+        }
+      }
+      continue
+    }
+    if (ch === '[') {
+      k += 1
+      while (k < strippedSql.length && strippedSql[k] !== ']') k += 1
+      k += 1
+      continue
+    }
+    if (ch === '(') {
+      depth += 1
+    } else if (ch === ')') {
+      depth -= 1
+      if (depth === 0) {
+        parts.push(strippedSql.slice(partStart, k))
+        closeParen = k
+        break
+      }
+    } else if (ch === ',' && depth === 1) {
+      parts.push(strippedSql.slice(partStart, k))
+      partStart = k + 1
+    }
+    k += 1
+  }
+  if (closeParen < 0) return undefined
+  return { parts, trailing: strippedSql.slice(closeParen + 1).trim() }
+}
+
+function extractVirtualColumnDirectSourceAlias(
+  tableSql: string,
+  targetColumnName: string,
+): string | undefined {
+  const { cleaned } = stripSqlCommentsAndMaskQuotes(tableSql)
+  const split = splitCreateTableBodyParts(cleaned)
+  if (!split) return undefined
+  for (const rawPart of split.parts) {
+    const item = rawPart.trim()
+    if (!item) continue
+    const colTok = lexLeadingSqlToken(item)
+    if (!colTok) continue
+    if (!colTok.quoted && TABLE_CONSTRAINT_STARTERS.has(colTok.value.toUpperCase())) {
+      continue
+    }
+    if (colTok.value.toLowerCase() !== targetColumnName.toLowerCase()) {
+      continue
+    }
+    const rest = item.slice(colTok.nextOffset)
+    let depth = 0
+    let i = 0
+    while (i < rest.length) {
+      const ch = rest[i]!
+      if (ch === "'" || ch === '"' || ch === '`') {
+        const quote = ch
+        i += 1
+        while (i < rest.length) {
+          if (rest[i] === quote) {
+            if (rest[i + 1] === quote) i += 2
+            else {
+              i += 1
+              break
+            }
+          } else {
+            i += 1
+          }
+        }
+        continue
+      }
+      if (ch === '[') {
+        i += 1
+        while (i < rest.length && rest[i] !== ']') i += 1
+        i += 1
+        continue
+      }
+      if (ch === '(') {
+        depth += 1
+        i += 1
+        continue
+      }
+      if (ch === ')') {
+        depth = Math.max(0, depth - 1)
+        i += 1
+        continue
+      }
+      if (depth === 0 && /[a-z_]/iu.test(ch)) {
+        const start = i
+        while (i < rest.length && /[a-z0-9_$]/iu.test(rest[i]!)) i += 1
+        if (rest.slice(start, i).toUpperCase() === 'AS') {
+          let j = i
+          while (j < rest.length && /\s/u.test(rest[j]!)) j += 1
+          if (rest[j] !== '(') continue
+          let exprDepth = 0
+          let exprEnd = -1
+          for (let m = j; m < rest.length; m += 1) {
+            const ech = rest[m]!
+            if (ech === "'" || ech === '"' || ech === '`') {
+              const eq = ech
+              m += 1
+              while (m < rest.length) {
+                if (rest[m] === eq) {
+                  if (rest[m + 1] === eq) m += 2
+                  else break
+                } else {
+                  m += 1
+                }
+              }
+              continue
+            }
+            if (ech === '[') {
+              m += 1
+              while (m < rest.length && rest[m] !== ']') m += 1
+              continue
+            }
+            if (ech === '(') exprDepth += 1
+            else if (ech === ')') {
+              exprDepth -= 1
+              if (exprDepth === 0) {
+                exprEnd = m
+                break
+              }
+            }
+          }
+          if (exprEnd < 0) return undefined
+          let inner = rest.slice(j + 1, exprEnd).trim()
+          while (inner.startsWith('(') && inner.endsWith(')')) {
+            // Strip redundant outer parens only if they wrap the entire expression.
+            let pDepth = 0
+            let wrapsAll = true
+            for (let p = 0; p < inner.length; p += 1) {
+              const pch = inner[p]!
+              if (pch === '(') pDepth += 1
+              else if (pch === ')') {
+                pDepth -= 1
+                if (pDepth === 0 && p < inner.length - 1) {
+                  wrapsAll = false
+                  break
+                }
+              }
+            }
+            if (!wrapsAll) break
+            inner = inner.slice(1, -1).trim()
+          }
+          const aliasTok = lexLeadingSqlToken(inner)
+          if (!aliasTok || inner.slice(aliasTok.nextOffset).trim().length > 0) {
+            return undefined
+          }
+          return aliasTok.value
+        }
+        continue
+      }
+      i += 1
+    }
+    return undefined
+  }
+  return undefined
+}
+
+function stripSqlCommentsAndMaskQuotes(sql: string): { cleaned: string; unquoted: string } {
+  let cleaned = ''
+  let unquoted = ''
+  let i = 0
+  while (i < sql.length) {
+    const ch = sql[i]!
+    const next = sql[i + 1]
+    if (ch === '-' && next === '-') {
+      i += 2
+      while (i < sql.length && sql[i] !== '\n') i += 1
+      cleaned += ' '
+      unquoted += ' '
+      continue
+    }
+    if (ch === '/' && next === '*') {
+      i += 2
+      while (i + 1 < sql.length && !(sql[i] === '*' && sql[i + 1] === '/')) i += 1
+      i += 2
+      cleaned += ' '
+      unquoted += ' '
+      continue
+    }
+    if (ch === "'" || ch === '"' || ch === '`') {
+      const quote = ch
+      cleaned += ch
+      unquoted += ' '
+      i += 1
+      while (i < sql.length) {
+        const qch = sql[i]!
+        cleaned += qch
+        i += 1
+        if (qch === quote) {
+          if (sql[i] === quote) {
+            cleaned += sql[i]!
+            i += 1
+          } else {
+            break
+          }
+        }
+      }
+      unquoted += ' '
+      continue
+    }
+    if (ch === '[') {
+      cleaned += ch
+      unquoted += ' '
+      i += 1
+      while (i < sql.length) {
+        const bch = sql[i]!
+        cleaned += bch
+        i += 1
+        if (bch === ']') break
+      }
+      unquoted += ' '
+      continue
+    }
+    cleaned += ch
+    unquoted += ch
+    i += 1
+  }
+  return { cleaned, unquoted }
+}
+
+function splitColumnTypeAndConstraints(rest: string): {
+  typeText: string
+  constraintsText: string
+} {
+  let depth = 0
+  let i = 0
+  while (i < rest.length) {
+    const ch = rest[i]!
+    if (ch === "'" || ch === '"' || ch === '`') {
+      const quote = ch
+      i += 1
+      while (i < rest.length) {
+        if (rest[i] === quote) {
+          if (rest[i + 1] === quote) i += 2
+          else {
+            i += 1
+            break
+          }
+        } else {
+          i += 1
+        }
+      }
+      continue
+    }
+    if (ch === '[') {
+      i += 1
+      while (i < rest.length && rest[i] !== ']') i += 1
+      i += 1
+      continue
+    }
+    if (ch === '(') {
+      depth += 1
+      i += 1
+      continue
+    }
+    if (ch === ')') {
+      depth = Math.max(0, depth - 1)
+      i += 1
+      continue
+    }
+    if (depth === 0 && /[a-z_]/iu.test(ch)) {
+      const start = i
+      while (i < rest.length && /[a-z0-9_$]/iu.test(rest[i]!)) i += 1
+      const word = rest.slice(start, i).toUpperCase()
+      if (COLUMN_CONSTRAINT_STARTERS.has(word)) {
+        return {
+          typeText: rest.slice(0, start).trim(),
+          constraintsText: rest.slice(start).trim(),
+        }
+      }
+      continue
+    }
+    i += 1
+  }
+  return { typeText: rest.trim(), constraintsText: '' }
+}
+
+function hasOnlyWhitelistedIntegerConstraints(
+  constraintsText: string,
+  allowPrimaryKey: boolean,
+): boolean {
+  let remaining = constraintsText.trim()
+  while (remaining.length > 0) {
+    const pkMatch = allowPrimaryKey
+      ? /^PRIMARY\s+KEY(?:\s+ASC)?(?:\s+ON\s+CONFLICT\s+(?:ROLLBACK|ABORT|FAIL|IGNORE|REPLACE))?(?:\s+AUTOINCREMENT)?(?=\s|$)/iu.exec(
+          remaining,
+        )
+      : null
+    if (pkMatch) {
+      remaining = remaining.slice(pkMatch[0].length).trim()
+      continue
+    }
+    const notNullMatch =
+      /^NOT\s+NULL(?:\s+ON\s+CONFLICT\s+(?:ROLLBACK|ABORT|FAIL|IGNORE|REPLACE))?(?=\s|$)/iu.exec(
+        remaining,
+      )
+    if (notNullMatch) {
+      remaining = remaining.slice(notNullMatch[0].length).trim()
+      continue
+    }
+    const uniqueMatch =
+      /^UNIQUE(?:\s+ON\s+CONFLICT\s+(?:ROLLBACK|ABORT|FAIL|IGNORE|REPLACE))?(?=\s|$)/iu.exec(
+        remaining,
+      )
+    if (uniqueMatch) {
+      remaining = remaining.slice(uniqueMatch[0].length).trim()
+      continue
+    }
+    return false
+  }
+  return true
+}
+
+function hasNonAsciiCodeUnit(value: string): boolean {
+  for (let i = 0; i < value.length; i += 1) {
+    if (value.charCodeAt(i) > 0x7f) return true
+  }
+  return false
+}
+
+function hasNonPrintableAscii(value: string): boolean {
+  for (let i = 0; i < value.length; i += 1) {
+    const code = value.charCodeAt(i)
+    if (code < 0x20 || code > 0x7e) return true
+  }
+  return false
+}
+
+function parseCreateTableDdl(
+  sql: string,
+): { columns: string[]; rowidAliasCol: string | undefined } | undefined {
+  const { cleaned: stripped, unquoted } = stripSqlCommentsAndMaskQuotes(sql)
+  if (
+    hasNonAsciiCodeUnit(unquoted) ||
+    /\bVIRTUAL\s+TABLE\b/iu.test(unquoted) ||
+    /\bCREATE\s+(?:TEMP(?:ORARY)?\s+)?TABLE\b[\s\S]*\bAS\s+SELECT\b/iu.test(unquoted) ||
+    /\b(?:WITHOUT\s+ROWID|VIRTUAL|GENERATED|STORED)\b/iu.test(unquoted) ||
+    /\bAS\s*\(/iu.test(unquoted)
+  ) {
+    return undefined
+  }
+
+  const split = splitCreateTableBodyParts(stripped)
+  if (!split || split.trailing.length > 0) {
+    return undefined
+  }
+  const { parts } = split
+
+  const columns: string[] = []
+  const colNameByLower = new Map<string, string>()
+  const exactIntegerForTablePk = new Map<string, boolean>()
+  const nonExactIntegerCols = new Set<string>()
+  let inlineRowidCol: string | undefined
+  let tablePkCol: string | undefined
+  let pkCount = 0
+
+  const handleTablePrimaryKeyConstraint = (constraintText: string): boolean => {
+    const pkMatch = TABLE_PK_CONSTRAINT_RE.exec(constraintText)
+    if (!pkMatch) return false
+    pkCount += 1
+    if (pkCount > 1) return false
+    const pkExpr = pkMatch[1]!.trim()
+    if (pkExpr.includes(',') || /\bDESC\b/iu.test(pkExpr)) {
+      return false
+    }
+    const singleCol = SINGLE_PK_COLUMN_RE.exec(pkExpr)
+    if (!singleCol) return false
+    tablePkCol = unquoteSqlIdent(singleCol[1]!)
+    return true
+  }
+
+  for (const rawPart of parts) {
+    const item = rawPart.trim()
+    if (!item) return undefined
+    const leadingTok = lexLeadingSqlToken(item)
+    if (!leadingTok) return undefined
+
+    if (!leadingTok.quoted && TABLE_CONSTRAINT_STARTERS.has(leadingTok.value.toUpperCase())) {
+      const keyword = leadingTok.value.toUpperCase()
+      let constraintHead = keyword
+      let afterHead = item.slice(leadingTok.nextOffset).trim()
+      if (keyword === 'CONSTRAINT') {
+        const nameTok = lexLeadingSqlToken(afterHead)
+        if (!nameTok) return undefined
+        const afterName = afterHead.slice(nameTok.nextOffset).trim()
+        const bodyKwTok = lexLeadingSqlToken(afterName)
+        if (!bodyKwTok || bodyKwTok.quoted) return undefined
+        constraintHead = bodyKwTok.value.toUpperCase()
+        afterHead = afterName.slice(bodyKwTok.nextOffset).trim()
+      }
+      if (constraintHead === 'PRIMARY') {
+        const keyTok = lexLeadingSqlToken(afterHead)
+        if (!keyTok || keyTok.quoted || keyTok.value.toUpperCase() !== 'KEY') return undefined
+        if (!handleTablePrimaryKeyConstraint(item)) return undefined
+        continue
+      }
+      if (constraintHead === 'UNIQUE' || constraintHead === 'CHECK') {
+        if (!afterHead.startsWith('(')) return undefined
+        continue
+      }
+      if (constraintHead === 'FOREIGN') {
+        const keyTok = lexLeadingSqlToken(afterHead)
+        if (!keyTok || keyTok.quoted || keyTok.value.toUpperCase() !== 'KEY') return undefined
+        const afterKey = afterHead.slice(keyTok.nextOffset).trim()
+        if (!afterKey.startsWith('(')) return undefined
+        continue
+      }
+      return undefined
+    }
+
+    const colName = leadingTok.value
+    if (!colName || hasNonPrintableAscii(colName)) return undefined
+    const colKey = colName.toLowerCase()
+    if (colNameByLower.has(colKey)) return undefined
+    colNameByLower.set(colKey, colName)
+    columns.push(colName)
+
+    const rest = item.slice(leadingTok.nextOffset).trim()
+    const { typeText, constraintsText } = splitColumnTypeAndConstraints(rest)
+    const constraintsUnquoted = stripSqlCommentsAndMaskQuotes(constraintsText).unquoted
+    if (/(?:REAL|FLOA|DOUB)/iu.test(typeText)) {
+      return undefined
+    }
+    const isExactIntegerType = /^INTEGER$/iu.test(typeText)
+    const isIntegerLikeType = /^INT(?:EGER|\b)/iu.test(typeText)
+
+    if (/\bPRIMARY\s+KEY\b/iu.test(constraintsUnquoted)) {
+      pkCount += 1
+      if (pkCount > 1) return undefined
+      if (/\bPRIMARY\s+KEY\s+DESC\b/iu.test(constraintsUnquoted)) {
+        return undefined
+      }
+      if (isExactIntegerType) {
+        if (!hasOnlyWhitelistedIntegerConstraints(constraintsText, true)) {
+          return undefined
+        }
+        inlineRowidCol = colName
+      } else if (isIntegerLikeType) {
+        // Non-exact single-token INTEGER primary key (e.g. `INTEGER VARYING PRIMARY KEY`, `INT PRIMARY KEY`).
+        return undefined
+      }
+    } else if (isExactIntegerType) {
+      exactIntegerForTablePk.set(
+        colKey,
+        hasOnlyWhitelistedIntegerConstraints(constraintsText, false),
+      )
+    } else if (isIntegerLikeType) {
+      nonExactIntegerCols.add(colKey)
+    }
+  }
+
+  let rowidAliasCol: string | undefined
+  if (pkCount === 1) {
+    if (inlineRowidCol !== undefined) {
+      rowidAliasCol = inlineRowidCol
+    } else if (tablePkCol !== undefined) {
+      const pkKey = tablePkCol.toLowerCase()
+      const canonicalCol = colNameByLower.get(pkKey)
+      if (!canonicalCol) return undefined
+      if (nonExactIntegerCols.has(pkKey)) return undefined
+      if (exactIntegerForTablePk.get(pkKey) === true) {
+        rowidAliasCol = canonicalCol
+      }
+    }
+  }
+  return { columns, rowidAliasCol }
+}
+
+function queryBoundedIdentityFromOpenSqlite(
+  db: Database.Database,
+  expectedSessionId: string,
+  proof: AgyPreScannedSqliteProof,
+  options?: {
+    readonly signal?: AbortSignal
+    readonly deadlineAt?: number
+    readonly maxTableDdlBytes?: number
+  },
+):
+  | { readonly kind: 'ok'; readonly trajectoryId: string; readonly stepCount: number }
+  | { readonly kind: 'invalid' } {
+  const signal = options?.signal
+  const deadlineAt = options?.deadlineAt
+  const maxTableDdlBytes = options?.maxTableDdlBytes ?? MAX_FALLBACK_TABLE_DDL_BYTES
+  assertIdentityNotCancelledOrExpired(signal, deadlineAt)
+
+  // Prove BOTH target tables are ordinary storage tables from the pre-scan proof BEFORE any
+  // `pragma_table_xinfo` or SQL prepare, blocking virtual-table `xConnect` side-reads (e.g. FTS5).
+  const metaEntry = proof.tables.get('trajectory_meta')
+  const stepsEntry = proof.tables.get('steps')
+  if (
+    !metaEntry ||
+    !stepsEntry ||
+    metaEntry.isVirtual ||
+    stepsEntry.isVirtual ||
+    metaEntry.rootPage < 2 ||
+    stepsEntry.rootPage < 2
+  ) {
+    return { kind: 'invalid' }
+  }
+  if (
+    Buffer.byteLength(metaEntry.sql, 'utf8') > maxTableDdlBytes ||
+    Buffer.byteLength(stepsEntry.sql, 'utf8') > maxTableDdlBytes
+  ) {
+    throw new AgyIdentityBudgetExceededError(
+      'Antigravity table DDL exceeds bounded schema inspection limit.',
+    )
+  }
+
+  const metaColHidden = readBoundedIdentityTableColumns(db, 'trajectory_meta', [
+    'trajectory_id',
+    'cascade_id',
+  ])
+  const stepColHidden = readBoundedIdentityTableColumns(db, 'steps', ['idx'])
+  const trajectoryHidden = metaColHidden.get('trajectory_id')
+  const cascadeHidden = metaColHidden.get('cascade_id')
+  const idxHidden = stepColHidden.get('idx')
+  if (trajectoryHidden === undefined || cascadeHidden === undefined || idxHidden === undefined) {
+    return { kind: 'invalid' }
+  }
+
+  const resolveBoundedVirtualSource = (
+    tableName: 'trajectory_meta' | 'steps',
+    colName: string,
+  ): string => {
+    const entry = proof.tables.get(tableName)
+    if (!entry || entry.isVirtual || !entry.sql) {
+      throw new AgyIdentityBudgetExceededError(
+        `Generated Antigravity column ${tableName}.${colName} cannot be bounded safely.`,
+      )
+    }
+    const aliasTarget = extractVirtualColumnDirectSourceAlias(entry.sql, colName)
+    if (!aliasTarget) {
+      throw new AgyIdentityBudgetExceededError(
+        `Generated Antigravity column ${tableName}.${colName} expression cannot be bounded safely within memory limits.`,
+      )
+    }
+    const storedName = findStoredTableColumnName(db, tableName, aliasTarget)
+    if (!storedName) {
+      throw new AgyIdentityBudgetExceededError(
+        `Generated Antigravity column ${tableName}.${colName} does not map to a bounded stored column.`,
+      )
+    }
+    return quoteArbitrarySqlIdentifier(storedName)
+  }
+
+  const buildBoundedTextIdentityProjection = (
+    colName: 'trajectory_id' | 'cascade_id',
+    aliasPrefix: 'trajectory' | 'cascade',
+    hidden: number,
+  ): string => {
+    const quotedCol = `"${colName}"`
+    if (hidden === 2) {
+      const quotedSource = resolveBoundedVirtualSource('trajectory_meta', colName)
+      return `
+        CASE
+          WHEN octet_length(${quotedSource}) BETWEEN 1 AND 1024
+          THEN typeof(${quotedCol})
+          ELSE NULL
+        END AS ${aliasPrefix}Type,
+        CASE
+          WHEN octet_length(${quotedSource}) BETWEEN 1 AND 1024
+          THEN octet_length(${quotedCol})
+          ELSE NULL
+        END AS ${aliasPrefix}ByteLength,
+        CASE
+          WHEN octet_length(${quotedSource}) BETWEEN 1 AND 1024
+            AND typeof(${quotedCol}) = 'text'
+            AND octet_length(${quotedCol}) BETWEEN 1 AND 1024
+          THEN ${quotedCol}
+          ELSE NULL
+        END AS ${aliasPrefix}Id`
+    }
+    return `
+      typeof(${quotedCol}) AS ${aliasPrefix}Type,
+      octet_length(${quotedCol}) AS ${aliasPrefix}ByteLength,
+      CASE
+        WHEN typeof(${quotedCol}) = 'text'
+          AND octet_length(${quotedCol}) BETWEEN 1 AND 1024
+        THEN ${quotedCol}
+        ELSE NULL
+      END AS ${aliasPrefix}Id`
+  }
+
+  const metaQuerySql = `SELECT
+    ${buildBoundedTextIdentityProjection('trajectory_id', 'trajectory', trajectoryHidden)},
+    ${buildBoundedTextIdentityProjection('cascade_id', 'cascade', cascadeHidden)}
+  FROM "trajectory_meta" NOT INDEXED
+  LIMIT 2`
+  assertBoundedFallbackQueryPlan(db, metaQuerySql, {
+    allowGuardedVirtualEval: trajectoryHidden === 2 || cascadeHidden === 2,
+  })
+  assertIdentityNotCancelledOrExpired(signal, deadlineAt)
+  const metaRows = db
+    .prepare<
+      [],
+      {
+        trajectoryType: unknown
+        trajectoryByteLength: unknown
+        trajectoryId: unknown
+        cascadeType: unknown
+        cascadeByteLength: unknown
+        cascadeId: unknown
+      }
+    >(metaQuerySql)
+    .all()
+  if (metaRows.length !== 1) {
+    return { kind: 'invalid' }
+  }
+  const row = metaRows[0]!
+  const trajectoryId = row.trajectoryId
+  const cascadeId = row.cascadeId
+  if (
+    row.trajectoryType !== 'text' ||
+    row.cascadeType !== 'text' ||
+    typeof row.trajectoryByteLength !== 'number' ||
+    typeof row.cascadeByteLength !== 'number' ||
+    !isValidAgyTrajectoryId(trajectoryId) ||
+    cascadeId !== expectedSessionId
+  ) {
+    return { kind: 'invalid' }
+  }
+
+  if (idxHidden === 0) {
+    const probeOps = readBoundedExplainOps(db, `SELECT "idx" FROM "steps" NOT INDEXED LIMIT 1`)
+    const isProvenRowidAlias =
+      probeOps.length <= MAX_FALLBACK_VDBE_OPS &&
+      probeOps.some((op) => op.opcode === 'Rowid') &&
+      probeOps.every(
+        (op) => op.opcode !== 'Column' && !DISALLOWED_FALLBACK_VDBE_OPCODES.has(op.opcode),
+      )
+    if (isProvenRowidAlias) {
+      const minSql = `SELECT "idx" AS idxVal FROM "steps" ORDER BY "idx" ASC LIMIT 1`
+      const maxSql = `SELECT "idx" AS idxVal FROM "steps" ORDER BY "idx" DESC LIMIT 1`
+      assertBoundedFallbackQueryPlan(db, minSql)
+      assertBoundedFallbackQueryPlan(db, maxSql)
+      assertIdentityNotCancelledOrExpired(signal, deadlineAt)
+      const minStmt = db.prepare<[], { idxVal: unknown }>(minSql)
+      minStmt.safeIntegers(true)
+      const minRow = minStmt.get()
+      if (!minRow) {
+        return { kind: 'ok', trajectoryId, stepCount: 0 }
+      }
+      assertIdentityNotCancelledOrExpired(signal, deadlineAt)
+      const maxStmt = db.prepare<[], { idxVal: unknown }>(maxSql)
+      maxStmt.safeIntegers(true)
+      const maxRow = maxStmt.get()
+      if (
+        !maxRow ||
+        typeof minRow.idxVal !== 'bigint' ||
+        typeof maxRow.idxVal !== 'bigint' ||
+        minRow.idxVal < 0n ||
+        maxRow.idxVal < 0n ||
+        maxRow.idxVal >= BigInt(Number.MAX_SAFE_INTEGER)
+      ) {
+        return { kind: 'invalid' }
+      }
+      return {
+        kind: 'ok',
+        trajectoryId,
+        stepCount: Number(maxRow.idxVal) + 1,
+      }
+    }
+  }
+
+  const stepQuerySql =
+    idxHidden === 2
+      ? (() => {
+          const quotedSource = resolveBoundedVirtualSource('steps', 'idx')
+          const safeSourceGuard = `(typeof(${quotedSource}) = 'integer' OR typeof(${quotedSource}) = 'real' OR (typeof(${quotedSource}) = 'text' AND octet_length(${quotedSource}) BETWEEN 1 AND 32))`
+          return `SELECT
+            CASE
+              WHEN typeof(${quotedSource}) IN ('text', 'blob') AND octet_length(${quotedSource}) > 32
+              THEN 1
+              ELSE 0
+            END AS oversized,
+            CASE
+              WHEN ${safeSourceGuard}
+              THEN typeof("idx")
+              ELSE NULL
+            END AS idxType,
+            CASE
+              WHEN ${safeSourceGuard} AND typeof("idx") = 'integer'
+              THEN "idx"
+              ELSE NULL
+            END AS idxVal
+          FROM "steps" NOT INDEXED`
+        })()
+      : `SELECT
+          0 AS oversized,
+          typeof("idx") AS idxType,
+          CASE WHEN typeof("idx") = 'integer' THEN "idx" ELSE NULL END AS idxVal
+        FROM "steps" NOT INDEXED`
+  assertBoundedFallbackQueryPlan(db, stepQuerySql, {
+    allowGuardedVirtualEval: idxHidden === 2,
+  })
+  const stepStmt = db.prepare<[], { oversized: unknown; idxType: unknown; idxVal: unknown }>(
+    stepQuerySql,
+  )
+  stepStmt.safeIntegers(true)
+
+  let rowCount = 0
+  let maxIdx: bigint | undefined
+  for (const stepRow of stepStmt.iterate()) {
+    if (rowCount % FALLBACK_STEP_SCAN_CHECK_INTERVAL === 0) {
+      assertIdentityNotCancelledOrExpired(signal, deadlineAt)
+    }
+    rowCount += 1
+    if (rowCount > AGY_STORAGE_MAX_RECORDS) {
+      throw new AgyIdentityBudgetExceededError(
+        `Antigravity fallback steps scan exceeded the ${AGY_STORAGE_MAX_RECORDS}-row record budget.`,
+      )
+    }
+    if (stepRow.oversized === 1n || stepRow.oversized === 1) {
+      throw new AgyIdentityBudgetExceededError(
+        'Antigravity VIRTUAL steps.idx source value exceeded bounded evaluation size.',
+      )
+    }
+    if (
+      stepRow.idxType !== 'integer' ||
+      typeof stepRow.idxVal !== 'bigint' ||
+      stepRow.idxVal < 0n ||
+      stepRow.idxVal >= BigInt(Number.MAX_SAFE_INTEGER)
+    ) {
+      return { kind: 'invalid' }
+    }
+    if (maxIdx === undefined || stepRow.idxVal > maxIdx) {
+      maxIdx = stepRow.idxVal
+    }
+  }
+  assertIdentityNotCancelledOrExpired(signal, deadlineAt)
+  if (rowCount === 0) {
+    return { kind: 'ok', trajectoryId, stepCount: 0 }
+  }
+  if (maxIdx === undefined) {
+    return { kind: 'invalid' }
+  }
+  return {
+    kind: 'ok',
+    trajectoryId,
+    stepCount: Number(maxIdx) + 1,
+  }
+}
+
+type FastIdentityImageOutcome =
+  | { readonly kind: 'ok'; readonly trajectoryId: string; readonly stepCount: number }
+  | { readonly kind: 'invalid' }
+  | { readonly kind: 'fallback' }
+
+function readFastIdentityFromCommittedImage(
+  image: AgyCommittedReadImage,
+  expectedSessionId: string,
+  schemaCatalogBudget?: AgySchemaCatalogBudget,
+): FastIdentityImageOutcome {
+  const usableSize = image.usableSize
+  const readPage = (pageNo: number): Buffer => image.readPage(pageNo)
+
+  const returnInvalidIfStable = (): FastIdentityImageOutcome => {
+    image.verifyUnchanged({ includeAccessedPages: true })
+    return { kind: 'invalid' }
+  }
+
+  // Always pre-scan sqlite_schema + sqlite_stat1/4 within budget BEFORE fast decode or fallback!
+  const catalog = image.preScanCatalog(schemaCatalogBudget)
+  const metaEntry = catalog.tables.get('trajectory_meta')
+  const stepsEntry = catalog.tables.get('steps')
+  if (!metaEntry || !stepsEntry) {
+    return returnInvalidIfStable()
+  }
+  if (
+    metaEntry.isVirtual ||
+    stepsEntry.isVirtual ||
+    metaEntry.rootPage < 2 ||
+    stepsEntry.rootPage < 2
+  ) {
+    return returnInvalidIfStable()
+  }
+
+  const textEncoding = image.effectivePage1.readUInt32BE(56)
+  if (textEncoding !== 1) {
+    return { kind: 'fallback' }
+  }
+
+  const metaDdl = parseCreateTableDdl(metaEntry.sql)
+  const stepsDdl = parseCreateTableDdl(stepsEntry.sql)
+  if (!metaDdl || !stepsDdl) {
+    return { kind: 'fallback' }
+  }
+  const trajColIdx = metaDdl.columns.indexOf('trajectory_id')
+  const cascadeColIdx = metaDdl.columns.indexOf('cascade_id')
+  if (trajColIdx < 0 || cascadeColIdx < 0) {
+    return returnInvalidIfStable()
+  }
+  const stepsIdxCol = stepsDdl.columns.indexOf('idx')
+  if (stepsIdxCol < 0) {
+    return returnInvalidIfStable()
+  }
+
+  const assembleLeafPayload = (
+    pageBuf: Buffer,
+    payloadStart: number,
+    payloadLen: number,
+    maxPrefixBytes?: number,
+  ): Buffer =>
+    assembleSqliteLeafPayload(
+      readPage,
+      usableSize,
+      pageBuf,
+      payloadStart,
+      payloadLen,
+      maxPrefixBytes,
+    )
+
+  const collectTableRows = (
+    rootPageNo: number,
+    maxRows: number,
+    neededColumns: number,
+  ):
+    | {
+        kind: 'ok'
+        rows: Array<{ rowId: bigint; serialTypes: bigint[]; values: unknown[] }>
+        truncated: boolean
+      }
+    | { kind: 'fallback' } => {
+    const rows: Array<{ rowId: bigint; serialTypes: bigint[]; values: unknown[] }> = []
+    const visited = new Set<number>()
+    const stack: number[] = [rootPageNo]
+    let truncated = false
+    while (stack.length > 0) {
+      const pageNo = stack.pop()!
+      if (visited.has(pageNo)) throw new Error('SQLite B-tree cycle detected.')
+      visited.add(pageNo)
+      const page = readPage(pageNo)
+      const bhdr = pageNo === 1 ? 100 : 0
+      const pageType = page[bhdr]!
+      const cellCount = page.readUInt16BE(bhdr + 3)
+      if (pageType === 0x05) {
+        const rightChild = page.readUInt32BE(bhdr + 8)
+        const ptrBase = bhdr + 12
+        if (ptrBase + cellCount * 2 > usableSize) {
+          throw new Error('SQLite interior cell pointer array out of bounds.')
+        }
+        stack.push(rightChild)
+        for (let c = cellCount - 1; c >= 0; c -= 1) {
+          const cellOff = page.readUInt16BE(ptrBase + c * 2)
+          if (cellOff < ptrBase + cellCount * 2 || cellOff + 4 > usableSize) {
+            throw new Error('SQLite interior cell offset out of bounds.')
+          }
+          stack.push(page.readUInt32BE(cellOff))
+        }
+      } else if (pageType === 0x0d) {
+        const ptrBase = bhdr + 8
+        if (ptrBase + cellCount * 2 > usableSize) {
+          throw new Error('SQLite leaf cell pointer array out of bounds.')
+        }
+        for (let c = 0; c < cellCount; c += 1) {
+          if (rows.length >= maxRows) {
+            truncated = true
+            break
+          }
+          const cellOff = page.readUInt16BE(ptrBase + c * 2)
+          if (cellOff < ptrBase + cellCount * 2 || cellOff >= usableSize) {
+            throw new Error('SQLite leaf cell offset out of bounds.')
+          }
+          const lenDec = decodeSqliteVarint(page, cellOff, usableSize)
+          const rowIdDec = decodeSqliteVarint(page, lenDec.nextOffset, usableSize)
+          const payloadLen = Number(lenDec.value)
+          if (lenDec.value < 0n || !Number.isSafeInteger(payloadLen)) {
+            throw new Error('Invalid SQLite leaf payload length.')
+          }
+          const payload = assembleLeafPayload(page, rowIdDec.nextOffset, payloadLen)
+          const decoded = decodeSqliteRecord(payload, neededColumns)
+          rows.push({ rowId: rowIdDec.value, ...decoded })
+        }
+        if (truncated) break
+      } else {
+        return { kind: 'fallback' }
+      }
+    }
+    return { kind: 'ok', rows, truncated }
+  }
+
+  const readExtremeRowId = (
+    rootPageNo: number,
+    side: 'min' | 'max',
+    idxColIndex: number,
+  ):
+    | { kind: 'empty' }
+    | { kind: 'row'; rowId: bigint; idxSerialType: bigint }
+    | { kind: 'fallback' } => {
+    const visited = new Set<number>()
+    const walk = (
+      pageNo: number,
+    ):
+      | { kind: 'empty' }
+      | { kind: 'row'; rowId: bigint; idxSerialType: bigint }
+      | { kind: 'fallback' } => {
+      if (visited.has(pageNo)) throw new Error('SQLite B-tree cycle detected.')
+      visited.add(pageNo)
+      const page = readPage(pageNo)
+      const bhdr = pageNo === 1 ? 100 : 0
+      const pageType = page[bhdr]!
+      const cellCount = page.readUInt16BE(bhdr + 3)
+      if (pageType === 0x0d) {
+        if (cellCount === 0) return { kind: 'empty' }
+        const ptrBase = bhdr + 8
+        if (ptrBase + cellCount * 2 > usableSize) {
+          throw new Error('SQLite leaf cell pointers out of bounds.')
+        }
+        const cellIndex = side === 'min' ? 0 : cellCount - 1
+        const cellOff = page.readUInt16BE(ptrBase + cellIndex * 2)
+        if (cellOff < ptrBase + cellCount * 2 || cellOff >= usableSize) {
+          throw new Error('SQLite leaf cell offset out of bounds.')
+        }
+        const lenDec = decodeSqliteVarint(page, cellOff, usableSize)
+        const rowIdDec = decodeSqliteVarint(page, lenDec.nextOffset, usableSize)
+        const payloadLen = Number(lenDec.value)
+        if (lenDec.value < 0n || !Number.isSafeInteger(payloadLen)) {
+          throw new Error('Invalid SQLite leaf payload length.')
+        }
+        const payloadPrefix = assembleLeafPayload(page, rowIdDec.nextOffset, payloadLen, 4096)
+        const serialTypes = decodeSqliteRecordHeader(payloadPrefix, payloadLen, idxColIndex)
+        const idxSerialType = serialTypes[idxColIndex]
+        if (idxSerialType === undefined) {
+          return { kind: 'fallback' }
+        }
+        return { kind: 'row', rowId: rowIdDec.value, idxSerialType }
+      }
+      if (pageType === 0x05) {
+        const rightChild = page.readUInt32BE(bhdr + 8)
+        const ptrBase = bhdr + 12
+        if (ptrBase + cellCount * 2 > usableSize) {
+          throw new Error('SQLite interior cell pointers out of bounds.')
+        }
+        const childPages: number[] = []
+        for (let c = 0; c < cellCount; c += 1) {
+          const cellOff = page.readUInt16BE(ptrBase + c * 2)
+          if (cellOff < ptrBase + cellCount * 2 || cellOff + 4 > usableSize) {
+            throw new Error('SQLite interior cell offset out of bounds.')
+          }
+          childPages.push(page.readUInt32BE(cellOff))
+        }
+        childPages.push(rightChild)
+        const start = side === 'min' ? 0 : childPages.length - 1
+        const step = side === 'min' ? 1 : -1
+        for (let idx = start; idx >= 0 && idx < childPages.length; idx += step) {
+          const res = walk(childPages[idx]!)
+          if (res.kind !== 'empty') return res
+        }
+        return { kind: 'empty' }
+      }
+      return { kind: 'fallback' }
+    }
+    return walk(rootPageNo)
+  }
+
+  let trajectoryId: string
+  let stepCount: number
+  try {
+    const metaRowsRes = collectTableRows(
+      metaEntry.rootPage,
+      2,
+      Math.max(trajColIdx, cascadeColIdx) + 1,
+    )
+    if (metaRowsRes.kind === 'fallback') return { kind: 'fallback' }
+    if (metaRowsRes.rows.length !== 1) {
+      return returnInvalidIfStable()
+    }
+    const metaRow = metaRowsRes.rows[0]!
+    if (metaDdl.rowidAliasCol === 'trajectory_id' || metaDdl.rowidAliasCol === 'cascade_id') {
+      return { kind: 'fallback' }
+    }
+    if (metaRow.serialTypes.length <= trajColIdx || metaRow.serialTypes.length <= cascadeColIdx) {
+      return { kind: 'fallback' }
+    }
+    const rawTrajectoryId = metaRow.values[trajColIdx]
+    const cascadeId = metaRow.values[cascadeColIdx]
+    if (!isValidAgyTrajectoryId(rawTrajectoryId) || cascadeId !== expectedSessionId) {
+      return returnInvalidIfStable()
+    }
+    trajectoryId = rawTrajectoryId
+
+    if (stepsDdl.rowidAliasCol !== 'idx') {
+      const emptyProbe = collectTableRows(stepsEntry.rootPage, 1, 0)
+      if (emptyProbe.kind === 'fallback') return { kind: 'fallback' }
+      if (emptyProbe.rows.length === 0) {
+        stepCount = 0
+      } else {
+        return { kind: 'fallback' }
+      }
+    } else {
+      const minRes = readExtremeRowId(stepsEntry.rootPage, 'min', stepsIdxCol)
+      if (minRes.kind === 'fallback') return { kind: 'fallback' }
+      if (minRes.kind === 'empty') {
+        stepCount = 0
+      } else {
+        const maxRes = readExtremeRowId(stepsEntry.rootPage, 'max', stepsIdxCol)
+        if (maxRes.kind !== 'row') {
+          if (maxRes.kind === 'fallback') return { kind: 'fallback' }
+          throw new AgyTransientIdentityChurnError('B-tree extreme rowId mismatch.')
+        }
+        if (minRes.idxSerialType !== 0n || maxRes.idxSerialType !== 0n) {
+          return { kind: 'fallback' }
+        }
+        if (
+          minRes.rowId < 0n ||
+          maxRes.rowId < 0n ||
+          maxRes.rowId >= BigInt(Number.MAX_SAFE_INTEGER)
+        ) {
+          return returnInvalidIfStable()
+        }
+        stepCount = Number(maxRes.rowId) + 1
+      }
+    }
+  } catch (error) {
+    if (error instanceof AgyIdentityFallbackError) {
+      return { kind: 'fallback' }
+    }
+    if (
+      error instanceof AgyIdentityBudgetExceededError ||
+      error instanceof AgyTransientIdentityChurnError ||
+      error instanceof AgyHotRollbackJournalError ||
+      error instanceof AgyOperationalStorageError ||
+      isOperationalFsError(error) ||
+      isIdentityAbortOrTimeoutError(error)
+    ) {
+      throw error
+    }
+    // Re-verify source stability before classifying any decode failure as `invalid`.
+    image.verifyUnchanged({ includeAccessedPages: true })
+    if (error instanceof AgyUnexpectedEofError) {
+      throw new AgyTransientIdentityChurnError(
+        'SQLite file experienced unexpected EOF during bounded read.',
+      )
+    }
+    throw error
+  }
+
+  image.verifyUnchanged({ includeAccessedPages: true })
+  return { kind: 'ok', trajectoryId, stepCount }
+}
+
+/**
+ * Safely reads the host-assigned `trajectory_id` and committed step count from an
+ * Antigravity session SQLite database via the single unified anchored `withAgyReadImage`
+ * view — acquiring SQLite-VFS-compatible SHARED lock before reading page 1, NEVER creating
+ * `-wal` or `-shm` sidefiles in `conversations/`, and NEVER opening `new Database(sourcePath)`.
+ */
+export function readAgyTrajectoryIdentityDetailed(input: {
+  readonly appDataDir: string
+  readonly nativeSessionId: string
+  readonly signal?: AbortSignal
+  readonly deadlineAt?: number
+  readonly schemaCatalogBudget?: AgySchemaCatalogBudget
+  readonly walShrinkBudget?: AgyWalShrinkBudget
+}): AgyTrajectoryIdentityResult {
+  assertIdentityNotCancelledOrExpired(input.signal, input.deadlineAt)
+  if (
+    !isValidAgyTrajectoryId(input.nativeSessionId) ||
+    input.nativeSessionId === 'conversation_summaries' ||
+    !isAbsolute(input.appDataDir)
+  ) {
+    return { status: 'invalid' }
+  }
+  const configuredRoot = resolve(input.appDataDir)
+  let dbObservedPresent = false
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    let db: Database.Database | undefined
+    try {
+      assertIdentityNotCancelledOrExpired(input.signal, input.deadlineAt)
+      const imageOutcome = withAgyReadImage(
+        {
+          rootDir: configuredRoot,
+          parentSegments: ['conversations'],
+          leafName: `${input.nativeSessionId}.db`,
+        },
+        {
+          maxSnapshotBytes: MAX_FALLBACK_SNAPSHOT_TOTAL_BYTES,
+          snapshotParentTempDir: resolveSnapshotParentTempDir(),
+          ...(input.schemaCatalogBudget !== undefined
+            ? { schemaCatalogBudget: input.schemaCatalogBudget }
+            : {}),
+          ...(input.walShrinkBudget !== undefined
+            ? { walShrinkBudget: input.walShrinkBudget }
+            : {}),
+        },
+        {
+          ...(input.signal !== undefined ? { signal: input.signal } : {}),
+          ...(input.deadlineAt !== undefined ? { deadlineAt: input.deadlineAt } : {}),
+          onLeafObserved: () => {
+            dbObservedPresent = true
+          },
+        },
+        (image) => {
+          dbObservedPresent = true
+          const fast = readFastIdentityFromCommittedImage(
+            image,
+            input.nativeSessionId,
+            input.schemaCatalogBudget,
+          )
+          if (fast.kind === 'ok' || fast.kind === 'invalid') {
+            return fast
+          }
+          const snapshot = image.materializePrivateSnapshot({
+            maxSnapshotBytes: MAX_FALLBACK_SNAPSHOT_TOTAL_BYTES,
+            snapshotParentTempDir: resolveSnapshotParentTempDir(),
+            ...(input.schemaCatalogBudget !== undefined
+              ? { schemaCatalogBudget: input.schemaCatalogBudget }
+              : {}),
+          })
+          return { kind: 'materialized' as const, snapshot }
+        },
+      )
+
+      if (imageOutcome.kind === 'ok') {
+        return {
+          status: 'ok',
+          trajectoryId: imageOutcome.trajectoryId,
+          stepCount: imageOutcome.stepCount,
+        }
+      }
+      if (imageOutcome.kind === 'invalid') {
+        return { status: 'invalid' }
+      }
+
+      const { snapshot } = imageOutcome
+      try {
+        db = snapshot.openReadOnlyDatabase()
+      } catch (openError) {
+        snapshot.cleanup()
+        throw openError
+      }
+      const queried = queryBoundedIdentityFromOpenSqlite(
+        db,
+        input.nativeSessionId,
+        snapshot.proof,
+        {
+          ...(input.signal !== undefined ? { signal: input.signal } : {}),
+          ...(input.deadlineAt !== undefined ? { deadlineAt: input.deadlineAt } : {}),
+          ...(input.schemaCatalogBudget?.maxItemSqlBytes !== undefined
+            ? { maxTableDdlBytes: input.schemaCatalogBudget.maxItemSqlBytes }
+            : {}),
+        },
+      )
+      if (queried.kind === 'invalid') {
+        return { status: 'invalid' }
+      }
+      return {
+        status: 'ok',
+        trajectoryId: queried.trajectoryId,
+        stepCount: queried.stepCount,
+      }
+    } catch (error) {
+      if (
+        (typeof AgyNativeLoaderError === 'function' && error instanceof AgyNativeLoaderError) ||
+        (error instanceof Error &&
+          (error.name === 'AgyNativeLoaderError' ||
+            Reflect.get(error, 'code') === 'EAGY_NATIVE_LOADER')) ||
+        error instanceof AgyOperationalStorageError ||
+        isOperationalFsError(error) ||
+        isOperationalSqliteError(error) ||
+        isIdentityAbortOrTimeoutError(error)
+      ) {
+        throw error
+      }
+      if (
+        error instanceof AgyIdentityBudgetExceededError ||
+        (error instanceof AgentExecutionError && error.kind === 'response_too_large')
+      ) {
+        return {
+          status: 'budget_exceeded',
+          reason: boundIdentityReason(error.message),
+        }
+      }
+      if (error instanceof AgyStorageMissingError) {
+        if (error.stage === 'root' || error.stage === 'parent') {
+          return { status: 'no_storage_root' }
+        }
+        if (!dbObservedPresent) {
+          return { status: 'missing' }
+        }
+        if (attempt < 2) continue
+        return { status: 'transient_churn' }
+      }
+      if (error instanceof AgyInvalidSqliteImageError) {
+        return { status: 'invalid' }
+      }
+      const isTransient =
+        isTransientAgySnapshotChurn(error) ||
+        isSqliteBusyOrLockedError(error) ||
+        error instanceof AgyUnexpectedEofError
+      const attemptTransientReason =
+        isTransient && error instanceof AgyTransientIdentityChurnError ? error.reason : undefined
+      if (isTransient) {
+        if (attempt < 2) continue
+        return {
+          status: 'transient_churn',
+          ...(attemptTransientReason !== undefined
+            ? { reason: boundIdentityReason(attemptTransientReason) }
+            : {}),
+        }
+      }
+      return { status: 'invalid' }
+    } finally {
+      try {
+        db?.close()
+      } catch {
+        /* Best-effort close on read-only staged snapshot. */
+      }
+    }
+  }
+  return { status: 'invalid' }
+}
+
+export function readAgyTrajectoryIdentity(input: {
+  readonly appDataDir: string
+  readonly nativeSessionId: string
+  readonly signal?: AbortSignal
+  readonly deadlineAt?: number
+}): { readonly trajectoryId: string; readonly stepCount: number } | undefined {
+  const res = readAgyTrajectoryIdentityDetailed(input)
+  return res.status === 'ok'
+    ? { trajectoryId: res.trajectoryId, stepCount: res.stepCount }
+    : undefined
 }

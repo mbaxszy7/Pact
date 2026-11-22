@@ -155,3 +155,48 @@ it('a newer paused projection keeps an uncertain old action on pure Check until 
   expect(send).toHaveBeenCalledTimes(1)
   expect(screen.getByRole('button', { name: 'Check status' })).toHaveProperty('disabled', false)
 })
+
+it('renders the saved source <pre> with semantic code block surface tokens', async () => {
+  const getConversation = vi.fn<DesktopBridge['getConversation']>().mockResolvedValue({
+    ok: true,
+    value: {
+      scope: 'prepared-input',
+      sessionId,
+      batchId: input.batchId,
+      revision: input.revision,
+      body: input.body,
+      sources: [
+        {
+          sourceId: input.body.id,
+          label: 'Original request',
+          sha256: input.body.sha256,
+          bytes: input.body.bytes,
+          chars: input.body.chars,
+        },
+      ],
+      sourceId: input.body.id,
+      offset: 0,
+      text: 'Saved markdown snippet',
+      nextOffset: null,
+    },
+  })
+  Object.defineProperty(window, 'pact', {
+    configurable: true,
+    value: { getConversation },
+  })
+  const user = userEvent.setup()
+  const { container } = render(
+    <PreparedInputCard sessionId={sessionId} input={input} disabled={false} onChanged={() => {}} />,
+  )
+
+  await user.click(screen.getByRole('button', { name: 'View request' }))
+  const pre = await waitFor(() => {
+    const node = container.querySelector('pre')
+    expect(node?.textContent).toBe('Saved markdown snippet')
+    return node!
+  })
+  expect(pre.className).toContain('border-code-border')
+  expect(pre.className).toContain('bg-code-block-surface')
+  expect(pre.className).toContain('text-code-foreground')
+  expect(pre.className).not.toContain('bg-surface-raised')
+})

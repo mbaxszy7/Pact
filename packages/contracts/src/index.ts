@@ -176,6 +176,8 @@ import {
 export * from './native-permissions.js'
 export * from './native-user-input.js'
 export * from './native-fork.js'
+export * from './agy-storage.js'
+import { agyRebuildInitializationWitnessSchema } from './agy-storage.js'
 export * from './diagnostics.js'
 import type { DiagnosticStatus, RendererFault } from './diagnostics.js'
 
@@ -888,6 +890,11 @@ export const runtimePreparationSchema = z
     'Runtime preparation entries must have unique Agent identities.',
   )
 export type RuntimePreparation = z.infer<typeof runtimePreparationSchema>
+
+export const runtimePreparationGetInputSchema = z.strictObject({
+  forceRefresh: z.boolean().optional(),
+})
+export type RuntimePreparationGetInput = z.infer<typeof runtimePreparationGetInputSchema>
 
 export const runtimeExecutablePathUpdateSchema = z.strictObject({
   agentId: runtimeAgentIdSchema,
@@ -1781,21 +1788,6 @@ export const codexInitializationWitnessSchema = z.strictObject({
   recordCount: z.number().int().positive().max(10_000),
 })
 export type CodexInitializationWitness = z.infer<typeof codexInitializationWitnessSchema>
-
-export const agyRebuildInitializationWitnessSchema = z.strictObject({
-  kind: z.literal('agy_rebuild_v1'),
-  nativeSessionId: nativeEvidenceIdentitySchema.shape.nativeSessionId,
-  pbSha256: z.string().regex(/^[a-f0-9]{64}$/u),
-  pbBytes: z
-    .number()
-    .int()
-    .positive()
-    .max(64 * 1024 * 1024),
-  stepCount: z.literal(2),
-  sourceHash: z.string().regex(/^[a-f0-9]{64}$/u),
-  coldLoadVerifiedAt: z.string().datetime(),
-})
-export type AgyRebuildInitializationWitness = z.infer<typeof agyRebuildInitializationWitnessSchema>
 
 /** Small private initialization receipt; never a copy of native history. */
 export const nativeInitializationWitnessSchema = z.discriminatedUnion('kind', [
@@ -3349,6 +3341,7 @@ export const utilityRequestSchema = z.discriminatedUnion('type', [
   z.object({
     type: z.literal('runtime-preparation.get.request'),
     requestId: z.string().uuid(),
+    input: runtimePreparationGetInputSchema.optional(),
   }),
   z.object({
     type: z.literal('runtime-preparation.path.update.request'),
@@ -4155,7 +4148,7 @@ export interface DesktopBridge {
   ): Promise<RpcResult<ConversationPatch>>
   getAppInfo(): Promise<RpcResult<AppInfo>>
   getRuntimeHealth(): Promise<RpcResult<RuntimeHealth>>
-  getRuntimePreparation(): Promise<RpcResult<RuntimePreparation>>
+  getRuntimePreparation(input?: RuntimePreparationGetInput): Promise<RpcResult<RuntimePreparation>>
   chooseRuntimeExecutable(agentId: RuntimeAgentId): Promise<RpcResult<RuntimePreparation>>
   getDefaultSessionSettingsEditorState(
     activePair?: ActiveAgentPairInput,

@@ -4,7 +4,7 @@ import type { ChildProcessWithoutNullStreams } from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import { mkdir, mkdtemp, realpath, rm, stat, symlink } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { PassThrough } from 'node:stream'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -204,9 +204,19 @@ describe('Antigravity zero-Turn /skills discovery and binding', () => {
       })
 
     const fromSymlink = await runDiscovery(symlinkProjectDir)
+    const firstLogFile = observedArgs[5]
+    await expect(stat(dirname(firstLogFile!))).rejects.toThrow(/ENOENT/u)
     const fromCanonical = await runDiscovery(canonicalProjectDir)
 
-    expect(observedArgs).toEqual(['-p', '/skills', '--output-format', 'json'])
+    expect(observedArgs).toEqual([
+      '-p',
+      '/skills',
+      '--output-format',
+      'json',
+      '--log-file',
+      expect.stringMatching(/pact-agy-skills-[^/\\]+[/\\]skills\.log$/u),
+    ])
+    await expect(stat(dirname(observedArgs[5]!))).rejects.toThrow(/ENOENT/u)
     expect(observedCwds).toEqual([canonicalProjectDir, canonicalProjectDir])
     // Target project directory remains intact on disk!
     expect((await stat(canonicalProjectDir)).isDirectory()).toBe(true)
@@ -235,7 +245,7 @@ describe('Antigravity zero-Turn /skills discovery and binding', () => {
     ).toThrow(/changed or is unavailable/u)
   })
 
-  it('rejects non-zero num_turns, 256 KiB overflow, and 4-second hangs cleanly', async () => {
+  it('rejects non-zero num_turns, 256 KiB overflow, and 15-second hangs cleanly', async () => {
     await expect(
       discoverAgySkills('/owned/project', process.execPath, new AbortController().signal, {
         spawnProcess() {
@@ -293,7 +303,7 @@ describe('Antigravity zero-Turn /skills discovery and binding', () => {
     await timerArmed
     await vi.advanceTimersByTimeAsync(AGY_SKILL_DISCOVERY_TIMEOUT_MS + 50)
     expect(await caughtError).toMatchObject({
-      message: expect.stringMatching(/four-second deadline/u),
+      message: expect.stringMatching(/15-second deadline/u),
     })
   })
 })

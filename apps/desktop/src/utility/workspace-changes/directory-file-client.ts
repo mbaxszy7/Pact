@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto'
 import {
   directoryFileOperationInputSchema,
   directoryFileOperationMessageSchema,
+  MAX_DIRECTORY_REQUEST_BYTES,
   PROJECT_FILE_PREVIEW_TIMEOUT_MS,
   WORKSPACE_OPERATION_TIMEOUT_MS,
   type DirectoryFileOperationInput,
@@ -10,7 +11,7 @@ import {
 } from '@pact/contracts'
 
 const MAX_PENDING_REQUESTS = 20
-const MAX_REQUEST_BYTES = 64 * 1024
+const MAX_REQUEST_BYTES = MAX_DIRECTORY_REQUEST_BYTES
 const CANCEL_CONFIRM_TIMEOUT_MS = 4_000
 interface PendingDirectoryRequest {
   resolve: (result: DirectoryFileOperationResult) => void

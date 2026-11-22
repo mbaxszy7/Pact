@@ -294,29 +294,28 @@ function createMarkdownComponents(
     h1: ({ children }) => <h1 className="mb-2 mt-4 text-subtitle font-medium">{children}</h1>,
     h2: ({ children }) => <h2 className="mb-2 mt-4 text-body font-medium">{children}</h2>,
     h3: ({ children }) => <h3 className="mb-1 mt-3 text-body font-medium">{children}</h3>,
-    p: ({ children }) => <p className="my-2 first:mt-0 last:mb-0">{children}</p>,
+    p: ({ children }) => <p className="my-2 leading-[1.65] first:mt-0 last:mb-0">{children}</p>,
     ul: ({ children }) => <ul className="my-2 list-disc space-y-1 pl-5">{children}</ul>,
     ol: ({ children, start }) => (
       <ol start={start} className="my-2 list-decimal space-y-1 pl-5">
         {children}
       </ol>
     ),
-    li: ({ children }) => <li className="pl-0.5">{children}</li>,
+    li: ({ children }) => <li className="pl-0.5 leading-[1.65]">{children}</li>,
     blockquote: ({ children }) => (
       <blockquote className="my-3 border-l border-border-strong pl-3 text-secondary">
         {children}
       </blockquote>
     ),
-    code: ({ className, children }) =>
-      className ? (
-        <code className={`${className} font-mono text-code`}>{children}</code>
-      ) : (
-        <code className="rounded-control bg-surface-raised/70 px-1.5 py-0.5 font-mono text-code">
-          {children}
-        </code>
-      ),
+    code: ({ className, children }) => (
+      <code
+        className={`box-decoration-clone rounded-[5px] bg-code-surface px-[5px] py-[1px] font-mono text-[0.875em] text-code-foreground ring-1 ring-inset ring-code-border ${className ?? ''}`.trim()}
+      >
+        {children}
+      </code>
+    ),
     pre: ({ children }) => (
-      <pre className="my-3 overflow-auto rounded-control bg-surface-raised/85 p-3 font-mono text-code leading-relaxed">
+      <pre className="my-3 overflow-auto rounded-control border border-code-border bg-code-block-surface p-3 font-mono text-code leading-relaxed text-code-foreground [&>code]:box-decoration-slice [&>code]:rounded-none [&>code]:border-0 [&>code]:bg-transparent [&>code]:p-0 [&>code]:text-[1em] [&>code]:text-inherit [&>code]:ring-0">
         {children}
       </pre>
     ),
@@ -326,7 +325,7 @@ function createMarkdownComponents(
       </div>
     ),
     th: ({ children }) => (
-      <th className="border-b border-border bg-surface-raised/60 px-3 py-2 font-medium">
+      <th className="border-b border-border bg-code-surface px-3 py-2 font-medium text-primary">
         {children}
       </th>
     ),

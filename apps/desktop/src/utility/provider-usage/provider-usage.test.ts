@@ -1,6 +1,6 @@
-import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { RuntimePreparation as RuntimePreparationSnapshot } from '@pact/contracts'
@@ -735,9 +735,20 @@ describe.skipIf(process.platform === 'win32')('ProviderUsage utility owner', () 
     const agyFacts = await f.readFacts(f.agyFactsPath)
     expect(codexFacts[0]?.cwd).toContain('provider-usage-probe')
     expect(claudeFacts[0]?.cwd).toContain('provider-usage-probe')
+    const agyProbeRoot = dirname(agyFacts[0]!.cwd!)
     expect(agyFacts[0]?.cwd).toContain('provider-usage-probe')
     expect(agyFacts[0]?.cwdMode).toBe(0o700)
-    expect(agyFacts[0]?.args).toEqual(['-p', '/usage', '--output-format', 'json'])
+    expect(agyFacts[0]?.args?.slice(0, 5)).toEqual([
+      '-p',
+      '/usage',
+      '--output-format',
+      'json',
+      '--log-file',
+    ])
+    expect(agyFacts[0]?.args?.[5]?.replace(/^\/private/u, '')).toBe(
+      join(agyProbeRoot, 'usage.log').replace(/^\/private/u, ''),
+    )
+    await expect(stat(agyProbeRoot)).rejects.toThrow(/ENOENT/u)
 
     // All spawned probe processes are confirmed dead after completion.
     for (const fact of [...codexFacts, ...claudeFacts, ...agyFacts]) {

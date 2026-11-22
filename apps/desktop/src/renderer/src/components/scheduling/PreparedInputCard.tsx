@@ -243,7 +243,7 @@ export function PreparedInputCard({
                   )}
                 </div>
               ) : null}
-              <pre className="max-h-40 overflow-auto whitespace-pre-wrap rounded-control bg-surface-raised p-3 text-caption">
+              <pre className="max-h-40 overflow-auto whitespace-pre-wrap rounded-control border border-code-border bg-code-block-surface p-3 text-caption text-code-foreground">
                 {loading ? 'Loading saved source…' : (page?.text ?? '')}
               </pre>
               <div className="flex gap-3">

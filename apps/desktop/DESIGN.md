@@ -1,27 +1,35 @@
 ---
 name: Pact Desktop
-description: An airy daylight and midnight control room for governed dual-agent software work.
+description: A Warm Porcelain Atelier and midnight slate control room for governed dual-agent software work.
 colors:
   canvas-light: '#ebf5ff'
   surface-light: '#fafdff'
   surface-raised-light: '#ffffff'
   ink-light: '#0a0d12'
-  text-secondary-light: '#535862'
+  text-secondary-light: '#525b6b'
   canvas-dark: '#0f1720'
   surface-dark: '#141e28'
   surface-raised-dark: '#1d2a36'
   ink-dark: '#f2f7fb'
-  text-secondary-dark: '#a9b7c4'
-  action-light: '#181d27'
+  text-secondary-dark: '#a1adbf'
+  action-light: '#171b24'
   action-dark: '#edf5fb'
   iris: '#0069e0'
   iris-dark: '#67b1ff'
   user-light: '#f1e6ff'
   claude-light: '#fff2eb'
+  claude-fg-light: '#b5471c'
   codex-light: '#d3f6e3'
+  codex-fg-light: '#137043'
+  agy-light: '#e6f4fa'
+  agy-fg-light: '#155e75'
   user-dark: '#2b2941'
   claude-dark: '#382923'
+  claude-fg-dark: '#f79a72'
   codex-dark: '#19372f'
+  codex-fg-dark: '#6ee7a8'
+  agy-dark: '#162e38'
+  agy-fg-dark: '#7ad7f0'
   diff-added-light: '#e5f8ed'
   diff-removed-light: '#fff0ee'
   diff-added-dark: '#17392b'
@@ -61,6 +69,7 @@ rounded:
   control: '8px'
   message: '12px'
   panel: '14px'
+  sheet: '14px'
   pill: '9999px'
 spacing:
   compact: '6px'
@@ -87,37 +96,43 @@ components:
     backgroundColor: '{colors.user-light}'
     textColor: '{colors.ink-light}'
     rounded: '{rounded.message}'
-    padding: '14px 16px'
-  message-claude:
+    padding: '12px 16px'
+  crest-claude:
     backgroundColor: '{colors.claude-light}'
-    textColor: '{colors.ink-light}'
-    rounded: '{rounded.message}'
-    padding: '14px 16px'
-  message-codex:
+    textColor: '{colors.claude-fg-light}'
+    rounded: '{rounded.pill}'
+    padding: '2px 8px'
+  crest-codex:
     backgroundColor: '{colors.codex-light}'
-    textColor: '{colors.ink-light}'
-    rounded: '{rounded.message}'
-    padding: '14px 16px'
+    textColor: '{colors.codex-fg-light}'
+    rounded: '{rounded.pill}'
+    padding: '2px 8px'
+  crest-agy:
+    backgroundColor: '{colors.agy-light}'
+    textColor: '{colors.agy-fg-light}'
+    rounded: '{rounded.pill}'
+    padding: '2px 8px'
 ---
 
 # Design System: Pact Desktop
 
 ## Overview
 
-**Creative North Star: "The Daylight Control Room"**
+**Creative North Star: "Warm Porcelain Atelier"**
 
-Pact pairs an airy sky-tinted workspace with a midnight companion theme. The interface remains operational and precise, while soft lavender, peach, mint, and cool glacier-blue message surfaces give User, Claude Code, Codex, and Antigravity (`agy`) distinct identities within each Session's active two-Agent pair without becoming noisy. Dense actions stay charcoal or pale inverse; Iris blue is rationed to focus, selection, and live state.
+Pact pairs a calm porcelain ambient canvas with crisp inset floating sheets in daylight mode and a deep obsidian-slate companion in dark mode. The workspace stays quiet and editorial for long coding sessions: right-aligned Lavender **User** pills contrast with a frame-free 3-Agent Editorial Stream where **Claude Code** (terracotta crest), **Codex** (sage crest), and **Antigravity** (`agy`, glacier sky crest) carry unmistakable provenance within each Session's active two-Agent pair without heavy card clutter. Dense actions stay charcoal or pale inverse; Iris blue is rationed to focus, selection, and live state.
 
 This is an Operate interface. Transcript, Diff, documents, permissions, and runtime activity must remain readable for hours. Translucency is optional material depth, not decoration: navigation may reveal more of the desktop environment, Chat reveals less, and code surfaces remain nearly opaque.
 
 **Key Characteristics:**
 
-- Pale sky canvas and bone-white work surfaces in light mode.
-- Midnight-blue surfaces rather than generic black in dark mode.
-- Lavender User messages on the right; peach Claude Code, mint Codex, and glacier-blue Antigravity messages on the left.
-- Compact, familiar desktop controls with deliberate color fields.
-- Solid and pure-translucent variants sharing one component system.
-- Fully opaque type, icons, code, Diff meaning, and focus states.
+- Cool porcelain ambient canvas (`#ebf5ff`) framing inset floating sheets (`#fafdff`, `14px` radius, `6px` breathing gap) in light mode.
+- Deep obsidian canvas (`#0f1720`) framing midnight-slate sheets (`#141e28`) in dark mode.
+- Frame-free Editorial Stream for Agent replies identified by terracotta (`Claude Code`), sage (`Codex`), and glacier sky (`Antigravity`) speaker crests and subtle vertical guides; right-aligned Lavender pills for User messages.
+- Unified floating `ContextInspector` sheet with persistent `Plan` and `Side chats` tabs plus contextual `Changes`, `File`/`Skill`, and `Session settings` views.
+- Unified `ComposerIsland` anchored with dedicated `shrink-0` breathing clearance at the base of the Chat sheet.
+- FLIP zero-reflow pane and surface motion on `--ease-silk-out` with gentle displacement-free reduced-motion fades.
+- Solid and pure-translucent variants sharing one component system, with fully opaque type, icons, code, Diff meaning, and focus states.
 
 Main-workspace visual references:
 
@@ -130,35 +145,37 @@ These references govern visual hierarchy, material, speaker alignment, Project/S
 
 ## Colors
 
-The palette uses daylight blue and midnight navy as environmental fields, with pastel speaker surfaces and a single precise Iris interaction accent.
+The palette uses porcelain and obsidian as environmental canvases, inset work sheets for primary reading and editing, distinct speaker crest accents, and a single precise Iris interaction accent.
 
 ### Primary
 
-- **Iris Focus** (`#0069e0` light, `#67b1ff` dark): current selection, keyboard focus, and bounded progress indicators only.
-- **Charcoal Action** (`#181d27` light, `#edf5fb` dark): the strongest action in a local decision area.
+- **Iris Focus** (`#0069e0` light, `#67b1ff` dark): current selection, keyboard focus, active unread cues, and bounded progress indicators only.
+- **Charcoal Action** (`#171b24` light, `#edf5fb` dark): the strongest action in a local decision area.
 
 ### Secondary
 
-- **User Lavender** (`#f1e6ff` / `#2b2941`): right-aligned User messages.
-- **Claude Peach** (`#fff2eb` / `#382923`): left-aligned Claude Code messages.
-- **Codex Mint** (`#d3f6e3` / `#19372f`): left-aligned Codex messages and its inline activity rows.
-- **Antigravity Glacier**: left-aligned Antigravity (`agy`) messages and inline activity rows using cool sky-slate provenance tinting paired with the `Antigravity` speaker label and mark.
+- **User Lavender** (`#f1e6ff` / `#2b2941`): right-aligned User message pills.
+- **Claude Code Terracotta** (crest tint `#fff2eb` / `#382923`, foreground `#b5471c` / `#f79a72`, vertical guide `rgb(217 102 54 / 30%)` / `rgb(247 154 114 / 32%)`): left-aligned Claude Code editorial turns and inline activity rows.
+- **Codex Sage** (crest tint `#d3f6e3` / `#19372f`, foreground `#137043` / `#6ee7a8`, vertical guide `rgb(22 136 82 / 30%)` / `rgb(110 231 168 / 32%)`): left-aligned Codex editorial turns and inline activity rows.
+- **Antigravity Glacier Sky** (crest tint `#e6f4fa` / `#162e38`, foreground `#155e75` / `#7ad7f0`, vertical guide `rgb(14 116 144 / 30%)` / `rgb(122 215 240 / 32%)`): left-aligned Antigravity (`agy`) editorial turns and inline activity rows paired with the `Antigravity` speaker label and mark.
 
 ### Tertiary
 
-- **Ready Green** (`#16883f` / `#5ee58a`): healthy and running states.
-- **Warning Ochre** (`#946200` / `#e6b84a`): recoverable operational risk. Routine collaboration decisions use neutral surfaces.
+- **Ready Green** (`#16883f` / `#5ee58a`, foreground `#0d6b32` / `#5ee58a`): healthy and running states.
+- **Warning Ochre** (`#b4690e` / `#eab308`, foreground `#8c510a` / `#f4c753`): recoverable operational risk. Routine collaboration decisions use neutral surfaces.
 - **Danger Red** (`#b42318` / `#ff8a80`): failed, blocked, destructive, and irreversible actions.
 
 ### Neutral
 
-- **Sky Canvas** (`#ebf5ff` / `#0f1720`): window environment and navigation field.
-- **Bone Surface** (`#fafdff` / `#141e28`): Chat, documents, and primary pane surfaces.
-- **Raised Surface** (`#ffffff` / `#1d2a36`): Composer, menus, and protected local emphasis.
+- **Atelier Canvas** (`#ebf5ff` / `#0f1720`): ambient window environment and navigation field behind floating sheets.
+- **Porcelain Sheet Surface** (`#fafdff` / `#141e28`): inset Chat, `ContextInspector`, and primary document sheets.
+- **Muted Surface** (`#f0f7fc` / `#192633`): segmented tab tracks, subtle strips, and secondary quiet wells.
+- **Raised Surface** (`#ffffff` / `#1d2a36`): `ComposerIsland`, popovers, dialogs, and protected local emphasis.
+- **Code Surfaces** (`--pact-code-surface` `#e7f0f8` / `#202f3f`, `--pact-code-block-surface` `#edf4fa` / `#0e1620`, `--pact-code-foreground` `#101b29` / `#edf5fc`, `--pact-code-border` `rgb(15 23 42 / 12%)` / `rgb(241 245 249 / 14%)`; mapped via Tailwind `--color-code-surface`, `--color-code-block-surface`, `--color-code-foreground`, `--color-code-border`): inline Markdown code chips, table headers, fenced code blocks, and saved source `<pre>` wells. Light mode uses cool porcelain-slate wells with subtle hairlines that separate cleanly from both `#fafdff` porcelain Agent surfaces and `#f1e6ff` Lavender User bubbles; Dark mode pairs lifted slate inline pills with recessed obsidian-slate block wells separated from `#141e28` Chat sheets, `#1d2a36` raised cards, and `#2b2941` User bubbles. Both themes maintain `>= 7:1` WCAG AAA ink contrast (`> 12:1`). Translucent mode applies `var(--pact-material-code-alpha)` (`94–99%`) cool slate / obsidian overlays with stronger hairlines (`15%` / `18%`) while keeping `--pact-code-foreground` 100% opaque; `forced-colors: active` maps code surfaces to `Canvas`, foreground to `CanvasText`, and borders to `ButtonBorder`.
 - **Primary Ink** (`#0a0d12` / `#f2f7fb`): headings, body copy, and code-adjacent labels.
-- **Secondary Ink** (`#535862` / `#a9b7c4`): helper text and metadata.
+- **Secondary Ink** (`#525b6b` / `#a1adbf`): helper text and metadata.
 
-**The Semantic Color Rule.** Speaker color identifies provenance; Iris identifies interaction; green, ochre, and red identify operational state. Every colored signal also carries text, iconography, position, or shape.
+**The Semantic Color Rule.** Speaker crests and guide lines identify provenance; Iris identifies interaction; green, ochre, and red identify operational state. Every colored signal also carries text, iconography, position, or shape.
 
 **The Density-by-Importance Rule.** In translucent mode, Sidebar is most transparent, Chat is denser, and Diff/terminal/permissions are nearly opaque. Text and code never inherit surface Alpha.
 
@@ -183,11 +200,13 @@ The palette uses daylight blue and midnight navy as environmental fields, with p
 
 ## Layout
 
-The main workspace uses three resizable panes: Git Project/Session navigation, shared Session chat, and an optional contextual Artifact panel. The center Chat owns attention; selecting a Diff, document, or Comment opens the right panel, and closing it returns width to Chat.
+The main workspace uses three resizable regions on an ambient Atelier Canvas (`--pact-canvas`): frameless Git Project/Session navigation on the left, an inset floating Chat sheet in the center, and an optional inset floating `ContextInspector` sheet on the right. Each floating sheet uses `--pact-surface`, a hairline `--pact-border`, a `14px` sheet radius (`--pact-sheet-radius`), subtle ambient sheet elevation (`--pact-shadow-sheet`), and a `6px` breathing gap (`--pact-sheet-gap`) separating sheets and inset edges. The center Chat owns attention; selecting a Diff, document, Comment, Plan, Side chat, or Session settings opens `ContextInspector`, and closing it returns width to Chat.
 
-The shell fills the Renderer viewport; only internal panes scroll. Wide mode starts at 1100px with three panes, compact mode is 860–1099px, and narrower supported windows retain Navigation left of Chat with Context overlaying from the right. The native minimum window is 720px wide and 520px high. Navigation never moves above Chat. Hiding a side pane returns its space and exposes a labeled restoration control; closing returns keyboard focus to that control. Overlay Context is a labeled modal with contained Tab order and Escape dismissal.
+The shell fills the Renderer viewport; only internal panes scroll. Wide mode starts at 1100px with three panes, compact mode is 860–1099px, and narrower supported windows retain Navigation left of Chat with `ContextInspector` overlaying from the right (`rounded-l-[14px]`). The native minimum window is 720px wide and 520px high. Navigation never moves above Chat. Hiding a side pane returns its space and exposes a labeled restoration control; closing returns keyboard focus to that control. Overlay Context is a labeled modal with contained Tab order and Escape dismissal.
 
-Resize separators show one 1px rule with an invisible 6px pointer extension on each side and support keyboard resizing. Interactive titlebar content is `no-drag`; native caption/traffic-light safe areas remain clear, and remaining titlebar space stays draggable. Navigation/Context transitions are interruptible, short and reduced-motion-aware. Lazy editors/details stay unloaded until needed; scoped loading and retry must preserve the rest of the workspace.
+Resize separators live cleanly inside the `6px` breathing gap between floating sheets, showing a soft `2px` focus-tinted glow rule (inset `16px` vertically) on hover, keyboard focus, or active drag with an extended pointer hit area and full keyboard resizing. Interactive titlebar content is `no-drag`; native caption/traffic-light safe areas remain clear, and remaining titlebar space stays draggable.
+
+Pane and surface choreography uses FLIP zero-reflow motion calibrated on `--ease-silk-out` (`cubic-bezier(0.22, 1, 0.36, 1)`): toggling Navigation or `ContextInspector` commits target layout immediately and animates GPU `transform` and `opacity` (`260ms`) without per-frame reflow. Under `prefers-reduced-motion: reduce`, all transforms, scale, and stagger zero out while gentle `80–120ms` (`100ms` for shell FLIP) opacity fades keep state transitions legible. Lazy editors/details stay unloaded until needed; scoped loading and retry must preserve the rest of the workspace.
 
 Project rows show disclosure state, repository icon, and editable Project name. The folder toggles disclosure; clicking the name opens its inline editor. Project-level New Session, Rename and Archive appear only on Hover or keyboard focus. Session rows begin 6px below the expanded Project header and are indented without tree connector lines, a persistent `Sessions` label, branch, Changes, path, or count metadata. A collapsed Project remains a single quiet row.
 
@@ -195,7 +214,7 @@ Spacing follows a 6px rhythm with 12px grouped gaps, 18px surface padding, and 2
 
 ## Elevation & Depth
 
-Solid themes use tonal separation and hairline dividers. Persistent panes do not use decorative shadows. Menus and dialogs may use one ambient shadow because they genuinely leave the plane.
+Solid themes layer inset floating porcelain sheets (`--pact-shadow-sheet` + hairline `--pact-border`) over the ambient Atelier Canvas (`--pact-canvas`), while elevated overlays (`ComposerIsland`, popovers, and application dialogs) use dedicated depth tokens (`--pact-shadow-island`, `--pact-shadow-popover`, `--pact-shadow-dialog`). Internal content rows and sections rely on tonal separation rather than boxed shadows.
 
 Translucent uses explicit transparent window backing and per-surface color overlays on macOS and supported Windows. macOS has no Vibrancy blur; Windows disables native backdrop material rather than using Mica. Do not use whole-window opacity for material transparency; the bounded workspace visibility transition below is the sole temporary exception. The UI shows a 0–100 **Transparency strength** scale (default 50, higher is more see-through), not a literal window-opacity percentage. It maps to stored `materialOpacity` 100–70 (default 85) and then to separate surface Alpha ranges:
 
@@ -211,7 +230,7 @@ macOS uses `transparent: true` with `#00000000` backing and no Vibrancy. Windows
 
 ## Shapes
 
-Windows opaque Solid windows use system corner and shadow treatment, without a manual window region. Transparent-backed Windows windows retain subtle 8px corners with native clipping of drawing and pointer input. Maximized and full-screen windows use square corners; macOS retains its native window rounding. Inputs, icon buttons, and code-adjacent controls use 8px. Message surfaces use 12px; genuinely detached panels may use 14px. Pills are reserved for short recipient and attachment chips; normal toolbar actions are not pills.
+Windows opaque Solid windows use system corner and shadow treatment, without a manual window region. Transparent-backed Windows windows retain subtle 8px corners with native clipping of drawing and pointer input. Maximized and full-screen windows use square corners; macOS retains its native window rounding. Inputs, icon buttons, and code-adjacent controls use 8px. User message pills and inline cards use 12px; floating workspace sheets (`--pact-sheet-radius`), `ComposerIsland`, and detached panels use 14px. Pills are reserved for short speaker crests, recipient chips, and attachment chips; normal toolbar actions are not pills.
 
 ## Components
 
@@ -254,7 +273,7 @@ Recipient and Comment attachment chips use a compact raised surface and full lab
 
 ### Cards / Containers
 
-Messages and self-contained Artifacts earn a colored surface. Navigation groups, ordinary rows, and pane sections remain unboxed. Persistent content uses tonal layering rather than shadows.
+User message pills and genuinely self-contained Artifacts earn distinct containers; Agent editorial turns, navigation groups, ordinary rows, and inline `WorkspaceChangesCard` summaries remain frame-free on the porcelain sheet so reading flows without box fatigue. Persistent content uses tonal layering and quiet dividers rather than heavy borders or nested shadows.
 
 ### Inputs / Fields
 
@@ -276,9 +295,9 @@ Session group headers mix the chosen color into the raised surface and show the 
 
 ### Transcript and Composer
 
-User messages are right-aligned on lavender. Claude Code, Codex, and Antigravity messages are left-aligned on peach, mint, and glacier-blue surfaces. Speaker labels remain visible, and ordinary messages avoid avatars that could be mistaken for account UI. Flow steps and runtime states may appear inline inside the responsible Agent message; global workflow timelines and `Plan approved` banners are not persistent Chat chrome. Main-chat user messages synced from a side chat carry a clickable **From side chat** badge (`+8px → 0`, 180 ms `--ease-out-pact`) that opens that side chat in the right pane; ordinary text selections on main-chat User/Agent messages expose **Ask in side chat** beside **Add comment** (`@starting-style` 140 ms float-in / 90 ms float-out).
+The transcript renders a frame-free 3-Agent Editorial Stream directly on the porcelain Chat sheet. Right-aligned **User** messages sit on soft Lavender pills (`--pact-speaker-user`). Left-aligned **Claude Code**, **Codex**, and **Antigravity** (`agy`) turns flow without outer card boxes, anchored by compact provenance crests and subtle vertical guide lines (**Claude Code** terracotta crest, **Codex** sage crest, **Antigravity** glacier sky crest). Speaker labels remain visible, and ordinary messages avoid avatars that could be mistaken for account UI. Flow steps and runtime states may appear inline inside the responsible Agent turn; global workflow timelines and `Plan approved` banners are not persistent Chat chrome. Main-chat user messages synced from a side chat carry a clickable **From side chat** badge (`+8px → 0`, 180 ms `--ease-silk-out`) that opens that side chat in `ContextInspector`; ordinary text selections on main-chat User/Agent messages expose **Ask in side chat** beside **Add comment** (`@starting-style` 160–180 ms float-in / 100–120 ms float-out on `--ease-silk-out`).
 
-The Composer is a stable dense surface at least two lines high. Native Skills and the selected route (`@claude`, `@codex`, `@agy`, `@all`, or side-chat `@Main`) are atomic inline units; attached Comments are removable source chips above the input; native question answers stay in their live forms. Images show thumbnails, filename and state, with Add image below full-width text. Active-pair Agent permissions, Speed, Project folder and branch stay on one row below the input. Project context shrinks first; labels truncate as space decreases while icons and dropdown controls remain visible. Full values remain available through accessible names, tooltips and menus. Send becomes Stop during a response. Enter queues one message, Shift+Enter inserts a newline; a disabled queue retains Enter as newline. Unsubmitted drafts never auto-send.
+The unified **ComposerIsland** (`shrink-0`, `--pact-surface-raised`, `--pact-shadow-island`, `14px` radius) anchors at the base of the Chat sheet with dedicated bottom breathing clearance so the scrolling Editorial Stream never clips behind or collides with the input bar. Native Skills and the selected route (`@claude`, `@codex`, `@agy`, `@all`, or side-chat `@Main`) are atomic inline units; attached Comments are removable source chips above the input; native question answers stay in their live forms. Images show thumbnails, filename and state, with Add image below full-width text. Active-pair Agent permissions, Speed, Project folder and branch stay on one row below the input. Project context shrinks first; labels truncate as space decreases while icons and dropdown controls remain visible. Full values remain available through accessible names, tooltips and menus. Send becomes Stop during a response. Enter queues one message, Shift+Enter inserts a newline; a disabled queue retains Enter as newline. Unsubmitted drafts never auto-send.
 
 Completed Pact command tokens use the same book icon and inline badge treatment as native Skills, labeled `pact:plan`, `pact:review`, `pact:build`, and main-chat `pact:btw`. Their original slash text remains authoritative for editing, copying and sending. Main-Session `@` autocomplete offers the Session's active two-Agent pair and `All` (supporting `/btw @agy /skill` handoffs without `@gemini` aliases); `/` Skills groups Pact commands separately from native catalogs of the active two-Agent pair. In side chats, all Pact slash commands and **Fork** are disabled, and the locked Composer footer hides the Session settings gear, Permission, Speed, and Project controls. Side-chat `@` autocomplete places `@Main` below the side chat's active member mentions and `@all`, morphing Send (150 ms) to `CornerUpLeft` (**Send to main**) and displaying a compact **Sent to main chat · View** bar (160 ms entrance) upon sync-back. Seeding a `/btw` draft into a new side-chat Composer plays a 220 ms Iris border/surface arrive settle (`.pact-composer-handoff-arrive`) with cursor at end and zero auto-send. Skill and Agent recipient pickers sit 8px above the entire Composer and escape input-panel clipping. The Skill picker keeps command targets fixed as native catalogs load; both pickers fit their scrollable height to the available viewport. Escape and outside clicks dismiss the active picker until its query changes; incidental cursor events must not reopen it. Ordinary draft and validation resizing must preserve the complete Composer focus outline.
 
@@ -290,13 +309,15 @@ Composer permission, Project-folder and branch popovers share one presentation: 
 
 ### Artifact, Diff, and Review
 
-The right panel is contextual, resizable and closable. Diff uses dedicated add/remove tokens in both themes and becomes nearly opaque under translucency. Documents preserve comfortable prose measure; Comments retain a visible anchor without obscuring code.
+The unified right-side `ContextInspector` sheet (`14px` radius, `⌘J` / `Ctrl+J` toggle) consolidates persistent **Plan** and **Side chats** tabs alongside contextual **Changes**, **File** / **Skill**, and **Session settings** tabs behind a GPU-composited `translate3d` sliding-pill tab indicator (`240ms --ease-silk-out`). Dual DOM keep-alive hosts preserve **Plan** and **Side chats** scroll position, drafts, and Comment state while switching tabs.
+
+Inline edit summaries use a borderless `WorkspaceChangesCard` directly within the Editorial Stream, listing edited files with tabular `+additions` / `−deletions`, active-file highlighting synced to the open Diff, per-file Undo, and full-changeset Undo with accessible disabled reasons. Opening a file renders a single-scroll Diff or source preview inside `ContextInspector` without nested vertical scrollbars, using dedicated add/remove tokens in both themes (nearly opaque under translucency) and supporting inline text selection commenting (**Add comment**) with exact anchor highlights and return-to-source navigation. Documents preserve comfortable prose measure; Comments retain a visible anchor without obscuring code.
 
 ### Side chats
 
-Main-chat headers place a **Side chats** button beside **Session settings** with a subtle Running/Needs attention badge (`pact-badge-pop`, 180 ms), or a quiet unread dot (`bg-focus`) when unread completed replies exist without active runs or attention items. Clicking opens a continuous scrolling virtualized list with a single **+** (**New side chat**) icon button in the header, fixed `84px` row height, and zero pagination or Load more buttons; each row shows title, Running/Needs attention badge (or quiet `New reply` unread dot), `ChevronRight` (`+2px` hover slide, 150 ms), single-line latest message preview (falling back to anchor quote or `Started with /btw`), and timestamp, with empty (`No side chats yet`) and inline boundary Retry states. Initial panel reveal staggers rows `150 ms` (`translateY(4px → 0)` + opacity, `18 ms` step capped `≤90 ms`), with zero enter animation while scrolling.
+Main-chat headers place a **Side chats** button beside **Session settings** and the **ContextInspector** toggle, showing a subtle Running/Needs attention badge (`pact-badge-pop`, 180 ms), or a quiet unread dot (`bg-focus`) when unread completed replies exist without active runs or attention items. Clicking opens the persistent **Side chats** tab inside `ContextInspector` with a continuous scrolling virtualized list, a single **+** (**New side chat**) icon button in the header, fixed `84px` row height, and zero pagination or Load more buttons; each row shows title, Running/Needs attention badge (or quiet `New reply` unread dot), `ChevronRight` (`+2px` hover slide, 160 ms `--ease-silk-out`), single-line latest message preview (falling back to anchor quote or `Started with /btw`), and timestamp, with empty (`No side chats yet`) and inline boundary Retry states. Initial panel reveal staggers rows `160 ms` (`translateY(4px → 0)` + opacity, `18 ms` step capped `≤90 ms`), with zero enter animation while scrolling.
 
-Side-chat detail replaces the list via `SideChatStage` horizontal push (`data-direction='1'`, 180 ms `+12px → 0`) and pop (`data-direction='-1'`, 160 ms `-12px → 0`) transitions using `--ease-out-pact` (`cubic-bezier(0.16, 1, 0.3, 1)`), animating only `transform` and `opacity`, keeping the outgoing layer inert, and respecting `freezePanelContent` reflow protection plus `prefers-reduced-motion: reduce` (60 ms opacity fade, zero translate or stagger). Its header renders **‹ Side chats** (restoring list scroll before paint), truncated title (starting at `New side chat` until updated by Agent naming), and **×** close (leaving runs intact and restoring trigger focus) with no settings gear. Empty side chats show `Ask <Agent>` and `Ask about the main chat, or type @Main to send a takeaway back.`; leaving an untouched empty draft side chat automatically discards it, while opening a side chat with unread completed replies marks it read. Selecting text for **Ask in side chat** pre-attaches the quoted excerpt as a standard removable Comment draft chip inside the side-chat Composer (`Main chat · “…”`, with **↩** return-to-source highlighting/pulsing the parent quote and **×** remove), settling into a standard sent **Comment** card once sent; `/btw` side chats show a quiet **Context from main chat** line when parent context exists. Main-chat messages tagged **From side chat** dynamically resolve the current side-chat title in their tooltip/label. Opening a File, Changes, or Skill preview from an active side chat pushes it onto the Context navigation stack with **‹ Back to side chat** in the header to pop smoothly back while preserving side-chat scroll and draft.
+Side-chat detail replaces the list via `SideChatStage` horizontal push (`data-direction='1'`, 180 ms `+12px → 0`) and pop (`data-direction='-1'`, 160 ms `-12px → 0`) transitions using `--ease-silk-out` (`cubic-bezier(0.22, 1, 0.36, 1)`), animating only `transform` and `opacity`, keeping the outgoing layer inert, and respecting `prefers-reduced-motion: reduce` (gentle 80–120 ms opacity fade, zero translate or stagger). Its header renders **‹ Side chats** (restoring list scroll before paint), truncated title (starting at `New side chat` until updated by Agent naming), and **×** close (leaving runs intact and restoring trigger focus) with no settings gear. Empty side chats show `Ask <Agent>` and `Ask about the main chat, or type @Main to send a takeaway back.`; leaving an untouched empty draft side chat automatically discards it, while opening a side chat with unread completed replies marks it read. Selecting text for **Ask in side chat** pre-attaches the quoted excerpt as a standard removable Comment draft chip inside the side-chat Composer (`Main chat · “…”`, with **↩** return-to-source highlighting/pulsing the parent quote and **×** remove), settling into a standard sent **Comment** card once sent; `/btw` side chats show a quiet **Context from main chat** line when parent context exists. Main-chat messages tagged **From side chat** dynamically resolve the current side-chat title in their tooltip/label. Opening a File, Changes, or Skill preview from an active side chat pushes it onto the `ContextInspector` navigation stack with **‹ Back to side chat** in the header to pop smoothly back while preserving side-chat scroll and draft.
 
 The current full plan is read only in Context's Plan tab with one status badge (`Unreviewed`, `Needs update`, `Ready`). Plan headers expose Expand/Restore beside Close. The Plan pane resizes within the available workspace without a percentage cap or document-width ceiling. In-app expansion keeps the same document, scroll position, Conversation owner and Comment state mounted; its Comment editor and attached drafts remain usable inside the expanded pane. Restoring returns them to the Composer without sending or discarding drafts. Chat preserves complete natural replies and review reports, with a compact footer for the native plan version, review state and next action. Avoid a second full plan or a separate structured-feedback disclosure. A native plan with no ordinary answer still has its compact source/footer and opens the saved plan document. Current **Implement plan**, **Review plan**, **Review code**, **Update plan**, **Fix issues**, and **Retry** actions remain visible independently of historical folding. Task action rows place one primary action first and bordered secondary actions after it on a single horizontal row that scrolls rather than wraps; at narrow widths repeated Agent suffixes compact while complete accessible names and tooltips remain. There is no standalone Pause or Continue collaboration action. A replaced task's result footer reads Ended, or Ended before review when its last changes were not reviewed.
 
@@ -304,7 +325,7 @@ The context pane contains Plan, files, Changes and Session settings; findings an
 
 Historical plans and reports retain their exact source/version; unsupported old anchors show their saved quote and an unavailable reason without reopening removed workflow UI. Navigation waits for body readiness before alignment, restores exact source focus, and does not reset reading position on refresh. Internal UUIDs, hashes, JSON fields and transport instructions do not belong in visible product prose.
 
-During authorized automatic collaboration, show the responsible Agent and concise current step. User Send immediately blocks later handoffs until its priority reply is processed; the current root normally finishes. Confirmed latest-input settlement automatically continues authorized planning/review unless an explicit or exceptional pause remains. When a completed reply requires a user decision, its question card replaces the ordinary Composer. Show each explicit prompt, unselected choices when supplied, and a labelled free-answer field; do not infer questions from report prose. Send answers submits only the card answers to the verified requesting Agent. Sent replies show the frozen @recipient beside You, a separate reply heading, and numbered question blocks with selected answers on their own lines. Stop interrupts the current response and pauses collaboration while preserving sent answers and ordinary drafts. Keep the ordinary message draft, images, Comments, Skills, route and returned-input receipts intact and unsent. The reusable InputReplacement component owns the shared input location, a 220ms height transition with a 140ms fade, focus handoff and inert inactive panels. Reduced motion removes height/movement and keeps a brief opacity cue. Its two panels, one ResizeObserver, one animation and one exit-retention timer are disposed on unmount. Processing keeps a compact answer status in this location with Stop and existing recovery/queue controls; ordinary message input returns only after the decision gate clears. Failed or uncertain work retains recovery and never silently opens a new-message path. When the current plan requires recovery, replace an existing decision form with a neutral Plan recovery required state. Keep its answers and ordinary drafts intact, and use the existing Proposal recovery action. Do not show question or answer-processing copy for this recovery state. Older requests retain an expandable original-text entry and a free-answer field inside the card. Result footers distinguish requests for input, processed replies and ordinary review responses using that Run's stored facts. Use a neutral muted surface, a thin neutral border and a monochrome conversation icon; routine input requests are not operational warnings. Successful Send dismisses this prompt immediately; failed Send preserves it. Sending a new Pact command over an unfinished task opens an application modal replacement confirmation using the Archive dialog's raised surface, backdrop and motion: the Composer and input stay unchanged behind the backdrop with the draft intact, the modal suspends with the native presentation surface, Keep current task takes initial focus, and Escape or Keep returns focus to the Composer draft without sending. Queue/progress/recovery use their existing surfaces. Only a new decision request shows the prompt again. Hide Continue and the next-review suggestion until the reply is confirmed processed. Active collaboration then proceeds automatically; only a persistent pause shows Continue collaboration with its computed next step. Keep Stop separate from pausing future work. At Session limits, show the specific exhausted allowance and retain the plan/report rather than implying failure erased it. Native form answers continue the existing root while any independent automation pause remains visible. Restart preserves a paused continuation and the original unknown-work recovery action; no hidden automatic peer restart or generic approval banner is introduced.
+During authorized automatic collaboration, show the responsible Agent and concise current step. User Send immediately blocks later handoffs until its priority reply is processed; the current root normally finishes. Confirmed latest-input settlement automatically continues authorized planning/review unless an explicit or exceptional pause remains. When a completed reply requires a user decision, its question card replaces the ordinary Composer. Show each explicit prompt, unselected choices when supplied, and a labelled free-answer field; do not infer questions from report prose. Send answers submits only the card answers to the verified requesting Agent. Sent replies show the frozen @recipient beside You, a separate reply heading, and numbered question blocks with selected answers on their own lines. Stop interrupts the current response and pauses collaboration while preserving sent answers and ordinary drafts. Keep the ordinary message draft, images, Comments, Skills, route and returned-input receipts intact and unsent. The reusable InputReplacement component owns the shared input location, committing target height synchronously with zero per-frame height reflow, compensating transcript scroll, animating panes via GPU `translate3d`/`opacity`/`scale` (`220ms`/`160ms --ease-silk-out`), handling focus handoff, and keeping inactive panels inert. Reduced motion removes translation/scale and keeps a gentle opacity fade. Its two panels, event listeners, and 220ms exit-retention timer are disposed on unmount. Processing keeps a compact answer status in this location with Stop and existing recovery/queue controls; ordinary message input returns only after the decision gate clears. Failed or uncertain work retains recovery and never silently opens a new-message path. When the current plan requires recovery, replace an existing decision form with a neutral Plan recovery required state. Keep its answers and ordinary drafts intact, and use the existing Proposal recovery action. Do not show question or answer-processing copy for this recovery state. Older requests retain an expandable original-text entry and a free-answer field inside the card. Result footers distinguish requests for input, processed replies and ordinary review responses using that Run's stored facts. Use a neutral muted surface, a thin neutral border and a monochrome conversation icon; routine input requests are not operational warnings. Successful Send dismisses this prompt immediately; failed Send preserves it. Sending a new Pact command over an unfinished task opens an application modal replacement confirmation using the Archive dialog's raised surface, backdrop and motion: the Composer and input stay unchanged behind the backdrop with the draft intact, the modal suspends with the native presentation surface, Keep current task takes initial focus, and Escape or Keep returns focus to the Composer draft without sending. Queue/progress/recovery use their existing surfaces. Only a new decision request shows the prompt again. Hide Continue and the next-review suggestion until the reply is confirmed processed. Active collaboration then proceeds automatically; only a persistent pause shows Continue collaboration with its computed next step. Keep Stop separate from pausing future work. At Session limits, show the specific exhausted allowance and retain the plan/report rather than implying failure erased it. Native form answers continue the existing root while any independent automation pause remains visible. Restart preserves a paused continuation and the original unknown-work recovery action; no hidden automatic peer restart or generic approval banner is introduced.
 
 Image preview is a native modal with previous/next, directional keys, bounded filmstrip, close/Escape and trigger focus return. It fits content without zoom/Fit/100% controls. Its 180ms slide/fade honors reduced motion. Recovery uses one compact card for affected Agents, with currently valid action and specific reason rather than stacked warnings or repeated safety paragraphs.
 

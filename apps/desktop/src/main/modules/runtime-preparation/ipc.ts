@@ -1,6 +1,10 @@
 import { BrowserWindow, ipcMain } from 'electron'
 
-import { IPC_CHANNELS, runtimeAgentIdSchema } from '@pact/contracts'
+import {
+  IPC_CHANNELS,
+  runtimeAgentIdSchema,
+  runtimePreparationGetInputSchema,
+} from '@pact/contracts'
 
 import type { RendererTrust } from '../../renderer-trust'
 import type { RuntimePreparationController } from './controller'
@@ -9,9 +13,17 @@ export function registerRuntimePreparationIpcHandlers(
   trust: RendererTrust,
   controller: RuntimePreparationController,
 ): () => void {
-  ipcMain.handle(IPC_CHANNELS.runtimePreparationGet, (event) => {
+  ipcMain.handle(IPC_CHANNELS.runtimePreparationGet, (event, rawInput?: unknown) => {
     trust.assertTrustedMainFrame(event)
-    return controller.load()
+    if (rawInput === undefined) return controller.load()
+    const parsedInput = runtimePreparationGetInputSchema.safeParse(rawInput)
+    if (!parsedInput.success) {
+      return {
+        ok: false,
+        error: { code: 'VALIDATION', message: 'Invalid runtime preparation request.' },
+      }
+    }
+    return controller.load(parsedInput.data)
   })
 
   ipcMain.handle(IPC_CHANNELS.runtimeExecutableChoose, async (event, agentIdInput: unknown) => {

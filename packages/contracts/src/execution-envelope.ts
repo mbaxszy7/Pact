@@ -66,6 +66,60 @@ export const frozenExecutionEnvelopeSchema = z
       )
       .max(FROZEN_EXECUTION_INPUT_ITEMS)
       .optional(),
+    handoffImages: z
+      .array(
+        z.strictObject({
+          messageId: id,
+          images: conversationImagesSchema,
+        }),
+      )
+      .max(FROZEN_EXECUTION_INPUT_ITEMS)
+      .optional(),
+    handoffSpine: z
+      .array(
+        z.strictObject({
+          messageId: id,
+          sequence: z.number().int().nonnegative(),
+          speaker: z.string().min(1).max(64),
+          chars: z.number().int().nonnegative(),
+          preview: z.string().max(1024),
+        }),
+      )
+      .max(128)
+      .optional(),
+    /**
+     * Explicit empty array (`[]`) records a newly captured empty peer workspace change ledger;
+     * `undefined` indicates a non-handoff turn or legacy pre-upgrade snapshot without ledger capture.
+     */
+    peerWorkspaceChanges: z
+      .array(
+        z.strictObject({
+          runId: id,
+          agentId: z.enum(['codex', 'claude', 'agy']),
+          sequence: z.number().int().nonnegative().optional(),
+          truncatedFileCount: z.number().int().positive().optional(),
+          files: z
+            .array(
+              z.strictObject({
+                path: z.string().min(1).max(4096),
+                kind: z.string().min(1).max(64),
+                additions: z.number().int().nonnegative().nullable(),
+                deletions: z.number().int().nonnegative().nullable(),
+              }),
+            )
+            .max(FROZEN_EXECUTION_INPUT_ITEMS),
+        }),
+      )
+      .max(64)
+      .optional(),
+    planSummary: z
+      .strictObject({
+        version: z.number().int().nonnegative(),
+        stage: z.string().min(1).max(64),
+        reviewVerdict: z.string().min(1).max(64).optional(),
+        excerpt: z.string().max(4096).optional(),
+      })
+      .optional(),
     rebuiltContext: z
       .array(
         z.strictObject({

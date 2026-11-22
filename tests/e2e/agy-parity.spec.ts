@@ -1595,6 +1595,10 @@ test(
       await expect(
         settingsSection.getByRole('button', { name: 'Save changes', exact: true }),
       ).toBeDisabled()
+      await settingsSection
+        .getByRole('button', { name: 'Close Session settings', exact: true })
+        .click()
+      await expect(settingsSection).toHaveCount(0)
 
       // Release the active Antigravity turn so the main Session returns to clean idle
       await agy.updateControl({ holdTurn: false, scenario: 'complete' })
@@ -2261,6 +2265,54 @@ test(
       if (process.platform !== 'win32') {
         await chmod(sentinelHome, 0o700).catch(() => undefined)
       }
+      await rm(scratchRoot, { recursive: true, force: true })
+    }
+  },
+)
+
+test(
+  'verifyAgyMinimumVersion enforces explicit 1.5.13 threshold for 2-turn real plan_review precheck',
+  { tag: '@deterministic' },
+  async () => {
+    const scratchRoot = await mkdtemp(join(tmpdir(), 'pact-agy-minver-1513-'))
+    const isolatedHome = join(scratchRoot, 'isolated-home')
+    await mkdir(isolatedHome, { recursive: true, mode: 0o700 })
+    try {
+      const writeVersionCli = async (name: string, output: string): Promise<string> => {
+        const script = join(scratchRoot, `${name}.mjs`)
+        await writeFile(script, `process.stdout.write(${JSON.stringify(output)})\n`, {
+          mode: 0o600,
+        })
+        if (process.platform === 'win32') {
+          return writeWindowsNodeLauncher(scratchRoot, name, [script])
+        }
+        const bin = join(scratchRoot, name)
+        const quotedNode = process.execPath.replace(/'/gu, "'\\''")
+        const quotedScript = script.replace(/'/gu, "'\\''")
+        await writeFile(bin, `#!/bin/sh\nexec '${quotedNode}' '${quotedScript}' "$@"\n`, {
+          mode: 0o755,
+        })
+        await chmod(bin, 0o755)
+        return bin
+      }
+
+      const cli1512 = await writeVersionCli('agy-1512', 'agy version 1.5.12\n')
+      const cli1513 = await writeVersionCli('agy-1513', 'agy version 1.5.13\n')
+      await expect(
+        verifyAgyMinimumVersion(
+          cli1512,
+          { PATH: process.env.PATH },
+          { cwd: isolatedHome, isolatedRoot: isolatedHome, minimumVersion: '1.5.13' },
+        ),
+      ).rejects.toThrow(/older than required 1\.5\.13/iu)
+      await expect(
+        verifyAgyMinimumVersion(
+          cli1513,
+          { PATH: process.env.PATH },
+          { cwd: isolatedHome, isolatedRoot: isolatedHome, minimumVersion: '1.5.13' },
+        ),
+      ).resolves.toBe('1.5.13')
+    } finally {
       await rm(scratchRoot, { recursive: true, force: true })
     }
   },

@@ -321,10 +321,15 @@ DWORD run(Control& control, HANDLE receipt, Reader& reader, ULONGLONG initialDea
   Handle root, thread; Birth rootBirth{}, bridgeBirth = identity(GetCurrentProcess());
   bool created = false, resumed = false, signaled = false, rootObserved = false, terminated = false;
   bool attributesReady = false, failed = false;
-  DWORD exitCode = 1; ULONGLONG stoppingAt = 0, cleanupDeadline = 0;
+  DWORD exitCode = 1; ULONGLONG stoppingAt = 0, terminateDeadline = 0, cleanupDeadline = 0;
   auto stopping = [&](ULONGLONG remaining = kCleanupMs) {
     if (!stoppingAt) {
-      stoppingAt = GetTickCount64(); cleanupDeadline = stoppingAt + std::min(remaining, kCleanupMs);
+      stoppingAt = GetTickCount64();
+      const ULONGLONG clamped = std::min(remaining, kCleanupMs);
+      terminateDeadline = stoppingAt + std::min(kGraceMs, clamped);
+      const ULONGLONG maxLifetimeCleanup =
+          lifetimeDeadline <= ~ULONGLONG(0) - kCleanupMs ? lifetimeDeadline + kCleanupMs : ~ULONGLONG(0);
+      cleanupDeadline = std::min(stoppingAt + kCleanupMs, maxLifetimeCleanup);
     }
   };
   try {
@@ -407,7 +412,7 @@ DWORD run(Control& control, HANDLE receipt, Reader& reader, ULONGLONG initialDea
         job.close();
         return exitCode;
       }
-      if (stoppingAt && !terminated && (!resumed || tick - stoppingAt >= kGraceMs)) {
+      if (stoppingAt && !terminated && (!resumed || tick >= terminateDeadline)) {
         terminated = true; check(TerminateJobObject(job.value, 1));
       }
       if (stoppingAt && tick >= cleanupDeadline) return 1; // No receipt => unconfirmed.
@@ -473,6 +478,30 @@ BYTE retire(Reader& reader) {
   check(SetFileInformationByHandle(file.leaf, FileDispositionInfo, &disposition, sizeof(disposition)));
   return 1; // removed; the pinned leaf handle closes before the helper exits
 }
+BYTE abortAllocated(HANDLE receipt, Reader& reader) {
+  Request request; request.base(reader); reader.end();
+  // Pre-witness startup failure cleanup: the allocated receipt has no witness
+  // metadata yet. Anchor every parent without reparse traversal, match the
+  // leaf's kernel FileIdInfo against the inherited receipt handle, confirm
+  // zero bytes, and delete strictly via the validated leaf handle.
+  PinnedFile file; file.pin(request.path, true);
+  if (file.missing) {
+    FILE_STANDARD_INFO standard{};
+    check(GetFileInformationByHandleEx(receipt, FileStandardInfo, &standard, sizeof(standard)));
+    if (GetFileType(receipt) != FILE_TYPE_DISK || standard.Directory != FALSE ||
+        standard.EndOfFile.QuadPart != 0 ||
+        (standard.DeletePending == FALSE && standard.NumberOfLinks != 0)) return 0;
+    return 2; // already_absent under verified parent chain for an already-unlinked zero-byte receipt
+  }
+  if (!same(file.identity, fileIdentity(receipt))) return 0;
+  LARGE_INTEGER receiptSize{}, leafSize{};
+  check(GetFileSizeEx(receipt, &receiptSize));
+  check(GetFileSizeEx(file.leaf, &leafSize));
+  if (receiptSize.QuadPart != 0 || leafSize.QuadPart != 0) return 0;
+  FILE_DISPOSITION_INFO disposition{TRUE};
+  check(SetFileInformationByHandle(file.leaf, FileDispositionInfo, &disposition, sizeof(disposition)));
+  return 1; // removed; NTFS unlinks the leaf once the owner closes its receipt handle
+}
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
@@ -508,12 +537,20 @@ int wmain(int argc, wchar_t** argv) {
     if (retirement) {
       const BYTE result = retire(request);
       BYTE bytes[] = {17, result}; Writer reply{bytes, 2, 2};
-      control.emit(reply); return result ? 0 : 1;
+      const bool emitted = control.emit(reply);
+      return (result && emitted) ? 0 : 1;
+    }
+    if (!wcscmp(argv[1], L"abort-allocated")) {
+      const BYTE result = abortAllocated(receipt, request);
+      BYTE bytes[] = {17, result}; Writer reply{bytes, 2, 2};
+      const bool emitted = control.emit(reply);
+      return (result && emitted) ? 0 : 1;
     }
     if (!wcscmp(argv[1], L"prove") || !wcscmp(argv[1], L"verify")) {
       const bool result = prove(receipt, request, !wcscmp(argv[1], L"prove"));
       BYTE bytes[] = {15, static_cast<BYTE>(result)}; Writer reply{bytes, 2, 2};
-      control.emit(reply); return result ? 0 : 1;
+      const bool emitted = control.emit(reply);
+      return (result && emitted) ? 0 : 1;
     }
   } catch (const Failure& error) { control.error(error.code); }
   return 1;

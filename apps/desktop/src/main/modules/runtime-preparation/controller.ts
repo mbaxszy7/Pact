@@ -5,12 +5,13 @@ import {
   type RpcResult,
   type RuntimeAgentId,
   type RuntimePreparation,
+  type RuntimePreparationGetInput,
 } from '@pact/contracts'
 
 import type { UtilityProcessClient } from '../../utility-process/client'
 
 export interface RuntimePreparationController {
-  load(): Promise<RpcResult<RuntimePreparation>>
+  load(input?: RuntimePreparationGetInput): Promise<RpcResult<RuntimePreparation>>
   chooseExecutable(
     agentId: RuntimeAgentId,
     owner?: BrowserWindow,
@@ -24,8 +25,8 @@ class ElectronRuntimePreparationController implements RuntimePreparationControll
     private readonly platform: NodeJS.Platform,
   ) {}
 
-  load(): Promise<RpcResult<RuntimePreparation>> {
-    return this.utilityClient.getRuntimePreparation()
+  load(input?: RuntimePreparationGetInput): Promise<RpcResult<RuntimePreparation>> {
+    return this.utilityClient.getRuntimePreparation(input)
   }
 
   async chooseExecutable(

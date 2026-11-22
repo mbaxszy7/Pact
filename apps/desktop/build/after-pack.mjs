@@ -2,6 +2,10 @@ import { flipFuses, FuseV1Options, FuseVersion } from '@electron/fuses'
 
 import identities from '../app-identities.json' with { type: 'json' }
 import {
+  agySqliteFileSourceHash,
+  inspectAgySqliteFileResource,
+} from './agy-sqlite-file-resource.mjs'
+import {
   assertNoWindowsOwnedProcessResource,
   inspectWindowsOwnedProcessResource,
   windowsOwnedProcessSourceHash,
@@ -99,6 +103,14 @@ export default async function afterPack(context) {
       { runIdentity: true },
     )
   else await assertNoWindowsOwnedProcessResource(resources)
+
+  await inspectAgySqliteFileResource(
+    join(resources, 'native'),
+    context.electronPlatformName,
+    arch,
+    await agySqliteFileSourceHash(),
+    { verifyLoad: context.electronPlatformName === process.platform && arch === process.arch },
+  )
 
   await flipFuses(executablePath, {
     version: FuseVersion.V1,

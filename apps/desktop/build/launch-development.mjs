@@ -18,6 +18,7 @@ import { pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
 
 import identities from '../app-identities.json' with { type: 'json' }
+import { prepareAgySqliteFileResource } from './agy-sqlite-file-resource.mjs'
 import { acquireMacDevelopmentLaunchLock } from './mac-development-launch-lock.mjs'
 import { prepareWindowsOwnedProcessResource } from './windows-owned-process-resource.mjs'
 
@@ -332,6 +333,10 @@ try {
       signal: cancellation.signal,
       autoMsvc: true,
     })
+  await prepareAgySqliteFileResource(process.arch, process.platform, {
+    signal: cancellation.signal,
+    autoMsvc: process.platform === 'win32',
+  })
   cancellation.signal.throwIfAborted()
   const vite = join(dirname(require.resolve('electron-vite/package.json')), 'bin/electron-vite.js')
   process.removeListener('SIGINT', interrupt)

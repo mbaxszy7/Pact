@@ -161,9 +161,9 @@ interface MenuState {
 }
 
 const ACTION =
-  'grid size-7 shrink-0 place-items-center rounded-control text-tertiary hover:bg-surface-muted hover:text-primary disabled:opacity-55'
+  'grid size-7 shrink-0 place-items-center rounded-lg text-tertiary transition-colors duration-150 hover:bg-row-hover hover:text-primary disabled:opacity-55'
 const MENU_ITEM =
-  'flex min-h-8 w-full min-w-0 items-center gap-2 rounded-control px-2 py-1.5 text-left text-caption text-primary hover:bg-surface-muted focus:bg-surface-muted disabled:opacity-50'
+  'flex min-h-8 w-full min-w-0 items-center gap-2 rounded-lg px-2 py-1.5 text-left text-caption text-primary transition-colors duration-150 hover:bg-surface-muted focus:bg-surface-muted disabled:opacity-50'
 
 function anchoredOverlayStyle(
   anchor: HTMLButtonElement,
@@ -1006,7 +1006,7 @@ export function ProjectNavigation({
         role="menu"
         tabIndex={-1}
         aria-label="Navigation actions"
-        className={`fixed z-50 max-h-60 overflow-auto rounded-control border border-border bg-surface-raised p-1 shadow-lg ${state.picker ? 'space-y-1' : ''}`}
+        className={`fixed z-50 max-h-60 overflow-auto rounded-panel border border-border bg-menu-surface p-1 shadow-popover ${state.picker ? 'space-y-1' : ''}`}
         style={anchoredOverlayStyle(anchor, 242, 240)}
         onKeyDown={(event) => {
           if (event.key === 'Escape') {
@@ -1050,7 +1050,7 @@ export function ProjectNavigation({
       // oxlint-disable-next-line jsx-a11y/no-noninteractive-element-interactions -- Escape closes the editor from any form control.
       <form
         ref={editorRef}
-        className="fixed z-50 overflow-auto rounded-control bg-surface-raised px-3 pt-3 shadow-popover"
+        className="fixed z-50 overflow-auto rounded-panel border border-border bg-menu-surface px-3 pt-3 shadow-popover"
         style={anchoredOverlayStyle(state.anchor, 262, 168)}
         aria-label={state.id ? 'Edit Session group' : 'New Session group'}
         aria-busy={busy}
@@ -1300,7 +1300,7 @@ export function ProjectNavigation({
                     data-nav-primary
                     aria-expanded={!collapsed}
                     aria-label={`${collapsed ? 'Expand' : 'Collapse'} ${group.name}${current ? ', current Session' : ''}`}
-                    className="flex h-8 w-full min-w-0 touch-pan-y select-none items-center gap-1.5 rounded-control px-2 text-left text-caption font-medium pr-8"
+                    className="flex h-8 w-full min-w-0 touch-pan-y select-none items-center gap-1.5 rounded-xl px-2 text-left text-caption font-medium transition-colors duration-150 pr-8"
                     onClick={() => {
                       setHighlight(undefined)
                       setRevealedGroupId(undefined)
@@ -1323,7 +1323,7 @@ export function ProjectNavigation({
                       <span className="ml-auto shrink-0 text-[10px] opacity-80">Current</span>
                     )}
                   </button>
-                  <div className="pointer-events-none absolute right-0.5 top-2.5 opacity-0 group-hover/group:pointer-events-auto group-hover/group:opacity-100 group-focus-within/group:pointer-events-auto group-focus-within/group:opacity-100 [@media(hover:none)]:pointer-events-auto [@media(hover:none)]:opacity-100">
+                  <div className="pointer-events-none absolute right-0.5 top-2.5 opacity-0 transition-opacity duration-150 ease-out group-hover/group:pointer-events-auto group-hover/group:opacity-100 group-focus-within/group:pointer-events-auto group-focus-within/group:opacity-100 [@media(hover:none)]:pointer-events-auto [@media(hover:none)]:opacity-100">
                     {menuButton(row.key, { kind: 'group', group }, `Group ${group.name} actions`)}
                   </div>
                 </li>
@@ -1332,11 +1332,13 @@ export function ProjectNavigation({
             if (row.kind === 'session') {
               const { session, group } = row
               const selected = selectedSessionId === session.id
+              const hasIndicator =
+                session.activity.state !== 'idle' || (!selected && session.hasUnread)
               return (
                 <li
                   key={row.key}
                   {...attributes}
-                  className={`group/session relative ml-group ${group ? 'pact-nav-group-body h-8 pl-2' : 'h-[34px] rounded-control'}`}
+                  className={`group/session relative ml-group ${group ? 'pact-nav-group-body h-8 pl-2' : 'h-[34px] rounded-xl'}`}
                   data-session-menu={session.id}
                   data-session-located={highlight === session.id}
                   data-drop-project={session.projectId}
@@ -1356,7 +1358,7 @@ export function ProjectNavigation({
                   }}
                 >
                   <button
-                    className="flex h-8 w-full touch-pan-y select-none items-center gap-2 rounded-control px-2 text-left text-caption text-secondary hover:bg-surface-raised hover:text-primary group-hover/session:pr-16 group-focus-within/session:pr-16 data-[selected=true]:bg-navigation-selected data-[selected=true]:font-medium data-[selected=true]:text-primary [@media(hover:none)]:pr-16"
+                    className={`relative flex h-8 w-full touch-pan-y select-none items-center gap-2 rounded-xl px-2 text-left text-caption text-secondary transition-colors duration-150 hover:bg-row-hover hover:text-primary group-hover/session:pr-16 group-focus-within/session:pr-16 data-[selected=true]:bg-navigation-selected data-[selected=true]:font-medium data-[selected=true]:text-primary ${hasIndicator ? 'pr-9 [@media(hover:none)]:pr-[5.5rem] [@media(hover:none)]:group-hover/session:pr-[5.5rem] [@media(hover:none)]:group-focus-within/session:pr-[5.5rem]' : '[@media(hover:none)]:pr-16'}`}
                     data-selected={selected}
                     aria-disabled={row.pending || undefined}
                     aria-current={selected ? 'page' : undefined}
@@ -1384,7 +1386,7 @@ export function ProjectNavigation({
                       selected={selected}
                     />
                   </button>
-                  <div className="pointer-events-none absolute right-0.5 top-0.5 flex opacity-0 group-hover/session:pointer-events-auto group-hover/session:opacity-100 group-focus-within/session:pointer-events-auto group-focus-within/session:opacity-100 [@media(hover:none)]:pointer-events-auto [@media(hover:none)]:opacity-100">
+                  <div className="pointer-events-none absolute right-0.5 top-0.5 flex opacity-0 transition-opacity duration-150 ease-out group-hover/session:pointer-events-auto group-hover/session:opacity-100 group-focus-within/session:pointer-events-auto group-focus-within/session:opacity-100 [@media(hover:none)]:pointer-events-auto [@media(hover:none)]:opacity-100">
                     {menuButton(
                       row.key,
                       { kind: 'session', session },
@@ -1392,7 +1394,7 @@ export function ProjectNavigation({
                     )}
                   </div>
                   <button
-                    className={`${ACTION} pointer-events-none absolute right-7 top-0.5 opacity-0 group-hover/session:pointer-events-auto group-hover/session:opacity-100 group-focus-within/session:pointer-events-auto group-focus-within/session:opacity-100 [@media(hover:none)]:pointer-events-auto [@media(hover:none)]:opacity-100`}
+                    className={`${ACTION} pointer-events-none absolute right-7 top-0.5 opacity-0 transition-opacity duration-150 ease-out group-hover/session:pointer-events-auto group-hover/session:opacity-100 group-focus-within/session:pointer-events-auto group-focus-within/session:opacity-100 [@media(hover:none)]:pointer-events-auto [@media(hover:none)]:opacity-100`}
                     type="button"
                     aria-label={`Archive Session ${session.title}`}
                     title="Archive Session"
@@ -1513,7 +1515,7 @@ export function ProjectNavigation({
         <ProviderUsagePanel visible={navigationVisible} onInteract={() => drag.cancel()} />
         <button
           ref={settingsButtonRef}
-          className="flex min-h-9 w-full items-center gap-group rounded-control px-group py-2 text-left text-body font-medium text-primary hover:bg-surface-raised"
+          className="flex min-h-9 w-full items-center gap-group rounded-xl px-group py-2 text-left text-body font-medium text-primary transition-colors duration-150 hover:bg-row-hover"
           type="button"
           onClick={() => {
             drag.cancel()
@@ -1628,9 +1630,9 @@ function ProjectNavigationHeader({
   }
 
   return (
-    <div className="group/project-header relative flex h-9 items-center gap-1 rounded-control pl-0.5 pr-1 hover:bg-surface-raised">
+    <div className="group/project-header relative flex h-9 items-center gap-1 rounded-xl pl-0.5 pr-1 transition-colors duration-150 hover:bg-row-hover">
       <button
-        className="grid size-7 shrink-0 place-items-center rounded-control text-secondary hover:bg-surface-muted hover:text-primary"
+        className="grid size-7 shrink-0 place-items-center rounded-lg text-secondary transition-colors duration-150 hover:bg-row-hover hover:text-primary"
         aria-label={`${collapsed ? 'Expand' : 'Collapse'} Project ${project.name}`}
         aria-expanded={!collapsed}
         title={`${collapsed ? 'Expand' : 'Collapse'} Project`}
@@ -1735,7 +1737,7 @@ function ProjectNavigationHeader({
           </button>
           <div className="pointer-events-none absolute right-1 top-1 flex items-center opacity-0 transition-opacity duration-150 ease-out group-hover/project-header:pointer-events-auto group-hover/project-header:opacity-100 group-focus-within/project-header:pointer-events-auto group-focus-within/project-header:opacity-100 [@media(hover:none)]:pointer-events-auto [@media(hover:none)]:opacity-100">
             <button
-              className="grid size-7 place-items-center rounded-control text-tertiary hover:bg-surface-muted hover:text-primary"
+              className="grid size-7 place-items-center rounded-lg text-tertiary transition-colors duration-150 hover:bg-row-hover hover:text-primary"
               type="button"
               aria-label={`New Session in ${project.name}`}
               title="New Session"
@@ -1744,7 +1746,7 @@ function ProjectNavigationHeader({
               <Plus aria-hidden="true" className="size-4" strokeWidth={1.75} />
             </button>
             <button
-              className="grid size-7 place-items-center rounded-control text-tertiary hover:bg-surface-muted hover:text-primary disabled:cursor-wait disabled:opacity-55"
+              className="grid size-7 place-items-center rounded-lg text-tertiary transition-colors duration-150 hover:bg-row-hover hover:text-primary disabled:cursor-wait disabled:opacity-55"
               type="button"
               aria-label={`Edit Project ${project.name}`}
               title="Rename Project"
@@ -1754,7 +1756,7 @@ function ProjectNavigationHeader({
               <Pencil aria-hidden="true" className="size-3.5" strokeWidth={1.75} />
             </button>
             <button
-              className="grid size-7 place-items-center rounded-control text-tertiary transition-colors duration-150 hover:bg-surface-muted/50 hover:text-danger disabled:cursor-wait disabled:opacity-55"
+              className="grid size-7 place-items-center rounded-lg text-tertiary transition-colors duration-150 hover:bg-row-hover hover:text-danger disabled:cursor-wait disabled:opacity-55"
               type="button"
               aria-label={`Archive Project ${project.name}`}
               title={archiving ? 'Archiving…' : 'Archive Project'}
@@ -1788,14 +1790,12 @@ function SessionActivityIndicator({
   hasUnread: boolean
   selected: boolean
 }): React.JSX.Element | null {
+  const layoutClass =
+    'pointer-events-none absolute right-2 top-1/2 grid size-6 shrink-0 -translate-y-1/2 place-items-center transition-opacity duration-150 group-hover/session:opacity-0 group-focus-within/session:opacity-0 [@media(hover:none)]:right-[3.75rem] [@media(hover:none)]:opacity-100 [@media(hover:none)]:group-hover/session:opacity-100 [@media(hover:none)]:group-focus-within/session:opacity-100'
   if (activity.state === 'idle') {
     if (selected || !hasUnread) return null
     return (
-      <output
-        className="grid size-6 shrink-0 place-items-center"
-        aria-label="New reply"
-        title="New reply"
-      >
+      <output className={layoutClass} aria-label="New reply" title="New reply">
         <span aria-hidden="true" className="size-1.5 rounded-pill bg-focus" />
       </output>
     )
@@ -1853,7 +1853,7 @@ function SessionActivityIndicator({
   }[activity.state]
   return (
     <output
-      className={`grid size-6 shrink-0 place-items-center ${details.className}`}
+      className={`${layoutClass} ${details.className}`}
       aria-label={details.label}
       title={details.label}
     >

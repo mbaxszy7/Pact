@@ -536,6 +536,13 @@ export function agyFileChanges(
     const newText = Reflect.get(diff, 'newText')
 
     if (newText === null) {
+      if (
+        typeof oldText === 'string' &&
+        Buffer.byteLength(oldText, 'utf8') > WORKSPACE_FILE_BYTES
+      ) {
+        const reason = 'The Antigravity diff original content exceeded the file byte limit.'
+        return { changes, uncertain: reason, invalidatesPriorEvidence: true }
+      }
       const reason = 'Antigravity file deletions cannot be safely undone.'
       changes.push({
         path: relPath,
@@ -1059,6 +1066,19 @@ export class AgyRoundEffectsTracker {
           ? 'A native tool or subagent in this round may have modified recorded files; Undo is unavailable.'
           : 'Native tool or subagent execution may have effects outside recorded file operations.',
     }
+  }
+}
+
+export async function anchorNativeFileBeforeEdit(
+  input: AgentRunInput,
+  path: string,
+  signal: AbortSignal,
+): Promise<void> {
+  if (!path || path.length > 4096) return
+  try {
+    await input.anchorFileBeforeEdit?.(path, signal)
+  } catch {
+    /* Pre-touch anchoring is passive and must never block or fail a native tool. */
   }
 }
 

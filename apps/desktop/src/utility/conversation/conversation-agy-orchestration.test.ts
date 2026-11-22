@@ -9,19 +9,23 @@ import { pathToFileURL } from 'node:url'
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 
 import type { AgentNativeForkWitness, AgentRunInput } from '@pact/agent-runtime'
-import type {
-  DefaultSessionSettings,
-  NormalizedAgentEvent,
-  PeerRequestKind,
-  RuntimeAgentId,
-} from '@pact/contracts'
 
+import {
+  buildBoundedNativePlanId,
+  encodeBoundedOpenPlanCallKey,
+  encodeBoundedOpenPlanProgressToken,
+  type DefaultSessionSettings,
+  type NormalizedAgentEvent,
+  type PeerRequestKind,
+  type RuntimeAgentId,
+} from '@pact/contracts'
 import { PactDatabase } from '@pact/persistence'
 
 import { ProjectFileReader } from '../project-file/project-file-reader.js'
 import { RuntimePreparation } from '../runtime-preparation/runtime-preparation.js'
 import { runDirectoryWorker } from '../workspace-changes/directory-worker.test-support.js'
 import { AgyAcpConnectionPool } from './agy-acp-connection.js'
+import { buildAgyPactMcpServerName } from './agy-agent-adapter.js'
 import {
   CORTEX_STEP_STATUS_DONE,
   CORTEX_STEP_TYPE_PLANNER_RESPONSE,
@@ -101,6 +105,9 @@ const harness = vi.hoisted(() => ({
   releaseWait: undefined as (() => void) | undefined,
   nextRunBehavior: undefined as
     | ((agentId: RuntimeAgentId, input: AgentRunInput) => Promise<void> | void)
+    | undefined,
+  nextRunGenerator: undefined as
+    | ((agentId: RuntimeAgentId, input: AgentRunInput) => AsyncGenerator<NormalizedAgentEvent>)
     | undefined,
   rebuildHandler: undefined as
     | ((
@@ -194,6 +201,12 @@ function createMockAdapter(agentId: RuntimeAgentId) {
 
     async *run(input: AgentRunInput, signal: AbortSignal): AsyncGenerator<NormalizedAgentEvent> {
       harness.runs.push({ agentId, input })
+      if (harness.nextRunGenerator) {
+        const gen = harness.nextRunGenerator
+        harness.nextRunGenerator = undefined
+        yield* gen(agentId, input)
+        return
+      }
       if (harness.nextRunBehavior) {
         const custom = harness.nextRunBehavior
         harness.nextRunBehavior = undefined
@@ -260,7 +273,13 @@ function createMockAdapter(agentId: RuntimeAgentId) {
 
 vi.mock('./codex-agent-adapter.js', () => ({ CodexAgentAdapter: createMockAdapter('codex') }))
 vi.mock('./claude-agent-adapter.js', () => ({ ClaudeAgentAdapter: createMockAdapter('claude') }))
-vi.mock('./agy-agent-adapter.js', () => ({ AgyAgentAdapter: createMockAdapter('agy') }))
+vi.mock('./agy-agent-adapter.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./agy-agent-adapter.js')>()
+  return {
+    ...actual,
+    AgyAgentAdapter: createMockAdapter('agy'),
+  }
+})
 
 const owners: Array<{ db: PactDatabase; flow?: Conversation | undefined; directory: string }> = []
 
@@ -282,6 +301,7 @@ afterEach(async () => {
   harness.waitOnAgent = undefined
   harness.releaseWait = undefined
   harness.nextRunBehavior = undefined
+  harness.nextRunGenerator = undefined
   harness.rebuildHandler = undefined
   harness.rebuildCheckHandler = undefined
   vi.restoreAllMocks()
@@ -2124,6 +2144,7 @@ describe('Module 5 Conversation 3-Agent & Antigravity Orchestration', () => {
                     name: `mcp__${mcpServerName}__read_collaboration_source`,
                     status: 'in_progress',
                     progressToken: 'traj-live:0',
+                    rawInput: { runId, grant: grantId, source: 'inputs', offset: 0 },
                   },
                 },
               })
@@ -2601,5 +2622,1037 @@ describe('Module 5 Conversation 3-Agent & Antigravity Orchestration', () => {
       else process.env['ANTIGRAVITY_GEMINI_DIR'] = prevGeminiDir
       await Promise.all(tempGeminiDirs.map((dir) => rm(dir, { recursive: true, force: true })))
     }
+  })
+
+  it('Round-4 Med #16: wires shared agyForkFiles physical operation observer and retries failed agyForkFiles / agyConnectionPool disposal without replaying completed base shutdown', async () => {
+    const f = await createOrchestrationFixture({
+      primaryAgentId: 'agy',
+      secondaryAgentId: 'codex',
+    })
+
+    // Exercise adapter creation with a shared agyForkFiles implementing addPhysicalOperationObserver
+    const registeredObservers: Array<(signal: AbortSignal, completion: Promise<void>) => void> = []
+    let unsubscribeCalls = 0
+    let forkDisposeCalls = 0
+    let failFirstForkDispose = true
+    const fakeSharedForkFiles = {
+      addPhysicalOperationObserver(
+        observer: (signal: AbortSignal, completion: Promise<void>) => void,
+      ): () => void {
+        registeredObservers.push(observer)
+        return () => {
+          unsubscribeCalls += 1
+        }
+      },
+      async dispose(): Promise<void> {
+        forkDisposeCalls += 1
+        if (failFirstForkDispose) {
+          failFirstForkDispose = false
+          throw new Error('forced fork-files dispose failure')
+        }
+      },
+    }
+    Reflect.set(f.flow, 'agyForkFiles', fakeSharedForkFiles)
+
+    const sendRes = await f.sendMessage(f.sessionId, 'Trigger agy adapter & pool creation')
+    expect(sendRes.ok).toBe(true)
+    await f.waitForIdle()
+
+    // Adapter options MUST receive subscribeStoragePhysicalOperations wired to agyForkFiles.addPhysicalOperationObserver
+    const rawOpt = harness.agyOptions.at(-1)
+    const rawSubscribe =
+      typeof rawOpt === 'object' && rawOpt !== null
+        ? Reflect.get(rawOpt, 'subscribeStoragePhysicalOperations')
+        : undefined
+    expect(typeof rawSubscribe).toBe('function')
+    if (typeof rawSubscribe !== 'function') {
+      throw new Error('Expected subscribeStoragePhysicalOperations function')
+    }
+    const unsub: unknown = rawSubscribe(() => undefined)
+    expect(registeredObservers).toHaveLength(1)
+    if (typeof unsub === 'function') unsub()
+    expect(unsubscribeCalls).toBe(1)
+
+    // Also make the active agyConnectionPool fail its first dispose() call and succeed on retry
+    const rawPool =
+      typeof rawOpt === 'object' && rawOpt !== null
+        ? Reflect.get(rawOpt, 'connectionPool')
+        : undefined
+    expect(rawPool).toBeInstanceOf(AgyAcpConnectionPool)
+    if (!(rawPool instanceof AgyAcpConnectionPool)) throw new Error('Expected AgyAcpConnectionPool')
+    const origPoolDispose = rawPool.dispose.bind(rawPool)
+    let poolDisposeCalls = 0
+    let failFirstPoolDispose = true
+    vi.spyOn(rawPool, 'dispose').mockImplementation(async (deadline) => {
+      poolDisposeCalls += 1
+      if (failFirstPoolDispose) {
+        failFirstPoolDispose = false
+        throw new Error('forced pool dispose failure')
+      }
+      await origPoolDispose(deadline)
+    })
+
+    // Spy on base shutdown resource (notificationProjector) to ensure completed base shutdown does NOT replay on retry
+    const rawProjector: unknown = Reflect.get(f.flow, 'notificationProjector')
+    if (typeof rawProjector !== 'object' || rawProjector === null) {
+      throw new Error('Expected notificationProjector object')
+    }
+    const origProjectorDispose: unknown = Reflect.get(rawProjector, 'dispose')
+    if (typeof origProjectorDispose !== 'function') {
+      throw new Error('Expected notificationProjector.dispose function')
+    }
+    let projectorDisposeCalls = 0
+    Reflect.set(rawProjector, 'dispose', (...args: unknown[]) => {
+      projectorDisposeCalls += 1
+      return Reflect.apply(origProjectorDispose, rawProjector, args)
+    })
+
+    const getPoolMap = (): Map<unknown, unknown> => {
+      const m: unknown = Reflect.get(f.flow, 'agyConnectionPools')
+      if (!(m instanceof Map)) throw new Error('Expected agyConnectionPools Map')
+      return m
+    }
+
+    // First dispose() MUST reject, retaining failed pool & agyForkFiles for retry
+    await expect(f.flow.dispose()).rejects.toThrow(
+      /Pact could not finish all output commits and resource cleanup/u,
+    )
+    expect(forkDisposeCalls).toBe(1)
+    expect(poolDisposeCalls).toBe(1)
+    expect(projectorDisposeCalls).toBe(1)
+    expect(Reflect.get(f.flow, 'agyForkFiles')).toBe(fakeSharedForkFiles)
+    expect(getPoolMap().size).toBe(1)
+
+    // Second dispose() retries ONLY pending agyForkFiles + failed pool and succeeds cleanly without replaying base shutdown
+    await expect(f.flow.dispose()).resolves.toBeUndefined()
+    expect(forkDisposeCalls).toBe(2)
+    expect(poolDisposeCalls).toBe(2)
+    expect(projectorDisposeCalls).toBe(1)
+    expect(Reflect.get(f.flow, 'agyForkFiles')).toBeUndefined()
+    expect(getPoolMap().size).toBe(0)
+  })
+
+  it('Round-5 Shard 3: 9th pool eviction retires healthy idle pools with warm occupiedProcessSlotCount > 0, skips busy pools, never swallows dispose errors, and retains unconfirmed pools', async () => {
+    const f = await createOrchestrationFixture({
+      primaryAgentId: 'agy',
+      secondaryAgentId: 'codex',
+    })
+
+    const prevGeminiDir = process.env['ANTIGRAVITY_GEMINI_DIR']
+    const tempGeminiDirs: string[] = []
+    let pool0Occupied = 0
+    let pool1Occupied = 0
+    let pool2Occupied = 0
+    try {
+      const createdPools: AgyAcpConnectionPool[] = []
+      const createAgySession = (title: string) =>
+        f.db.sessionRepository.create(
+          {
+            id: randomUUID(),
+            projectId: f.projectId,
+            title,
+            createdAt: new Date().toISOString(),
+          },
+          {
+            primaryAgentId: 'agy',
+            secondaryAgentId: 'codex',
+            agents: {
+              claude: { model: null, effort: null, speed: 'native' },
+              codex: { model: null, effort: null, speed: 'native' },
+              agy: { model: null, effort: null, speed: 'native' },
+            },
+            maxDiscussionRounds: 6,
+            maxReviewCycles: 3,
+            maxRepairAttempts: 3,
+          },
+        )
+
+      // Populate 8 distinct pool slots
+      for (let idx = 0; idx < 8; idx += 1) {
+        // oxlint-disable-next-line eslint/no-await-in-loop -- Populate 8 distinct pools sequentially.
+        const customDir = await mkdtemp(join(tmpdir(), `pact-pool-rec8-${idx}-`))
+        tempGeminiDirs.push(customDir)
+        process.env['ANTIGRAVITY_GEMINI_DIR'] = customDir
+        const created = createAgySession(`Rec8 Pool ${idx}`)
+        // oxlint-disable-next-line eslint/no-await-in-loop -- Sequential run to allocate each pool.
+        const sendRes = await f.sendMessage(created.session.id, `Rec8 turn ${idx}`)
+        expect(sendRes.ok).toBe(true)
+        // oxlint-disable-next-line eslint/no-await-in-loop -- Wait for idle before next slot.
+        await f.waitForIdle()
+        const latestOpt = harness.agyOptions.at(-1)
+        const pool =
+          typeof latestOpt === 'object' && latestOpt !== null
+            ? Reflect.get(latestOpt, 'connectionPool')
+            : undefined
+        expect(pool).toBeInstanceOf(AgyAcpConnectionPool)
+        if (pool instanceof AgyAcpConnectionPool) createdPools.push(pool)
+      }
+
+      const rawPoolMap: unknown = Reflect.get(f.flow, 'agyConnectionPools')
+      if (!(rawPoolMap instanceof Map)) throw new Error('Expected agyConnectionPools Map')
+      const poolMap = rawPoolMap
+      expect(poolMap.size).toBe(8)
+
+      // Subcase 0 (Shard 3 fix): Pool #0 is a healthy idle pool holding a warm process
+      // (`occupiedProcessSlotCount === 1`). `tryRetireIdle()` MUST be invoked and retire Pool #0
+      // (releasing its warm process slot to 0) so the 9th pool succeeds via LRU eviction!
+      const pool0 = createdPools[0]!
+      pool0Occupied = 1
+      Object.defineProperty(pool0, 'occupiedProcessSlotCount', {
+        get: () => pool0Occupied,
+        configurable: true,
+      })
+      const pool0DisposeSpy = vi.spyOn(pool0, 'dispose').mockImplementationOnce(async () => {
+        pool0Occupied = 0
+      })
+
+      const ninthDir = await mkdtemp(join(tmpdir(), 'pact-pool-rec8-9-'))
+      tempGeminiDirs.push(ninthDir)
+      process.env['ANTIGRAVITY_GEMINI_DIR'] = ninthDir
+      const ninthSession = createAgySession('Rec8 Pool 9')
+      const ninthSend = await f.sendMessage(ninthSession.session.id, 'Rec8 turn 9')
+      expect(ninthSend.ok).toBe(true)
+      await f.waitForIdle()
+
+      expect(pool0DisposeSpy).toHaveBeenCalledTimes(1)
+      expect([...poolMap.values()]).not.toContain(pool0)
+      expect(poolMap.size).toBe(8)
+
+      // Subcase A: Pool #1 is genuinely busy (`tryRetireIdle()` returns `{ kind: 'busy' }`, e.g.
+      // quarantined/unconfirmed slot with `occupiedProcessSlotCount === 1`). Eviction MUST skip
+      // Pool #1 without calling `dispose()` and evict Pool #2!
+      const pool1 = createdPools[1]!
+      const pool2 = createdPools[2]!
+      pool1Occupied = 1
+      Object.defineProperty(pool1, 'occupiedProcessSlotCount', {
+        get: () => pool1Occupied,
+        configurable: true,
+      })
+      vi.spyOn(pool1, 'tryRetireIdle').mockReturnValue({ kind: 'busy' })
+      const pool1DisposeSpy = vi.spyOn(pool1, 'dispose')
+      const pool2DisposeSpy = vi.spyOn(pool2, 'dispose')
+
+      const tenthDir = await mkdtemp(join(tmpdir(), 'pact-pool-rec8-10-'))
+      tempGeminiDirs.push(tenthDir)
+      process.env['ANTIGRAVITY_GEMINI_DIR'] = tenthDir
+      const tenthSession = createAgySession('Rec8 Pool 10')
+      const tenthSend = await f.sendMessage(tenthSession.session.id, 'Rec8 turn 10')
+      expect(tenthSend.ok).toBe(true)
+      await f.waitForIdle()
+
+      expect(pool1DisposeSpy).not.toHaveBeenCalled()
+      expect(pool2DisposeSpy).toHaveBeenCalledTimes(1)
+      expect([...poolMap.values()]).toContain(pool1)
+      expect([...poolMap.values()]).not.toContain(pool2)
+      expect(poolMap.size).toBe(8)
+
+      // Subcase B: When candidate pool dispose() rejects, the error is NOT swallowed and the
+      // candidate pool stays retained in agyConnectionPools.
+      const pool3 = createdPools[3]!
+      vi.spyOn(pool3, 'dispose').mockRejectedValueOnce(new Error('quarantined eviction failure'))
+      const eleventhDir = await mkdtemp(join(tmpdir(), 'pact-pool-rec8-11-'))
+      tempGeminiDirs.push(eleventhDir)
+      process.env['ANTIGRAVITY_GEMINI_DIR'] = eleventhDir
+      const eleventhSession = createAgySession('Rec8 Pool 11')
+      const eleventhSendA = await f.sendMessage(eleventhSession.session.id, 'Rec8 turn 11A')
+      expect(eleventhSendA.ok).toBe(false)
+      await f.waitForIdle()
+      expect([...poolMap.values()]).toContain(pool3)
+      expect(poolMap.size).toBe(8)
+
+      // Subcase C: Even if dispose() resolves without throwing, if occupiedProcessSlotCount stays > 0,
+      // the pool is retained rather than deleted (and eviction moves on to the next truly idle pool, pool4)!
+      const pool4 = createdPools[4]!
+      pool2Occupied = 0
+      Object.defineProperty(pool3, 'occupiedProcessSlotCount', {
+        get: () => pool2Occupied,
+        configurable: true,
+      })
+      const pool3DisposeMock = vi.spyOn(pool3, 'dispose').mockImplementationOnce(async () => {
+        // Simulate a slot becoming quarantined during dispose
+        pool2Occupied = 1
+      })
+      const eleventhSessionB = createAgySession('Rec8 Pool 11B')
+      const eleventhSendB = await f.sendMessage(eleventhSessionB.session.id, 'Rec8 turn 11B')
+      expect(eleventhSendB.ok).toBe(true)
+      await f.waitForIdle()
+      // 1 call in Subcase B (rejected) + 1 call in Subcase C (quarantined)
+      expect(pool3DisposeMock).toHaveBeenCalledTimes(2)
+      expect([...poolMap.values()]).toContain(pool3)
+      expect([...poolMap.values()]).not.toContain(pool4)
+      expect(poolMap.size).toBe(8)
+    } finally {
+      pool0Occupied = 0
+      pool1Occupied = 0
+      pool2Occupied = 0
+      if (prevGeminiDir === undefined) delete process.env['ANTIGRAVITY_GEMINI_DIR']
+      else process.env['ANTIGRAVITY_GEMINI_DIR'] = prevGeminiDir
+      await Promise.all(tempGeminiDirs.map((dir) => rm(dir, { recursive: true, force: true })))
+    }
+  })
+
+  it('Wave-3: resolves Open-mode cold publish_plan intent only when inspectAgyRun confirms completion', async () => {
+    const nativeSessionId = randomUUID()
+    const runId = randomUUID()
+    const sessionId = randomUUID()
+    const requestId = randomUUID()
+    let hasCompleted = true
+    let completedTokens: readonly string[] = ['traj-1:42']
+    const fakeForkFiles = {
+      execute: async () => {
+        throw new Error('unused')
+      },
+      prepareAgyBoundary: async () => {
+        throw new Error('unused')
+      },
+      exists: async () => true,
+      forkAgy: async () => {
+        throw new Error('unused')
+      },
+      inspectAgyFork: async () => {
+        throw new Error('unused')
+      },
+      rebuildAgySeed: async () => {
+        throw new Error('unused')
+      },
+      verifyAgySeed: async () => {
+        throw new Error('unused')
+      },
+      readAgyTrajectoryIdentity: async () => ({
+        nativeSessionId,
+        status: 'ok' as const,
+        trajectoryId: 'traj-1',
+        stepCount: 4,
+      }),
+      inspectAgyRun: async () => ({
+        exists: true,
+        stepCount: 4,
+        terminalState: {
+          executionId: 'exec-open-1',
+          status: 'completed' as const,
+          consumedInputStepIds: [],
+          consumedInputs: [],
+          answer: 'Updated the plan.',
+          responseHash: 'a'.repeat(64),
+          hasCompletedPactPublishPlan: hasCompleted,
+          completedPactPublishPlanTokens: completedTokens,
+        },
+      }),
+    }
+
+    const storageClient = createAgyNativeStorageClient(
+      fakeForkFiles,
+      '/tmp/app-data',
+      (_probeRunId, terminalState) => {
+        if (
+          terminalState.hasCompletedPactPublishPlan &&
+          terminalState.completedPactPublishPlanTokens?.includes('traj-1:42')
+        ) {
+          return {
+            plan: {
+              nativeId: `${nativeSessionId}:tc-open-final`,
+              text: '# Recovered Open Plan\nVerified from intent.',
+            },
+          }
+        }
+        return undefined
+      },
+    )
+
+    // 1. Confirmed completed publish_plan token -> cold probe recovers plan cleanly.
+    const confirmed = await storageClient.probeSessionStatus!(
+      {
+        agentId: 'agy',
+        sessionId,
+        requestId,
+        runId,
+        nativeSessionId,
+        nativeTurnId: 'exec-open-1',
+        bindingGeneration: 1,
+        executorId: 'exec-1',
+        cwd: '/tmp/repo',
+        model: null,
+        effort: null,
+        inspectMissingPlan: true,
+      },
+      new AbortController().signal,
+    )
+    expect(confirmed).toMatchObject({
+      kind: 'ended',
+      output: {
+        plan: {
+          nativeId: `${nativeSessionId}:tc-open-final`,
+          text: '# Recovered Open Plan\nVerified from intent.',
+        },
+      },
+    })
+
+    // 2. Unconfirmed / mismatched token -> cold probe NEVER invents a plan!
+    hasCompleted = false
+    completedTokens = []
+    const unconfirmed = await storageClient.probeSessionStatus!(
+      {
+        agentId: 'agy',
+        sessionId,
+        requestId,
+        runId,
+        nativeSessionId,
+        nativeTurnId: 'exec-open-1',
+        bindingGeneration: 1,
+        executorId: 'exec-1',
+        cwd: '/tmp/repo',
+        model: null,
+        effort: null,
+        inspectMissingPlan: true,
+      },
+      new AbortController().signal,
+    )
+    expect(unconfirmed.kind).toBe('ended')
+    expect(unconfirmed.kind === 'ended' ? unconfirmed.output?.plan : 'wrong-kind').toBeUndefined()
+  })
+
+  it('Round-5 Shard 4: strictly isolates Open-mode publish_plan from Brain artifacts, rejects empty token fallback, and shares canonical bounded nativePlanId', async () => {
+    const f = await createOrchestrationFixture({
+      primaryAgentId: 'agy',
+      secondaryAgentId: 'codex',
+    })
+
+    // 1. Open Mode probeSessionStatus MUST NOT request Brain artifacts (`includePlan === false`)
+    // and MUST NEVER let a Brain artifact shadow journaled publish_plan recovery!
+    const nativeSessionId = randomUUID()
+    const runId = randomUUID()
+    const observedIncludePlan: boolean[] = []
+    const fakeForkFiles = {
+      execute: async () => {
+        throw new Error('unused')
+      },
+      prepareAgyBoundary: async () => {
+        throw new Error('unused')
+      },
+      exists: async () => true,
+      forkAgy: async () => {
+        throw new Error('unused')
+      },
+      inspectAgyFork: async () => {
+        throw new Error('unused')
+      },
+      rebuildAgySeed: async () => {
+        throw new Error('unused')
+      },
+      verifyAgySeed: async () => {
+        throw new Error('unused')
+      },
+      readAgyTrajectoryIdentity: async () => ({
+        nativeSessionId,
+        status: 'ok' as const,
+        trajectoryId: 'traj-open',
+        stepCount: 4,
+      }),
+      inspectAgyRun: async (input: { includePlan?: boolean }) => {
+        observedIncludePlan.push(Boolean(input.includePlan))
+        return {
+          exists: true,
+          stepCount: 4,
+          terminalState: {
+            executionId: 'exec-open-shadow',
+            status: 'completed' as const,
+            consumedInputStepIds: [],
+            consumedInputs: [],
+            answer: 'Done.',
+            responseHash: 'b'.repeat(64),
+            // Even if Brain artifact were somehow returned on an Open Mode probe, Open Mode must ignore it!
+            plan: {
+              nativeId: `${nativeSessionId}:implementation_plan`,
+              text: '# Stale Brain Plan (MUST NOT SHADOW OPEN MODE)',
+            },
+            hasCompletedPactPublishPlan: true,
+            completedPactPublishPlanTokens: ['traj-open:77'],
+          },
+        }
+      },
+    }
+
+    const storageClient = createAgyNativeStorageClient(
+      fakeForkFiles,
+      '/tmp/app-data',
+      (_probeRunId, _terminalState, probedNativeSessionId) => ({
+        plan: {
+          nativeId: buildBoundedNativePlanId(
+            probedNativeSessionId ?? nativeSessionId,
+            'tc-open-77',
+          ),
+          text: '# Canonical Open Mode Plan',
+        },
+      }),
+    )
+
+    // Open Mode (no `planSource`, `inspectMissingPlan: true`) -> includePlan MUST be false, Open Mode plan wins!
+    const openProbe = await storageClient.probeSessionStatus!(
+      {
+        agentId: 'agy',
+        sessionId: f.sessionId,
+        requestId: randomUUID(),
+        runId,
+        nativeSessionId,
+        nativeTurnId: 'exec-open-shadow',
+        bindingGeneration: 1,
+        executorId: 'exec-1',
+        cwd: '/tmp/repo',
+        model: null,
+        effort: null,
+        inspectMissingPlan: true,
+      },
+      new AbortController().signal,
+    )
+    expect(observedIncludePlan[0]).toBe(false)
+    expect(openProbe).toMatchObject({
+      kind: 'ended',
+      output: {
+        plan: {
+          nativeId: buildBoundedNativePlanId(nativeSessionId, 'tc-open-77'),
+          text: '# Canonical Open Mode Plan',
+        },
+      },
+    })
+
+    // Phase 1 (`planSource: 'native_plan_artifact'`) -> includePlan MUST be true, Brain artifact wins!
+    const phase1Probe = await storageClient.probeSessionStatus!(
+      {
+        agentId: 'agy',
+        sessionId: f.sessionId,
+        requestId: randomUUID(),
+        runId,
+        nativeSessionId,
+        nativeTurnId: 'exec-open-shadow',
+        bindingGeneration: 1,
+        executorId: 'exec-1',
+        cwd: '/tmp/repo',
+        model: null,
+        effort: null,
+        planSource: true,
+        inspectMissingPlan: true,
+      },
+      new AbortController().signal,
+    )
+    expect(observedIncludePlan[1]).toBe(true)
+    expect(phase1Probe).toMatchObject({
+      kind: 'ended',
+      output: {
+        plan: {
+          nativeId: `${nativeSessionId}:implementation_plan`,
+          text: '# Stale Brain Plan (MUST NOT SHADOW OPEN MODE)',
+        },
+      },
+    })
+
+    // 2. Test Conversation.resolveColdOpenPlanIntent directly:
+    // - Rejects empty completedPactPublishPlanTokens (no weak intents.length === 1 fallback)
+    // - Matches long (>256-char) toolCallId using shared bounded encoders and returns canonical nativePlanId
+    const longCallId = `tc-${'x'.repeat(300)}`
+    const boundedCallKey = encodeBoundedOpenPlanCallKey(`call:${longCallId}`)
+    const boundedToken = encodeBoundedOpenPlanProgressToken(`traj-long-${'y'.repeat(280)}:99`)
+    const expectedCanonicalNativePlanId = buildBoundedNativePlanId(nativeSessionId, longCallId)
+
+    const repo = f.db.conversationRepository
+    const openRunId = randomUUID()
+    vi.spyOn(repo, 'workflowOpenPlanPublishIntents').mockReturnValue([
+      {
+        runId: openRunId,
+        executionId: 'exec-long-1',
+        actor: 'agy',
+        callKey: boundedCallKey,
+        progressToken: boundedToken,
+        nativePlanId: expectedCanonicalNativePlanId,
+        document: {
+          id: randomUUID(),
+          sha256: 'c'.repeat(64),
+          bytes: 32,
+          chars: 32,
+        },
+      },
+    ])
+    vi.spyOn(repo, 'readOpenPlanPublishIntentText').mockReturnValue(
+      '# Long ID Open Plan\nVerified.',
+    )
+    const rawResolver: unknown = Reflect.get(f.flow, 'resolveColdOpenPlanIntent')
+    if (typeof rawResolver !== 'function') {
+      throw new Error('Expected resolveColdOpenPlanIntent method on Conversation')
+    }
+
+    // Empty tokens -> MUST return planUnavailable (NO weak intents.length === 1 fallback)!
+    expect(
+      Reflect.apply(rawResolver, f.flow, [
+        openRunId,
+        {
+          executionId: 'exec-long-1',
+          status: 'completed',
+          hasCompletedPactPublishPlan: true,
+          completedPactPublishPlanTokens: [],
+        },
+        nativeSessionId,
+      ]),
+    ).toEqual({ planUnavailable: true })
+
+    // Matching raw long toolCallId -> matches bounded callKey AND returns exact canonical nativePlanId!
+    expect(
+      Reflect.apply(rawResolver, f.flow, [
+        openRunId,
+        {
+          executionId: 'exec-long-1',
+          status: 'completed',
+          hasCompletedPactPublishPlan: true,
+          completedPactPublishPlanTokens: [longCallId],
+        },
+        nativeSessionId,
+      ]),
+    ).toEqual({
+      plan: {
+        nativeId: expectedCanonicalNativePlanId,
+        text: '# Long ID Open Plan\nVerified.',
+      },
+    })
+  })
+
+  it('Round-5 Shard 4: Open Mode Ask only dispatches strictly as read-only reply stage and blocks persisted non-reply ask_only authorizations before native dispatch', async () => {
+    const f = await createOrchestrationFixture({
+      primaryAgentId: 'agy',
+      secondaryAgentId: 'codex',
+    })
+    const repo = f.db.conversationRepository
+
+    // Bring a collaboration task cleanly into idle Open Mode (accepted plan -> execute -> waiting openMode).
+    const startRes = await f.sendMessage(f.sessionId, '/plan Design and build module Z')
+    expect(startRes.ok).toBe(true)
+    await f.waitForIdle()
+
+    // Advance into an idle Open Mode task directly in SQLite for deterministic ask_only dispatch test.
+    const planRun = harness.runs.at(-1)!
+    repo.recordWorkflowPlan(planRun.input.runId, {
+      nativeId: 'plan-z-1',
+      text: '# Plan Z\n1. Implement Z',
+    })
+    repo.reconcileCompletedCollaboration(planRun.input.runId)
+    const afterPlan = repo.collaboration(f.sessionId)!
+    expect(afterPlan.nextStage).toBe('plan_review')
+
+    // Verify directly through ConversationRepository + Conversation dispatch that ask_only on an
+    // idle Open Mode task chooses stage === 'reply' (never 'collaborate').
+    const openTask = {
+      ...afterPlan,
+      openMode: true,
+      status: 'waiting' as const,
+      stage: 'collaborate' as const,
+      automation: 'active' as const,
+      nextStage: undefined,
+      pauseReason: undefined,
+      notice: undefined,
+      planVersion: 1,
+      revision: afterPlan.revision + 1,
+    }
+    const askReply = repo.workflowReply(openTask, 'agy', true)
+    expect(askReply.stage).toBe('reply')
+    const normalCollab = repo.workflowReply(openTask, 'agy', false)
+    expect(normalCollab.stage).toBe('collaborate')
+
+    // Verify Conversation rejects a corrupted/persisted ask_only authorization whose stage !== 'reply'
+    // BEFORE recordNativeEffects(run.id, 'pending') and BEFORE adapter.run()!
+    const runsBefore = harness.runs.length
+    const nativeEffectsSpy = vi.spyOn(repo, 'recordNativeEffects')
+    const baseAuth = repo.collaborationTurnAuthorization(planRun.input.runId)!
+    vi.spyOn(repo, 'collaborationTurnAuthorization').mockReturnValueOnce({
+      ...baseAuth,
+      stage: 'collaborate',
+      actor: 'agy',
+      replyIntentBasis: {
+        kind: 'ask_only',
+        inputId: randomUUID(),
+        inputDigest: 'e'.repeat(64),
+        taskRevision: openTask.revision - 1,
+        priorInputSequence: openTask.inputSequence,
+      },
+    })
+
+    const sendGuard = await f.sendMessage(f.sessionId, 'Just a quick question')
+    expect(sendGuard.ok).toBe(true)
+    await f.waitForIdle()
+    // Adapter MUST NOT have been invoked and nativeEffects MUST NOT have been marked 'pending' for the rejected run!
+    expect(harness.runs.length).toBe(runsBefore)
+    const pendingCalls = nativeEffectsSpy.mock.calls.filter(([, state]) => state === 'pending')
+    expect(pendingCalls.length).toBe(0)
+  })
+
+  it('Wave 6: Open Mode Ask only through the real received-input queue dispatches strictly as read-only reply stage', async () => {
+    const f = await createOrchestrationFixture({
+      primaryAgentId: 'agy',
+      secondaryAgentId: 'codex',
+    })
+    const repo = f.db.conversationRepository
+
+    // 1. Start /plan -> plan_review (accepted) -> execute -> idle Open Mode using real Conversation transitions.
+    const makeStageGenerator = (
+      nextStageHook?: (stage: string | undefined, input: AgentRunInput) => void,
+    ) => {
+      const gen = async function* (
+        agentId: RuntimeAgentId,
+        input: AgentRunInput,
+      ): AsyncGenerator<NormalizedAgentEvent> {
+        const stage = input.promptEnvelope.collaboration?.stage
+        if (stage === 'plan' || stage === 'plan_review' || stage === 'implement') {
+          harness.nextRunGenerator = gen
+        }
+        const nativeSessionId =
+          input.nativeSessionId ?? `${agentId}-sid-${input.sessionId.slice(0, 8)}`
+        const executorId =
+          agentId === 'agy'
+            ? '00000000-0000-4000-8000-0000000000a1'
+            : '00000000-0000-4000-8000-0000000000c2'
+        input.recordDispatch?.('possibly_sent', nativeSessionId, executorId)
+        yield { agentId, type: 'session.started', nativeSessionId }
+        input.recordDispatch?.('accepted', nativeSessionId, executorId)
+        yield { agentId, type: 'turn.started', turnId: input.runId }
+        nextStageHook?.(stage, input)
+        yield {
+          agentId,
+          type: 'text.completed',
+          turnId: input.runId,
+          outputId: `${agentId}-out`,
+          text: `Completed ${stage ?? 'turn'}.`,
+        }
+        const activeRun = repo.findRun(input.runId)
+        input.recordNativeEvidence?.({
+          kind: 'ended',
+          source: 'live_terminal',
+          outcome: 'completed',
+          identity: {
+            sessionId: input.sessionId,
+            agentId,
+            requestId: input.runId,
+            runId: input.runId,
+            nativeSessionId,
+            nativeTurnId: input.runId,
+            bindingGeneration: activeRun?.bindingGeneration ?? input.bindingGeneration ?? 1,
+            executorId,
+          },
+          output: {
+            outputId: `${agentId}-out`,
+            text: `Completed ${stage ?? 'turn'}.`,
+            completeness: 'complete',
+          },
+        })
+        yield { agentId, type: 'turn.completed', turnId: input.runId, outcome: 'completed' }
+        input.reportNativeEffects?.({
+          runId: input.runId,
+          generation: String(input.nativeGeneration ?? 1),
+          state: 'settled',
+        })
+      }
+      return gen
+    }
+    harness.nextRunGenerator = makeStageGenerator((stage, input) => {
+      if (stage === 'plan') {
+        input.recordWorkflowPlan?.({ nativeId: 'plan-q-1', text: '# Plan Q\n1. Build Q' })
+      } else if (stage === 'plan_review') {
+        input.recordWorkflowReview?.({ verdict: 'accepted' })
+      }
+    })
+    const startRes = await f.sendMessage(f.sessionId, '/plan Design module Q')
+    expect(startRes.ok).toBe(true)
+    await vi.waitFor(() => {
+      const task = repo.collaboration(f.sessionId)
+      expect(task?.stage).toBe('plan_review')
+      expect(task?.status).toBe('ready')
+    })
+    await f.waitForIdle()
+
+    const afterReview = repo.collaboration(f.sessionId)!
+    const execRes = await f.flow.actOnCollaboration({
+      sessionId: f.sessionId,
+      taskId: afterReview.id,
+      revision: afterReview.revision,
+      action: 'execute',
+      clientMessageId: randomUUID(),
+    })
+    expect(execRes.ok).toBe(true)
+    await f.waitForIdle()
+    harness.nextRunGenerator = undefined
+
+    const settledOpenTask = repo.collaboration(f.sessionId)!
+    expect(settledOpenTask.openMode).toBe(true)
+    expect(settledOpenTask.status).toBe('waiting')
+
+    // 2. Send a real `askOnly` message through Conversation.send() -> received-input queue -> dispatch!
+    const runsBeforeAsk = harness.runs.length
+    const askRes = await f.sendMessage(f.sessionId, 'Why did we pick strategy A?', {
+      askOnly: { taskId: settledOpenTask.id, expectedRevision: settledOpenTask.revision },
+      freezeDrafts: false,
+    })
+    expect(askRes.ok ? 'ok' : askRes.error.message).toBe('ok')
+    await vi.waitFor(() => {
+      expect(harness.runs.length).toBe(runsBeforeAsk + 1)
+    })
+    await f.waitForIdle()
+
+    // Verify the dispatched run materialized through the received-input queue as read-only `reply` stage!
+    expect(harness.runs.length).toBe(runsBeforeAsk + 1)
+    const askRun = harness.runs.at(-1)!
+    expect(askRun.input.promptEnvelope.collaboration?.stage).toBe('reply')
+    expect(askRun.input.promptEnvelope.collaborationAuthorization?.stage).toBe('reply')
+    expect(askRun.input.promptEnvelope.collaborationAuthorization?.replyIntentBasis?.kind).toBe(
+      'ask_only',
+    )
+  })
+
+  it('Wave 6: resolveColdOpenPlanIntent enforces exact per-run serverName, typed callId/progressToken matching, ignores stepId, and fails closed on ambiguity', async () => {
+    const f = await createOrchestrationFixture({
+      primaryAgentId: 'agy',
+      secondaryAgentId: 'codex',
+    })
+    const repo = f.db.conversationRepository
+    const nativeSessionId = randomUUID()
+    const openRunId = randomUUID()
+    const expectedServerName = buildAgyPactMcpServerName(openRunId)
+    const wrongServerName = buildAgyPactMcpServerName(randomUUID())
+
+    const longCallId = `tc-w6-${'a'.repeat(300)}`
+    const boundedCallKey = encodeBoundedOpenPlanCallKey(`call:${longCallId}`)
+    const longProgressToken = `traj-w6-${'b'.repeat(280)}:42`
+    const boundedProgressToken = encodeBoundedOpenPlanProgressToken(longProgressToken)
+    const canonicalNativePlanId = buildBoundedNativePlanId(nativeSessionId, longCallId)
+
+    const rawResolver: unknown = Reflect.get(f.flow, 'resolveColdOpenPlanIntent')
+    if (typeof rawResolver !== 'function') {
+      throw new Error('Expected resolveColdOpenPlanIntent method on Conversation')
+    }
+    const callResolver = (terminalState: Record<string, unknown>) =>
+      Reflect.apply(rawResolver, f.flow, [openRunId, terminalState, nativeSessionId])
+
+    const intentsSpy = vi.spyOn(repo, 'workflowOpenPlanPublishIntents')
+    const readTextSpy = vi.spyOn(repo, 'readOpenPlanPublishIntentText')
+
+    // 1. Exact per-run serverName + >256B callId & progressToken -> matches cleanly!
+    intentsSpy.mockReturnValue([
+      {
+        runId: openRunId,
+        executionId: 'exec-w6-1',
+        actor: 'agy',
+        callKey: boundedCallKey,
+        progressToken: boundedProgressToken,
+        nativePlanId: canonicalNativePlanId,
+        document: { id: randomUUID(), sha256: 'a'.repeat(64), bytes: 24, chars: 24 },
+      },
+    ])
+    readTextSpy.mockReturnValue('# Wave 6 Typed Cold Plan\nMatched.')
+
+    expect(
+      callResolver({
+        executionId: 'exec-w6-1',
+        status: 'completed',
+        hasCompletedPactPublishPlan: true,
+        completedPactPublishPlanCalls: [
+          {
+            serverName: expectedServerName,
+            callId: boundedCallKey,
+            progressToken: boundedProgressToken,
+            stepId: 'step-ignored-1',
+          },
+        ],
+      }),
+    ).toEqual({
+      plan: {
+        nativeId: canonicalNativePlanId,
+        text: '# Wave 6 Typed Cold Plan\nMatched.',
+      },
+    })
+
+    // 2. Wrong serverName -> MUST fail closed (`planUnavailable: true`) even if callId & progressToken match!
+    expect(
+      callResolver({
+        executionId: 'exec-w6-1',
+        status: 'completed',
+        hasCompletedPactPublishPlan: true,
+        completedPactPublishPlanCalls: [
+          {
+            serverName: wrongServerName,
+            callId: boundedCallKey,
+            progressToken: boundedProgressToken,
+          },
+        ],
+      }),
+    ).toEqual({ planUnavailable: true })
+
+    // 3. stepId colliding with another intent's callId/progressToken -> stepId MUST be ignored!
+    intentsSpy.mockReturnValue([
+      {
+        runId: openRunId,
+        executionId: 'exec-w6-1',
+        actor: 'agy',
+        callKey: 'call:step-collision-99',
+        progressToken: 'step-collision-99',
+        nativePlanId: `${nativeSessionId}:step-collision-99`,
+        document: { id: randomUUID(), sha256: 'b'.repeat(64), bytes: 20, chars: 20 },
+      },
+    ])
+    expect(
+      callResolver({
+        executionId: 'exec-w6-1',
+        status: 'completed',
+        hasCompletedPactPublishPlan: true,
+        completedPactPublishPlanCalls: [
+          {
+            serverName: expectedServerName,
+            callId: 'call:different-call',
+            progressToken: 'different-token',
+            stepId: 'step-collision-99',
+          },
+        ],
+      }),
+    ).toEqual({ planUnavailable: true })
+
+    // 4. Provisional `token:` intent without `callId` on the completed call MUST NOT borrow stepId or unrelated tokens!
+    intentsSpy.mockReturnValue([
+      {
+        runId: openRunId,
+        executionId: 'exec-w6-1',
+        actor: 'agy',
+        callKey: 'token:traj-prov:7',
+        progressToken: 'traj-prov:7',
+        document: { id: randomUUID(), sha256: 'c'.repeat(64), bytes: 20, chars: 20 },
+      },
+    ])
+    expect(
+      callResolver({
+        executionId: 'exec-w6-1',
+        status: 'completed',
+        hasCompletedPactPublishPlan: true,
+        completedPactPublishPlanCalls: [
+          {
+            serverName: expectedServerName,
+            progressToken: 'traj-prov:7',
+            stepId: 'step-must-not-become-native-id',
+          },
+        ],
+      }),
+    ).toEqual({
+      plan: {
+        nativeId: buildBoundedNativePlanId(nativeSessionId, 'traj-prov:7'),
+        text: '# Wave 6 Typed Cold Plan\nMatched.',
+      },
+    })
+
+    // 5. Ambiguous multi-intent match -> MUST fail closed (`planUnavailable: true`)!
+    intentsSpy.mockReturnValue([
+      {
+        runId: openRunId,
+        executionId: 'exec-w6-1',
+        actor: 'agy',
+        callKey: 'token:dup-token:1',
+        progressToken: 'dup-token:1',
+        document: { id: randomUUID(), sha256: 'd'.repeat(64), bytes: 20, chars: 20 },
+      },
+      {
+        runId: openRunId,
+        executionId: 'exec-w6-1',
+        actor: 'agy',
+        callKey: 'token:dup-token:2',
+        progressToken: 'dup-token:1',
+        document: { id: randomUUID(), sha256: 'e'.repeat(64), bytes: 20, chars: 20 },
+      },
+    ])
+    expect(
+      callResolver({
+        executionId: 'exec-w6-1',
+        status: 'completed',
+        hasCompletedPactPublishPlan: true,
+        completedPactPublishPlanCalls: [
+          {
+            serverName: expectedServerName,
+            progressToken: 'dup-token:1',
+          },
+        ],
+      }),
+    ).toEqual({ planUnavailable: true })
+  })
+
+  it('Wave 6: incomplete visible prefix (text.delta + turn.completed failed without text.completed) persists assistant message as incomplete while preserving verified native completed outcome', async () => {
+    const f = await createOrchestrationFixture({
+      primaryAgentId: 'agy',
+      secondaryAgentId: 'codex',
+    })
+    const repo = f.db.conversationRepository
+
+    harness.nextRunGenerator = async function* (_agentId, input) {
+      const nativeSessionId = randomUUID()
+      const turnId = `exec-partial-${randomUUID()}`
+      const executorId = '00000000-0000-4000-8000-0000000000a1'
+      input.recordDispatch?.('possibly_sent', nativeSessionId, executorId)
+      yield { type: 'session.started', agentId: 'agy', nativeSessionId }
+      input.recordDispatch?.('accepted', nativeSessionId, executorId)
+      yield { type: 'turn.started', agentId: 'agy', turnId }
+      yield {
+        type: 'text.delta',
+        agentId: 'agy',
+        turnId,
+        outputId: 'partial-out-1',
+        text: 'Truncated prefix before unresolved pre-bind frames',
+      }
+      // Intentionally omit `text.completed` and emit `turn.completed { outcome: 'failed' }`
+      // before recording the independently verified native outcome with `completeness: 'partial'`,
+      // matching AgyAgentAdapter's unresolved pre-bind output settlement.
+      yield { type: 'turn.completed', agentId: 'agy', turnId, outcome: 'failed' }
+      const activeRun = repo.findRun(input.runId)
+      input.recordNativeEvidence?.({
+        kind: 'ended',
+        source: 'live_terminal',
+        outcome: 'completed',
+        identity: {
+          sessionId: input.sessionId,
+          agentId: 'agy',
+          requestId: input.runId,
+          runId: input.runId,
+          nativeSessionId,
+          nativeTurnId: turnId,
+          bindingGeneration: activeRun?.bindingGeneration ?? input.bindingGeneration ?? 1,
+          executorId,
+        },
+        output: {
+          outputId: 'partial-out-1',
+          text: 'Truncated prefix before unresolved pre-bind frames',
+          completeness: 'partial',
+        },
+      })
+      input.reportNativeEffects?.({
+        runId: input.runId,
+        generation: String(input.nativeGeneration ?? 1),
+        state: 'unknown',
+      })
+    }
+
+    const res = await f.sendMessage(f.sessionId, 'Trigger truncated prefix', {
+      route: { type: 'agent', agentId: 'agy' },
+    })
+    expect(res.ok).toBe(true)
+    await f.waitForIdle()
+
+    const run = harness.runs.at(-1)!
+    const runRecord = repo.findRun(run.input.runId)
+    expect(runRecord).toEqual(
+      expect.objectContaining({
+        nativeOutcome: 'completed',
+      }),
+    )
+
+    const page = repo.readPage({ scope: 'messages', sessionId: f.sessionId })
+    if (page.scope !== 'messages') throw new Error('Expected messages page')
+    const assistantEntry = page.messages.find(
+      (entry) => entry.kind === 'complete' && entry.message.role === 'assistant',
+    )
+    expect(assistantEntry).toBeDefined()
+    if (!assistantEntry || assistantEntry.kind !== 'complete') {
+      throw new Error('Expected complete message entry')
+    }
+    expect(assistantEntry.message.state).toBe('incomplete')
+    expect(assistantEntry.message.content).toBe(
+      'Truncated prefix before unresolved pre-bind frames',
+    )
   })
 })

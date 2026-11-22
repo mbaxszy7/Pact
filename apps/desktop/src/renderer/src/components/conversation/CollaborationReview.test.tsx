@@ -452,3 +452,30 @@ it('renders historical legacy tasks without stageRoles where owner === reviewer 
     await screen.findByText('Use Claude Code instead of Codex to implement this plan.'),
   ).toBeTruthy()
 })
+
+it('clears a stale actionError once a newer run makes the card historical', async () => {
+  const { props, task } = collaborationFixture()
+  task.stage = 'plan'
+  task.actor = 'codex'
+  task.nextStage = 'plan_review'
+  const bridge = installRead(task)
+  bridge.getConversation.mockResolvedValue({
+    ok: true,
+    value: reportPage(task, { availableActions: ['review_plan'] }),
+  })
+  bridge.actOnCollaboration.mockResolvedValue({
+    ok: false,
+    error: { code: 'TIMEOUT', message: 'Pact background service request timed out.' },
+  })
+  const { rerender } = render(<CollaborationReview {...props} />)
+  const reviewButton = await screen.findByRole('button', { name: 'Review plan · Claude Code' })
+  fireEvent.click(reviewButton)
+  expect(await screen.findByRole('alert')).toBeTruthy()
+  expect(screen.getByText('Pact background service request timed out.')).toBeTruthy()
+
+  rerender(<CollaborationReview {...props} latestRunId="run-newer-agy" />)
+  await waitFor(() => {
+    expect(screen.queryByText('Pact background service request timed out.')).toBeNull()
+  })
+  expect(screen.queryByRole('alert')).toBeNull()
+})

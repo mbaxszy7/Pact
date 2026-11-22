@@ -1,7 +1,7 @@
 import { sql } from 'drizzle-orm'
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { OPENAI_DECISION_MODEL } from '@pact/contracts'
@@ -495,8 +495,13 @@ rl.on('line', (line) => {
     }) + '\\n')
   } else if (msg.method === 'session/new') {
     const sid = '22222222-2222-4222-8222-222222222222'
-    if (process.env.ANTIGRAVITY_GEMINI_DIR) {
-      const convDir = join(process.env.ANTIGRAVITY_GEMINI_DIR, 'antigravity-cli', 'conversations')
+    const geminiIdx = args.indexOf('--gemini-dir')
+    const appDataIdx = args.indexOf('--app-data-dir')
+    const effectiveGeminiDir =
+      geminiIdx >= 0 ? args[geminiIdx + 1] : process.env.ANTIGRAVITY_GEMINI_DIR
+    const effectiveAppDataDir = appDataIdx >= 0 ? args[appDataIdx + 1] : 'antigravity-cli'
+    if (effectiveGeminiDir && effectiveAppDataDir) {
+      const convDir = join(effectiveGeminiDir, effectiveAppDataDir, 'conversations')
       mkdirSync(convDir, { recursive: true })
       writeFileSync(join(convDir, sid + '.db'), 'probe-zero-turn')
     }
@@ -594,7 +599,7 @@ rl.on('close', () => process.exit(0))
       })
       vi.spyOn(f.runtime, 'inspectReadiness').mockImplementation(async () => {
         // Together with PATH preparation this leaves less than the original 4s cleanup reserve.
-        now += 18_500
+        now += 36_500
         return readiness
       })
       try {
@@ -716,9 +721,17 @@ rl.on('close', () => process.exit(0))
 
       const agyFacts = await f.readJsonl(f.agyFacts)
       const spawnFact = agyFacts.find((fact) => fact.event === 'spawn')
-      expect(spawnFact?.args).toEqual(['acp', '--disable-telemetry'])
+      const probeRootFromCwd = dirname(spawnFact!.cwd!)
+      expect(spawnFact?.args?.slice(0, 3)).toEqual(['acp', '--disable-telemetry', '--gemini-dir'])
+      expect(spawnFact?.args?.[3]?.replace(/^\/private/u, '')).toBe(
+        join(probeRootFromCwd, 'gemini').replace(/^\/private/u, ''),
+      )
+      expect(spawnFact?.args?.slice(4, 7)).toEqual(['--app-data-dir', 'probe', '--log-file'])
+      expect(spawnFact?.args?.[7]?.replace(/^\/private/u, '')).toBe(
+        join(probeRootFromCwd, 'acp-probe.log').replace(/^\/private/u, ''),
+      )
       expect(spawnFact?.cwdMode).toBe(0o700)
-      expect(await exists(spawnFact!.cwd!)).toBe(false)
+      expect(await exists(probeRootFromCwd)).toBe(false)
 
       const initFact = agyFacts.find((fact) => fact.method === 'initialize')
       expect(initFact?.params).toMatchObject({
@@ -731,9 +744,9 @@ rl.on('close', () => process.exit(0))
       expect(agyFacts.some((fact) => fact.method === 'session/prompt')).toBe(false)
       expect(() => process.kill(spawnFact!.pid, 0)).toThrow(/ESRCH/u)
 
-      // Zero scanning or deleting of user conversation DBs.
+      // Zero scanning or deleting of user conversation DBs, and isolated probe storage stays out of userConvDir.
       expect(await readFile(userDb, 'utf8')).toBe('important-user-history')
-      expect(await exists(join(userConvDir, '22222222-2222-4222-8222-222222222222.db'))).toBe(true)
+      expect(await exists(join(userConvDir, '22222222-2222-4222-8222-222222222222.db'))).toBe(false)
       expect(await f.readJsonl(f.claudeFacts)).toEqual([])
     })
 
@@ -1766,6 +1779,431 @@ rl.on('close', () => process.exit(0))
             },
           },
         })
+      },
+    )
+
+    it('saveDefaults refuses to flip a failed selected agent to ready when probing the unselected 3rd agent, and refuses persistence after deadline expiry', async () => {
+      const f = await createThreeAgentCatalogFixture()
+      const checkedAt = new Date().toISOString()
+      const saveSpy = vi.spyOn(f.repo, 'save')
+
+      // Part 1: Selected agy failed while codex is ready; probing only unselected claude cannot flip agy to ready.
+      const readinessSpy = vi
+        .spyOn(f.runtime, 'inspectReadiness')
+        .mockResolvedValueOnce({
+          ok: true,
+          value: {
+            firstUse: true,
+            agents: [
+              {
+                agentId: 'codex',
+                state: 'ready',
+                executablePath: f.codexPath,
+                version: 'codex-cli 0.159.2',
+                checkedAt,
+              },
+              { agentId: 'agy', state: 'authentication_required', version: '1.5.9', checkedAt },
+            ],
+          },
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          value: {
+            firstUse: true,
+            agents: [
+              {
+                agentId: 'claude',
+                state: 'ready',
+                executablePath: f.claudePath,
+                version: '2.1.272 (Claude Code)',
+                checkedAt,
+              },
+              // Even if the extra lookup returned a ready selected agent, saveDefaults must keep only claude.
+              {
+                agentId: 'agy',
+                state: 'ready',
+                executablePath: f.agyPath,
+                version: '1.5.9',
+                checkedAt,
+              },
+            ],
+          },
+        })
+
+      const rejectedSave = await f.catalogs.saveDefaults({
+        settings: {
+          primaryAgentId: 'codex',
+          secondaryAgentId: 'agy',
+          agents: {
+            claude: { model: null, effort: null },
+            codex: { model: null, effort: null },
+            agy: { model: null, effort: null },
+          },
+          maxDiscussionRounds: 6,
+          maxReviewCycles: 3,
+          maxRepairAttempts: 3,
+        },
+      })
+      expect(rejectedSave).toEqual({
+        ok: false,
+        error: {
+          code: 'RUNTIME_UNAVAILABLE',
+          message: 'Both selected Agents must be ready before saving.',
+        },
+      })
+      expect(readinessSpy).toHaveBeenNthCalledWith(
+        1,
+        expect.anything(),
+        ['codex', 'agy'],
+        expect.any(Number),
+        {
+          agySessionHook: {
+            onNotification: expect.any(Function),
+            inspectSession: expect.any(Function),
+          },
+        },
+      )
+      expect(readinessSpy).toHaveBeenNthCalledWith(
+        2,
+        expect.anything(),
+        ['claude'],
+        expect.any(Number),
+      )
+      expect(saveSpy).not.toHaveBeenCalled()
+
+      // Part 2: Once saveDeadlineAt expires before repository.save, saveDefaults fails closed without persisting.
+      let nowMs = 1_700_000_000_000
+      vi.spyOn(Date, 'now').mockImplementation(() => nowMs)
+      readinessSpy.mockResolvedValueOnce({
+        ok: true,
+        value: {
+          firstUse: false,
+          agents: [
+            {
+              agentId: 'claude',
+              state: 'ready',
+              executablePath: f.claudePath,
+              version: '2.1.272 (Claude Code)',
+              checkedAt,
+            },
+            {
+              agentId: 'codex',
+              state: 'ready',
+              executablePath: f.codexPath,
+              version: 'codex-cli 0.159.2',
+              checkedAt,
+            },
+            {
+              agentId: 'agy',
+              state: 'ready',
+              executablePath: f.agyPath,
+              version: '1.5.9',
+              checkedAt,
+            },
+          ],
+        },
+      })
+      const origRead = f.repo.read.bind(f.repo)
+      let readCalls = 0
+      vi.spyOn(f.repo, 'read').mockImplementation(() => {
+        readCalls += 1
+        // 3rd read occurs right before repository.save in saveDefaults (after validateSettings/collectEditorState).
+        if (readCalls >= 3) {
+          nowMs += 120_000
+        }
+        return origRead()
+      })
+
+      const expiredSave = await f.catalogs.saveDefaults({
+        settings: {
+          primaryAgentId: 'claude',
+          secondaryAgentId: 'agy',
+          agents: {
+            claude: { model: null, effort: null },
+            codex: { model: null, effort: null },
+            agy: { model: 'gemini-4-carbon', effort: 'high' },
+          },
+          maxDiscussionRounds: 6,
+          maxReviewCycles: 3,
+          maxRepairAttempts: 3,
+        },
+      })
+      expect(expiredSave).toEqual({
+        ok: false,
+        error: { code: 'INTERNAL', message: 'Default session settings could not be saved.' },
+      })
+      expect(saveSpy).not.toHaveBeenCalled()
+    })
+
+    it(
+      'coalesces real RuntimePreparation readiness and Antigravity catalog discovery into 1 agy acp spawn, and never caches empty catalogs',
+      { timeout: 15_000 },
+      async () => {
+        const f = await fixture()
+        const claudePath = join(f.directory, 'claude-real-coalesce.mjs')
+        const codexPath = join(f.directory, 'codex-real-coalesce.mjs')
+        const agyPath = join(f.directory, 'agy-real-coalesce.mjs')
+        const agyFacts = join(f.directory, 'agy-real-coalesce-facts.jsonl')
+        const agyGateFile = join(f.directory, 'agy-real-coalesce-gate')
+        const agyReturnEmptyFile = join(f.directory, 'agy-return-empty')
+
+        await writeFile(
+          claudePath,
+          `#!${process.execPath}
+if (process.argv[2] === '--version') {
+  process.stdout.write('2.1.272 (Claude Code)\\n')
+  process.exit(0)
+}
+if (process.argv[2] === 'auth' && process.argv[3] === 'status') {
+  process.exit(1)
+}
+`,
+          { mode: 0o755 },
+        )
+        await chmod(claudePath, 0o755)
+
+        await writeFile(
+          codexPath,
+          `#!${process.execPath}
+import { createInterface } from 'node:readline'
+const args = process.argv.slice(2)
+if (args[0] === '--version') {
+  process.stdout.write('codex-cli 0.159.2\\n')
+  process.exit(0)
+}
+if (args[0] === 'login' && args[1] === 'status') {
+  process.exit(0)
+}
+const rl = createInterface({ input: process.stdin })
+rl.on('line', (line) => {
+  const msg = JSON.parse(line)
+  if (msg.method === 'initialize') {
+    process.stdout.write(JSON.stringify({ id: msg.id, result: {} }) + '\\n')
+  } else if (msg.method === 'model/list') {
+    process.stdout.write(JSON.stringify({
+      id: msg.id,
+      result: {
+        data: [{ id: 'gpt-5.4', displayName: 'GPT-5.4', supportedReasoningEfforts: [{ reasoningEffort: 'high' }] }],
+        nextCursor: null,
+      },
+    }) + '\\n')
+  }
+})
+`,
+          { mode: 0o755 },
+        )
+        await chmod(codexPath, 0o755)
+
+        await writeFile(
+          agyPath,
+          `#!${process.execPath}
+import { appendFileSync, existsSync } from 'node:fs'
+import { createInterface } from 'node:readline'
+const facts = ${JSON.stringify(agyFacts)}
+const gateFile = ${JSON.stringify(agyGateFile)}
+const emptyFlag = ${JSON.stringify(agyReturnEmptyFile)}
+const record = (entry) => appendFileSync(facts, JSON.stringify({ pid: process.pid, ...entry }) + '\\n')
+const args = process.argv.slice(2)
+if (args[0] === '--version') {
+  process.stdout.write('1.5.13\\n')
+  process.exit(0)
+}
+if (args[0] === 'acp') {
+  record({ event: 'acp_spawn', args })
+  const rl = createInterface({ input: process.stdin })
+  rl.on('line', (line) => {
+    const msg = JSON.parse(line)
+    record({ method: msg.method })
+    if (msg.method === 'initialize') {
+      process.stdout.write(JSON.stringify({
+        jsonrpc: '2.0',
+        id: msg.id,
+        result: { protocolVersion: 1, agentInfo: { name: 'Antigravity ACP Server', version: '1.5.13' } },
+      }) + '\\n')
+    } else if (msg.method === 'session/new') {
+      const reply = () => {
+        if (existsSync(emptyFlag)) {
+          process.stdout.write(JSON.stringify({
+            jsonrpc: '2.0',
+            id: msg.id,
+            result: { sessionId: '99999999-9999-4999-8999-999999999991', models: { availableModels: [] }, configOptions: [] },
+          }) + '\\n')
+          return
+        }
+        process.stdout.write(JSON.stringify({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            sessionId: '99999999-9999-4999-8999-999999999992',
+            models: {
+              currentModelId: 'gemini-4-neon-high',
+              availableModels: [{ modelId: 'gemini-pro-orchestrator', name: 'Orchestrator (Carbon)' }],
+            },
+            configOptions: [
+              {
+                id: 'model',
+                category: 'model',
+                type: 'select',
+                currentValue: 'gemini-4-neon',
+                options: [
+                  { value: 'gemini-4-neon', name: 'Gemini 4 Neon' },
+                  { value: 'gemini-pro-orchestrator', name: 'Orchestrator (Carbon)' },
+                ],
+              },
+              {
+                id: 'thought_level',
+                category: 'thought_level',
+                type: 'select',
+                currentValue: 'high',
+                options: [{ value: 'low', name: 'Low' }, { value: 'high', name: 'High' }],
+              },
+            ],
+          },
+        }) + '\\n')
+      }
+      if (!existsSync(gateFile)) {
+        reply()
+      } else {
+        const timer = setInterval(() => {
+          if (!existsSync(gateFile)) {
+            clearInterval(timer)
+            reply()
+          }
+        }, 15)
+      }
+    } else if (msg.method === 'session/set_config_option') {
+      const val = msg.params?.value
+      const configOptions = [
+        {
+          id: 'model',
+          category: 'model',
+          type: 'select',
+          currentValue: val,
+          options: [
+            { value: 'gemini-4-neon', name: 'Gemini 4 Neon' },
+            { value: 'gemini-pro-orchestrator', name: 'Orchestrator (Carbon)' },
+          ],
+        },
+        ...(val === 'gemini-4-neon'
+          ? [{
+              id: 'thought_level',
+              category: 'thought_level',
+              type: 'select',
+              currentValue: 'high',
+              options: [{ value: 'low', name: 'Low' }, { value: 'high', name: 'High' }],
+            }]
+          : []),
+      ]
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { configOptions } }) + '\\n')
+    } else if (msg.method === 'session/close') {
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: {} }) + '\\n')
+    }
+  })
+  rl.on('close', () => process.exit(0))
+}
+`,
+          { mode: 0o755 },
+        )
+        await chmod(agyPath, 0o755)
+
+        f.db.runtimePreparationRepository.saveSelectedExecutablePath('claude', claudePath)
+        f.db.runtimePreparationRepository.saveSelectedExecutablePath('codex', codexPath)
+        f.db.runtimePreparationRepository.saveSelectedExecutablePath('agy', agyPath)
+
+        // 1. Empty catalog must return 'unavailable' and must NOT be poisoned into completedCatalogs cache.
+        await writeFile(agyReturnEmptyFile, '1', 'utf8')
+        const emptyLoaded = await f.catalogs.loadEditorState(f.directory, {
+          primaryAgentId: 'codex',
+          secondaryAgentId: 'agy',
+        })
+        expect(emptyLoaded.ok).toBe(true)
+        if (!emptyLoaded.ok) throw new Error(emptyLoaded.error.message)
+        expect(emptyLoaded.value.modelCatalogs.agy.status).toBe('unavailable')
+        expect(emptyLoaded.value.modelCatalogs.agy.models).toEqual([])
+        const emptySpawns = (await readJsonlFacts(agyFacts)).filter(
+          (entry) => entry.event === 'acp_spawn',
+        )
+        expect(emptySpawns).toHaveLength(1)
+
+        // Clear empty flag and reset facts: a fresh load must run (not cached) and spawn ONLY 1 agy acp process!
+        await rm(agyReturnEmptyFile, { force: true })
+        await rm(agyFacts, { force: true })
+        const populatedDir = join(f.directory, 'proj-1')
+        await mkdir(populatedDir, { recursive: true })
+        const singleLoaded = await f.catalogs.loadEditorState(populatedDir, {
+          primaryAgentId: 'codex',
+          secondaryAgentId: 'agy',
+        })
+        expect(singleLoaded.ok).toBe(true)
+        if (!singleLoaded.ok) throw new Error(singleLoaded.error.message)
+        expect(singleLoaded.value.modelCatalogs.agy).toMatchObject({
+          agentId: 'agy',
+          status: 'available',
+          cliVersion: '1.5.13',
+          models: [
+            { id: 'gemini-4-neon', supportedEfforts: ['low', 'high'], defaultEffort: 'high' },
+            { id: 'gemini-pro-orchestrator', supportedEfforts: [] },
+          ],
+        })
+        const singleSpawns = (await readJsonlFacts(agyFacts)).filter(
+          (entry) => entry.event === 'acp_spawn',
+        )
+        expect(singleSpawns).toHaveLength(1)
+
+        // 2. Overlapping runtime.inspectReadiness() + loadEditorState() share 1 gated agy acp spawn!
+        await rm(agyFacts, { force: true })
+        await writeFile(agyGateFile, 'hold', 'utf8')
+        const overlappedDir = join(f.directory, 'proj-2')
+        await mkdir(overlappedDir, { recursive: true })
+
+        const readinessPromise = f.runtime.inspectReadiness()
+        await expect
+          .poll(
+            async () =>
+              (await readJsonlFacts(agyFacts)).some((entry) => entry.method === 'session/new'),
+            { timeout: 5_000 },
+          )
+          .toBe(true)
+        const catalogPromise = f.catalogs.loadEditorState(overlappedDir, {
+          primaryAgentId: 'codex',
+          secondaryAgentId: 'agy',
+        })
+        await new Promise((r) => setTimeout(r, 30))
+        await rm(agyGateFile, { force: true })
+
+        const [readinessRes, catalogRes] = await Promise.all([readinessPromise, catalogPromise])
+        expect(readinessRes).toMatchObject({
+          ok: true,
+          value: {
+            agents: expect.arrayContaining([
+              expect.objectContaining({
+                agentId: 'agy',
+                state: 'ready',
+                version: '1.5.13',
+                executablePath: agyPath,
+                checkedAt: expect.any(String),
+              }),
+            ]),
+          },
+        })
+        expect(catalogRes).toMatchObject({
+          ok: true,
+          value: {
+            modelCatalogs: {
+              agy: {
+                status: 'available',
+                models: [
+                  { id: 'gemini-4-neon', supportedEfforts: ['low', 'high'], defaultEffort: 'high' },
+                  { id: 'gemini-pro-orchestrator', supportedEfforts: [] },
+                ],
+              },
+            },
+          },
+        })
+        const overlapSpawns = (await readJsonlFacts(agyFacts)).filter(
+          (entry) => entry.event === 'acp_spawn',
+        )
+        expect(overlapSpawns).toHaveLength(1)
       },
     )
   },

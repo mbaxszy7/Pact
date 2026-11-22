@@ -1,23 +1,39 @@
 import type { ChildProcessWithoutNullStreams } from 'node:child_process'
-import type { BigIntStats } from 'node:fs'
 
-import Database from 'better-sqlite3'
-import { chmod, lstat, mkdtemp, open, realpath, rm, unlink } from 'node:fs/promises'
-import { homedir, tmpdir } from 'node:os'
-import { isAbsolute, join, resolve } from 'node:path'
+import { lstatSync, realpathSync } from 'node:fs'
+import { chmod, lstat, mkdir, mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { isAbsolute, join, win32 as win32Path } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
-import { pathToFileURL } from 'node:url'
 
 import desktopPackage from '../../../package.json'
 import { OwnedProcessGroup } from '../owned-process-group'
 
 const MAX_PENDING_ACP_REQUESTS = 16
+const DEFAULT_INITIALIZE_TIMEOUT_MS = 4_000
 const SESSION_CLOSE_GRACE_MS = 1_000
-const MAX_PROBE_DB_INSPECT_BYTES = 16 * 1024 * 1024
-const PROBE_CLOCK_SKEW_MS = 2_000
-const COPY_CHUNK_BYTES = 64 * 1024
+const MAX_LOG_FILE_PATH_BYTES = 4_096
 const SAFE_PROBE_SESSION_ID = /^[a-zA-Z0-9_-]{8,128}$/u
 const UNSAFE_WINDOWS_CMD_METACHARS = /[&|<>^%!"\r\n\0]/u
+const WINDOWS_DRIVE_ABSOLUTE_PATH = /^[A-Za-z]:\\(?:[^\\/:*?"<>|]+\\)*[^\\/:*?"<>|]*$/u
+
+function hasAsciiControlChar(text: string): boolean {
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index)
+    if (code <= 0x1f || code === 0x7f) {
+      return true
+    }
+  }
+  return false
+}
+
+function isEnoentError(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT'
+}
+
+export interface UnconfirmedAgyProbeArtifact {
+  readonly probeRoot: string
+}
 
 export type AgyProbeErrorKind =
   | 'start_failed'
@@ -55,11 +71,13 @@ export interface AgyAcpProbeRequest<T> {
   readonly executablePath: string
   readonly env?: NodeJS.ProcessEnv
   readonly signal?: AbortSignal
+  readonly initializeTimeoutMs?: number
   readonly timeoutMs: number
+  readonly businessDeadlineAt?: number
   readonly closeDeadlineAt?: number
+  readonly getShutdownDeadlineAt?: () => number | undefined
   readonly maxFrameBytes: number
   readonly maxTotalBytes: number
-  readonly deleteProbeSessionDb?: boolean
   readonly ownProbe: (
     signal: AbortSignal,
     onCloseInput: () => void | Promise<void>,
@@ -70,11 +88,14 @@ export interface AgyAcpProbeRequest<T> {
   readonly onCloseError?: (
     error: unknown,
     probe: OwnedProcessGroup,
-    probeCwd: string,
-    openedSessionId: string | undefined,
+    artifact: UnconfirmedAgyProbeArtifact,
   ) => void
-  readonly onProbeSettled?: (probe: OwnedProcessGroup) => void
-  readonly onSessionCleanupNote?: (note: string) => void
+  readonly onProbeSettled?: (
+    probe: OwnedProcessGroup,
+    artifact: UnconfirmedAgyProbeArtifact,
+    artifactRemoved: boolean,
+  ) => void
+  readonly reconcileArtifact?: (artifact: UnconfirmedAgyProbeArtifact) => Promise<boolean>
 }
 
 export function isAgyProbeSettled(probe: OwnedProcessGroup): boolean {
@@ -83,6 +104,71 @@ export function isAgyProbeSettled(probe: OwnedProcessGroup): boolean {
 
 export function isUnsafeWindowsCmdPath(executablePath: string): boolean {
   return UNSAFE_WINDOWS_CMD_METACHARS.test(executablePath)
+}
+
+function readEnvCaseInsensitive(env: NodeJS.ProcessEnv, targetKey: string): string | undefined {
+  const lowerTarget = targetKey.toLowerCase()
+  for (const [key, value] of Object.entries(env)) {
+    if (key.toLowerCase() === lowerTarget && typeof value === 'string') {
+      return value
+    }
+  }
+  return undefined
+}
+
+/**
+ * Derives a trusted absolute `%SystemRoot%\\System32\\cmd.exe` path without falling back to
+ * bare `cmd.exe` or trusting relative/overridden `ComSpec`.
+ */
+export function deriveTrustedWindowsCmdPath(env?: NodeJS.ProcessEnv): string | undefined {
+  const sourceEnv = env ?? process.env
+  const systemRoot =
+    readEnvCaseInsensitive(sourceEnv, 'SystemRoot') ?? readEnvCaseInsensitive(sourceEnv, 'WINDIR')
+  if (
+    !systemRoot ||
+    hasAsciiControlChar(systemRoot) ||
+    isUnsafeWindowsCmdPath(systemRoot) ||
+    !WINDOWS_DRIVE_ABSOLUTE_PATH.test(systemRoot)
+  ) {
+    return undefined
+  }
+  const segments = systemRoot.split('\\').slice(1)
+  if (segments.some((segment) => segment === '.' || segment === '..')) {
+    return undefined
+  }
+  const trustedCmd = win32Path.resolve(systemRoot, 'System32', 'cmd.exe')
+  if (
+    isUnsafeWindowsCmdPath(trustedCmd) ||
+    !trustedCmd.toLowerCase().endsWith('\\system32\\cmd.exe')
+  ) {
+    return undefined
+  }
+  return trustedCmd
+}
+
+/**
+ * Resolves `%SystemRoot%\\System32\\cmd.exe` and, on Windows, verifies non-symlink directory and
+ * executable identity before returning it.
+ */
+export function resolveTrustedWindowsCmdExe(env?: NodeJS.ProcessEnv): string | undefined {
+  const trustedCmd = deriveTrustedWindowsCmdPath(env)
+  if (!trustedCmd) return undefined
+  if (process.platform === 'win32') {
+    const system32Dir = win32Path.dirname(trustedCmd)
+    const systemRootDir = win32Path.dirname(system32Dir)
+    try {
+      const rootStat = lstatSync(systemRootDir)
+      if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) return undefined
+      const sys32Stat = lstatSync(system32Dir)
+      if (!sys32Stat.isDirectory() || sys32Stat.isSymbolicLink()) return undefined
+      const cmdStat = lstatSync(trustedCmd)
+      if (!cmdStat.isFile() || cmdStat.isSymbolicLink()) return undefined
+      if (realpathSync(trustedCmd).toLowerCase() !== trustedCmd.toLowerCase()) return undefined
+    } catch {
+      return undefined
+    }
+  }
+  return trustedCmd
 }
 
 export function resolvePactClientVersion(): string {
@@ -106,393 +192,89 @@ export function isSafeAgyProbeSessionId(sessionId: string): boolean {
   return SAFE_PROBE_SESSION_ID.test(sessionId)
 }
 
-export function resolveEffectiveAgyAppDataDir(env: NodeJS.ProcessEnv = process.env): string {
-  const customGeminiDir = env.ANTIGRAVITY_GEMINI_DIR
-  const geminiRoot =
-    customGeminiDir && isAbsolute(customGeminiDir)
-      ? customGeminiDir
-      : join(env.HOME || env.USERPROFILE || homedir(), '.gemini')
-  return resolve(join(geminiRoot, 'antigravity-cli'))
-}
-
-function resolveAgyConversationsDir(env: NodeJS.ProcessEnv = process.env): string {
-  return join(resolveEffectiveAgyAppDataDir(env), 'conversations')
-}
-
-async function statBigintIfPresent(filePath: string): Promise<BigIntStats | null> {
+export async function removeDirConfirmed(dirPath: string): Promise<boolean> {
+  await rm(dirPath, { recursive: true, force: true }).catch(() => undefined)
   try {
-    return await lstat(filePath, { bigint: true })
+    await lstat(dirPath)
+    return false
   } catch (error) {
-    if (typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT') {
-      return null
-    }
-    throw error
+    return isEnoentError(error)
   }
 }
 
-function sameRegularFileIdentity(expected: BigIntStats, current: BigIntStats): boolean {
+/**
+ * Confirms deletion of a settled Antigravity ACP probe's isolated `0o700` temp directory.
+ */
+export async function reconcileSettledAgyProbeArtifact(
+  artifact: UnconfirmedAgyProbeArtifact,
+): Promise<boolean> {
+  return await removeDirConfirmed(artifact.probeRoot)
+}
+
+function resolveEffectiveCloseDeadline(
+  closeDeadlineAt?: number,
+  shutdownDeadlineAt?: number,
+): number | undefined {
+  if (closeDeadlineAt !== undefined && shutdownDeadlineAt !== undefined) {
+    return Math.min(closeDeadlineAt, shutdownDeadlineAt)
+  }
+  return closeDeadlineAt ?? shutdownDeadlineAt
+}
+
+function isSafeAgyStoragePath(filePath: string): boolean {
   return (
-    !current.isSymbolicLink() &&
-    current.isFile() &&
-    expected.dev === current.dev &&
-    expected.ino === current.ino &&
-    expected.size === current.size &&
-    expected.mtimeNs === current.mtimeNs
+    isAbsolute(filePath) &&
+    !filePath.includes('\0') &&
+    Buffer.byteLength(filePath, 'utf8') <= MAX_LOG_FILE_PATH_BYTES
   )
-}
-
-async function copyRegularFileExclusiveBounded(
-  srcPath: string,
-  expectedStat: BigIntStats,
-  destPath: string,
-): Promise<boolean> {
-  if (expectedStat.size < 0n || expectedStat.size > BigInt(MAX_PROBE_DB_INSPECT_BYTES)) {
-    return false
-  }
-  const srcHandle = await open(srcPath, 'r')
-  try {
-    const fdStat = await srcHandle.stat({ bigint: true })
-    if (!sameRegularFileIdentity(expectedStat, fdStat)) {
-      return false
-    }
-    const destHandle = await open(destPath, 'wx', 0o600)
-    try {
-      const buffer = Buffer.allocUnsafe(
-        Math.min(COPY_CHUNK_BYTES, Math.max(1, Number(expectedStat.size))),
-      )
-      let totalCopied = 0
-      while (totalCopied < Number(expectedStat.size)) {
-        const remaining = Number(expectedStat.size) - totalCopied
-        // oxlint-disable-next-line no-await-in-loop -- Sequential bounded copy into exclusive staging handle.
-        const { bytesRead } = await srcHandle.read(
-          buffer,
-          0,
-          Math.min(buffer.byteLength, remaining),
-          totalCopied,
-        )
-        if (bytesRead <= 0) return false
-        let writtenOffset = 0
-        while (writtenOffset < bytesRead) {
-          // oxlint-disable-next-line no-await-in-loop -- Complete short writes sequentially.
-          const { bytesWritten } = await destHandle.write(
-            buffer,
-            writtenOffset,
-            bytesRead - writtenOffset,
-          )
-          if (bytesWritten <= 0) return false
-          writtenOffset += bytesWritten
-        }
-        totalCopied += bytesRead
-        if (totalCopied > MAX_PROBE_DB_INSPECT_BYTES) return false
-      }
-      const trailingCheck = Buffer.allocUnsafe(1)
-      const extra = await srcHandle.read(trailingCheck, 0, 1, totalCopied)
-      if (extra.bytesRead > 0) return false
-      return totalCopied === Number(expectedStat.size)
-    } finally {
-      await destHandle.close().catch(() => undefined)
-    }
-  } catch {
-    return false
-  } finally {
-    await srcHandle.close().catch(() => undefined)
-  }
-}
-
-function metadataContainsPositiveProbeWorkspaceUri(
-  rawText: string,
-  allowedFileUrls: readonly string[],
-): boolean {
-  if (!rawText.includes('file://')) return false
-  const fileUrlTokens = rawText.match(/file:\/\/[^\s"\0<>'`]+/gu)
-  if (!fileUrlTokens || fileUrlTokens.length === 0) return false
-  return fileUrlTokens.every((token) =>
-    allowedFileUrls.some(
-      (allowed) =>
-        allowed.length > 0 &&
-        (token === allowed || token.startsWith(`${allowed}/`) || allowed.startsWith(`${token}/`)),
-    ),
-  )
-}
-
-async function verifyZeroStepProbeSessionDb(input: {
-  sessionId: string
-  probeCwd: string
-  probeStartedAtMs: number
-  dbPath: string
-  walPath: string
-  journalPath: string
-}): Promise<
-  | { readonly verified: true; readonly dbStat: BigIntStats; readonly walStat: BigIntStats | null }
-  | { readonly verified: false }
-> {
-  if (!isSafeAgyProbeSessionId(input.sessionId)) return { verified: false }
-
-  const journalBefore = await statBigintIfPresent(input.journalPath)
-  if (journalBefore !== null) return { verified: false }
-
-  const dbStat = await statBigintIfPresent(input.dbPath)
-  const minWindowMs = BigInt(Math.max(0, input.probeStartedAtMs - PROBE_CLOCK_SKEW_MS))
-  if (
-    !dbStat ||
-    !dbStat.isFile() ||
-    dbStat.isSymbolicLink() ||
-    dbStat.size <= 0n ||
-    dbStat.size > BigInt(MAX_PROBE_DB_INSPECT_BYTES) ||
-    dbStat.mtimeMs < minWindowMs ||
-    (dbStat.birthtimeMs > 0n && dbStat.birthtimeMs < minWindowMs)
-  ) {
-    return { verified: false }
-  }
-
-  const walStat = await statBigintIfPresent(input.walPath)
-  if (
-    walStat &&
-    (!walStat.isFile() ||
-      walStat.isSymbolicLink() ||
-      walStat.size < 0n ||
-      walStat.size > BigInt(MAX_PROBE_DB_INSPECT_BYTES))
-  ) {
-    return { verified: false }
-  }
-
-  const canonicalProbeCwd = await realpath(input.probeCwd).catch(() => input.probeCwd)
-  const allowedFileUrls = [
-    pathToFileURL(input.probeCwd).href.replace(/\/+$/u, ''),
-    pathToFileURL(canonicalProbeCwd).href.replace(/\/+$/u, ''),
-  ]
-
-  const stagingDir = await mkdtemp(join(tmpdir(), 'pact-agy-probe-inspect-'))
-  try {
-    await chmod(stagingDir, 0o700)
-    const stagedDbPath = join(stagingDir, 'session.db')
-    const stagedWalPath = join(stagingDir, 'session.db-wal')
-    if (!(await copyRegularFileExclusiveBounded(input.dbPath, dbStat, stagedDbPath))) {
-      return { verified: false }
-    }
-    if (
-      walStat &&
-      !(await copyRegularFileExclusiveBounded(input.walPath, walStat, stagedWalPath))
-    ) {
-      return { verified: false }
-    }
-
-    if ((await statBigintIfPresent(input.journalPath)) !== null) {
-      return { verified: false }
-    }
-
-    let db: Database.Database | undefined
-    try {
-      db = new Database(stagedDbPath, { readonly: true, fileMustExist: true })
-      const masterRows = db
-        .prepare<[], { name: string; type: string }>(
-          `SELECT name, type FROM sqlite_master WHERE type IN ('table', 'view', 'trigger') AND name NOT LIKE 'sqlite_%'`,
-        )
-        .all()
-      if (masterRows.some((row) => row.type === 'view' || row.type === 'trigger')) {
-        return { verified: false }
-      }
-      const tableNames = new Set(
-        masterRows.filter((row) => row.type === 'table').map((row) => row.name),
-      )
-      if (!tableNames.has('steps')) return { verified: false }
-
-      const stepCountRow = db
-        .prepare<[], { count: number }>('SELECT COUNT(*) AS count FROM "steps"')
-        .get()
-      if (!stepCountRow || stepCountRow.count !== 0) return { verified: false }
-
-      let matchedWorkspaceUri = false
-
-      if (tableNames.has('trajectory_meta')) {
-        const metaRows = db
-          .prepare<[], Record<string, unknown>>('SELECT * FROM "trajectory_meta" LIMIT 2')
-          .all()
-        if (metaRows.length > 1) return { verified: false }
-        const metaRow = metaRows[0]
-        if (metaRow) {
-          const cascadeId = metaRow.cascade_id
-          if (cascadeId !== undefined && cascadeId !== input.sessionId) return { verified: false }
-          for (const colValue of Object.values(metaRow)) {
-            if (typeof colValue === 'string' && colValue.includes('file://')) {
-              if (!metadataContainsPositiveProbeWorkspaceUri(colValue, allowedFileUrls)) {
-                return { verified: false }
-              }
-              matchedWorkspaceUri = true
-            } else if (Buffer.isBuffer(colValue)) {
-              if (colValue.byteLength > MAX_PROBE_DB_INSPECT_BYTES) return { verified: false }
-              const text = colValue.toString('utf8')
-              if (text.includes('file://')) {
-                if (!metadataContainsPositiveProbeWorkspaceUri(text, allowedFileUrls)) {
-                  return { verified: false }
-                }
-                matchedWorkspaceUri = true
-              }
-            }
-          }
-        }
-      }
-
-      if (tableNames.has('trajectory_metadata_blob')) {
-        const blobRows = db
-          .prepare<[], Record<string, unknown>>('SELECT * FROM "trajectory_metadata_blob" LIMIT 2')
-          .all()
-        if (blobRows.length > 1) return { verified: false }
-        const rawData = blobRows[0]?.data
-        if (Buffer.isBuffer(rawData)) {
-          if (rawData.byteLength > MAX_PROBE_DB_INSPECT_BYTES) return { verified: false }
-          const text = rawData.toString('utf8')
-          if (text.includes('file://')) {
-            if (!metadataContainsPositiveProbeWorkspaceUri(text, allowedFileUrls)) {
-              return { verified: false }
-            }
-            matchedWorkspaceUri = true
-          }
-        }
-      }
-
-      if (!matchedWorkspaceUri) {
-        return { verified: false }
-      }
-    } catch {
-      return { verified: false }
-    } finally {
-      db?.close()
-    }
-
-    return { verified: true, dbStat, walStat }
-  } finally {
-    await rm(stagingDir, { recursive: true, force: true }).catch(() => undefined)
-  }
-}
-
-async function unlinkVerifiedIdentity(
-  filePath: string,
-  expectedStat: BigIntStats,
-): Promise<boolean> {
-  const latest = await statBigintIfPresent(filePath)
-  if (!latest || !sameRegularFileIdentity(expectedStat, latest)) {
-    return false
-  }
-  await unlink(filePath).catch((error: unknown) => {
-    if (typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT') {
-      return
-    }
-    throw error
-  })
-  return true
-}
-
-async function cleanupVerifiedAgyProbeSessionDb(input: {
-  sessionId: string
-  probeCwd: string
-  probeStartedAtMs: number
-  sessionCloseSucceeded: boolean
-  env: NodeJS.ProcessEnv | undefined
-}): Promise<{ retained: boolean; note: string | undefined }> {
-  if (!isSafeAgyProbeSessionId(input.sessionId)) {
-    return {
-      retained: true,
-      note: 'Probe session cleanup was skipped because sessionId format could not be verified.',
-    }
-  }
-  const conversationsDir = resolveAgyConversationsDir(input.env)
-  const dbPath = join(conversationsDir, `${input.sessionId}.db`)
-  const walPath = join(conversationsDir, `${input.sessionId}.db-wal`)
-  const shmPath = join(conversationsDir, `${input.sessionId}.db-shm`)
-  const journalPath = join(conversationsDir, `${input.sessionId}.db-journal`)
-
-  const [dbStat, walStat, shmStat, journalStat] = await Promise.all([
-    statBigintIfPresent(dbPath).catch(() => null),
-    statBigintIfPresent(walPath).catch(() => null),
-    statBigintIfPresent(shmPath).catch(() => null),
-    statBigintIfPresent(journalPath).catch(() => null),
-  ])
-  const anyFilePresent = Boolean(dbStat || walStat || shmStat || journalStat)
-  if (!anyFilePresent) {
-    return {
-      retained: false,
-      note: input.sessionCloseSucceeded ? undefined : 'Probe session close was not acknowledged.',
-    }
-  }
-
-  if (!input.sessionCloseSucceeded || journalStat !== null) {
-    return {
-      retained: true,
-      note: 'Probe session file was retained because session/close or rollback journal settlement was not confirmed.',
-    }
-  }
-
-  const verified = await verifyZeroStepProbeSessionDb({
-    sessionId: input.sessionId,
-    probeCwd: input.probeCwd,
-    probeStartedAtMs: input.probeStartedAtMs,
-    dbPath,
-    walPath,
-    journalPath,
-  })
-  if (!verified.verified) {
-    return {
-      retained: true,
-      note: 'Probe session file was retained because exclusive probe ownership could not be confirmed.',
-    }
-  }
-
-  const [latestJournal, latestDb, latestWal, latestShm] = await Promise.all([
-    statBigintIfPresent(journalPath),
-    statBigintIfPresent(dbPath),
-    statBigintIfPresent(walPath),
-    statBigintIfPresent(shmPath),
-  ])
-  if (
-    latestJournal !== null ||
-    !latestDb ||
-    !sameRegularFileIdentity(verified.dbStat, latestDb) ||
-    (verified.walStat
-      ? !latestWal || !sameRegularFileIdentity(verified.walStat, latestWal)
-      : latestWal !== null) ||
-    (latestShm !== null &&
-      (!latestShm.isFile() ||
-        latestShm.isSymbolicLink() ||
-        latestShm.size > BigInt(MAX_PROBE_DB_INSPECT_BYTES)))
-  ) {
-    return {
-      retained: true,
-      note: 'Probe session file changed before unlink and was retained safely.',
-    }
-  }
-
-  const dbUnlinked = await unlinkVerifiedIdentity(dbPath, verified.dbStat)
-  if (!dbUnlinked) {
-    return {
-      retained: true,
-      note: 'Probe session file changed before unlink and was retained safely.',
-    }
-  }
-  if (verified.walStat) {
-    await unlinkVerifiedIdentity(walPath, verified.walStat)
-  }
-  if (latestShm) {
-    await unlinkVerifiedIdentity(shmPath, latestShm)
-  }
-  return { retained: false, note: undefined }
 }
 
 function spawnAgyAcpServer(
   executablePath: string,
   workingDirectory: string,
+  probeGeminiDir: string,
+  probeLogFile: string,
   probe: OwnedProcessGroup,
   env?: NodeJS.ProcessEnv,
 ): ChildProcessWithoutNullStreams {
-  const isWindowsCommand = process.platform === 'win32' && /\.cmd$/iu.test(executablePath)
-  if (isWindowsCommand && isUnsafeWindowsCmdPath(executablePath)) {
-    throw new AgyProbeError('start_failed', 'Unsafe Windows executable path.')
+  if (!isSafeAgyStoragePath(probeGeminiDir) || !isSafeAgyStoragePath(probeLogFile)) {
+    throw new AgyProbeError('start_failed', 'Unsafe Antigravity probe storage path.')
   }
-  const target = isWindowsCommand ? (process.env.ComSpec ?? 'cmd.exe') : executablePath
+  const isWindowsCommand = process.platform === 'win32' && /\.cmd$/iu.test(executablePath)
+  if (
+    isWindowsCommand &&
+    (isUnsafeWindowsCmdPath(executablePath) ||
+      isUnsafeWindowsCmdPath(probeGeminiDir) ||
+      isUnsafeWindowsCmdPath(probeLogFile))
+  ) {
+    throw new AgyProbeError('start_failed', 'Unsafe Windows executable or probe storage path.')
+  }
+  const target = isWindowsCommand ? resolveTrustedWindowsCmdExe(env) : executablePath
+  if (isWindowsCommand && !target) {
+    throw new AgyProbeError(
+      'start_failed',
+      'Trusted Windows command interpreter could not be confirmed.',
+    )
+  }
+  const resolvedTarget = target ?? executablePath
   const args = isWindowsCommand
-    ? ['/d', '/s', '/c', `""${executablePath}" acp --disable-telemetry"`]
-    : ['acp', '--disable-telemetry']
-  return probe.spawn(target, args, {
+    ? [
+        '/d',
+        '/s',
+        '/c',
+        `""${executablePath}" acp --disable-telemetry --gemini-dir "${probeGeminiDir}" --app-data-dir probe --log-file "${probeLogFile}""`,
+      ]
+    : [
+        'acp',
+        '--disable-telemetry',
+        '--gemini-dir',
+        probeGeminiDir,
+        '--app-data-dir',
+        'probe',
+        '--log-file',
+        probeLogFile,
+      ]
+  return probe.spawn(resolvedTarget, args, {
     cwd: workingDirectory,
     ...(env ? { env } : {}),
     windowsHide: true,
@@ -522,31 +304,53 @@ export async function runAgyAcpProbe<T>(request: AgyAcpProbeRequest<T>): Promise
     throw abortError(request.signal.reason)
   }
 
-  const probeCwd = await mkdtemp(join(tmpdir(), 'pact-agy-acp-'))
-  const probeAbort = new AbortController()
-  const onCallerAbort = (): void => probeAbort.abort(request.signal?.reason)
+  const probeRoot = await mkdtemp(join(tmpdir(), 'pact-agy-acp-'))
+  const probeCwd = join(probeRoot, 'cwd')
+  const probeGeminiDir = join(probeRoot, 'gemini')
+  const probeLogFile = join(probeRoot, 'acp-probe.log')
+  const processAbort = new AbortController()
   let child: ChildProcessWithoutNullStreams | undefined
   let probe: OwnedProcessGroup | undefined
   let openedSessionId: string | undefined
-  let probeStartedAtMs = Date.now()
-  let sessionCloseSucceeded = false
-  let closeFailed = false
   let sessionResult!: T
+  const onCallerAbort = (): void => {
+    if (!openedSessionId) {
+      processAbort.abort(request.signal?.reason)
+    }
+  }
+  let hasBodyError = false
+  let bodyError: unknown
+  let closeFailureError: AgyProbeError | undefined
 
   try {
+    await chmod(probeRoot, 0o700)
+    await mkdir(probeCwd, { mode: 0o700 })
     await chmod(probeCwd, 0o700)
+    await mkdir(probeGeminiDir, { mode: 0o700 })
+    await chmod(probeGeminiDir, 0o700)
     request.signal?.addEventListener('abort', onCallerAbort, { once: true })
     if (request.signal?.aborted) {
-      probeAbort.abort(request.signal.reason)
+      processAbort.abort(request.signal.reason)
       throw abortError(request.signal.reason)
     }
 
-    probe = request.ownProbe(probeAbort.signal, () => {
+    probe = request.ownProbe(processAbort.signal, () => {
       if (child && !child.stdin.destroyed) child.stdin.end()
     })
 
-    const deadlineAt = Date.now() + Math.max(0, request.timeoutMs)
-    const runningChild = spawnAgyAcpServer(request.executablePath, probeCwd, probe, request.env)
+    const initTimeoutMs = Math.max(0, request.initializeTimeoutMs ?? DEFAULT_INITIALIZE_TIMEOUT_MS)
+    let activeDeadlineAt = Math.min(
+      Date.now() + initTimeoutMs,
+      request.businessDeadlineAt ?? Infinity,
+    )
+    const runningChild = spawnAgyAcpServer(
+      request.executablePath,
+      probeCwd,
+      probeGeminiDir,
+      probeLogFile,
+      probe,
+      request.env,
+    )
     child = runningChild
 
     let transportClosed = false
@@ -727,72 +531,96 @@ export async function runAgyAcpProbe<T>(request: AgyAcpProbeRequest<T>): Promise
     runningChild.once('error', onChildError)
     runningChild.once('exit', onChildExit)
 
-    const transport: AgyAcpRpcTransport = {
-      request: (method, params, customTimeoutMs) => {
-        if (request.signal?.aborted) {
-          return Promise.reject(abortError(request.signal.reason))
-        }
-        const remainingMs =
-          customTimeoutMs === undefined
-            ? deadlineAt - Date.now()
-            : Math.min(customTimeoutMs, deadlineAt - Date.now())
-        if (remainingMs <= 0) {
-          return Promise.reject(new AgyProbeError('timeout', 'Antigravity ACP probe timed out.'))
-        }
-        if (transportClosed) {
-          return Promise.reject(
-            new AgyProbeError(
-              spawnFailed ? 'start_failed' : 'protocol',
-              'Antigravity ACP transport already closed.',
-            ),
-          )
-        }
-        if (pending.size >= MAX_PENDING_ACP_REQUESTS) {
-          return Promise.reject(
-            new AgyProbeError('protocol', 'Antigravity ACP pending request limit exceeded.'),
-          )
-        }
-        const id = nextId
-        nextId += 1
-        return new Promise<unknown>((resolveRpc, rejectRpc) => {
-          const onSignalAbort = (): void => {
-            const entry = pending.get(id)
-            if (!entry) return
-            pending.delete(id)
-            if (entry.timer) clearTimeout(entry.timer)
-            rejectRpc(abortError(request.signal?.reason))
+    const sendRpcRequest = (
+      method: string,
+      params: Record<string, unknown>,
+      customTimeoutMs?: number,
+      clampToActiveDeadline = true,
+      ignoreCallerAbort = false,
+    ): Promise<unknown> => {
+      if (!ignoreCallerAbort && request.signal?.aborted) {
+        return Promise.reject(abortError(request.signal.reason))
+      }
+      if (processAbort.signal.aborted) {
+        return Promise.reject(abortError(processAbort.signal.reason))
+      }
+      const remainingMs = clampToActiveDeadline
+        ? customTimeoutMs === undefined
+          ? activeDeadlineAt - Date.now()
+          : Math.min(customTimeoutMs, activeDeadlineAt - Date.now())
+        : (customTimeoutMs ?? SESSION_CLOSE_GRACE_MS)
+      if (remainingMs <= 0) {
+        return Promise.reject(new AgyProbeError('timeout', 'Antigravity ACP probe timed out.'))
+      }
+      if (transportClosed) {
+        return Promise.reject(
+          new AgyProbeError(
+            spawnFailed ? 'start_failed' : 'protocol',
+            'Antigravity ACP transport already closed.',
+          ),
+        )
+      }
+      if (pending.size >= MAX_PENDING_ACP_REQUESTS) {
+        return Promise.reject(
+          new AgyProbeError('protocol', 'Antigravity ACP pending request limit exceeded.'),
+        )
+      }
+      const id = nextId
+      nextId += 1
+      return new Promise<unknown>((resolveRpc, rejectRpc) => {
+        const detachAbortListeners = (): void => {
+          if (!ignoreCallerAbort) {
+            request.signal?.removeEventListener('abort', onCallerSignalAbort)
           }
-          const timer = setTimeout(() => {
-            if (!pending.delete(id)) return
-            request.signal?.removeEventListener('abort', onSignalAbort)
-            rejectRpc(new AgyProbeError('timeout', 'Antigravity ACP probe timed out.'))
-          }, remainingMs)
-          request.signal?.addEventListener('abort', onSignalAbort, { once: true })
-          pending.set(id, {
-            timer,
-            resolve: (value) => {
-              request.signal?.removeEventListener('abort', onSignalAbort)
-              resolveRpc(value)
-            },
-            reject: (error) => {
-              request.signal?.removeEventListener('abort', onSignalAbort)
-              rejectRpc(error)
-            },
-          })
-          try {
-            writeFrame({ jsonrpc: '2.0', id, method, params })
-          } catch (error) {
-            pending.delete(id)
-            clearTimeout(timer)
-            request.signal?.removeEventListener('abort', onSignalAbort)
-            rejectRpc(
-              error instanceof Error
-                ? error
-                : new AgyProbeError('protocol', 'Antigravity ACP request write failed.'),
-            )
-          }
+          processAbort.signal.removeEventListener('abort', onProcessAbort)
+        }
+        const cancelWaiter = (reason: unknown): void => {
+          const entry = pending.get(id)
+          if (!entry) return
+          pending.delete(id)
+          if (entry.timer) clearTimeout(entry.timer)
+          detachAbortListeners()
+          rejectRpc(abortError(reason))
+        }
+        const onCallerSignalAbort = (): void => cancelWaiter(request.signal?.reason)
+        const onProcessAbort = (): void => cancelWaiter(processAbort.signal.reason)
+        const timer = setTimeout(() => {
+          if (!pending.delete(id)) return
+          detachAbortListeners()
+          rejectRpc(new AgyProbeError('timeout', 'Antigravity ACP probe timed out.'))
+        }, remainingMs)
+        if (!ignoreCallerAbort) {
+          request.signal?.addEventListener('abort', onCallerSignalAbort, { once: true })
+        }
+        processAbort.signal.addEventListener('abort', onProcessAbort, { once: true })
+        pending.set(id, {
+          timer,
+          resolve: (value) => {
+            detachAbortListeners()
+            resolveRpc(value)
+          },
+          reject: (error) => {
+            detachAbortListeners()
+            rejectRpc(error)
+          },
         })
-      },
+        try {
+          writeFrame({ jsonrpc: '2.0', id, method, params })
+        } catch (error) {
+          pending.delete(id)
+          clearTimeout(timer)
+          detachAbortListeners()
+          rejectRpc(
+            error instanceof Error
+              ? error
+              : new AgyProbeError('protocol', 'Antigravity ACP request write failed.'),
+          )
+        }
+      })
+    }
+
+    const transport: AgyAcpRpcTransport = {
+      request: (method, params, customTimeoutMs) => sendRpcRequest(method, params, customTimeoutMs),
     }
 
     try {
@@ -817,7 +645,11 @@ export async function runAgyAcpProbe<T>(request: AgyAcpProbeRequest<T>): Promise
         request.onAgentInfoVersion?.(agentInfoVersion)
       }
 
-      probeStartedAtMs = Date.now()
+      // Stage 2 starts a separate session deadline once initialize handshake succeeds.
+      activeDeadlineAt = Math.min(
+        Date.now() + Math.max(0, request.timeoutMs),
+        request.businessDeadlineAt ?? Infinity,
+      )
 
       const newSessionRaw = await transport.request('session/new', {
         cwd: probeCwd,
@@ -848,20 +680,27 @@ export async function runAgyAcpProbe<T>(request: AgyAcpProbeRequest<T>): Promise
           transport,
         })
       } finally {
-        if (!transportClosed && !request.signal?.aborted && Date.now() < deadlineAt) {
-          const closeWaitMs = Math.min(
-            SESSION_CLOSE_GRACE_MS,
-            Math.max(100, deadlineAt - Date.now()),
+        if (!transportClosed && !processAbort.signal.aborted && openedSessionId) {
+          const effectiveCloseDeadlineAt = resolveEffectiveCloseDeadline(
+            request.closeDeadlineAt,
+            request.getShutdownDeadlineAt?.(),
           )
-          await transport
-            .request('session/close', { sessionId: rawSessionId }, closeWaitMs)
-            .then(() => {
-              sessionCloseSucceeded = true
-              return undefined
-            })
-            .catch(() => {
-              sessionCloseSucceeded = false
-            })
+          const closeWaitMs =
+            effectiveCloseDeadlineAt !== undefined
+              ? Math.min(
+                  SESSION_CLOSE_GRACE_MS,
+                  Math.max(0, effectiveCloseDeadlineAt - Date.now() - 1_000),
+                )
+              : SESSION_CLOSE_GRACE_MS
+          if (closeWaitMs > 0) {
+            await sendRpcRequest(
+              'session/close',
+              { sessionId: rawSessionId },
+              closeWaitMs,
+              false,
+              true,
+            ).catch(() => undefined)
+          }
         }
       }
     } finally {
@@ -871,48 +710,70 @@ export async function runAgyAcpProbe<T>(request: AgyAcpProbeRequest<T>): Promise
       runningChild.off('exit', onChildExit)
       if (!runningChild.stdin.destroyed) runningChild.stdin.end()
     }
-  } finally {
-    request.signal?.removeEventListener('abort', onCallerAbort)
-    if (probe) {
-      const currentProbe = probe
-      await currentProbe.close(request.closeDeadlineAt).catch((closeError: unknown) => {
-        closeFailed = true
-        request.onCloseError?.(closeError, currentProbe, probeCwd, openedSessionId)
-        throw new AgyProbeError(
+  } catch (error) {
+    hasBodyError = true
+    bodyError = error
+  }
+
+  request.signal?.removeEventListener('abort', onCallerAbort)
+  if (request.signal?.aborted && !processAbort.signal.aborted) {
+    processAbort.abort(request.signal.reason)
+  }
+
+  const artifact: UnconfirmedAgyProbeArtifact = { probeRoot }
+  if (probe) {
+    const currentProbe = probe
+    let closeThrew = false
+    let closeError: unknown
+    const effectiveCloseDeadlineAt = resolveEffectiveCloseDeadline(
+      request.closeDeadlineAt,
+      request.getShutdownDeadlineAt?.(),
+    )
+    try {
+      await currentProbe.close(effectiveCloseDeadlineAt)
+    } catch (error) {
+      closeThrew = true
+      closeError = error
+    }
+    if (isAgyProbeSettled(currentProbe)) {
+      const reconcile = request.reconcileArtifact ?? reconcileSettledAgyProbeArtifact
+      let artifactRemoved = false
+      try {
+        artifactRemoved = await reconcile(artifact).catch(() => false)
+      } finally {
+        request.onProbeSettled?.(currentProbe, artifact, artifactRemoved)
+      }
+      if (closeThrew) {
+        request.onCloseError?.(closeError, currentProbe, artifact)
+        closeFailureError = new AgyProbeError(
           'close_unconfirmed',
           'Antigravity ACP probe cleanup could not be confirmed.',
           undefined,
           { cause: closeError },
         )
-      })
-      if (isAgyProbeSettled(currentProbe)) {
-        try {
-          if (request.deleteProbeSessionDb && openedSessionId) {
-            const dbCleanup = await cleanupVerifiedAgyProbeSessionDb({
-              sessionId: openedSessionId,
-              probeCwd,
-              probeStartedAtMs,
-              sessionCloseSucceeded,
-              env: request.env,
-            }).catch(() => ({
-              retained: true,
-              note: 'Probe session file was retained because probe cleanup inspection failed.',
-            }))
-            if (dbCleanup.note) {
-              request.onSessionCleanupNote?.(dbCleanup.note)
-            }
-          }
-        } finally {
-          try {
-            await rm(probeCwd, { recursive: true, force: true }).catch(() => undefined)
-          } finally {
-            request.onProbeSettled?.(currentProbe)
-          }
-        }
       }
-    } else if (!closeFailed) {
-      await rm(probeCwd, { recursive: true, force: true }).catch(() => undefined)
+    } else {
+      const effectiveError = closeThrew
+        ? closeError
+        : new Error('Antigravity ACP probe did not confirm settlement.')
+      request.onCloseError?.(effectiveError, currentProbe, artifact)
+      closeFailureError = new AgyProbeError(
+        'close_unconfirmed',
+        'Antigravity ACP probe cleanup could not be confirmed.',
+        undefined,
+        { cause: effectiveError },
+      )
     }
+  } else {
+    const reconcile = request.reconcileArtifact ?? reconcileSettledAgyProbeArtifact
+    await reconcile(artifact).catch(() => false)
+  }
+
+  if (closeFailureError) {
+    throw closeFailureError
+  }
+  if (hasBodyError) {
+    throw bodyError
   }
   return sessionResult
 }

@@ -19,6 +19,11 @@ import { promisify } from 'node:util'
 
 import identities from '../apps/desktop/app-identities.json' with { type: 'json' }
 import {
+  agySqliteFileResourcePrefix,
+  inspectAgySqliteFileResource,
+  validateAgySqliteFileManifest,
+} from '../apps/desktop/build/agy-sqlite-file-resource.mjs'
+import {
   inspectWindowsOwnedProcessResource,
   validateWindowsOwnedProcessManifest,
 } from '../apps/desktop/build/windows-owned-process-resource.mjs'
@@ -326,10 +331,16 @@ export async function readDistributionManifest(path) {
       throw new Error('Distribution artifact metadata is invalid.')
   }
   validateWindowsOwnedProcessManifest(manifest)
+  validateAgySqliteFileManifest(manifest)
   return manifest
 }
 
-export async function verifyApplication(application, manifest, installed) {
+export async function verifyApplication(
+  application,
+  manifest,
+  installed,
+  { verifyNativeLoad = false } = {},
+) {
   const extras =
     installed && manifest.platform === 'win32' ? [`Uninstall ${manifest.productName}.exe`] : []
   const content = await applicationContent(application, manifest.platform, {
@@ -354,6 +365,7 @@ export async function verifyApplication(application, manifest, installed) {
     throw mismatch
   }
   const windowsOwnedProcess = validateWindowsOwnedProcessManifest(manifest)
+  const agySqliteFile = validateAgySqliteFileManifest(manifest)
   const executable = resolveWithin(application, manifest.application.executable)
   if (windowsOwnedProcess) {
     const observed = await inspectWindowsOwnedProcessResource(
@@ -363,6 +375,24 @@ export async function verifyApplication(application, manifest, installed) {
     )
     if (JSON.stringify(observed) !== JSON.stringify(windowsOwnedProcess))
       throw new Error('Installed Windows helper differs from its exact distribution identity.')
+  }
+  const observedAgy = await inspectAgySqliteFileResource(
+    join(application, agySqliteFileResourcePrefix(manifest.platform)),
+    manifest.platform,
+    manifest.arch,
+    agySqliteFile.sourceSha256,
+    {
+      verifyLoad:
+        verifyNativeLoad &&
+        manifest.platform === process.platform &&
+        manifest.arch === process.arch,
+      allowSignedBinary: manifest.platform === 'darwin',
+    },
+  )
+  if (JSON.stringify(observedAgy) !== JSON.stringify(agySqliteFile)) {
+    throw new Error(
+      'Installed agy-sqlite-file module differs from its exact distribution identity.',
+    )
   }
   if (!(await pathExists(executable)))
     throw new Error('The explicit packaged executable is missing or not executable.')
@@ -430,7 +460,9 @@ export async function prepareApplication({
       : resolveWithin(dirname(manifestPath), manifest.application.path)
     return {
       applicationPath: application,
-      executable: await verifyApplication(application, manifest, false),
+      executable: await verifyApplication(application, manifest, false, {
+        verifyNativeLoad: runProcess === run,
+      }),
       verificationMode: 'unpacked',
       installationVerified: false,
       dispose: async () => {},
@@ -529,7 +561,9 @@ export async function prepareApplication({
     } else throw new Error('A macOS smoke requires a DMG or ZIP artifact.')
     return {
       applicationPath: application,
-      executable: await verifyApplication(application, manifest, true),
+      executable: await verifyApplication(application, manifest, true, {
+        verifyNativeLoad: runProcess === run,
+      }),
       artifact: installedArtifact,
       verificationMode: selected.kind === 'dmg' ? 'mounted-dmg-copy' : 'extracted-zip',
       installationVerified: true,
@@ -642,7 +676,9 @@ export async function prepareApplication({
     if (!(await pathExists(uninstaller)))
       throw new Error('NSIS did not install its owned uninstaller.')
     stage = 'application-content'
-    const executable = await verifyApplication(destination, manifest, true)
+    const executable = await verifyApplication(destination, manifest, true, {
+      verifyNativeLoad: runProcess === run,
+    })
     return {
       applicationPath: destination,
       executable,

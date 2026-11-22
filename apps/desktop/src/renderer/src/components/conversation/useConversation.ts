@@ -478,6 +478,7 @@ export interface ConversationFlow {
   seedComposerDraft(
     targetSessionId: string,
     value: import('./composer-document').ComposerDocument,
+    options?: { onConflict?: (() => void) | undefined },
   ): boolean
   clearSubmittedComposerDraft(
     targetSessionId: string,
@@ -505,7 +506,7 @@ export interface ConversationFlow {
   dismissPeerProposal(proposalId: string): Promise<boolean>
   saveCommentDraft(input: CommentDraftInputWithoutRevision): Promise<CommentDraftSaveOutcome>
   removeCommentDraft(commentId: string): Promise<boolean>
-  undoWorkspaceChanges(changeSetId: string): Promise<boolean>
+  undoWorkspaceChanges(changeSetId: string, path?: string): Promise<boolean>
   respondNativePermission(
     runId: string,
     permissionId: string,
@@ -673,6 +674,7 @@ export function useConversation(
     disableAutoInterest?: boolean | undefined
     waitForInterest?: (() => Promise<boolean>) | undefined
     onSessionRead?: ((session: CollaborationSession) => void) | undefined
+    projectionActive?: boolean | undefined
   },
 ): ConversationFlow {
   const onSessionReadRef = useRef(hookOptions?.onSessionRead)
@@ -867,10 +869,13 @@ export function useConversation(
   const snapshotFoldGuardRef = useRef<(() => boolean) | undefined>(undefined)
   const [readingPositionLost, setReadingPositionLost] = useState(false)
   const [readPending, setReadPending] = useState(true)
+  const isProjectionActive = Boolean(visible || hookOptions?.projectionActive)
   const visibleRef = useRef(visible)
+  const projectionActiveRef = useRef(isProjectionActive)
   useLayoutEffect(() => {
     visibleRef.current = visible
-  }, [visible])
+    projectionActiveRef.current = isProjectionActive
+  }, [visible, isProjectionActive])
   const protectReading = useCallback((messageId: string | undefined): void => {
     readingMessageIdRef.current = messageId
     setReadingPositionLost(false)
@@ -979,7 +984,7 @@ export function useConversation(
         signal.throwIfAborted()
         if (
           expired ||
-          !visibleRef.current ||
+          !projectionActiveRef.current ||
           initialPatchesRef.current?.generation !== generation ||
           snapshotViewGeneration !== snapshotViewGenerationRef.current
         )
@@ -1040,7 +1045,7 @@ export function useConversation(
         if (cancel) signal.removeEventListener('abort', cancel)
       }
     },
-    enabled: Boolean(sessionId && visible),
+    enabled: Boolean(sessionId && isProjectionActive),
     retry: 0,
     staleTime: Number.POSITIVE_INFINITY,
     gcTime: 0,
@@ -1050,7 +1055,7 @@ export function useConversation(
   useEffect(() => {
     // Selection changes must activate even a fresh cached page (gcTime:0 is
     // asynchronous). Join an existing fetch instead of duplicating its read.
-    if (sessionId && visible) void refetchConversation({ cancelRefetch: false })
+    if (sessionId && isProjectionActive) void refetchConversation({ cancelRefetch: false })
     else {
       initialPatchesRef.current = undefined
       requestGenerationRef.current += 1
@@ -1078,7 +1083,7 @@ export function useConversation(
           .catch(() => undefined)
       }
     }
-  }, [queryClient, refetchConversation, sessionId, visible])
+  }, [queryClient, refetchConversation, sessionId, isProjectionActive])
   /* oxlint-enable react/set-state-in-effect */
   useEffect(
     () => () => {
@@ -1279,17 +1284,58 @@ export function useConversation(
     [sessionId, putComposerDraft],
   )
   const seedComposerDraft = useCallback(
-    (targetSessionId: string, value: import('./composer-document').ComposerDocument): boolean => {
-      const previous = composerDraftsRef.current[targetSessionId]
+    (
+      targetSessionId: string,
+      value: import('./composer-document').ComposerDocument,
+      options?: { onConflict?: (() => void) | undefined },
+    ): boolean => {
+      const existing =
+        latestComposerDraft.current?.sessionId === targetSessionId
+          ? latestComposerDraft.current.draft
+          : composerDraftsRef.current[targetSessionId]
+      const nextRoute = value.route ? releaseComposerRoute(value.route) : undefined
+      const hasExistingContent = Boolean(
+        existing &&
+        (existing.text.trim().length > 0 ||
+          (existing.skills?.length ?? 0) > 0 ||
+          Boolean(existing.mention) ||
+          (existing.images?.length ?? 0) > 0),
+      )
+      if (hasExistingContent && existing) {
+        const existingSkills = existing.skills ?? []
+        const sameSkills =
+          existingSkills.length === value.skills.length &&
+          existingSkills.every(
+            (skill, index) =>
+              skill.id === value.skills[index]?.id &&
+              skill.agentId === value.skills[index]?.agentId &&
+              skill.name === value.skills[index]?.name,
+          )
+        const sameMention =
+          JSON.stringify(existing.mention ?? null) === JSON.stringify(value.mention ?? null)
+        const sameRoute =
+          JSON.stringify(existing.route ?? null) === JSON.stringify(nextRoute ?? null)
+        const hasImages = (existing.images?.length ?? 0) > 0
+        if (
+          hasImages ||
+          existing.text !== value.text ||
+          !sameSkills ||
+          !sameMention ||
+          !sameRoute
+        ) {
+          options?.onConflict?.()
+          return false
+        }
+      }
       const next: ConversationComposerDraft = {
-        ...previous,
+        ...existing,
         text: value.text,
         skills: value.skills.length ? value.skills : undefined,
         mention: value.mention,
-        route: value.route ? releaseComposerRoute(value.route) : undefined,
+        route: nextRoute,
         returnedInputOperationId: undefined,
         queueReturnOperationId: undefined,
-        revision: (previous?.revision ?? 0) + 1,
+        revision: (existing?.revision ?? 0) + 1,
       }
       const admitted = putComposerDraft(targetSessionId, next)
       if (admitted && activeSessionIdRef.current === targetSessionId) {
@@ -2143,7 +2189,7 @@ export function useConversation(
     (patch: ConversationPatch): void => {
       acknowledgePatch(patch)
       patchCatalogSession(queryClient, patch.session)
-      if (!visible) return
+      if (!isProjectionActive) return
       if (patch.sessionId !== sessionId || patch.sessionId !== activeSessionIdRef.current) return
       if (patch.resync?.drafts) {
         setDraftsReadyRevision(undefined)
@@ -2199,7 +2245,7 @@ export function useConversation(
         if (windowRef.current?.activityView?.runId === runId) void loadActivities(runId, true)
       }
     },
-    [acknowledgePatch, commitWindow, queryClient, sessionId, visible, loadActivities],
+    [acknowledgePatch, commitWindow, queryClient, sessionId, isProjectionActive, loadActivities],
   )
 
   const markSelectedRead = useCallback(
@@ -2257,7 +2303,12 @@ export function useConversation(
   }, [cachePatch, markSelectedRead, onErrorNotice])
 
   useEffect(() => {
-    if (!visible || query.data?.scope !== 'messages' || query.data.sessionId !== sessionId) return
+    if (
+      !isProjectionActive ||
+      query.data?.scope !== 'messages' ||
+      query.data.sessionId !== sessionId
+    )
+      return
     if (
       query.isError ||
       query.isFetching ||
@@ -2311,24 +2362,35 @@ export function useConversation(
         setGapRecoveryPending(true)
       }
     }
-    void markSelectedRead(query.data.sessionId, query.data.header.latestCompleteAssistantSequence)
+    const windowLatestAssistantSeq =
+      windowRef.current?.view.sessionId === sessionId
+        ? windowRef.current.view.messages.findLast(
+            (message) => message.role === 'assistant' && message.state === 'complete',
+          )?.sequence
+        : undefined
+    const readThroughSequence =
+      query.data.header.latestCompleteAssistantSequence !== undefined &&
+      windowLatestAssistantSeq !== undefined
+        ? Math.max(query.data.header.latestCompleteAssistantSequence, windowLatestAssistantSeq)
+        : (windowLatestAssistantSeq ?? query.data.header.latestCompleteAssistantSequence)
+    void markSelectedRead(query.data.sessionId, readThroughSequence)
   }, [
     cachePatch,
     commitWindow,
+    isProjectionActive,
     markSelectedRead,
     query.data,
     query.dataUpdatedAt,
     query.isFetching,
     query.isError,
     sessionId,
-    visible,
   ])
 
   const draftWindowSessionId = windowState?.view.sessionId
   const draftWindowRevision = windowState?.view.commentsRevision
   useEffect(() => {
     const revision = draftWindowSessionId === sessionId ? draftWindowRevision : undefined
-    if (!visible || !sessionId || revision === undefined) return undefined
+    if (!isProjectionActive || !sessionId || revision === undefined) return undefined
     const generation = requestGenerationRef.current
     const reloadToken = draftReloadToken
     let cancelled = false
@@ -2397,8 +2459,8 @@ export function useConversation(
     draftPageAfter,
     draftWindowRevision,
     draftWindowSessionId,
+    isProjectionActive,
     sessionId,
-    visible,
   ])
 
   const commentWindow = windowState?.view.sessionId === sessionId ? windowState : undefined
@@ -3550,12 +3612,12 @@ export function useConversation(
   }
 
   const refreshConflictedDrafts = async (ownerSessionId: string): Promise<void> => {
-    if (activeSessionIdRef.current !== ownerSessionId || !visibleRef.current) return
+    if (activeSessionIdRef.current !== ownerSessionId || !projectionActiveRef.current) return
     setDraftsReadyRevision(undefined)
     // A read started before the rejected save may itself contain the stale revision.
     // Cancel that observation and obtain a new authoritative page after the conflict.
     const result = await refetchConversation({ cancelRefetch: true })
-    if (activeSessionIdRef.current !== ownerSessionId || !visibleRef.current) return
+    if (activeSessionIdRef.current !== ownerSessionId || !projectionActiveRef.current) return
     draftReloadTokenRef.current += 1
     setDraftReloadToken(draftReloadTokenRef.current)
     if (result.isError)
@@ -3651,10 +3713,13 @@ export function useConversation(
     }
   }
 
-  const undoWorkspaceChanges = async (changeSetId: string): Promise<boolean> => {
+  const undoWorkspaceChanges = async (changeSetId: string, path?: string): Promise<boolean> => {
     if (!sessionId) return false
     try {
-      const result = await window.pact.undoWorkspaceChanges({ changeSetId })
+      const result = await window.pact.undoWorkspaceChanges({
+        changeSetId,
+        ...(path !== undefined ? { path } : {}),
+      })
       if (!result.ok) {
         onNotice(result.error.message)
         return false
@@ -4528,7 +4593,8 @@ export function useConversation(
       readingPositionLost: Boolean(visibleWindow && readingPositionLost),
       readError: query.error?.message,
       retryRead: () => {
-        if (sessionId && visibleRef.current) void refetchConversation({ cancelRefetch: false })
+        if (sessionId && projectionActiveRef.current)
+          void refetchConversation({ cancelRefetch: false })
       },
       window: visibleWindow,
       loadingPage: Boolean(visibleWindow && loadingPage),

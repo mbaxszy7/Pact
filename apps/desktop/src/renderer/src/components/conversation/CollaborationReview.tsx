@@ -54,7 +54,7 @@ const genericPauseNotice = new Set([
   'Your reply has been processed. Continue collaboration when you are ready.',
 ])
 const proposalActionClass =
-  'min-h-8 shrink-0 whitespace-nowrap rounded-control border px-2.5 py-1.5 text-caption font-medium focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-focus disabled:cursor-default disabled:opacity-45'
+  'pact-pressable min-h-8 shrink-0 cursor-pointer whitespace-nowrap rounded-xl border px-3 py-1.5 text-caption font-medium focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-focus disabled:cursor-default disabled:opacity-45'
 
 /** Natural answers own the report body; this footer owns provenance and current actions. */
 export const CollaborationReview = memo(function CollaborationReview({
@@ -181,7 +181,13 @@ export const CollaborationReview = memo(function CollaborationReview({
     }
   }, [session.id, run.id, reportVersion, running, refresh])
   const task = view?.task
-  const error = actionError || readError
+  useEffect(() => {
+    if (!historical) return
+    setActionError('')
+    failedAction.current = undefined
+  }, [historical])
+  const visibleActionError = historical ? '' : actionError
+  const error = visibleActionError || readError
   const actionable = !historical && Boolean(view?.actionable) && loadedAt === reportVersion
   // An ephemeral scope token retires a frozen decision on Session/task/history change;
   // the dependencies are intentional even though the memoized value ignores them.
@@ -338,7 +344,7 @@ export const CollaborationReview = memo(function CollaborationReview({
           (!continuationBlocked || action !== 'resume') &&
           (!continuationLimit || !['resume', 'retry'].includes(action)) &&
           (!inputGate || action === 'recover_plan') &&
-          !(action === 'recover_plan' && actionError),
+          !(action === 'recover_plan' && visibleActionError),
       )
     : []
   const draftBlocksActions = feedbackDraft && actions.some((action) => action !== 'recover_plan')
@@ -388,25 +394,37 @@ export const CollaborationReview = memo(function CollaborationReview({
     <section
       aria-label="Pact collaboration result"
       data-pact-collaboration-run-id={run.id}
-      className="pact-review-card mt-2 mb-7 w-full min-w-0 self-start text-caption empty:hidden"
+      className="pact-review-card mt-2.5 mb-2 w-full min-w-0 self-start text-caption empty:hidden"
     >
       {showStageLabel ? (
-        <div className="flex min-h-7 flex-wrap items-center gap-x-2.5 gap-y-1 text-secondary">
-          <FileText aria-hidden="true" className="size-3.5 shrink-0" strokeWidth={1.75} />
-          <span>{label}</span>
+        <div className="flex min-h-7 flex-wrap items-center gap-x-2 gap-y-1 text-secondary">
+          <span className="inline-flex items-center gap-1.5 rounded-pill border border-border bg-surface-muted px-2.5 py-0.5 font-medium text-secondary">
+            <FileText aria-hidden="true" className="size-3 shrink-0" strokeWidth={1.8} />
+            <span>{label}</span>
+          </span>
           {review && (stage === 'plan_review' || stage === 'code_review') ? (
-            <span>· {verdictLabel[review.verdict]}</span>
+            <span
+              className={`inline-flex items-center rounded-pill px-2 py-0.5 font-medium ${
+                review.verdict === 'accepted'
+                  ? 'bg-status-ready-muted text-status-ready-foreground'
+                  : review.verdict === 'changes_requested'
+                    ? 'bg-status-warning-muted text-status-warning-foreground'
+                    : 'bg-surface-muted text-secondary'
+              }`}
+            >
+              {verdictLabel[review.verdict]}
+            </span>
           ) : null}
           {runPublishedPlan && onOpenPlan && view?.planSource && planVersion ? (
             <button
               type="button"
               onClick={() => onOpenPlan({ ...view.planSource!, version: planVersion })}
-              className="min-h-7 rounded-control px-2 text-secondary hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-focus"
+              className="pact-pressable min-h-7 cursor-pointer rounded-lg border border-border bg-surface-raised px-2.5 font-medium text-primary hover:bg-surface-muted focus-visible:outline-2 focus-visible:outline-focus"
             >
               Open plan
             </button>
           ) : null}
-          {isEndedFinalRun ? <span>· Ended</span> : null}
+          {isEndedFinalRun ? <span className="text-tertiary">· Ended</span> : null}
         </div>
       ) : null}
       {isEndedFinalRun && !showStageLabel ? (
@@ -429,7 +447,7 @@ export const CollaborationReview = memo(function CollaborationReview({
           onCreateComment={onCreateReportComment}
         />
       ) : null}
-      {planSync && !actionError ? (
+      {planSync && !visibleActionError ? (
         <p className="mt-1 text-secondary">
           {planSync.kind === 'response'
             ? 'Restore the saved response to continue.'
@@ -508,8 +526,8 @@ export const CollaborationReview = memo(function CollaborationReview({
                 }}
                 className={`${proposalActionClass} ${
                   index === 0
-                    ? 'border-transparent bg-surface-inverse text-inverse hover:opacity-90'
-                    : 'border-border bg-surface-muted text-primary hover:bg-surface-raised'
+                    ? 'border-transparent bg-surface-inverse px-3.5 text-inverse hover:opacity-90'
+                    : 'border-border-strong bg-surface-raised text-primary hover:bg-surface-muted'
                 }`}
               >
                 {busy ? (
@@ -540,8 +558,8 @@ export const CollaborationReview = memo(function CollaborationReview({
               onClick={onOpenSessionSettings}
               className={`${proposalActionClass} ${
                 actions.length === 0
-                  ? 'border-transparent bg-surface-inverse text-inverse hover:opacity-90'
-                  : 'border-border bg-surface-muted text-primary hover:bg-surface-raised'
+                  ? 'border-transparent bg-surface-inverse px-3.5 text-inverse hover:opacity-90'
+                  : 'border-border-strong bg-surface-raised text-primary hover:bg-surface-muted'
               }`}
             >
               Session settings
@@ -556,17 +574,21 @@ export const CollaborationReview = memo(function CollaborationReview({
         >
           <AlertCircle aria-hidden="true" className="size-3.5 shrink-0" strokeWidth={1.75} />
           <span>
-            {planSync && actionError
+            {planSync && visibleActionError
               ? 'Couldn’t restore that version. Your saved plan is intact.'
               : error}
           </span>
           <button
             type="button"
             disabled={
-              busy || refreshing || (Boolean(planSync && actionError) && (disabled || !actionable))
+              busy ||
+              refreshing ||
+              (Boolean(planSync && visibleActionError) && (disabled || !actionable))
             }
             className="min-h-8 rounded-control px-2 text-caption font-medium text-primary underline underline-offset-2 hover:bg-surface-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus disabled:cursor-default disabled:opacity-45"
-            onClick={() => (planSync && actionError ? void act('recover_plan') : refreshStatus())}
+            onClick={() =>
+              planSync && visibleActionError ? void act('recover_plan') : refreshStatus()
+            }
           >
             {busy ? 'Restoring…' : refreshing ? 'Checking…' : 'Try again'}
           </button>

@@ -1,8 +1,8 @@
 import type { ChildProcessWithoutNullStreams } from 'node:child_process'
 
 import { createHash } from 'node:crypto'
-import { chmod, mkdir, mkdtemp, rm } from 'node:fs/promises'
-import { join } from 'node:path'
+import { chmod, lstat, mkdir, mkdtemp, rm } from 'node:fs/promises'
+import { isAbsolute, join } from 'node:path'
 
 import {
   MAX_PROVIDER_USAGE_POOLS,
@@ -21,15 +21,19 @@ import {
 import { codexProcessEnvironment } from '../conversation/codex-process-environment'
 import { runClaudeInfoProbe, runCodexInfoProbe, withProbeTimeout } from '../native-info-probe'
 import { OwnedProcessGroup } from '../owned-process-group'
-import { isUnsafeWindowsCmdPath } from '../runtime-preparation/agy-acp-probe'
+import {
+  isUnsafeWindowsCmdPath,
+  resolveTrustedWindowsCmdExe,
+} from '../runtime-preparation/agy-acp-probe'
 import { RuntimePreparation } from '../runtime-preparation/runtime-preparation'
 
 const ALL_USAGE_PROVIDERS: readonly ProviderUsageProvider[] = ['codex', 'claude', 'agy']
 const MAX_CONCURRENT_APP_PROBES = 2
-const TOTAL_DEADLINE_MS = 24_000
+const TOTAL_DEADLINE_MS = 38_000
 const CLEANUP_RESERVE_MS = 4_000
 const QUERY_TIMEOUT_MS = 20_000
-const AGY_QUERY_TIMEOUT_MS = 10_000
+const AGY_QUERY_TIMEOUT_MS = 20_000
+const MAX_LOG_FILE_PATH_BYTES = 4_096
 const CANCEL_WAIT_MS = 5_000
 const COOLDOWN_MS = 30_000
 const RATE_LIMIT_BACKOFF_MS = 60_000
@@ -284,6 +288,46 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
+async function removeDirConfirmed(dir: string): Promise<boolean> {
+  try {
+    await rm(dir, { recursive: true, force: true })
+    try {
+      await lstat(dir)
+      return false
+    } catch (error) {
+      return (
+        typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT'
+      )
+    }
+  } catch {
+    return false
+  }
+}
+
+async function awaitAllWithinDeadline(
+  promises: readonly Promise<unknown>[],
+  flushDeadlineAt?: number,
+): Promise<boolean> {
+  if (promises.length === 0) return true
+  const allSettled = Promise.allSettled(promises).then(() => true)
+  if (flushDeadlineAt === undefined) {
+    return await allSettled
+  }
+  const remainingMs = flushDeadlineAt - Date.now()
+  if (remainingMs <= 0) return false
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      allSettled,
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), remainingMs)
+      }),
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 /**
  * Utility-owned readout for Codex, Claude Code, and Antigravity 5h/7d plan utilization windows.
  * Owns per-provider single-slot execution, App-wide <= 2 concurrent probe admission, PII-free
@@ -293,6 +337,8 @@ export class ProviderUsage {
   private readonly probeRoot: string
   private readonly probes = new Set<OwnedProcessGroup>()
   private readonly unconfirmedAgyDirs = new Map<OwnedProcessGroup, string>()
+  private readonly cleaningAgyDirProbes = new Set<OwnedProcessGroup>()
+  private readonly pendingAgyDirCleanups = new Set<Promise<void>>()
   private readonly slots: Record<ProviderUsageProvider, ProviderSlot> = {
     codex: createEmptySlot(),
     claude: createEmptySlot(),
@@ -422,7 +468,10 @@ export class ProviderUsage {
       ok: true,
       value: {
         cancelled: true,
-        settled: settledBeforeDeadline && !this.reconcileUnconfirmedProbes(slot),
+        settled:
+          settledBeforeDeadline &&
+          !this.reconcileUnconfirmedProbes(slot) &&
+          !this.runtimePreparation.hasClosingProbe(input.provider),
       },
     }
   }
@@ -440,7 +489,7 @@ export class ProviderUsage {
     return { ok: true, value: { ready: true } }
   }
 
-  dispose(): Promise<void> {
+  dispose(flushDeadlineAt?: number): Promise<void> {
     this.disposed = true
     this.disposal ??= (async () => {
       const pending: Promise<void>[] = []
@@ -456,28 +505,57 @@ export class ProviderUsage {
         waiter.resolve(false)
       }
       await Promise.allSettled(pending)
-      const closeResults = await Promise.allSettled([...this.probes].map((probe) => probe.close()))
-      const settledDirs: string[] = []
+      const closeResults = await Promise.allSettled(
+        [...this.probes].map((probe) => probe.close(flushDeadlineAt)),
+      )
       for (const [probe, dir] of this.unconfirmedAgyDirs.entries()) {
         if (isProbeSettled(probe)) {
-          this.unconfirmedAgyDirs.delete(probe)
-          settledDirs.push(dir)
+          this.scheduleSettledAgyDirRemoval(probe, dir)
         }
       }
-      await Promise.allSettled(settledDirs.map((dir) => rm(dir, { recursive: true, force: true })))
+      const cleanupsSettled = await awaitAllWithinDeadline(
+        [...this.pendingAgyDirCleanups],
+        flushDeadlineAt,
+      )
       for (const probe of this.probes) {
         if (isProbeSettled(probe)) this.probes.delete(probe)
       }
       const anyUnconfirmed = this.totalUnconfirmedProbes() > 0
+      const cleanupsSettledAfter = await awaitAllWithinDeadline(
+        [...this.pendingAgyDirCleanups],
+        flushDeadlineAt,
+      )
       if (
         closeResults.some((result) => result.status === 'rejected') ||
+        !cleanupsSettled ||
+        !cleanupsSettledAfter ||
         this.probes.size > 0 ||
-        anyUnconfirmed
+        anyUnconfirmed ||
+        this.unconfirmedAgyDirs.size > 0 ||
+        this.pendingAgyDirCleanups.size > 0
       ) {
         throw new Error('Provider usage probes did not finish closing.')
       }
     })()
     return this.disposal
+  }
+
+  private scheduleSettledAgyDirRemoval(probe: OwnedProcessGroup, dir: string): void {
+    if (this.cleaningAgyDirProbes.has(probe)) return
+    this.cleaningAgyDirProbes.add(probe)
+    const task = removeDirConfirmed(dir)
+      .then((removed) => {
+        if (removed && this.unconfirmedAgyDirs.get(probe) === dir) {
+          this.unconfirmedAgyDirs.delete(probe)
+        }
+        return undefined
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        this.cleaningAgyDirProbes.delete(probe)
+        this.pendingAgyDirCleanups.delete(task)
+      })
+    this.pendingAgyDirCleanups.add(task)
   }
 
   private totalUnconfirmedProbes(): number {
@@ -488,8 +566,7 @@ export class ProviderUsage {
     }
     for (const [probe, dir] of this.unconfirmedAgyDirs.entries()) {
       if (isProbeSettled(probe)) {
-        this.unconfirmedAgyDirs.delete(probe)
-        void rm(dir, { recursive: true, force: true }).catch(() => undefined)
+        this.scheduleSettledAgyDirRemoval(probe, dir)
       }
     }
     return count
@@ -1243,31 +1320,58 @@ export class ProviderUsage {
     timeoutMs: number,
     slot: ProviderSlot,
   ): Promise<ProbeOutcome> {
-    const agyProbeDir = await mkdtemp(join(this.probeRoot, 'agy-'))
+    const agyProbeRoot = await mkdtemp(join(this.probeRoot, 'agy-'))
+    const agyProbeCwd = join(agyProbeRoot, 'cwd')
+    const agyLogFile = join(agyProbeRoot, 'usage.log')
     let child: ChildProcessWithoutNullStreams | undefined
     let probe: OwnedProcessGroup | undefined
-    let closeFailed = false
+    let hasBodyError = false
+    let bodyError: unknown
+    let outcome!: ProbeOutcome
+    let hasCloseFailure = false
+    let closeFailureError: unknown
 
     try {
-      await chmod(agyProbeDir, 0o700)
+      await chmod(agyProbeRoot, 0o700)
+      await mkdir(agyProbeCwd, { mode: 0o700 })
+      await chmod(agyProbeCwd, 0o700)
       signal.throwIfAborted()
+      if (
+        !isAbsolute(agyLogFile) ||
+        agyLogFile.includes('\0') ||
+        Buffer.byteLength(agyLogFile, 'utf8') > MAX_LOG_FILE_PATH_BYTES
+      ) {
+        throw new Error('Unsafe Antigravity usage log path.')
+      }
       probe = this.ownProbe(signal, () => {
         if (child && !child.stdin.destroyed) child.stdin.end()
       })
 
       const effectiveTimeoutMs = Math.min(AGY_QUERY_TIMEOUT_MS, timeoutMs)
       const isWindowsCommand = process.platform === 'win32' && /\.cmd$/iu.test(executablePath)
-      if (isWindowsCommand && isUnsafeWindowsCmdPath(executablePath)) {
-        throw new Error('Unsafe Windows executable path.')
+      if (
+        isWindowsCommand &&
+        (isUnsafeWindowsCmdPath(executablePath) || isUnsafeWindowsCmdPath(agyLogFile))
+      ) {
+        throw new Error('Unsafe Windows executable or log path.')
       }
       const env = this.options.env
-      const target = isWindowsCommand ? ((env ?? process.env).ComSpec ?? 'cmd.exe') : executablePath
+      const target = isWindowsCommand ? resolveTrustedWindowsCmdExe(env) : executablePath
+      if (isWindowsCommand && !target) {
+        throw new Error('Trusted Windows command interpreter could not be confirmed.')
+      }
+      const resolvedTarget = target ?? executablePath
       const args = isWindowsCommand
-        ? ['/d', '/s', '/c', `""${executablePath}" -p /usage --output-format json"`]
-        : ['-p', '/usage', '--output-format', 'json']
+        ? [
+            '/d',
+            '/s',
+            '/c',
+            `""${executablePath}" -p /usage --output-format json --log-file "${agyLogFile}""`,
+          ]
+        : ['-p', '/usage', '--output-format', 'json', '--log-file', agyLogFile]
 
-      const runningChild = probe.spawn(target, args, {
-        cwd: agyProbeDir,
+      const runningChild = probe.spawn(resolvedTarget, args, {
+        cwd: agyProbeCwd,
         ...(env ? { env } : {}),
         windowsHide: true,
         windowsVerbatimArguments: isWindowsCommand,
@@ -1332,30 +1436,58 @@ export class ProviderUsage {
         signal,
       )
 
-      return this.parseAgyUsageOutput(rawResult, configKey, slot)
-    } finally {
-      if (probe) {
-        const currentProbe = probe
-        await currentProbe.close().catch((error: unknown) => {
-          closeFailed = true
-          if (!isProbeSettled(currentProbe)) {
-            slot.unconfirmedProbes.add(currentProbe)
-            this.unconfirmedAgyDirs.set(currentProbe, agyProbeDir)
-          }
+      outcome = this.parseAgyUsageOutput(rawResult, configKey, slot)
+    } catch (error) {
+      hasBodyError = true
+      bodyError = error
+    }
+
+    if (probe) {
+      const currentProbe = probe
+      let closeThrew = false
+      let closeError: unknown
+      try {
+        await currentProbe.close()
+      } catch (error) {
+        closeThrew = true
+        closeError = error
+      }
+      if (isProbeSettled(currentProbe)) {
+        slot.unconfirmedProbes.delete(currentProbe)
+        this.probes.delete(currentProbe)
+        const dirRemoved = await removeDirConfirmed(agyProbeRoot)
+        if (dirRemoved) {
+          this.unconfirmedAgyDirs.delete(currentProbe)
+        } else {
+          this.unconfirmedAgyDirs.set(currentProbe, agyProbeRoot)
+        }
+        if (closeThrew) {
           slot.windows = undefined
           slot.nonWindow = undefined
-          throw error
-        })
-        if (!closeFailed && isProbeSettled(currentProbe)) {
-          slot.unconfirmedProbes.delete(currentProbe)
-          this.unconfirmedAgyDirs.delete(currentProbe)
-          this.probes.delete(currentProbe)
-          await rm(agyProbeDir, { recursive: true, force: true }).catch(() => undefined)
+          hasCloseFailure = true
+          closeFailureError = closeError
         }
       } else {
-        await rm(agyProbeDir, { recursive: true, force: true }).catch(() => undefined)
+        slot.unconfirmedProbes.add(currentProbe)
+        this.unconfirmedAgyDirs.set(currentProbe, agyProbeRoot)
+        slot.windows = undefined
+        slot.nonWindow = undefined
+        hasCloseFailure = true
+        closeFailureError = closeThrew
+          ? closeError
+          : new Error('Antigravity usage probe did not confirm settlement.')
       }
+    } else {
+      await removeDirConfirmed(agyProbeRoot)
     }
+
+    if (hasCloseFailure) {
+      throw closeFailureError
+    }
+    if (hasBodyError) {
+      throw bodyError
+    }
+    return outcome
   }
 
   private parseAgyUsageOutput(
@@ -1784,12 +1916,14 @@ export class ProviderUsage {
         this.probes.delete(probe)
         const dir = this.unconfirmedAgyDirs.get(probe)
         if (dir) {
-          this.unconfirmedAgyDirs.delete(probe)
-          void rm(dir, { recursive: true, force: true }).catch(() => undefined)
+          this.scheduleSettledAgyDirRemoval(probe, dir)
         }
       }
     }
-    return slot.unconfirmedProbes.size > 0
+    return (
+      slot.unconfirmedProbes.size > 0 ||
+      (slot === this.slots.agy && this.unconfirmedAgyDirs.size > 0)
+    )
   }
 
   private ownProbe(

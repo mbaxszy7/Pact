@@ -24,6 +24,21 @@ export interface CurrentPlanDocument {
   status: string
 }
 
+function planStatusBadgeClasses(status: string): string {
+  const normalized = status.trim().toLowerCase()
+  if (normalized === 'ready' || normalized === 'accepted')
+    return 'bg-status-ready-muted text-status-ready-foreground'
+  if (
+    normalized === 'needs update' ||
+    normalized === 'changes requested' ||
+    normalized === 'needs restore'
+  )
+    return 'bg-status-warning-muted text-status-warning-foreground'
+  if (normalized === 'drafting' || normalized === 'in review')
+    return 'bg-status-info-muted text-status-info-foreground'
+  return 'border border-border bg-surface-muted text-secondary'
+}
+
 /** One context document; current plan or immutable Comment source, owned by ConversationView. */
 export function CurrentPlanPanel({
   plan,
@@ -79,7 +94,7 @@ export function CurrentPlanPanel({
       className="flex h-full min-h-0 flex-col"
       aria-label={source ? 'Plan source' : 'Current plan'}
     >
-      <header className="flex shrink-0 items-start justify-between gap-group border-b border-border px-section py-panel">
+      <header className="flex shrink-0 items-start justify-between gap-group border-b border-border px-panel py-3">
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
             <h2 className="flex items-baseline gap-2 text-body font-medium text-primary">
@@ -97,16 +112,23 @@ export function CurrentPlanPanel({
                 type="button"
                 aria-label={`View latest plan version ${latestVersion}`}
                 onClick={onOpenLatest}
-                className="inline-flex min-h-7 items-center rounded-control bg-surface-inverse px-2.5 text-caption font-medium text-inverse hover:opacity-90 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus"
+                className="pact-pressable inline-flex min-h-7 cursor-pointer items-center rounded-xl bg-surface-inverse px-2.5 text-caption font-medium text-inverse hover:opacity-90 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus"
               >
                 View latest · v{latestVersion}
               </button>
             ) : null}
           </div>
           {plan ? (
-            <p className="mt-2 text-caption text-secondary">
-              {agentDisplayName(plan.author)} · {plan.status}
-            </p>
+            <div className="mt-2 flex flex-wrap items-center gap-1.5 text-caption">
+              <span
+                className={`inline-flex items-center gap-1.5 rounded-pill px-2.5 py-0.5 font-medium ${planStatusBadgeClasses(plan.status)}`}
+              >
+                <span aria-hidden="true" className="size-1.5 rounded-full bg-current" />
+                <span>
+                  {agentDisplayName(plan.author)} · {plan.status}
+                </span>
+              </span>
+            </div>
           ) : null}
         </div>
         <div className="flex shrink-0 gap-1">
@@ -116,7 +138,7 @@ export function CurrentPlanPanel({
               aria-label={expanded ? 'Restore plan panel' : 'Expand plan panel'}
               title={expanded ? 'Restore plan panel' : 'Expand plan panel'}
               onClick={() => onExpandedChange(!expanded)}
-              className="grid size-8 place-items-center rounded-control text-secondary hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-focus"
+              className="pact-pressable grid size-8 cursor-pointer place-items-center rounded-lg text-secondary hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-focus"
             >
               {expanded ? (
                 <Minimize2 aria-hidden="true" className="size-4" strokeWidth={1.75} />
@@ -129,7 +151,7 @@ export function CurrentPlanPanel({
             type="button"
             aria-label="Close context panel"
             onClick={onClose}
-            className="grid size-8 shrink-0 place-items-center rounded-control text-secondary hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-focus"
+            className="pact-pressable grid size-8 shrink-0 cursor-pointer place-items-center rounded-lg text-secondary hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-focus"
           >
             <X aria-hidden="true" className="size-4" strokeWidth={1.75} />
           </button>
@@ -147,7 +169,7 @@ export function CurrentPlanPanel({
             <button
               type="button"
               onClick={onRetry}
-              className="mt-group inline-flex min-h-8 items-center gap-2 rounded-control px-3 py-1.5 font-medium text-primary hover:bg-surface-muted focus-visible:outline-2 focus-visible:outline-focus"
+              className="pact-pressable mt-group inline-flex min-h-8 cursor-pointer items-center gap-2 rounded-lg border border-border bg-surface-raised px-3 py-1.5 font-medium text-primary hover:bg-surface-muted focus-visible:outline-2 focus-visible:outline-focus"
             >
               <RotateCcw aria-hidden="true" className="size-3.5" strokeWidth={1.75} /> Try again
             </button>
@@ -220,9 +242,9 @@ export function CurrentPlanPanel({
           </div>
         ) : loading ? (
           <div aria-busy="true" aria-label="Loading current plan" className="space-y-group">
-            <div className="h-4 w-2/3 rounded-control bg-surface-muted" />
-            <div className="h-3 w-full rounded-control bg-surface-muted" />
-            <div className="h-3 w-4/5 rounded-control bg-surface-muted" />
+            <div className="h-4 w-2/3 animate-pulse rounded-control bg-surface-muted" />
+            <div className="h-3 w-full animate-pulse rounded-control bg-surface-muted" />
+            <div className="h-3 w-4/5 animate-pulse rounded-control bg-surface-muted" />
           </div>
         ) : (
           <div className="mt-section text-caption text-secondary">

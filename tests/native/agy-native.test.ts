@@ -1,7 +1,17 @@
 import type { Socket } from 'node:net'
 
 import { randomUUID } from 'node:crypto'
-import { chmod, copyFile, lstat, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
+import {
+  chmod,
+  copyFile,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readdir,
+  rm,
+  symlink,
+  writeFile,
+} from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
@@ -180,6 +190,13 @@ async function pathExists(filePath: string): Promise<boolean> {
       return false
     }
     throw error
+  }
+}
+
+async function assertConversationsDirHygiene(conversationsDir: string): Promise<void> {
+  const entries = await readdir(conversationsDir)
+  for (const entry of entries) {
+    expect(entry).toMatch(/^[0-9a-f-]+\.db(?:-wal|-shm)?$/iu)
   }
 }
 
@@ -497,6 +514,14 @@ it('verifies production AgyAgentAdapter zero-Turn Rebuild seed and cold-load ver
     await bootstrapIsolatedAgyAuth(owned, env, deadlineAt)
 
     const agyAppDataDir = join(owned.root, '.gemini', 'antigravity-cli')
+    const nativeIdentity = bundle.getAgySqliteFileModuleIdentity()
+    expect(nativeIdentity).toMatchObject({
+      version: 1,
+      platform: process.platform,
+      architecture: process.arch,
+    })
+    expect(nativeIdentity.sourceSha256).toMatch(/^[a-f0-9]{64}$/u)
+    const childStatsBefore = bundle.getNodeAgyStorageChildStatsForTesting()
     forkFiles = new bundle.NativeForkFiles()
     const storageClient = bundle.createAgyNativeStorageClient(forkFiles, agyAppDataDir)
 
@@ -737,6 +762,12 @@ it('verifies production AgyAgentAdapter zero-Turn Rebuild seed and cold-load ver
     )
     expect(missingReceiptProbe.kind).toBe('no_evidence')
     expect(guard.requestCount).toBe(0)
+    await assertConversationsDirHygiene(join(agyAppDataDir, 'conversations'))
+    const childStatsAfter = bundle.getNodeAgyStorageChildStatsForTesting()
+    expect(childStatsAfter.started).toBeGreaterThan(childStatsBefore.started)
+    expect(childStatsAfter.lastPid).toBeDefined()
+    expect(childStatsAfter.lastPid).not.toBe(process.pid)
+    expect(childStatsAfter.live).toBe(0)
   } finally {
     await runAllCleanupSteps([
       async () => {
@@ -765,6 +796,14 @@ it('prepares and executes an execution_id-closed SQLite Fork boundary with cold 
     await bootstrapIsolatedAgyAuth(owned, env, deadlineAt)
 
     const agyAppDataDir = join(owned.root, '.gemini', 'antigravity-cli')
+    const nativeIdentity = bundle.getAgySqliteFileModuleIdentity()
+    expect(nativeIdentity).toMatchObject({
+      version: 1,
+      platform: process.platform,
+      architecture: process.arch,
+    })
+    expect(nativeIdentity.sourceSha256).toMatch(/^[a-f0-9]{64}$/u)
+    const childStatsBefore = bundle.getNodeAgyStorageChildStatsForTesting()
     forkFiles = new bundle.NativeForkFiles()
     const storageClient = bundle.createAgyNativeStorageClient(forkFiles, agyAppDataDir)
     // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- Production storage helpers exported from buildAdapters.
@@ -1174,6 +1213,30 @@ it('prepares and executes an execution_id-closed SQLite Fork boundary with cold 
     })
     expect(summaryCounts.childStepCount).toBe(2)
     expect(guard.requestCount).toBe(0)
+    await assertConversationsDirHygiene(join(agyAppDataDir, 'conversations'))
+
+    // Verify real N-API v8 agy-sqlite-file anchored SHARED lock & isolated child PID accounting:
+    const lockedView = bundle.openAnchoredLockedSqliteView(
+      agyAppDataDir,
+      ['conversations'],
+      `${forked.nativeSessionId}.db`,
+      { acquireSharedLock: true, openWal: true, openShm: true, checkJournal: true },
+    )
+    try {
+      expect(lockedView.sharedLockHeld).toBe(true)
+      expect(lockedView.byteLength).toBeGreaterThanOrEqual(100)
+      expect(lockedView.readAt(0, 16).toString('ascii')).toBe('SQLite format 3\0')
+      expect(lockedView.verifyUnchanged().unchanged).toBe(true)
+    } finally {
+      lockedView.close()
+    }
+    expect(bundle.getOpenAgySqliteViewCountForTesting()).toBe(0)
+
+    const forkChildStatsAfter = bundle.getNodeAgyStorageChildStatsForTesting()
+    expect(forkChildStatsAfter.started).toBeGreaterThan(childStatsBefore.started)
+    expect(forkChildStatsAfter.lastPid).toBeDefined()
+    expect(forkChildStatsAfter.lastPid).not.toBe(process.pid)
+    expect(forkChildStatsAfter.live).toBe(0)
   } finally {
     await runAllCleanupSteps([
       async () => {
@@ -1234,6 +1297,14 @@ it('enforces explicit PACT_E2E_AGY_AUTH_DIR isolation without reading host HOME 
     expect(parseSupportedAgySemver('agy version 1.5.8')).toEqual({
       status: 'outdated',
       version: '1.5.8',
+    })
+    expect(parseSupportedAgySemver('agy version 1.5.13', '1.5.13')).toEqual({
+      status: 'supported',
+      version: '1.5.13',
+    })
+    expect(parseSupportedAgySemver('agy version 1.5.12', '1.5.13')).toEqual({
+      status: 'outdated',
+      version: '1.5.12',
     })
 
     const writeVersionCli = async (name: string, versionOutput: string): Promise<string> => {

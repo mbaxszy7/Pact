@@ -19,6 +19,12 @@ import { promisify } from 'node:util'
 
 import identities from '../apps/desktop/app-identities.json' with { type: 'json' }
 import {
+  agySqliteFileResourcePrefix,
+  agySqliteFileSourceHash,
+  inspectAgySqliteFileResource,
+  validateAgySqliteFileManifest,
+} from '../apps/desktop/build/agy-sqlite-file-resource.mjs'
+import {
   inspectWindowsOwnedProcessResource,
   validateWindowsOwnedProcessManifest,
   windowsOwnedProcessSourceHash,
@@ -521,6 +527,13 @@ export async function main(args = process.argv.slice(2)) {
             { runIdentity: true },
           )
         : null
+    const agySqliteFile = await inspectAgySqliteFileResource(
+      join(application.appPath, agySqliteFileResourcePrefix(options.platform)),
+      options.platform,
+      options.arch,
+      await agySqliteFileSourceHash(),
+      { verifyLoad: true, allowSignedBinary: options.platform === 'darwin' },
+    )
     if (windowsSharp)
       requireSharpInspection(
         'packaged',
@@ -562,6 +575,7 @@ export async function main(args = process.argv.slice(2)) {
       },
       artifacts,
       windowsOwnedProcess,
+      agySqliteFile,
       signing: { mac: 'ad-hoc', windows: 'none', notarized: false },
       verification: {
         packagedSmoke: 'pending',
@@ -570,6 +584,7 @@ export async function main(args = process.argv.slice(2)) {
       },
     }
     validateWindowsOwnedProcessManifest(manifest)
+    validateAgySqliteFileManifest(manifest)
     const bytes = `${JSON.stringify(manifest, null, 2)}\n`
     if (Buffer.byteLength(bytes) > MAX_MANIFEST_BYTES)
       throw new Error('Distribution manifest exceeds its metadata bound.')

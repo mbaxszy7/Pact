@@ -23,7 +23,7 @@ export async function nativeWorkerFixture(
     )
     await writeFile(
       configFile,
-      `import {externalizeDepsPlugin} from ${JSON.stringify(pathToFileURL(require.resolve('electron-vite')).href)}; export default {main:{plugins:[externalizeDepsPlugin({exclude:['@pact/contracts','@pact/contracts/images','@pact/contracts/diagnostics']})],build:{outDir:${JSON.stringify(join(directory, 'bundle'))},rollupOptions:{input:${JSON.stringify(Object.fromEntries(names.map((name) => [name, sources[name] ?? join(import.meta.dirname, `${name}.ts`)])))}}}}};`,
+      `import {externalizeDepsPlugin} from ${JSON.stringify(pathToFileURL(require.resolve('electron-vite')).href)}; export default {main:{plugins:[externalizeDepsPlugin({include:['better-sqlite3','sharp'],exclude:['@pact/contracts','@pact/contracts/images','@pact/contracts/diagnostics']})],build:{outDir:${JSON.stringify(join(directory, 'bundle'))},rollupOptions:{input:${JSON.stringify(Object.fromEntries(names.map((name) => [name, sources[name] ?? (name === 'agy-storage-child' ? join(import.meta.dirname, '../agy-storage-child.ts') : join(import.meta.dirname, `${name}.ts`))])))}}}}};`,
     )
     await build({ root: directory, configFile, ignoreConfigWarning: true, logLevel: 'silent' })
     await writeFile(join(directory, 'bundle', 'package.json'), '{"type":"module"}\n')

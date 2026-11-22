@@ -180,7 +180,7 @@ export function SessionReminder({
     // oxlint-disable-next-line jsx-a11y/no-noninteractive-element-interactions -- Pointer and focus capture pause the status timer; the nested buttons remain the controls.
     <div
       ref={cardRef}
-      className={`pact-session-reminder fixed right-5 z-[80] flex w-[min(24.5rem,calc(100vw-2.5rem))] items-center gap-2.5 rounded-panel border border-border bg-surface-raised py-2.5 pr-2 pl-3 text-caption text-primary shadow-popover ${
+      className={`pact-session-reminder fixed right-5 z-[80] flex w-[min(24.5rem,calc(100vw-2.5rem))] items-center gap-2.5 rounded-panel border border-border bg-menu-surface py-2.5 pr-2 pl-3 text-caption text-primary shadow-island ${
         aboveComposer ? 'bottom-[11.75rem]' : 'bottom-5'
       }`}
       role="status"
@@ -215,14 +215,14 @@ export function SessionReminder({
         <p className="truncate leading-snug text-secondary">{metadata}</p>
       </div>
       <button
-        className="h-7 shrink-0 rounded-control px-2.5 font-medium text-secondary transition-colors hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-focus"
+        className="pact-pressable h-7 shrink-0 rounded-lg px-2.5 font-medium text-secondary hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-focus"
         type="button"
         onClick={onView}
       >
         {viewLabel}
       </button>
       <button
-        className="grid size-7 shrink-0 place-items-center rounded-control text-tertiary transition-colors hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-focus"
+        className="pact-pressable grid size-7 shrink-0 place-items-center rounded-lg text-tertiary hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-focus"
         type="button"
         aria-label="Dismiss Session reminder"
         onClick={onDismiss}

@@ -16,6 +16,7 @@ import { registerSettingsIpcHandlers } from './ipc'
 
 const harness = vi.hoisted(() => ({ handlers: new Map<string, (...args: unknown[]) => unknown>() }))
 vi.mock('electron', () => ({
+  app: { isPackaged: false },
   ipcMain: {
     handle: (channel: string, handler: (...args: unknown[]) => unknown) =>
       harness.handlers.set(channel, handler),

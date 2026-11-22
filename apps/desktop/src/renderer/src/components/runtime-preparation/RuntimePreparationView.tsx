@@ -123,11 +123,13 @@ function AgentBridge({
       data-loading={loading}
       aria-label={`${readyCount} of 3 agents ready`}
     >
-      <span className="runtime-bridge-node bg-speaker-claude">C</span>
+      <span className="runtime-bridge-node bg-speaker-claude text-speaker-claude-foreground">
+        C
+      </span>
       <span className="runtime-bridge-track" aria-hidden="true">
         <span className="runtime-bridge-signal" />
       </span>
-      <span className="runtime-bridge-node bg-speaker-codex">X</span>
+      <span className="runtime-bridge-node bg-speaker-codex text-speaker-codex-foreground">X</span>
       <span className="runtime-bridge-track" aria-hidden="true">
         <span className="runtime-bridge-signal runtime-bridge-signal-delayed" />
       </span>
@@ -137,7 +139,7 @@ function AgentBridge({
       <span className="runtime-bridge-track" aria-hidden="true">
         <span className="runtime-bridge-signal" />
       </span>
-      <span className="runtime-bridge-node bg-speaker-agy">A</span>
+      <span className="runtime-bridge-node bg-speaker-agy text-speaker-agy-foreground">A</span>
     </div>
   )
 }
@@ -248,118 +250,120 @@ export function RuntimePreparationView({
       className="flex h-full min-h-0 w-full flex-col overflow-hidden bg-canvas text-primary"
       aria-labelledby="runtime-preparation-title"
     >
-      <header className="pact-titlebar h-12 shrink-0 border-b border-border bg-canvas">
+      <header className="pact-titlebar h-12 shrink-0 bg-canvas">
         <div className="pact-titlebar-content flex h-full items-center px-section">
           <span className="text-body font-medium tracking-[-0.015em]">Pact</span>
         </div>
       </header>
-      <div className="min-h-0 flex-1 overflow-auto bg-surface">
-        <main className="mx-auto flex min-h-full w-full max-w-[58rem] flex-col px-section py-spacious sm:px-spacious">
-          {canReturnToWorkspace ? (
-            <button
-              className="mb-section flex h-8 items-center gap-2 self-start rounded-control px-2 text-caption font-medium text-primary hover:bg-surface-muted"
-              type="button"
-              onClick={onBack}
-            >
-              <ArrowLeft aria-hidden="true" className="size-4" strokeWidth={1.75} />
-              Back to workspace
-            </button>
-          ) : null}
-
-          <div className="grid items-end gap-section border-b border-border pb-spacious sm:grid-cols-[minmax(0,1fr)_auto]">
-            <div>
-              <h1
-                id="runtime-preparation-title"
-                className="max-w-[14ch] text-title font-medium tracking-[-0.025em]"
-              >
-                Connect your coding agents
-              </h1>
-              <p className="mt-group max-w-[60ch] text-body leading-relaxed text-secondary">
-                Uses Claude Code, Codex, and Antigravity installed on this device. Connect at least
-                2 to get started.
-              </p>
-            </div>
-            <div className="justify-self-start sm:justify-self-end">
-              <AgentBridge preparation={preparation} loading={loading} />
-              <p className="mt-2 text-center text-caption text-tertiary tabular-nums">
-                {loading ? 'Checking locally…' : `${readyCount} of 3 ready · Minimum 2 required`}
-              </p>
-            </div>
-          </div>
-
-          {error ? (
-            <div
-              className="mt-section flex flex-wrap items-center justify-between gap-group rounded-control bg-danger-muted px-group py-3 text-caption text-danger"
-              role="alert"
-            >
-              <span>{error}</span>
+      <div className="flex min-h-0 flex-1 p-1.5 pt-0">
+        <div className="workspace-sheet min-h-0 flex-1 overflow-auto">
+          <main className="mx-auto flex min-h-full w-full max-w-[58rem] flex-col px-section py-spacious sm:px-spacious">
+            {canReturnToWorkspace ? (
               <button
-                className="h-8 rounded-control border border-current px-3 font-medium hover:bg-surface-raised/30"
+                className="pact-pressable mb-section flex h-8 items-center gap-2 self-start rounded-xl px-2.5 text-caption font-medium text-primary hover:bg-row-hover"
                 type="button"
-                onClick={onRetry}
+                onClick={onBack}
               >
-                Try again
+                <ArrowLeft aria-hidden="true" className="size-4" strokeWidth={1.75} />
+                Back to workspace
               </button>
+            ) : null}
+
+            <div className="grid items-end gap-section border-b border-border pb-spacious sm:grid-cols-[minmax(0,1fr)_auto]">
+              <div>
+                <h1
+                  id="runtime-preparation-title"
+                  className="max-w-[14ch] text-title font-medium tracking-[-0.025em]"
+                >
+                  Connect your coding agents
+                </h1>
+                <p className="mt-group max-w-[60ch] text-body leading-relaxed text-secondary">
+                  Uses Claude Code, Codex, and Antigravity installed on this device. Connect at
+                  least 2 to get started.
+                </p>
+              </div>
+              <div className="justify-self-start sm:justify-self-end">
+                <AgentBridge preparation={preparation} loading={loading} />
+                <p className="mt-2 text-center text-caption text-tertiary tabular-nums">
+                  {loading ? 'Checking locally…' : `${readyCount} of 3 ready · Minimum 2 required`}
+                </p>
+              </div>
             </div>
-          ) : null}
 
-          <div className="runtime-agent-list" aria-busy={loading}>
-            <RuntimeRow
-              agentId="claude"
-              readiness={readiness.get('claude')}
-              loading={loading}
-              choosing={choosingAgent === 'claude'}
-              onChooseExecutable={onChooseExecutable}
-            />
-            <RuntimeRow
-              agentId="codex"
-              readiness={readiness.get('codex')}
-              loading={loading}
-              choosing={choosingAgent === 'codex'}
-              onChooseExecutable={onChooseExecutable}
-            />
-            <RuntimeRow
-              agentId="agy"
-              readiness={readiness.get('agy')}
-              loading={loading}
-              choosing={choosingAgent === 'agy'}
-              onChooseExecutable={onChooseExecutable}
-            />
-          </div>
+            {error ? (
+              <div
+                className="mt-section flex flex-wrap items-center justify-between gap-group rounded-control bg-danger-muted px-group py-3 text-caption text-danger"
+                role="alert"
+              >
+                <span>{error}</span>
+                <button
+                  className="h-8 rounded-control border border-current px-3 font-medium hover:bg-surface-raised/30"
+                  type="button"
+                  onClick={onRetry}
+                >
+                  Try again
+                </button>
+              </div>
+            ) : null}
 
-          <footer className="mt-auto flex flex-wrap items-center justify-between gap-group pt-spacious">
-            <output className="flex items-center gap-2 text-caption" aria-live="polite">
-              <span
-                className={`size-2 rounded-full ${ready ? 'bg-status-ready' : 'bg-status-warning'}`}
-                aria-hidden="true"
+            <div className="runtime-agent-list" aria-busy={loading}>
+              <RuntimeRow
+                agentId="claude"
+                readiness={readiness.get('claude')}
+                loading={loading}
+                choosing={choosingAgent === 'claude'}
+                onChooseExecutable={onChooseExecutable}
               />
-              <span className={ready ? 'text-status-ready-foreground' : 'text-secondary'}>
-                {ready
-                  ? canReturnToWorkspace
-                    ? 'Ready to use in your sessions.'
-                    : 'Next: choose your default session settings.'
-                  : 'Connect at least two coding agents, then click Check again.'}
-              </span>
-            </output>
-            <button
-              className="primary-action-button"
-              type="button"
-              disabled={loading}
-              data-busy={loading}
-              aria-busy={loading}
-              onClick={ready ? onContinue : onRetry}
-            >
-              {loading ? <span className="primary-action-spinner" aria-hidden="true" /> : null}
-              {loading
-                ? 'Checking agents'
-                : ready
-                  ? canReturnToWorkspace
-                    ? 'Back to workspace'
-                    : 'Continue'
-                  : 'Check again'}
-            </button>
-          </footer>
-        </main>
+              <RuntimeRow
+                agentId="codex"
+                readiness={readiness.get('codex')}
+                loading={loading}
+                choosing={choosingAgent === 'codex'}
+                onChooseExecutable={onChooseExecutable}
+              />
+              <RuntimeRow
+                agentId="agy"
+                readiness={readiness.get('agy')}
+                loading={loading}
+                choosing={choosingAgent === 'agy'}
+                onChooseExecutable={onChooseExecutable}
+              />
+            </div>
+
+            <footer className="mt-auto flex flex-wrap items-center justify-between gap-group pt-spacious">
+              <output className="flex items-center gap-2 text-caption" aria-live="polite">
+                <span
+                  className={`size-2 rounded-full ${ready ? 'bg-status-ready' : 'bg-status-warning'}`}
+                  aria-hidden="true"
+                />
+                <span className={ready ? 'text-status-ready-foreground' : 'text-secondary'}>
+                  {ready
+                    ? canReturnToWorkspace
+                      ? 'Ready to use in your sessions.'
+                      : 'Next: choose your default session settings.'
+                    : 'Connect at least two coding agents, then click Check again.'}
+                </span>
+              </output>
+              <button
+                className="primary-action-button"
+                type="button"
+                disabled={loading}
+                data-busy={loading}
+                aria-busy={loading}
+                onClick={ready ? onContinue : onRetry}
+              >
+                {loading ? <span className="primary-action-spinner" aria-hidden="true" /> : null}
+                {loading
+                  ? 'Checking agents'
+                  : ready
+                    ? canReturnToWorkspace
+                      ? 'Back to workspace'
+                      : 'Continue'
+                    : 'Check again'}
+              </button>
+            </footer>
+          </main>
+        </div>
       </div>
     </section>
   )

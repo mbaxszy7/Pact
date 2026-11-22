@@ -1,21 +1,22 @@
 import Database from 'better-sqlite3'
-import { build } from 'electron-vite'
+import { spawn, spawnSync } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import {
   appendFile,
-  copyFile,
+  link,
   mkdir,
   mkdtemp,
   readFile,
+  readdir,
   realpath,
   rm,
+  stat,
   symlink,
   writeFile,
 } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
-import { pathToFileURL } from 'node:url'
+import { join } from 'node:path'
 import { afterAll, beforeAll, expect, it, vi } from 'vitest'
 
 import type { ClaudePlanCheckpointSource } from '@pact/agent-runtime'
@@ -36,6 +37,12 @@ import {
   encodeStringField,
   encodeVarintField,
 } from './agy-native-storage'
+import {
+  AgyStorageRunner,
+  configureAgyStorageChildScriptForTesting,
+  getNodeAgyStorageChildStatsForTesting,
+  type AgyStorageTransport,
+} from './agy-storage-runner'
 import { claudePlanInputFingerprint, claudePlanSubmissionFingerprint } from './claude-native-plan'
 import {
   NativeForkFiles,
@@ -43,7 +50,12 @@ import {
   type NativeForkHistoryReference,
   type NativeForkFileResult,
 } from './native-fork-files'
-import { NativeWorkingMemory, NATIVE_OWNER_WORKING_BYTES } from './native-working-memory'
+import { nativeWorkerFixture } from './native-workers-fixture.test-support'
+import {
+  NativeWorkingMemory,
+  NATIVE_OWNER_WORKING_BYTES,
+  nativeWorkingMemoryDiagnostics,
+} from './native-working-memory'
 
 const workerLocation = vi.hoisted(() => ({
   path: '',
@@ -77,33 +89,24 @@ vi.mock('node:worker_threads', async (original) => {
   }
 })
 let directory: string
+let bundledWorkers: Awaited<ReturnType<typeof nativeWorkerFixture>> | undefined
+let agyChildBundlePath = ''
 const traffic = new LogicalIpcWorkerTraffic(
   ['utility-native-fork'],
   '00000000-0000-4000-8000-000000000001',
 )
-const files = new NativeForkFiles(traffic)
+let files = new NativeForkFiles(traffic)
 beforeAll(async () => {
   directory = await mkdtemp(join(tmpdir(), 'pact-fork-worker-test-'))
-  const desktopRoot = resolve(import.meta.dirname, '../../..')
-  const require = createRequire(join(desktopRoot, 'package.json'))
-  const configFile = join(directory, 'worker.config.mjs')
-  const betterSqliteEntry = pathToFileURL(require.resolve('better-sqlite3')).href
-  await copyFile(join(desktopRoot, 'package.json'), join(directory, 'package.json'))
-  await symlink(
-    join(desktopRoot, 'node_modules'),
-    join(directory, 'node_modules'),
-    process.platform === 'win32' ? 'junction' : 'dir',
-  )
-  await writeFile(
-    configFile,
-    `import {externalizeDepsPlugin} from ${JSON.stringify(pathToFileURL(require.resolve('electron-vite')).href)}; export default {main:{plugins:[externalizeDepsPlugin({exclude:['@pact/contracts']})],resolve:{alias:{'better-sqlite3':${JSON.stringify(betterSqliteEntry)}}},build:{outDir:${JSON.stringify(join(directory, 'bundle'))},rollupOptions:{external:[${JSON.stringify(betterSqliteEntry)}],input:{'native-fork-worker':${JSON.stringify(join(import.meta.dirname, 'native-fork-worker.ts'))}}}}}};`,
-  )
-  await build({ root: directory, configFile, ignoreConfigWarning: true, logLevel: 'silent' })
-  await writeFile(join(directory, 'bundle', 'package.json'), '{"type":"module"}\n')
-  workerLocation.path = join(directory, 'bundle', 'native-fork-worker.js')
-}, 20_000)
+  bundledWorkers = await nativeWorkerFixture(['native-fork-worker', 'agy-storage-child'])
+  workerLocation.path = bundledWorkers.paths['native-fork-worker']!
+  agyChildBundlePath = bundledWorkers.paths['agy-storage-child']!
+  configureAgyStorageChildScriptForTesting(agyChildBundlePath)
+}, 30_000)
 afterAll(async () => {
   await files.dispose()
+  configureAgyStorageChildScriptForTesting(undefined)
+  await bundledWorkers?.dispose()
   if (directory) await rm(directory, { recursive: true, force: true })
 })
 const hash = (text: string) => createHash('sha256').update(text).digest('hex')
@@ -408,27 +411,28 @@ it('uses the same authenticated checkpoint for live Hook prefixes and complete c
 
 it('retains the native owner until a cancelled checkpoint reader physically settles', async () => {
   const f = await publishedCheckpointFixture(),
+    localFiles = new NativeForkFiles(traffic),
     controller = new AbortController(),
     held = Promise.withResolvers<string>()
   f.read.mockImplementation(() => held.promise)
   try {
-    const reading = files.readAnswer(f.request, controller.signal).then(
+    const reading = localFiles.readAnswer(f.request, controller.signal).then(
       () => undefined,
       (error: unknown) => error,
     )
     await vi.waitFor(() => expect(f.read).toHaveBeenCalledTimes(1))
     controller.abort()
     expect(await reading).toMatchObject({ message: expect.stringMatching(/cancelled/iu) })
-    expect(files.active).toBe(true)
-    await expect(files.readAnswer(f.request, new AbortController().signal)).rejects.toThrow(
+    expect(localFiles.active).toBe(true)
+    await expect(localFiles.readAnswer(f.request, new AbortController().signal)).rejects.toThrow(
       /already active/iu,
     )
     held.resolve(f.base)
-    await vi.waitFor(() => expect(files.active).toBe(false))
+    await vi.waitFor(() => expect(localFiles.active).toBe(false))
     expect(workerLocation.live).toBe(0)
   } finally {
     held.resolve(f.base)
-    await files.dispose()
+    await localFiles.dispose()
     vi.unstubAllEnvs()
   }
 })
@@ -1874,6 +1878,7 @@ it('cancels the sole pending parent read and cleans up the worker before another
 
 it('keeps all actual Fork candidate/reference/ACK traffic and physical exits in one group', async () => {
   await files.dispose()
+  files = new NativeForkFiles(traffic)
   expect(traffic.snapshots()[0]).toMatchObject({
     complete: true,
     activeTransports: 0,
@@ -2563,4 +2568,1523 @@ it('executes Antigravity prepare, two-phase forkAgy, and inspect through the rea
     ),
   ).rejects.toThrow(/changed before Fork|disagrees/iu)
   expect(workerLocation.live).toBe(0)
+})
+
+it('reads Antigravity trajectory identity through native-fork-worker for >64 MiB DB with uncheckpointed WAL and zero sidefiles', async () => {
+  const storageRoot = join(directory, `agy-worker-identity-${randomUUID()}`)
+  const cwd = join(directory, `agy-worker-identity-cwd-${randomUUID()}`)
+  await mkdir(cwd, { recursive: true })
+  const sessionId = randomUUID()
+  const fixture = await createAgyWorkerShellFixture(storageRoot, sessionId)
+
+  const largeBlob = Buffer.alloc(1_600_000, 0x33)
+  const writer = new Database(fixture.dbPath)
+  let reader: Database.Database | undefined
+  try {
+    writer.pragma('journal_mode = WAL')
+    writer.pragma('wal_autocheckpoint = 0')
+    const insertStep = writer.prepare(
+      'INSERT INTO "steps" ("idx", "step_type", "status", "step_payload") VALUES (?, ?, ?, ?)',
+    )
+    const writeBatch = writer.transaction(() => {
+      for (let idx = 0; idx < 44; idx += 1) {
+        insertStep.run(
+          idx,
+          idx % 2 === 0 ? CORTEX_STEP_TYPE_USER_INPUT : CORTEX_STEP_TYPE_PLANNER_RESPONSE,
+          CORTEX_STEP_STATUS_DONE,
+          largeBlob,
+        )
+      }
+    })
+    writeBatch()
+    writer.pragma('wal_checkpoint(TRUNCATE)')
+
+    reader = new Database(fixture.dbPath, { readonly: true })
+    reader.prepare('SELECT COUNT(*) FROM "steps"').get()
+
+    insertStep.run(44, CORTEX_STEP_TYPE_USER_INPUT, CORTEX_STEP_STATUS_DONE, largeBlob)
+    insertStep.run(45, CORTEX_STEP_TYPE_PLANNER_RESPONSE, CORTEX_STEP_STATUS_DONE, largeBlob)
+  } finally {
+    writer.close()
+    reader?.close()
+  }
+
+  await rm(`${fixture.dbPath}-shm`, { force: true })
+  expect((await stat(fixture.dbPath)).size).toBeGreaterThan(64 * 1024 * 1024)
+  const beforeConv = (await readdir(join(storageRoot, 'conversations'))).toSorted()
+  expect(beforeConv).toContain(`${sessionId}.db-wal`)
+  expect(beforeConv).not.toContain(`${sessionId}.db-shm`)
+
+  const result = await files.readAgyTrajectoryIdentity(
+    { cwd, storageRoot, nativeSessionId: sessionId },
+    new AbortController().signal,
+  )
+  expect(result).toEqual({
+    nativeSessionId: sessionId,
+    status: 'ok',
+    trajectoryId: fixture.trajectoryId,
+    stepCount: 46,
+  })
+  expect((await readdir(join(storageRoot, 'conversations'))).toSorted()).toEqual(beforeConv)
+  expect(workerLocation.live).toBe(0)
+})
+
+const BETTER_SQLITE3_ENTRY = createRequire(import.meta.url).resolve('better-sqlite3')
+
+interface ExternalWorkerTestSqliteProcess {
+  readonly pid: number
+  pragma: (expr: string) => Promise<unknown>
+  seedLargeWalSteps: (count: number, payloadBytes: number) => Promise<void>
+  close: () => Promise<void>
+}
+
+async function openExternalWorkerTestSqliteProcess(
+  dbPath: string,
+): Promise<ExternalWorkerTestSqliteProcess> {
+  const script = `
+    const readline = require('node:readline');
+    const Database = require(${JSON.stringify(BETTER_SQLITE3_ENTRY)});
+    const db = new Database(${JSON.stringify(dbPath)});
+    const rl = readline.createInterface({ input: process.stdin });
+    const send = (obj) => process.stdout.write(JSON.stringify(obj) + '\\n');
+    send({ ready: true, pid: process.pid });
+    rl.on('line', (line) => {
+      let req;
+      try {
+        req = JSON.parse(line);
+      } catch (err) {
+        send({ id: -1, error: String(err) });
+        return;
+      }
+      try {
+        if (req.cmd === 'pragma') {
+          send({ id: req.id, ok: true, value: db.pragma(req.expr) });
+        } else if (req.cmd === 'seedLargeWalSteps') {
+          const payload = Buffer.alloc(req.payloadBytes, 0x62);
+          const ins = db.prepare(
+            'INSERT INTO "steps" ("idx", "step_type", "status", "step_payload") VALUES (?, ?, ?, ?)',
+          );
+          db.transaction(() => {
+            for (let i = 0; i < req.count; i += 1) {
+              ins.run(i, ${CORTEX_STEP_TYPE_USER_INPUT}, ${CORTEX_STEP_STATUS_DONE}, payload);
+            }
+          })();
+          send({ id: req.id, ok: true });
+        } else if (req.cmd === 'close') {
+          db.close();
+          send({ id: req.id, ok: true });
+          process.exit(0);
+        } else {
+          send({ id: req.id, error: 'unknown cmd' });
+        }
+      } catch (err) {
+        send({ id: req.id, error: err instanceof Error ? err.message : String(err) });
+      }
+    });
+  `
+  const child = spawn(process.execPath, ['-e', script], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+  })
+  if (child.pid === undefined) {
+    throw new Error('Failed to spawn external SQLite child process.')
+  }
+  const childPid = child.pid
+  let nextId = 1
+  const pending = new Map<
+    number,
+    { resolve: (val: unknown) => void; reject: (err: Error) => void }
+  >()
+  let readyResolve: (() => void) | undefined
+  let readyReject: ((err: Error) => void) | undefined
+  const readyPromise = new Promise<void>((res, rej) => {
+    readyResolve = res
+    readyReject = rej
+  })
+  let stderrBuf = ''
+  child.stderr.on('data', (chunk: Buffer) => {
+    stderrBuf += chunk.toString('utf8')
+  })
+  let stdoutBuf = ''
+  child.stdout.on('data', (chunk: Buffer) => {
+    stdoutBuf += chunk.toString('utf8')
+    let nl = stdoutBuf.indexOf('\n')
+    while (nl >= 0) {
+      const line = stdoutBuf.slice(0, nl).trim()
+      stdoutBuf = stdoutBuf.slice(nl + 1)
+      if (line) {
+        const parsed: unknown = JSON.parse(line)
+        if (parsed !== null && typeof parsed === 'object') {
+          if (Reflect.get(parsed, 'ready') === true) {
+            readyResolve?.()
+            readyResolve = undefined
+            readyReject = undefined
+          } else {
+            const id = Reflect.get(parsed, 'id')
+            if (typeof id === 'number') {
+              const entry = pending.get(id)
+              if (entry) {
+                pending.delete(id)
+                if (Reflect.get(parsed, 'ok') === true) {
+                  entry.resolve(Reflect.get(parsed, 'value'))
+                } else {
+                  const errMsg = Reflect.get(parsed, 'error')
+                  entry.reject(
+                    new Error(typeof errMsg === 'string' ? errMsg : 'External SQLite child error'),
+                  )
+                }
+              }
+            }
+          }
+        }
+      }
+      nl = stdoutBuf.indexOf('\n')
+    }
+  })
+  let exited = false
+  let exitError: Error | undefined
+  let resolveExit!: () => void
+  const exitPromise = new Promise<void>((res) => {
+    resolveExit = res
+  })
+  const markExited = (reason: string): void => {
+    if (exited) return
+    exited = true
+    exitError = new Error(reason)
+    readyReject?.(exitError)
+    readyResolve = undefined
+    readyReject = undefined
+    for (const [, entry] of pending) {
+      entry.reject(exitError)
+    }
+    pending.clear()
+    resolveExit()
+  }
+  child.stdin.on('error', () => {
+    /* Ignore EPIPE on killed test child. */
+  })
+  child.once('exit', (code, signal) => {
+    markExited(
+      `External SQLite child exited (code=${String(code)}, signal=${String(signal)}): ${stderrBuf}`,
+    )
+  })
+  child.once('error', (err) => {
+    markExited(`External SQLite child error: ${err.message}`)
+  })
+  await readyPromise
+  const send = (payload: Record<string, unknown>): Promise<unknown> => {
+    if (exited || child.exitCode !== null || child.signalCode !== null) {
+      return Promise.reject(exitError ?? new Error('External SQLite child has already exited.'))
+    }
+    return new Promise((res, rej) => {
+      const id = nextId++
+      pending.set(id, { resolve: res, reject: rej })
+      child.stdin.write(`${JSON.stringify({ id, ...payload })}\n`, (writeErr) => {
+        if (writeErr) {
+          const entry = pending.get(id)
+          if (entry) {
+            pending.delete(id)
+            entry.reject(writeErr)
+          }
+        }
+      })
+    })
+  }
+  let closed = false
+  return {
+    pid: childPid,
+    pragma: async (expr) => send({ cmd: 'pragma', expr }),
+    seedLargeWalSteps: async (count, payloadBytes) => {
+      await send({ cmd: 'seedLargeWalSteps', count, payloadBytes })
+    },
+    close: async () => {
+      if (closed) return
+      closed = true
+      const waitExitBounded = async (deadlineMs: number): Promise<boolean> => {
+        if (exited) return true
+        let timer: ReturnType<typeof setTimeout> | undefined
+        try {
+          return await Promise.race([
+            exitPromise.then(() => true),
+            new Promise<boolean>((res) => {
+              timer = setTimeout(() => res(false), deadlineMs)
+            }),
+          ])
+        } finally {
+          if (timer !== undefined) clearTimeout(timer)
+        }
+      }
+      if (!exited) {
+        try {
+          await Promise.race([
+            send({ cmd: 'close' }),
+            waitExitBounded(1_500).then((done) => {
+              if (!done) throw new Error('External SQLite child close timed out.')
+              return undefined
+            }),
+          ])
+        } catch {
+          try {
+            child.kill('SIGKILL')
+          } catch {
+            /* Already exited. */
+          }
+        }
+      }
+      if (!(await waitExitBounded(1_500))) {
+        try {
+          child.kill('SIGKILL')
+        } catch {
+          /* Best-effort kill. */
+        }
+        await waitExitBounded(1_000)
+      }
+    },
+  }
+}
+
+function observeWorkerTestPosixFcntlLock(
+  filePath: string,
+  byteOffset: number,
+): { lockType: number; pid: number; fRdlck: number; fWrlck: number; fUnlck: number } {
+  const probe = spawnSync(
+    'python3',
+    [
+      '-c',
+      `
+import fcntl, os, struct, sys
+p = sys.argv[1]
+off = int(sys.argv[2])
+fd = os.open(p, os.O_RDWR)
+try:
+    if sys.platform == 'darwin':
+        req = struct.pack('qqihh', off, 1, 0, fcntl.F_WRLCK, os.SEEK_SET)
+        out = fcntl.fcntl(fd, fcntl.F_GETLK, req)
+        l_start, l_len, l_pid, l_type, l_whence = struct.unpack('qqihh', out)
+    else:
+        req = struct.pack('hh4xqqi', fcntl.F_WRLCK, os.SEEK_SET, off, 1, 0)
+        out = fcntl.fcntl(fd, fcntl.F_GETLK, req)
+        l_type, l_whence, l_start, l_len, l_pid = struct.unpack('hh4xqqi', out)
+    print(f'{l_type},{l_pid},{fcntl.F_RDLCK},{fcntl.F_WRLCK},{fcntl.F_UNLCK}')
+finally:
+    os.close(fd)
+`,
+      filePath,
+      String(byteOffset),
+    ],
+    { encoding: 'utf8' },
+  )
+  if (probe.status !== 0) {
+    throw new Error(`POSIX fcntl probe failed: ${probe.stderr}`)
+  }
+  const [lockType, pid, fRdlck, fWrlck, fUnlck] = probe.stdout
+    .trim()
+    .split(',')
+    .map((part) => Number(part))
+  return {
+    lockType: lockType!,
+    pid: pid!,
+    fRdlck: fRdlck!,
+    fWrlck: fWrlck!,
+    fUnlck: fUnlck!,
+  }
+}
+
+it('propagates all 6 Antigravity trajectory identity statuses, bounded budget_exceeded reason, online -shm mxFrame bounds, and VIRTUAL fallback through the real Worker', async () => {
+  const cwd = join(directory, `agy-worker-statuses-cwd-${randomUUID()}`)
+  await mkdir(cwd, { recursive: true })
+
+  // 1. no_storage_root (missing appDataDir / conversations/) vs missing (conversations/ exists, <sid>.db missing).
+  const absentRoot = join(directory, `agy-no-root-${randomUUID()}`)
+  const sidMissing = randomUUID()
+  expect(
+    await files.readAgyTrajectoryIdentity(
+      { cwd, storageRoot: absentRoot, nativeSessionId: sidMissing },
+      new AbortController().signal,
+    ),
+  ).toEqual({
+    nativeSessionId: sidMissing,
+    status: 'no_storage_root',
+  })
+
+  const storageRoot = join(directory, `agy-worker-statuses-${randomUUID()}`)
+  await mkdir(join(storageRoot, 'conversations'), { recursive: true })
+  expect(
+    await files.readAgyTrajectoryIdentity(
+      { cwd, storageRoot, nativeSessionId: sidMissing },
+      new AbortController().signal,
+    ),
+  ).toEqual({
+    nativeSessionId: sidMissing,
+    status: 'missing',
+  })
+
+  // 2. invalid (missing steps table).
+  const invalidSid = randomUUID()
+  const invalidDb = new Database(join(storageRoot, 'conversations', `${invalidSid}.db`))
+  try {
+    invalidDb.exec(
+      'CREATE TABLE "trajectory_meta" ("trajectory_id" TEXT PRIMARY KEY, "cascade_id" TEXT NOT NULL);',
+    )
+    invalidDb
+      .prepare('INSERT INTO "trajectory_meta" ("trajectory_id", "cascade_id") VALUES (?, ?)')
+      .run(randomUUID(), invalidSid)
+  } finally {
+    invalidDb.close()
+  }
+  expect(
+    await files.readAgyTrajectoryIdentity(
+      { cwd, storageRoot, nativeSessionId: invalidSid },
+      new AbortController().signal,
+    ),
+  ).toEqual({
+    nativeSessionId: invalidSid,
+    status: 'invalid',
+  })
+
+  // 3. transient_churn (hot rollback -journal).
+  const churnSid = randomUUID()
+  const churnFixture = await createAgyWorkerShellFixture(storageRoot, churnSid)
+  await writeFile(`${churnFixture.dbPath}-journal`, Buffer.from('hot-journal'))
+  expect(
+    await files.readAgyTrajectoryIdentity(
+      { cwd, storageRoot, nativeSessionId: churnSid },
+      new AbortController().signal,
+    ),
+  ).toEqual({
+    nativeSessionId: churnSid,
+    status: 'transient_churn',
+  })
+  await rm(`${churnFixture.dbPath}-journal`, { force: true })
+
+  // 4. budget_exceeded (active uncheckpointed WAL > 64 MiB) with bounded <= 512B reason,
+  //    held open by an independent OS child process (separate PID) so POSIX fcntl locks stay intact!
+  const budgetSid = randomUUID()
+  const budgetFixture = await createAgyWorkerShellFixture(storageRoot, budgetSid)
+  const budgetWriter = await openExternalWorkerTestSqliteProcess(budgetFixture.dbPath)
+  try {
+    expect(budgetWriter.pid).not.toBe(process.pid)
+    await budgetWriter.pragma('journal_mode = WAL')
+    await budgetWriter.pragma('wal_autocheckpoint = 0')
+    await budgetWriter.seedLargeWalSteps(66, 1_048_576)
+    const beforeLock =
+      process.platform !== 'win32'
+        ? observeWorkerTestPosixFcntlLock(`${budgetFixture.dbPath}-shm`, 128)
+        : { lockType: 1, pid: budgetWriter.pid, fRdlck: 1, fWrlck: 3, fUnlck: 2 }
+    expect(beforeLock.lockType).toBe(beforeLock.fRdlck)
+    expect(beforeLock.pid).toBe(budgetWriter.pid)
+    const budgetResult = await files.readAgyTrajectoryIdentity(
+      { cwd, storageRoot, nativeSessionId: budgetSid },
+      new AbortController().signal,
+    )
+    expect(budgetResult).toEqual({
+      nativeSessionId: budgetSid,
+      status: 'budget_exceeded',
+      reason: expect.any(String),
+    })
+    const budgetReason =
+      budgetResult.status === 'budget_exceeded' ? (budgetResult.reason ?? '') : ''
+    expect(Buffer.byteLength(budgetReason, 'utf8')).toBeLessThanOrEqual(512)
+    const afterLock =
+      process.platform !== 'win32'
+        ? observeWorkerTestPosixFcntlLock(`${budgetFixture.dbPath}-shm`, 128)
+        : { lockType: 1, pid: budgetWriter.pid, fRdlck: 1, fWrlck: 3, fUnlck: 2 }
+    expect(afterLock.lockType).toBe(afterLock.fRdlck)
+    expect(afterLock.pid).toBe(budgetWriter.pid)
+  } finally {
+    await budgetWriter.close()
+  }
+
+  // 5. VIRTUAL generated column + online -shm boundary through the real worker:
+  //    (a) aligned SHM & WAL -> ok (stepCount 6);
+  //    (b) WAL committed frames beyond published SHM mxFrame (orphan/unpublished SHM) -> transient_churn!
+  const virtualSid = randomUUID()
+  const virtualTraj = randomUUID()
+  const virtualDbPath = join(storageRoot, 'conversations', `${virtualSid}.db`)
+  const virtualWriter = new Database(virtualDbPath)
+  try {
+    virtualWriter.pragma('journal_mode = WAL')
+    virtualWriter.pragma('wal_autocheckpoint = 0')
+    virtualWriter.exec(`
+      CREATE TABLE "trajectory_meta" (
+        "v_tag" TEXT GENERATED ALWAYS AS ('v') VIRTUAL,
+        "trajectory_id" TEXT PRIMARY KEY,
+        "cascade_id" TEXT NOT NULL
+      );
+      CREATE TABLE "steps" ("idx" INTEGER VARYING PRIMARY KEY, "step_type" INTEGER NOT NULL);
+    `)
+    virtualWriter
+      .prepare('INSERT INTO "trajectory_meta" ("trajectory_id", "cascade_id") VALUES (?, ?)')
+      .run(virtualTraj, virtualSid)
+    virtualWriter.prepare('INSERT INTO "steps" ("idx", "step_type") VALUES (5, 14)').run()
+    const dbAtOne = await readFile(virtualDbPath)
+    const walAtOne = await readFile(`${virtualDbPath}-wal`)
+    const shmAtOne = await readFile(`${virtualDbPath}-shm`)
+
+    // (a) Aligned SHM & WAL snapshot -> returns ok with exact stepCount 6 and zero sidefiles.
+    const alignedRoot = join(directory, `agy-worker-virtual-aligned-${randomUUID()}`)
+    await mkdir(join(alignedRoot, 'conversations'), { recursive: true })
+    const alignedDbPath = join(alignedRoot, 'conversations', `${virtualSid}.db`)
+    await writeFile(alignedDbPath, dbAtOne)
+    await writeFile(`${alignedDbPath}-wal`, walAtOne)
+    await writeFile(`${alignedDbPath}-shm`, shmAtOne)
+    const beforeAligned = (await readdir(join(alignedRoot, 'conversations'))).toSorted()
+    expect(
+      await files.readAgyTrajectoryIdentity(
+        { cwd, storageRoot: alignedRoot, nativeSessionId: virtualSid },
+        new AbortController().signal,
+      ),
+    ).toEqual({
+      nativeSessionId: virtualSid,
+      status: 'ok',
+      trajectoryId: virtualTraj,
+      stepCount: 6,
+    })
+    expect((await readdir(join(alignedRoot, 'conversations'))).toSorted()).toEqual(beforeAligned)
+
+    // (b) Write step 11 into WAL while retaining `shmAtOne` (orphan/unpublished SHM boundary):
+    //     MUST return `transient_churn` with `wal_exceeds_published_shm_boundary`, NEVER stale `ok`!
+    virtualWriter.prepare('INSERT INTO "steps" ("idx", "step_type") VALUES (11, 15)').run()
+    const isolatedRoot = join(directory, `agy-worker-virtual-${randomUUID()}`)
+    await mkdir(join(isolatedRoot, 'conversations'), { recursive: true })
+    const isoDbPath = join(isolatedRoot, 'conversations', `${virtualSid}.db`)
+    await writeFile(isoDbPath, await readFile(virtualDbPath))
+    await writeFile(`${isoDbPath}-wal`, await readFile(`${virtualDbPath}-wal`))
+    await writeFile(`${isoDbPath}-shm`, shmAtOne)
+
+    const beforeIso = (await readdir(join(isolatedRoot, 'conversations'))).toSorted()
+    expect(
+      await files.readAgyTrajectoryIdentity(
+        { cwd, storageRoot: isolatedRoot, nativeSessionId: virtualSid },
+        new AbortController().signal,
+      ),
+    ).toEqual({
+      nativeSessionId: virtualSid,
+      status: 'transient_churn',
+      reason: 'wal_exceeds_published_shm_boundary',
+    })
+    expect((await readdir(join(isolatedRoot, 'conversations'))).toSorted()).toEqual(beforeIso)
+  } finally {
+    virtualWriter.close()
+  }
+  expect(workerLocation.live).toBe(0)
+})
+
+it('enforces Worker memory bounds on oversized fallback values, respects PACT_AGY_APP_DATA_DIR when storageRoot is omitted, rejects relative storageRoot, rejects malformed trajectoryId replies, and refuses POSIX FIFO without blocking', async () => {
+  const cwd = join(directory, `agy-worker-hardening-cwd-${randomUUID()}`)
+  await mkdir(cwd, { recursive: true })
+  const storageRoot = join(directory, `agy-worker-hardening-${randomUUID()}`)
+  await mkdir(join(storageRoot, 'conversations'), { recursive: true })
+
+  // 1. Oversized (> 2 MiB) TEXT/BLOB in trajectory_id & steps.idx routed through staged SQLite
+  //    fallback inside the 128 MiB Worker -> cleanly rejected as `invalid` without OOM.
+  const assertOversizedFallbackRejected = async (
+    kind: 'text_tid' | 'blob_tid' | 'blob_idx',
+  ): Promise<void> => {
+    const sid = randomUUID()
+    const tid = randomUUID()
+    const dbPath = join(storageRoot, 'conversations', `${sid}.db`)
+    const db = new Database(dbPath)
+    try {
+      db.exec(`
+        CREATE TABLE "trajectory_meta" (
+          "v_tag" TEXT GENERATED ALWAYS AS ('v') VIRTUAL,
+          "trajectory_id" BLOB,
+          "cascade_id" TEXT NOT NULL
+        );
+        CREATE TABLE "steps" ("row_id" INTEGER PRIMARY KEY, "idx" BLOB);
+      `)
+      if (kind === 'text_tid') {
+        db.prepare(
+          'INSERT INTO "trajectory_meta" ("trajectory_id", "cascade_id") VALUES (?, ?)',
+        ).run('x'.repeat(2 * 1024 * 1024), sid)
+      } else if (kind === 'blob_tid') {
+        db.prepare(
+          'INSERT INTO "trajectory_meta" ("trajectory_id", "cascade_id") VALUES (?, ?)',
+        ).run(Buffer.alloc(2 * 1024 * 1024, 0x55), sid)
+      } else {
+        db.prepare(
+          'INSERT INTO "trajectory_meta" ("trajectory_id", "cascade_id") VALUES (?, ?)',
+        ).run(tid, sid)
+        db.prepare('INSERT INTO "steps" ("row_id", "idx") VALUES (1, ?)').run(
+          Buffer.alloc(2 * 1024 * 1024, 0x66),
+        )
+      }
+    } finally {
+      db.close()
+    }
+    expect(
+      await files.readAgyTrajectoryIdentity(
+        { cwd, storageRoot, nativeSessionId: sid },
+        new AbortController().signal,
+      ),
+    ).toEqual({
+      nativeSessionId: sid,
+      status: 'invalid',
+    })
+    expect(workerLocation.live).toBe(0)
+  }
+  await assertOversizedFallbackRejected('text_tid')
+  await assertOversizedFallbackRejected('blob_tid')
+  await assertOversizedFallbackRejected('blob_idx')
+
+  // 2. Omitted storageRoot honors PACT_AGY_APP_DATA_DIR (consistent with `exists`).
+  const envSid = randomUUID()
+  const envFixture = await createAgyWorkerShellFixture(storageRoot, envSid)
+  const prevEnv = process.env['PACT_AGY_APP_DATA_DIR']
+  process.env['PACT_AGY_APP_DATA_DIR'] = storageRoot
+  try {
+    expect(
+      await files.exists(
+        { provider: 'agy', cwd, nativeSessionId: envSid },
+        new AbortController().signal,
+      ),
+    ).toBe(true)
+    expect(
+      await files.readAgyTrajectoryIdentity(
+        { cwd, nativeSessionId: envSid },
+        new AbortController().signal,
+      ),
+    ).toEqual({
+      nativeSessionId: envSid,
+      status: 'ok',
+      trajectoryId: envFixture.trajectoryId,
+      stepCount: 0,
+    })
+  } finally {
+    if (prevEnv === undefined) delete process.env['PACT_AGY_APP_DATA_DIR']
+    else process.env['PACT_AGY_APP_DATA_DIR'] = prevEnv
+  }
+  expect(workerLocation.live).toBe(0)
+
+  // 3. Relative storageRoot is rejected consistently with other Antigravity storage actions.
+  await expect(
+    files.readAgyTrajectoryIdentity(
+      { cwd, storageRoot: 'relative/agy-store', nativeSessionId: envSid },
+      new AbortController().signal,
+    ),
+  ).rejects.toThrow(/not absolute/iu)
+  expect(workerLocation.live).toBe(0)
+
+  // 4. Malformed isolated child success reply containing whitespace / control / non-ASCII trajectoryId is rejected!
+  const fakeChildPath = join(directory, `fake-bad-tid-child-${randomUUID()}.mjs`)
+  const assertMalformedReplyRejected = async (badTrajectoryId: string): Promise<void> => {
+    await writeFile(
+      fakeChildPath,
+      `process.on('message', (msg) => {
+        if (msg?.type === 'request') {
+          process.send({
+            type: 'result',
+            jobKey: msg.jobKey,
+            action: msg.input.action,
+            result: {
+              nativeSessionId: msg.input.nativeSessionId,
+              status: 'ok',
+              trajectoryId: ${JSON.stringify(badTrajectoryId)},
+              stepCount: 1,
+            },
+            ...(msg.measure ? { ipcMeasurement: { complete: true, jsonBytes: 64, binaryBytes: 0, totalBytes: 64 } } : {}),
+          }, () => process.exit(0));
+        }
+      });`,
+    )
+    configureAgyStorageChildScriptForTesting(fakeChildPath)
+    await expect(
+      files.readAgyTrajectoryIdentity(
+        { cwd, storageRoot, nativeSessionId: envSid },
+        new AbortController().signal,
+      ),
+    ).rejects.toThrow(/Invalid Antigravity/iu)
+    expect(getNodeAgyStorageChildStatsForTesting().live).toBe(0)
+  }
+  try {
+    await assertMalformedReplyRejected('bad id')
+    await assertMalformedReplyRejected('bad\nid')
+    await assertMalformedReplyRejected('bad\tid')
+    await assertMalformedReplyRejected('bad_é')
+    await assertMalformedReplyRejected('\uFEFFbad')
+  } finally {
+    configureAgyStorageChildScriptForTesting(agyChildBundlePath)
+    await rm(fakeChildPath, { force: true })
+  }
+})
+
+it.skipIf(process.platform === 'win32')(
+  'refuses POSIX FIFO source paths without blocking isolated child termination',
+  async () => {
+    const cwd = join(directory, `agy-worker-fifo-cwd-${randomUUID()}`)
+    await mkdir(cwd, { recursive: true })
+    const storageRoot = join(directory, `agy-worker-fifo-${randomUUID()}`)
+    await mkdir(join(storageRoot, 'conversations'), { recursive: true })
+
+    const fifoSid = randomUUID()
+    const fifoPath = join(storageRoot, 'conversations', `${fifoSid}.db`)
+    const mk = spawnSync('mkfifo', [fifoPath], { encoding: 'utf8' })
+    expect(mk.status).toBe(0)
+    const started = performance.now()
+    expect(
+      await files.readAgyTrajectoryIdentity(
+        { cwd, storageRoot, nativeSessionId: fifoSid },
+        new AbortController().signal,
+      ),
+    ).toEqual({
+      nativeSessionId: fifoSid,
+      status: 'invalid',
+    })
+    expect(performance.now() - started).toBeLessThan(2_500)
+    expect(getNodeAgyStorageChildStatsForTesting().live).toBe(0)
+    expect(workerLocation.live).toBe(0)
+  },
+)
+
+function countAgySteps(dbPath: string): number {
+  const db = new Database(dbPath, { readonly: true })
+  try {
+    const row = db.prepare('SELECT COUNT(*) AS count FROM "steps"').get()
+    return row && typeof row === 'object' ? Number(Reflect.get(row, 'count')) : -1
+  } finally {
+    db.close()
+  }
+}
+
+it.skipIf(process.platform === 'win32')(
+  'preserves core PID exclusive POSIX lock on .pact-writer.sqlite across 3 real OS PIDs when isolated storage child rejects symlink and hardlink aliases',
+  async () => {
+    const workRoot = join(directory, `agy-3pid-lock-${randomUUID()}`)
+    const storageRoot = join(workRoot, 'agy-root')
+    const cwd = await realpath(directory)
+    await mkdir(join(storageRoot, 'conversations'), { recursive: true })
+
+    // PID #1 (this Vitest/Utility process): hold an exclusive SQLite write lock on `.pact-writer.sqlite`.
+    const writerDbPath = join(workRoot, '.pact-writer.sqlite')
+    const writerDb = new Database(writerDbPath)
+    try {
+      writerDb.pragma('journal_mode = DELETE')
+      writerDb.exec('CREATE TABLE "lock_probe" ("id" INTEGER PRIMARY KEY, "val" TEXT);')
+      writerDb.exec('BEGIN EXCLUSIVE')
+      writerDb.prepare('INSERT INTO "lock_probe" ("id", "val") VALUES (1, ?)').run('held-by-core')
+
+      const probeContender = (): { busy: boolean; pid: number } => {
+        const res = spawnSync(
+          process.execPath,
+          [
+            '-e',
+            `
+            const Database = require(${JSON.stringify(BETTER_SQLITE3_ENTRY)});
+            const db = new Database(${JSON.stringify(writerDbPath)}, { timeout: 50 });
+            try {
+              db.exec('BEGIN IMMEDIATE');
+              db.exec('ROLLBACK');
+              process.stdout.write(JSON.stringify({ busy: false, pid: process.pid }));
+            } catch (err) {
+              process.stdout.write(JSON.stringify({ busy: true, code: err?.code ?? '', pid: process.pid }));
+            } finally {
+              db.close();
+            }
+          `,
+          ],
+          { encoding: 'utf8' },
+        )
+        expect(res.status).toBe(0)
+        const parsed: unknown = JSON.parse(res.stdout.trim())
+        if (typeof parsed !== 'object' || parsed === null) {
+          throw new Error('Unexpected contender probe output.')
+        }
+        const busy = Reflect.get(parsed, 'busy')
+        const pid = Reflect.get(parsed, 'pid')
+        expect(typeof busy).toBe('boolean')
+        expect(typeof pid).toBe('number')
+        return { busy: Boolean(busy), pid: Number(pid) }
+      }
+
+      // Baseline: PID #3 (independent contender) is blocked by PID #1's exclusive lock.
+      const before = probeContender()
+      expect(before.pid).not.toBe(process.pid)
+      expect(before.busy).toBe(true)
+
+      // Create BOTH symlink and hardlink targets inside conversations/ pointing to `.pact-writer.sqlite`.
+      const symlinkSid = randomUUID()
+      const hardlinkSid = randomUUID()
+      await symlink(writerDbPath, join(storageRoot, 'conversations', `${symlinkSid}.db`))
+      await link(writerDbPath, join(storageRoot, 'conversations', `${hardlinkSid}.db`))
+
+      // PID #2 (isolated agy-storage-child): rejects symlink & hardlink cleanly without releasing PID #1's POSIX lock!
+      const symlinkRes = await files.readAgyTrajectoryIdentity(
+        { cwd, storageRoot, nativeSessionId: symlinkSid },
+        new AbortController().signal,
+      )
+      expect(symlinkRes).toEqual({ nativeSessionId: symlinkSid, status: 'invalid' })
+      const pidAfterSymlink = getNodeAgyStorageChildStatsForTesting().lastPid
+      expect(pidAfterSymlink).toBeDefined()
+      expect(pidAfterSymlink).not.toBe(process.pid)
+
+      const hardlinkRes = await files.readAgyTrajectoryIdentity(
+        { cwd, storageRoot, nativeSessionId: hardlinkSid },
+        new AbortController().signal,
+      )
+      expect(hardlinkRes).toEqual({ nativeSessionId: hardlinkSid, status: 'invalid' })
+      const pidAfterHardlink = getNodeAgyStorageChildStatsForTesting().lastPid
+      expect(pidAfterHardlink).toBeDefined()
+      expect(pidAfterHardlink).not.toBe(process.pid)
+      expect(pidAfterHardlink).not.toBe(pidAfterSymlink)
+
+      await expect(
+        files.inspectAgyRun(
+          { cwd, storageRoot, nativeSessionId: hardlinkSid },
+          new AbortController().signal,
+        ),
+      ).rejects.toThrow(/link|invalid|ordinary|storage|single/iu)
+
+      // PID #3 MUST STILL fail to acquire write lock because PID #1's POSIX fcntl lock stayed intact!
+      const afterChildReads = probeContender()
+      expect(afterChildReads.pid).not.toBe(process.pid)
+      expect(afterChildReads.pid).not.toBe(pidAfterHardlink)
+      expect(afterChildReads.busy).toBe(true)
+
+      // Release PID #1's exclusive lock -> PID #3 now acquires cleanly.
+      writerDb.exec('ROLLBACK')
+      const afterRelease = probeContender()
+      expect(afterRelease.busy).toBe(false)
+      expect(getNodeAgyStorageChildStatsForTesting().live).toBe(0)
+    } finally {
+      writerDb.close()
+    }
+  },
+)
+
+it('runs concurrent isolated-PID Antigravity Fork and identity reads without blocking and enforces candidate_committed ACK before atomic publish', async () => {
+  const storageRoot = join(directory, `agy-isolated-concurrent-${randomUUID()}`)
+  const cwd = await realpath(directory)
+  const sourceSid = randomUUID()
+  const candidateSid = randomUUID()
+  const rejectedCandidateSid = randomUUID()
+  const { dbPath: sourceDbPath, trajectoryId: sourceTrajId } = await createAgyWorkerShellFixture(
+    storageRoot,
+    sourceSid,
+  )
+  const candidateFixture = await createAgyWorkerShellFixture(storageRoot, candidateSid)
+  const rejectedFixture = await createAgyWorkerShellFixture(storageRoot, rejectedCandidateSid)
+
+  const pactRunId = randomUUID()
+  const pactMsgId = randomUUID()
+  const db = new Database(sourceDbPath)
+  try {
+    const u0Meta = encodeCortexStepMetadata({
+      createdAtSeconds: 1_710_000_600n,
+      source: 1,
+      executionId: 'exec-iso-1',
+      trajectoryId: sourceTrajId,
+      stepIndex: 0,
+      cascadeId: sourceSid,
+      stepId: 'step-i0',
+    })
+    const u0Data = encodeAgyUserInputStep({
+      metadata: u0Meta,
+      text: `Isolated prompt\n${JSON.stringify({
+        version: 'pact-agent-prompt-v1',
+        messageId: pactMsgId,
+        pactRunId,
+      })}`,
+    })
+    const p1Meta = encodeCortexStepMetadata({
+      createdAtSeconds: 1_710_000_601n,
+      source: 2,
+      executionId: 'exec-iso-1',
+      trajectoryId: sourceTrajId,
+      stepIndex: 1,
+      cascadeId: sourceSid,
+      stepId: 'step-i1',
+    })
+    const p1Data = encodeAgyPlannerResponseStep({
+      metadata: p1Meta,
+      response: 'Isolated answer.',
+    })
+    const insertStep = db.prepare(
+      'INSERT INTO "steps" ("idx", "step_type", "status", "has_subtrajectory", "metadata", "step_payload", "step_format") VALUES (?, ?, ?, 0, ?, ?, 0)',
+    )
+    insertStep.run(0, CORTEX_STEP_TYPE_USER_INPUT, CORTEX_STEP_STATUS_DONE, u0Meta, u0Data)
+    insertStep.run(1, CORTEX_STEP_TYPE_PLANNER_RESPONSE, CORTEX_STEP_STATUS_DONE, p1Meta, p1Data)
+    const genData = encodeProtobufFields([
+      encodeBytesField(
+        1,
+        encodeProtobufFields([
+          encodeBytesField(
+            20,
+            encodeProtobufFields([
+              encodeStringField(1, 'trajectory_id'),
+              encodeStringField(2, sourceTrajId),
+            ]),
+          ),
+          encodeBytesField(
+            20,
+            encodeProtobufFields([
+              encodeStringField(1, 'cascade_id'),
+              encodeStringField(2, sourceSid),
+            ]),
+          ),
+        ]),
+      ),
+      encodeVarintField(2, 1),
+      encodeStringField(4, 'exec-iso-1'),
+    ])
+    db.prepare('INSERT INTO "gen_metadata" ("idx", "data", "size") VALUES (0, ?, ?)').run(
+      genData,
+      genData.byteLength,
+    )
+    const execData = encodeExecutorMetadata({
+      terminationReason: EXECUTOR_TERMINATION_REASON_NO_TOOL_CALL,
+      numGeneratorInvocations: 1,
+      lastStepIdx: 1,
+      executionId: 'exec-iso-1',
+    })
+    db.prepare('INSERT INTO "executor_metadata" ("idx", "data", "size") VALUES (0, ?, ?)').run(
+      execData,
+      execData.byteLength,
+    )
+  } finally {
+    db.close()
+  }
+
+  const filesA = new NativeForkFiles(traffic)
+  const filesB = new NativeForkFiles(traffic)
+  try {
+    const responseHash = hash('Isolated answer.')
+    const boundary = await filesA.prepareAgyBoundary(
+      {
+        cwd,
+        storageRoot,
+        nativeSessionId: sourceSid,
+        nativeTurnId: pactRunId,
+        nativeInputIds: [pactRunId],
+        bindingGeneration: 1,
+        throughSequence: 2,
+        deliveryCursor: 2,
+        responseHash,
+      },
+      new AbortController().signal,
+    )
+
+    // Pause Fork inside onCandidate BEFORE atomic publish: candidate DB MUST still have 0 steps,
+    // AND a concurrent isolated-PID readAgyTrajectoryIdentity on filesB succeeds simultaneously!
+    const candidateEntered = Promise.withResolvers<void>()
+    const releaseCandidate = Promise.withResolvers<void>()
+    const forkPromise = filesA.forkAgy(
+      {
+        cwd,
+        storageRoot,
+        candidateNativeSessionId: candidateSid,
+        source: boundary,
+        responseHash,
+        model: 'gemini-3-flash',
+        effort: 'high',
+        permissionMode: 'auto',
+        markInitialized: true,
+        onCandidate: async () => {
+          expect(countAgySteps(candidateFixture.dbPath)).toBe(0)
+          candidateEntered.resolve()
+          await releaseCandidate.promise
+        },
+      },
+      new AbortController().signal,
+    )
+    await candidateEntered.promise
+    expect(getNodeAgyStorageChildStatsForTesting().live).toBe(1)
+
+    const concurrentIdentity = await filesB.readAgyTrajectoryIdentity(
+      { cwd, storageRoot, nativeSessionId: sourceSid },
+      new AbortController().signal,
+    )
+    expect(concurrentIdentity).toEqual({
+      nativeSessionId: sourceSid,
+      status: 'ok',
+      trajectoryId: sourceTrajId,
+      stepCount: 2,
+    })
+
+    // Still 0 steps before candidate_committed ACK is sent.
+    expect(countAgySteps(candidateFixture.dbPath)).toBe(0)
+    releaseCandidate.resolve()
+    const forked = await forkPromise
+    expect(forked.nativeSessionId).toBe(candidateSid)
+    expect(countAgySteps(candidateFixture.dbPath)).toBe(2)
+    expect(getNodeAgyStorageChildStatsForTesting().live).toBe(0)
+
+    // Rejecting onCandidate MUST prevent atomic publish (candidate DB stays at 0 steps) and reap child PID.
+    await expect(
+      filesA.forkAgy(
+        {
+          cwd,
+          storageRoot,
+          candidateNativeSessionId: rejectedCandidateSid,
+          source: boundary,
+          responseHash,
+          model: 'gemini-3-flash',
+          effort: 'high',
+          permissionMode: 'auto',
+          onCandidate: async () => {
+            throw new Error('Simulated Repository witness persistence failure')
+          },
+        },
+        new AbortController().signal,
+      ),
+    ).rejects.toThrow(/Simulated Repository witness persistence failure/u)
+    expect(countAgySteps(rejectedFixture.dbPath)).toBe(0)
+    expect(getNodeAgyStorageChildStatsForTesting().live).toBe(0)
+  } finally {
+    await filesA.dispose()
+    await filesB.dispose()
+  }
+})
+
+it('cancels and reaps isolated child PID when a physical operation observer throws, settles cleanly on immediate child exit, and releases once on cancel vs result race', async () => {
+  const cwd = await realpath(directory)
+  const storageRoot = join(directory, `agy-lifecycle-${randomUUID()}`)
+  const sid = randomUUID()
+  await createAgyWorkerShellFixture(storageRoot, sid)
+
+  const memBefore = nativeWorkingMemoryDiagnostics().chargedBytes ?? 0
+
+  // 1. Observer throwing synchronously on registration MUST still cancel & reap the isolated child PID!
+  const throwingOwner = new NativeForkFiles(traffic, () => {
+    throw new Error('Observer exploded during registration')
+  })
+  await expect(
+    throwingOwner.readAgyTrajectoryIdentity(
+      { cwd, storageRoot, nativeSessionId: sid },
+      new AbortController().signal,
+    ),
+  ).rejects.toThrow(/Observer exploded during registration/u)
+  expect(getNodeAgyStorageChildStatsForTesting().live).toBe(0)
+  expect(nativeWorkingMemoryDiagnostics().chargedBytes).toBe(memBefore)
+  await throwingOwner.dispose()
+
+  // 2. Isolated child exiting immediately on start settles both result and physical cleanly.
+  const immediateExitChild = join(directory, `immediate-exit-child-${randomUUID()}.mjs`)
+  await writeFile(immediateExitChild, `process.exit(1);\n`)
+  try {
+    configureAgyStorageChildScriptForTesting(immediateExitChild)
+    const runner = new AgyStorageRunner({ ipcTraffic: traffic })
+    const handle = runner.start(
+      { action: 'read-agy-trajectory-identity', cwd, storageRoot, nativeSessionId: sid },
+      { signal: new AbortController().signal, deadlineAt: Date.now() + 5_000 },
+    )
+    await expect(handle.result).rejects.toThrow(/ended without a result/iu)
+    await handle.physical
+    expect(getNodeAgyStorageChildStatsForTesting().live).toBe(0)
+    expect(nativeWorkingMemoryDiagnostics().chargedBytes).toBe(memBefore)
+    await runner.dispose()
+  } finally {
+    configureAgyStorageChildScriptForTesting(agyChildBundlePath)
+    await rm(immediateExitChild, { force: true })
+  }
+
+  // 3. Cancel vs result race on a controlled transport settles and releases memory & traffic EXACTLY ONCE.
+  const raceTraffic = new LogicalIpcWorkerTraffic(
+    ['utility-native-fork'],
+    '00000000-0000-4000-8000-000000000009',
+  )
+  const exitDeferred = Promise.withResolvers<import('@pact/contracts').AgyStorageClosedEvent>()
+  let portListener: ((msg: unknown) => void) | undefined
+  let cancelCount = 0
+  let capturedJobKey: import('@pact/contracts').AgyStorageJobKey | undefined
+  const raceTransport: AgyStorageTransport = {
+    generation: randomUUID(),
+    open: async (openReq) => {
+      capturedJobKey = openReq.jobKey
+      return {
+        port: {
+          onMessage: (listener) => {
+            portListener = listener
+          },
+          postMessage: () => undefined,
+          close: () => undefined,
+        },
+        exited: exitDeferred.promise,
+        cancel: () => {
+          cancelCount += 1
+        },
+      }
+    },
+  }
+
+  const raceRunner = new AgyStorageRunner({ ipcTraffic: raceTraffic, transport: raceTransport })
+  const observedPhysical: Promise<void>[] = []
+  const unsub = raceRunner.addPhysicalOperationObserver((_sig, physical) => {
+    observedPhysical.push(physical)
+  })
+  const handle = raceRunner.start(
+    { action: 'exists', cwd, storageRoot, nativeSessionId: sid },
+    { signal: new AbortController().signal, deadlineAt: Date.now() + 5_000 },
+  )
+  await vi.waitFor(() => expect(portListener).toBeDefined())
+  expect(observedPhysical).toHaveLength(1)
+  expect(nativeWorkingMemoryDiagnostics().chargedBytes).toBe(memBefore + NATIVE_OWNER_WORKING_BYTES)
+
+  let physicalSettled = false
+  void handle.physical.then(() => {
+    physicalSettled = true
+    return undefined
+  })
+
+  // Race: result arrives immediately followed by cancel() (and a duplicate cancel()).
+  portListener!({
+    type: 'result',
+    jobKey: capturedJobKey!,
+    action: 'exists',
+    result: { nativeSessionId: sid, exists: true },
+    ipcMeasurement: { complete: true, jsonBytes: 48, binaryBytes: 0, totalBytes: 48 },
+  })
+  handle.cancel()
+  handle.cancel()
+
+  await expect(handle.result).resolves.toEqual({ nativeSessionId: sid, exists: true })
+  await new Promise<void>((res) => setTimeout(res, 20))
+  // Physical completion MUST stay pending until confirmed exit!
+  expect(physicalSettled).toBe(false)
+  expect(cancelCount).toBeGreaterThanOrEqual(1)
+
+  exitDeferred.resolve({
+    type: 'agy-storage.closed.event',
+    jobKey: capturedJobKey!,
+    exitCode: 0,
+    signal: null,
+    timedOut: false,
+    cancelled: true,
+  })
+  await handle.physical
+  await observedPhysical[0]
+  expect(physicalSettled).toBe(true)
+  expect(nativeWorkingMemoryDiagnostics().chargedBytes).toBe(memBefore)
+
+  const snap = raceTraffic.collector('utility-native-fork')!.snapshot()
+  expect(snap.startedTransports).toBe(1)
+  expect(snap.settledTransports).toBe(1)
+  expect(snap.activeTransports).toBe(0)
+  unsub()
+  await raceRunner.dispose()
+})
+
+function canonicalJsonForAgyTest(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalJsonForAgyTest)
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value)
+        .toSorted(([l], [r]) => (l < r ? -1 : l > r ? 1 : 0))
+        .map(([k, v]) => [k, canonicalJsonForAgyTest(v)]),
+    )
+  }
+  return value
+}
+
+it('admits concurrent independent Agy reads on one shared NativeForkFiles instance, serializes mutations per candidate key, and persists the exact acknowledged witness', async () => {
+  const cwd = await realpath(directory)
+  const storageRoot = join(directory, `agy-shared-concurrency-${randomUUID()}`)
+  const sourceSid = randomUUID()
+  const candidateSidA = randomUUID()
+  const candidateSidB = randomUUID()
+  const sourceTrajId = `traj-src-${randomUUID().slice(0, 8)}`
+  const candTrajIdA = `traj-cand-a-${randomUUID().slice(0, 8)}`
+  const candTrajIdB = `traj-cand-b-${randomUUID().slice(0, 8)}`
+  const prefixHash = hash('shared-instance-prefix')
+  const rawHash = hash('shared-instance-raw')
+
+  const digestOf = (value: unknown): string => hash(JSON.stringify(canonicalJsonForAgyTest(value)))
+
+  const sourceBoundary: import('@pact/agent-runtime').AgentNativeForkBoundary = {
+    provider: 'agy',
+    nativeSessionId: sourceSid,
+    nativeTurnId: 'exec-1',
+    nativeCutId: 'exec-1',
+    agyCut: {
+      version: 'pact-agy-fork-cut-v1',
+      trajectoryId: sourceTrajId,
+      executionId: 'exec-1',
+      cutStepIdx: 1,
+      genMetadataCount: 0,
+      executorMetadataCount: 1,
+      mediaCount: 0,
+    },
+    bindingGeneration: 1,
+    throughSequence: 2,
+    deliveryCursor: 2,
+    prefixHash,
+    prefixRecords: 3,
+    prefixBytes: 256,
+  }
+
+  let openedJobs = 0
+  let maxConcurrentJobs = 0
+  let liveJobs = 0
+  const pendingExits: Array<() => void> = []
+
+  const controlledTransport: AgyStorageTransport = {
+    generation: randomUUID(),
+    open: async (openReq) => {
+      openedJobs += 1
+      liveJobs += 1
+      maxConcurrentJobs = Math.max(maxConcurrentJobs, liveJobs)
+      const exitDeferred = Promise.withResolvers<import('@pact/contracts').AgyStorageClosedEvent>()
+      let listener: ((msg: unknown) => void) | undefined
+      const finishExit = (cancelled = false): void => {
+        liveJobs = Math.max(0, liveJobs - 1)
+        exitDeferred.resolve({
+          type: 'agy-storage.closed.event',
+          jobKey: openReq.jobKey,
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          cancelled,
+        })
+      }
+      pendingExits.push(() => finishExit(true))
+
+      return {
+        port: {
+          onMessage: (fn) => {
+            listener = fn
+          },
+          postMessage: (msg) => {
+            const msgType = Reflect.get(msg, 'type')
+            if (msgType === 'request') {
+              const reqInput = Reflect.get(msg, 'input')
+              if (!reqInput || typeof reqInput !== 'object') return
+              const reqAction = Reflect.get(reqInput, 'action')
+              if (reqAction === 'read-agy-trajectory-identity') {
+                const reqSid = String(Reflect.get(reqInput, 'nativeSessionId'))
+                queueMicrotask(() => {
+                  listener?.({
+                    type: 'result',
+                    jobKey: openReq.jobKey,
+                    action: 'read-agy-trajectory-identity',
+                    result: {
+                      nativeSessionId: reqSid,
+                      status: 'ok',
+                      trajectoryId: sourceTrajId,
+                      stepCount: 2,
+                    },
+                  })
+                  queueMicrotask(() => finishExit(false))
+                })
+                return
+              }
+              if (reqAction === 'fork') {
+                const candSid = String(Reflect.get(reqInput, 'candidateNativeSessionId'))
+                const candTraj = candSid === candidateSidA ? candTrajIdA : candTrajIdB
+                const candFile = {
+                  nativeSessionId: candSid,
+                  nativeCutId: 'exec-1',
+                  prefixHash,
+                  prefixBytes: 256,
+                  prefixRecords: 3,
+                  idMap: [['exec-1', 'exec-1']] as Array<[string, string]>,
+                  rawHash: '',
+                  rawBytes: 0,
+                  rawRecords: 3,
+                  nativeStorageRoot: storageRoot,
+                  nativePath: join(storageRoot, 'conversations', `${candSid}.db`),
+                  cutStep: 1,
+                  trajectoryId: candTraj,
+                  sourceTrajectoryId: sourceTrajId,
+                  agyCut: {
+                    version: 'pact-agy-fork-cut-v1' as const,
+                    trajectoryId: candTraj,
+                    executionId: 'exec-1',
+                    cutStepIdx: 1,
+                    genMetadataCount: 0,
+                    executorMetadataCount: 1,
+                    mediaCount: 0,
+                  },
+                }
+                const candWitness = {
+                  version: 'pact-native-fork-v1' as const,
+                  provider: 'agy' as const,
+                  nativeSessionId: candSid,
+                  sourceNativeSessionId: sourceSid,
+                  sourceCutId: 'exec-1',
+                  sourceTrajectoryId: sourceTrajId,
+                  candidateTrajectoryId: candTraj,
+                  cutStepIdx: 1,
+                  agyCut: candFile.agyCut,
+                  sourcePrefixHash: prefixHash,
+                  candidatePrefixHash: prefixHash,
+                  idMap: candFile.idMap,
+                  candidatePrefixRecords: 3,
+                  nativeStorageRoot: storageRoot,
+                  nativePath: candFile.nativePath,
+                  model: 'gemini-3-flash',
+                  effort: 'high',
+                  permissionMode: 'auto' as const,
+                }
+                const witnessDigest = digestOf(candWitness)
+                queueMicrotask(() => {
+                  listener?.({
+                    type: 'candidate',
+                    jobKey: openReq.jobKey,
+                    candidateNativeSessionId: candSid,
+                    witnessDigest,
+                    witness: candWitness,
+                    candidate: candFile,
+                  })
+                })
+                return
+              }
+            }
+            if (msgType === 'candidate_committed') {
+              const candSid = String(Reflect.get(msg, 'candidateNativeSessionId'))
+              const candTraj = candSid === candidateSidA ? candTrajIdA : candTrajIdB
+              queueMicrotask(() => {
+                listener?.({
+                  type: 'result',
+                  jobKey: openReq.jobKey,
+                  action: 'fork',
+                  result: {
+                    nativeSessionId: candSid,
+                    nativeCutId: 'exec-1',
+                    prefixHash,
+                    prefixBytes: 256,
+                    prefixRecords: 3,
+                    idMap: [['exec-1', 'exec-1']],
+                    rawHash,
+                    rawBytes: 1024,
+                    rawRecords: 3,
+                    nativeStorageRoot: storageRoot,
+                    nativePath: join(storageRoot, 'conversations', `${candSid}.db`),
+                    cutStep: 1,
+                    trajectoryId: candTraj,
+                    sourceTrajectoryId: sourceTrajId,
+                    agyCut: {
+                      version: 'pact-agy-fork-cut-v1',
+                      trajectoryId: candTraj,
+                      executionId: 'exec-1',
+                      cutStepIdx: 1,
+                      genMetadataCount: 0,
+                      executorMetadataCount: 1,
+                      mediaCount: 0,
+                    },
+                  },
+                })
+                queueMicrotask(() => finishExit(false))
+              })
+            }
+          },
+          close: () => undefined,
+        },
+        exited: exitDeferred.promise,
+        cancel: () => finishExit(true),
+      }
+    },
+  }
+
+  const sharedFiles = new NativeForkFiles(undefined, undefined, controlledTransport)
+  try {
+    const forkAEntered = Promise.withResolvers<void>()
+    const releaseForkA = Promise.withResolvers<void>()
+    let persistedWitnessA: unknown
+
+    const forkAPromise = sharedFiles.forkAgy(
+      {
+        cwd,
+        storageRoot,
+        candidateNativeSessionId: candidateSidA,
+        source: sourceBoundary,
+        model: 'gemini-3-flash',
+        effort: 'high',
+        permissionMode: 'auto',
+        markInitialized: true,
+        onCandidate: async (_sid, receivedWitness) => {
+          persistedWitnessA = receivedWitness
+          forkAEntered.resolve()
+          await releaseForkA.promise
+        },
+      },
+      new AbortController().signal,
+    )
+
+    await forkAEntered.promise
+
+    // 1. Concurrent independent Agy read on the SAME shared NativeForkFiles instance MUST succeed!
+    const readWhileForkActive = await sharedFiles.readAgyTrajectoryIdentity(
+      { cwd, storageRoot, nativeSessionId: sourceSid },
+      new AbortController().signal,
+    )
+    expect(readWhileForkActive).toEqual({
+      nativeSessionId: sourceSid,
+      status: 'ok',
+      trajectoryId: sourceTrajId,
+      stepCount: 2,
+    })
+    expect(maxConcurrentJobs).toBeGreaterThanOrEqual(2)
+
+    // 2. Concurrent mutation targeting the SAME candidateSidA MUST be rejected immediately!
+    await expect(
+      sharedFiles.forkAgy(
+        {
+          cwd,
+          storageRoot,
+          candidateNativeSessionId: candidateSidA,
+          source: sourceBoundary,
+          model: 'gemini-3-flash',
+          effort: 'high',
+          permissionMode: 'auto',
+        },
+        new AbortController().signal,
+      ),
+    ).rejects.toThrow(/already active/iu)
+
+    // 3. Concurrent mutation targeting a DIFFERENT candidateSidB is admitted independently!
+    const forkBResult = await sharedFiles.forkAgy(
+      {
+        cwd,
+        storageRoot,
+        candidateNativeSessionId: candidateSidB,
+        source: sourceBoundary,
+        model: 'gemini-3-flash',
+        effort: 'high',
+        permissionMode: 'auto',
+        onCandidate: async () => undefined,
+      },
+      new AbortController().signal,
+    )
+    expect(forkBResult.nativeSessionId).toBe(candidateSidB)
+
+    releaseForkA.resolve()
+    const forkAResult = await forkAPromise
+    expect(forkAResult.nativeSessionId).toBe(candidateSidA)
+    expect(persistedWitnessA).toMatchObject({
+      nativeSessionId: candidateSidA,
+      candidateTrajectoryId: candTrajIdA,
+      sourceTrajectoryId: sourceTrajId,
+      candidatePrefixHash: prefixHash,
+    })
+    expect(openedJobs).toBe(3)
+    expect(sharedFiles.active).toBe(false)
+  } finally {
+    await sharedFiles.dispose()
+  }
+})
+
+it('recovers interrupted Claude Fork deterministic staging link (nlink === 2 -> 1) without deleting unrelated files', async () => {
+  const profile = join(directory, randomUUID())
+  const project = join(
+    profile,
+    'projects',
+    (await realpath(directory)).replace(/[^a-z0-9]/giu, '-'),
+  )
+  await mkdir(project, { recursive: true })
+  vi.stubEnv('CLAUDE_CONFIG_DIR', profile)
+  const signal = new AbortController().signal
+
+  try {
+    // 1. Interrupted link -> unlink crash: <sid>.jsonl and .pact-fork-<sid>.tmp share the same inode (nlink === 2).
+    const recoveredSid = randomUUID()
+    const recoveredTurnId = randomUUID()
+    const recoveredTranscript =
+      [
+        {
+          type: 'user',
+          uuid: recoveredTurnId,
+          parentUuid: null,
+          message: { role: 'user', content: 'Recover deterministic staging link' },
+        },
+        {
+          type: 'assistant',
+          uuid: randomUUID(),
+          parentUuid: recoveredTurnId,
+          message: {
+            id: 'answer-recover',
+            role: 'assistant',
+            content: [{ type: 'text', text: 'Recovered answer' }],
+          },
+        },
+      ]
+        .map((row) =>
+          JSON.stringify({
+            ...row,
+            sessionId: recoveredSid,
+            cwd: directory,
+            timestamp: new Date().toISOString(),
+          }),
+        )
+        .join('\n') + '\n'
+    const recoveredPath = join(project, `${recoveredSid}.jsonl`)
+    const deterministicStagePath = join(project, `.pact-fork-${recoveredSid}.tmp`)
+    const unrelatedSiblingPath = join(project, 'unrelated-keep.txt')
+    await writeFile(unrelatedSiblingPath, 'preserve-me')
+    await writeFile(recoveredPath, recoveredTranscript)
+    await link(recoveredPath, deterministicStagePath)
+    expect((await stat(recoveredPath)).nlink).toBe(2)
+
+    const prepared = await files.execute(
+      {
+        provider: 'claude',
+        action: 'prepare',
+        cwd: directory,
+        nativeSessionId: recoveredSid,
+        nativeTurnId: recoveredTurnId,
+        responseHash: hash('Recovered answer'),
+      },
+      signal,
+    )
+    expect(prepared.prefixRecords).toBeGreaterThan(0)
+    expect((await stat(recoveredPath)).nlink).toBe(1)
+    await expect(stat(deterministicStagePath)).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(await readFile(unrelatedSiblingPath, 'utf8')).toBe('preserve-me')
+
+    // 2. External hardlink (nlink === 2 via unrelated name) with an unrelated file at .pact-fork-<sid>.tmp:
+    //    MUST reject the linked transcript AND NEVER delete the unrelated file at the staging path!
+    const linkedSid = randomUUID()
+    const linkedTurnId = randomUUID()
+    const linkedTranscript =
+      [
+        {
+          type: 'user',
+          uuid: linkedTurnId,
+          parentUuid: null,
+          message: { role: 'user', content: 'External hardlink' },
+        },
+        {
+          type: 'assistant',
+          uuid: randomUUID(),
+          parentUuid: linkedTurnId,
+          message: {
+            id: 'answer-linked',
+            role: 'assistant',
+            content: [{ type: 'text', text: 'External answer' }],
+          },
+        },
+      ]
+        .map((row) =>
+          JSON.stringify({
+            ...row,
+            sessionId: linkedSid,
+            cwd: directory,
+            timestamp: new Date().toISOString(),
+          }),
+        )
+        .join('\n') + '\n'
+    const linkedPath = join(project, `${linkedSid}.jsonl`)
+    const externalAliasPath = join(project, 'external-alias.jsonl')
+    const unrelatedAtStagePath = join(project, `.pact-fork-${linkedSid}.tmp`)
+    await writeFile(linkedPath, linkedTranscript)
+    await link(linkedPath, externalAliasPath)
+    await writeFile(unrelatedAtStagePath, 'unrelated-staging-occupant')
+    expect((await stat(linkedPath)).nlink).toBe(2)
+
+    await expect(
+      files.execute(
+        {
+          provider: 'claude',
+          action: 'prepare',
+          cwd: directory,
+          nativeSessionId: linkedSid,
+          nativeTurnId: linkedTurnId,
+          responseHash: hash('External answer'),
+        },
+        signal,
+      ),
+    ).rejects.toThrow(/linked|unsupported/iu)
+    expect((await stat(linkedPath)).nlink).toBe(2)
+    expect(await readFile(unrelatedAtStagePath, 'utf8')).toBe('unrelated-staging-occupant')
+  } finally {
+    vi.unstubAllEnvs()
+  }
 })

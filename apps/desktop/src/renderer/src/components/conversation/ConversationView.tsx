@@ -1,104 +1,63 @@
 import { defaultRangeExtractor, useVirtualizer } from '@tanstack/react-virtual'
-/* oxlint-disable jsx-a11y/prefer-tag-over-role -- Composer autocomplete follows the ARIA listbox pattern; native select/options cannot insert inline Mention tokens. */
-import {
-  BookOpen,
-  ArrowUp,
-  Bot,
-  Check,
-  ChevronDown,
-  Copy,
-  CornerUpLeft,
-  LoaderCircle,
-  ImagePlus,
-  Info,
-  MessageSquarePlus,
-  MessageSquareText,
-  Square,
-  Split,
-  TriangleAlert,
-  Users,
-  X,
-} from 'lucide-react'
-import {
-  Fragment,
-  memo,
-  useCallback,
-  useEffect,
-  useId,
-  useLayoutEffect,
-  useMemo,
-  useRef,
-  useState,
-} from 'react'
+import { BookOpen, Info, MessageSquareText } from 'lucide-react'
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 
 import type {
-  AgentActivity,
-  AgentRun,
   AnchoredComment,
   CollaborationSession,
   CollaborationTask,
-  RelayDecisionAnswer,
+  ConversationDisplayOrder,
   ConversationPage,
-  CommentAnchor,
   MessageCommentAnchor,
-  PeerRequestProposal,
+  RelayDecisionAnswer,
   RuntimeAgentId,
-  WorkspaceChangeSet,
+  SessionCatalogChange,
   SessionPermissionSaveInput,
   SessionSpeedSaveInput,
-  SessionCatalogChange,
-  ConversationRunContext,
-  ConversationDisplayOrder,
   SideChatSyncMainReceipt,
+  SkillSelection,
   UserInformationDeclaration,
+  WorkspaceChangeSet,
 } from '@pact/contracts'
-import type { SkillSelection } from '@pact/contracts'
 import type { ConversationImage } from '@pact/contracts/images'
 
 import {
-  agentDisplayName,
-  compareConversationDisplayOrder,
-  conversationMessageOrder,
-  isConversationBackgroundReport,
-  otherAgent,
-  resolveActiveAgentPair,
-  CONVERSATION_MARKDOWN_BYTES,
-  parseComposerCommandPrefix,
-  CONVERSATION_WINDOW_MESSAGES,
-  WORKSPACE_CHANGE_FILES,
-  WORKSPACE_OPERATION_TIMEOUT_MS,
-  collaborationInputGate,
   collaborationActor,
+  collaborationInputGate,
   collaborationInputProcessing,
+  compareConversationDisplayOrder,
+  CONVERSATION_MARKDOWN_BYTES,
+  CONVERSATION_WINDOW_MESSAGES,
+  conversationMessageOrder,
   defaultTaskStageRoles,
   isCollaborationOpenMode,
+  otherAgent,
   pactSessionEntryPrimary,
+  parseComposerCommandPrefix,
+  resolveActiveAgentPair,
   resolveLegacyCompatibleTaskStageRoles,
   validateSideChatMainSyncContent,
+  WORKSPACE_CHANGE_FILES,
+  WORKSPACE_OPERATION_TIMEOUT_MS,
 } from '@pact/contracts'
 
+import type { RelayDecisionPresentation } from '../scheduling/RelayDecisionCard'
+import type { PlanTextSelection, ReportTextSelection } from './CollaborationReview'
+import type { ComposerEditorHandle } from './ComposerEditor'
 import type { ConversationViewProjection } from './conversation-window'
 import type { DraftImage } from './image-client'
+import type { ProjectFileTarget } from './MessageMarkdown'
 import type { MessageTextSelection } from './MessageSelectionSurface'
 import type {
   ConversationComposerMention,
-  ConversationHistoryControls,
   ConversationFlow,
+  ConversationHistoryControls,
+  DecisionReplyContext,
 } from './useConversation'
+import type { ComposerEdit, ComposerSkillOption } from './useSkillComposer'
 
 import { MESSAGE_ANCHOR_TEXT_BASIS } from '../../../../shared/message-anchor-text'
-import { PreparedInputCard } from '../scheduling/PreparedInputCard'
-import { RelayDecisionCard, type RelayDecisionPresentation } from '../scheduling/RelayDecisionCard'
-import { RelayActivityIndicator } from '../settings/scheduling/RelayActivityIndicator'
-import { InputReplacement } from '../ui/InputReplacement'
-import { AgentActivityList } from './AgentActivityList'
-import { CollaborationQuestionCard } from './CollaborationQuestionCard'
-import {
-  CollaborationReview,
-  type PlanTextSelection,
-  type ReportTextSelection,
-} from './CollaborationReview'
 import {
   composerDifference,
   composerHasContent,
@@ -108,73 +67,85 @@ import {
   resolveComposerRoute,
   type ComposerDocument,
 } from './composer-document'
-import { ComposerEditor, type ComposerEditorHandle } from './ComposerEditor'
 import {
-  nativeInputRequests,
+  CommentDraftChips,
+  CommentEditorCard,
+  ComposerIsland,
+  type CommentEditorState,
+} from './ComposerIsland'
+import {
+  agentName,
+  buildMentionOptions,
+  cancelWorkspaceFileLoadWaiters,
+  coalesceWorkspaceLoadIntent,
+  CONVERSATION_WIDTH,
+  EMPTY_COMMENTS,
+  EMPTY_IMAGES,
+  EMPTY_SKILLS,
+  enqueueWorkspaceFileLoadWaiter,
+  hasRecordingWarning,
+  hasVisibleChanges,
+  ignoreSkillChanges,
+  mentionQueryAt,
+  OLDER_HISTORY_SCROLL_THRESHOLD,
+  promoteWorkspaceFileLoadWaiter,
+  resolvePlanStatusLabel,
+  sha256Hex,
+  TRANSCRIPT_OVERSCAN,
+  tryAcquireWorkspaceFileLoadSlot,
+  upsertWorkspaceFilesLru,
+  type MentionOption,
+  type MentionQuery,
+  type WorkspaceFileLoadIntent,
+} from './conversation-view-helpers'
+import {
   conversationWindowStartOrder,
   isRunResponseComplete,
+  nativeInputRequests,
 } from './conversation-window'
-import { ConversationImages } from './ConversationImages'
 import { CurrentPlanPanel, type CurrentPlanDocument } from './CurrentPlanPanel'
+import { EditorialMessageItem, type ConversationTranscriptRow } from './EditorialMessageItem'
 import { ImageGallery } from './ImageGallery'
-import { LargeMessagePreview } from './LargeBodyPreview'
 import {
   clearProjectionHighlight,
   focusProjectionRange,
   isProjectionHighlightOwned,
-  pulseMessageTarget,
-  selectedTextRange,
   planSelectionSource,
+  pulseMessageTarget,
   reportSelectionSource,
   reportSourceSelector,
+  selectedTextRange,
 } from './message-selection'
-import { MessageMarkdown, type ProjectFileTarget } from './MessageMarkdown'
-import { NativeInputCard } from './NativeInputCard'
 import { NativePermissionCard } from './NativePermissionCard'
-import { PermissionMenu } from './PermissionMenu'
-import { ProjectContextMenu } from './ProjectContextMenu'
-import { QueueMessageBar } from './QueueMessageBar'
-import { SentComments } from './SentComments'
 import { NativeForkRecovery, SessionForkDialog, type SessionForkOpening } from './SessionFork'
-import { SessionWarningCard } from './SessionWarningCard'
-import { SpeedMenu } from './SpeedMenu'
 import { TaskReplacementConfirmation } from './TaskReplacementConfirmation'
-import { sameDecision, hasDecisionAnswers, type DecisionReplyContext } from './useConversation'
-import { commentDraftSaveSucceeded } from './useConversation'
-import { useSkillComposer, type ComposerEdit } from './useSkillComposer'
+import { commentDraftSaveSucceeded, hasDecisionAnswers, sameDecision } from './useConversation'
+import { useSkillComposer } from './useSkillComposer'
 import { WorkspaceChangesCard, type WorkspaceChangesList } from './WorkspaceChangesCard'
 
-const EMPTY_SKILLS: SkillSelection[] = []
-const EMPTY_IMAGES: readonly DraftImage[] = []
-const EMPTY_COMMENTS: AnchoredComment[] = []
-const ignoreSkillChanges = (_value: SkillSelection[]): void => undefined
-const commentSourceLabel = (
-  anchor: CommentAnchor,
-  currentSession?: Pick<CollaborationSession, 'id' | 'parentSessionId'>,
-): string =>
-  anchor.type === 'unavailable'
-    ? 'Source unavailable'
-    : anchor.type === 'file'
-      ? anchor.path
-      : anchor.type === 'cutoff_message'
-        ? (currentSession?.parentSessionId &&
-            anchor.sourceSessionId === currentSession.parentSessionId) ||
-          anchor.sourceSessionId === currentSession?.id
-          ? 'Main chat'
-          : 'Side chat'
-        : anchor.plan
-          ? `Plan v${anchor.plan.version}`
-          : anchor.report
-            ? 'Review'
-            : 'Message'
+interface WorkspaceFileLoadSlot {
+  changeSetId: string
+  generation: number
+  inFlight: boolean
+  inFlightRevision: number
+  inFlightExpand: boolean
+  inFlightOpen: boolean
+  inFlightContextGeneration?: number | undefined
+  timedOut: boolean
+  timeout?: number | undefined
+  waitingForConcurrency: boolean
+  queued?: WorkspaceFileLoadIntent | undefined
+}
 
-interface ConversationViewProps {
+export interface ConversationViewProps {
   planPanelHost?: HTMLElement | null | undefined
   planPanelOpen?: boolean | undefined
   planPanelExpanded?: boolean | undefined
   onPlanPanelExpandedChange?: ((expanded: boolean) => void) | undefined
   planAvailable?: boolean | undefined
   planRestoreFocusRef?: React.RefObject<HTMLButtonElement | null> | undefined
+  showPlanHeaderButton?: boolean | undefined
+  onRegisterShowCurrentPlan?: ((fn: (() => void) | undefined) => void) | undefined
   onPlanAvailable?: ((sessionId: string, taskId?: string) => void) | undefined
   onOpenPlan?: (() => void) | undefined
   onClosePlan?: (() => void) | undefined
@@ -237,6 +208,9 @@ interface ConversationViewProps {
   onAcceptPeerProposal: (proposalId: string) => Promise<boolean>
   onDismissPeerProposal: (proposalId: string) => Promise<boolean>
   onUndoWorkspaceChanges: (changeSetId: string) => Promise<boolean>
+  onUndoWorkspaceFile?: ((changeSetId: string, path: string) => Promise<boolean>) | undefined
+  activeWorkspaceDiff?: { sessionId: string; changeSetId: string; path: string } | undefined
+  activeWorkspaceFilePath?: string | undefined
   onRespondNativeInput: (input: import('@pact/contracts').NativeInputRespond) => Promise<boolean>
   nativeInputDrafts: ConversationFlow['nativeInputDrafts']
   onNativeInputDraftChange: ConversationFlow['setNativeInputDraft']
@@ -269,111 +243,14 @@ interface ConversationViewProps {
     | undefined
 }
 
-const messageTimeFormatter = new Intl.DateTimeFormat(undefined, {
-  hour: '2-digit',
-  minute: '2-digit',
-  hourCycle: 'h23',
-})
-const messageDateTimeFormatter = new Intl.DateTimeFormat(undefined, {
-  dateStyle: 'medium',
-  timeStyle: 'short',
-})
-
-const TRANSCRIPT_OVERSCAN = 4
-const CONVERSATION_WIDTH = 'w-full max-w-[clamp(56rem,82cqw,80rem)]'
-const OLDER_HISTORY_SCROLL_THRESHOLD = 160
-const agentName = (id: RuntimeAgentId): string => agentDisplayName(id)
-const speakerBgClass = (id: RuntimeAgentId | undefined): string =>
-  id === 'claude' ? 'bg-speaker-claude' : id === 'agy' ? 'bg-speaker-agy' : 'bg-speaker-codex'
-
-function hasVisibleChanges(run: AgentRun | undefined): boolean {
-  return Boolean(
-    run?.workspaceChanges &&
-    run.workspaceChanges.fileCount > 0 &&
-    (run.workspaceChanges.finalizedAt || run.dispatchPhase === 'ended'),
-  )
-}
-
-function hasRecordingWarning(run: AgentRun | undefined): boolean {
-  return Boolean(run?.dispatchPhase === 'ended' && run.workspaceRecordingUnavailableReason)
-}
-interface MentionQuery {
-  start: number
-  end: number
-  query: string
-}
-interface MentionOption {
-  token: '@claude' | '@codex' | '@agy' | '@all' | '@Main'
-  label: string
-  description: string
-  route: ConversationComposerMention['route']
-  icon: typeof Bot
-}
-
-function agentMentionOption(agentId: RuntimeAgentId): MentionOption {
-  const label = agentDisplayName(agentId)
-  const token = agentId === 'claude' ? '@claude' : agentId === 'codex' ? '@codex' : '@agy'
-  return {
-    token,
-    label,
-    description: `Send only to ${label}`,
-    route: { type: 'agent', agentId },
-    icon: Bot,
-  }
-}
-
-function buildMentionOptions(
-  pair: readonly [RuntimeAgentId, RuntimeAgentId],
-  isSideChat: boolean,
-): MentionOption[] {
-  const [first, second] = pair
-  if (isSideChat) {
-    return [
-      agentMentionOption(first),
-      agentMentionOption(second),
-      {
-        token: '@all',
-        label: 'All Agents',
-        description: 'Primary, then Secondary',
-        route: { type: 'all' },
-        icon: Users,
-      },
-      {
-        token: '@Main',
-        label: 'Main chat',
-        description: 'Send to the main chat',
-        route: { type: 'main' },
-        icon: CornerUpLeft,
-      },
-    ]
-  }
-  return [
-    agentMentionOption(first),
-    agentMentionOption(second),
-    {
-      token: '@all',
-      label: 'All',
-      description: 'Primary, then Secondary',
-      route: { type: 'all' },
-      icon: Users,
-    },
-  ]
-}
-
-function mentionQueryAt(value: string, cursor: number): MentionQuery | undefined {
-  const prefix = value.slice(0, cursor)
-  const match = /(?:^|\s)@([a-z]*)$/iu.exec(prefix)
-  if (!match) return undefined
-  const start = cursor - match[1]!.length - 1
-  return { start, end: cursor, query: match[1]!.toLowerCase() }
-}
-
 export function ConversationView({
   planPanelHost,
   planPanelExpanded = false,
   onPlanPanelExpandedChange,
   planAvailable,
   planRestoreFocusRef,
+  showPlanHeaderButton = true,
+  onRegisterShowCurrentPlan,
   onPlanAvailable,
   onOpenPlan,
   onClosePlan,
@@ -434,6 +311,9 @@ export function ConversationView({
   onAcceptPeerProposal,
   onDismissPeerProposal,
   onUndoWorkspaceChanges,
+  onUndoWorkspaceFile,
+  activeWorkspaceDiff,
+  activeWorkspaceFilePath,
   onRespondNativePermission,
   onRespondNativeInput,
   nativeInputDrafts,
@@ -453,78 +333,249 @@ export function ConversationView({
   useEffect(() => {
     setForkPoint((current) => (current?.sourceSessionId === session.id ? current : undefined))
   }, [session.id])
-  const [workspaceFiles, setWorkspaceFiles] = useState<WorkspaceChangesList>()
-  const workspaceFilesRef = useRef<WorkspaceChangesList | undefined>(undefined)
-  const workspaceFilesGenerationRef = useRef(0)
-  const workspaceFilesTimeoutRef = useRef<number | undefined>(undefined)
-  const workspaceFilesPendingRef = useRef(false)
-  const queuedWorkspaceFilesRef = useRef<
-    | {
-        changeSetId: string
-        expand: boolean
-        open: boolean
-        contextGeneration?: number | undefined
-      }
+
+  // Bounded LRU map (max 8 entries) keyed by changeSetId prevents expanding Card B from wiping Card A.
+  const [workspaceFilesById, setWorkspaceFilesById] = useState<Map<string, WorkspaceChangesList>>(
+    () => new Map(),
+  )
+  const workspaceFilesMapRef = useRef<Map<string, WorkspaceChangesList>>(new Map())
+  const workspaceFileLoadsRef = useRef<Map<string, WorkspaceFileLoadSlot>>(new Map())
+  const workspaceLoadOwnerIdRef = useRef<symbol>(Symbol('workspace-file-loads'))
+  const loadWorkspaceFilesRef = useRef<
+    | ((
+        changeSetId: string,
+        expand?: boolean,
+        open?: boolean,
+        contextGeneration?: number,
+        targetRevision?: number,
+      ) => Promise<void>)
     | undefined
   >(undefined)
   const [undoingChangeSetId, setUndoingChangeSetId] = useState<string>()
   const undoingChangeSetRef = useRef<string | undefined>(undefined)
+  const [undoingFile, setUndoingFile] = useState<{ changeSetId: string; path: string }>()
+  const undoingFileRef = useRef<{ changeSetId: string; path: string } | undefined>(undefined)
   const workspaceOwnerActiveRef = useRef(true)
   const defaultWorkspaceChangesIdRef = useRef<string | undefined>(undefined)
-  const installWorkspaceFiles = useCallback((list: WorkspaceChangesList | undefined): void => {
-    workspaceFilesRef.current = list
-    setWorkspaceFiles(list)
+
+  const upsertWorkspaceFiles = useCallback(
+    (changeSetId: string, entry: WorkspaceChangesList): void => {
+      const next = upsertWorkspaceFilesLru(workspaceFilesMapRef.current, changeSetId, entry)
+      workspaceFilesMapRef.current = next
+      setWorkspaceFilesById(next)
+    },
+    [],
+  )
+
+  const currentWorkspaceChangeSetRevision = useCallback(
+    (changeSetId: string): number | undefined => {
+      const summary = messageInteractionRef.current.snapshot?.runs.find(
+        (run) => run.workspaceChanges?.id === changeSetId,
+      )?.workspaceChanges
+      return summary ? (summary.revision ?? 0) : undefined
+    },
+    [],
+  )
+
+  const clearAllWorkspaceLoads = useCallback((): void => {
+    cancelWorkspaceFileLoadWaiters(workspaceLoadOwnerIdRef.current)
+    workspaceLoadOwnerIdRef.current = Symbol('workspace-file-loads')
+    for (const slot of workspaceFileLoadsRef.current.values()) {
+      slot.generation += 1
+      slot.queued = undefined
+      slot.waitingForConcurrency = false
+      if (slot.timeout !== undefined) {
+        window.clearTimeout(slot.timeout)
+        slot.timeout = undefined
+      }
+    }
+    workspaceFileLoadsRef.current.clear()
   }, [])
+
   useEffect(() => {
     workspaceOwnerActiveRef.current = true
     return () => {
       workspaceOwnerActiveRef.current = false
-      workspaceFilesGenerationRef.current += 1
-      queuedWorkspaceFilesRef.current = undefined
-      if (workspaceFilesTimeoutRef.current !== undefined)
-        window.clearTimeout(workspaceFilesTimeoutRef.current)
+      clearAllWorkspaceLoads()
     }
-  }, [])
+  }, [clearAllWorkspaceLoads])
+
+  useEffect(() => {
+    clearAllWorkspaceLoads()
+    const empty = new Map<string, WorkspaceChangesList>()
+    workspaceFilesMapRef.current = empty
+    setWorkspaceFilesById(empty)
+    defaultWorkspaceChangesIdRef.current = undefined
+  }, [session.id, clearAllWorkspaceLoads])
+
   const loadWorkspaceFiles = useCallback(
     async (
       changeSetId: string,
       expand = false,
       open = false,
       contextGeneration?: number,
+      targetRevision?: number,
     ): Promise<void> => {
-      const existing =
-        workspaceFilesRef.current?.changeSetId === changeSetId
-          ? workspaceFilesRef.current
-          : undefined
-      const revision =
-        messageInteractionRef.current.snapshot?.runs.find(
-          (run) => run.workspaceChanges?.id === changeSetId,
-        )?.workspaceChanges?.revision ?? 0
+      const existing = workspaceFilesMapRef.current.get(changeSetId)
+      const revision = currentWorkspaceChangeSetRevision(changeSetId) ?? targetRevision ?? 0
       const current = (existing?.revision ?? 0) === revision ? existing : undefined
-      if (workspaceFilesPendingRef.current) {
-        queuedWorkspaceFilesRef.current = { changeSetId, expand, open, contextGeneration }
+      let slot = workspaceFileLoadsRef.current.get(changeSetId)
+
+      // Cache hits never allocate a tracking slot.
+      if (!slot) {
+        if (
+          current &&
+          !current.loading &&
+          !current.error &&
+          ((!expand && current.files.length) || (expand && !current.expanded))
+        ) {
+          upsertWorkspaceFiles(changeSetId, { ...current, expanded: expand || current.expanded })
+          if (open && current.files[0])
+            onOpenWorkspaceChanges(
+              changeSetId,
+              current.files[0].path,
+              contextGeneration,
+              current.revision,
+            )
+          return
+        }
+        if (current && !current.loading && expand && !current.nextPath && !current.error) return
+      }
+
+      if (slot && (slot.inFlight || slot.waitingForConcurrency)) {
+        slot.queued = coalesceWorkspaceLoadIntent(slot.queued, {
+          expand,
+          open,
+          contextGeneration,
+          targetRevision: revision,
+        })
+        if (slot.waitingForConcurrency && slot.queued.open) {
+          promoteWorkspaceFileLoadWaiter(workspaceLoadOwnerIdRef.current, changeSetId)
+        }
         return
       }
-      if (
-        current &&
-        !current.error &&
-        ((!expand && current.files.length) || (expand && !current.expanded))
-      ) {
-        installWorkspaceFiles({ ...current, expanded: expand || current.expanded })
-        if (open && current.files[0])
-          onOpenWorkspaceChanges(
-            changeSetId,
-            current.files[0].path,
-            contextGeneration,
-            current.revision,
-          )
+
+      if (!slot) {
+        slot = {
+          changeSetId,
+          generation: 0,
+          inFlight: false,
+          inFlightRevision: revision,
+          inFlightExpand: expand,
+          inFlightOpen: open,
+          inFlightContextGeneration: contextGeneration,
+          timedOut: false,
+          waitingForConcurrency: false,
+        }
+        workspaceFileLoadsRef.current.set(changeSetId, slot)
+      }
+
+      const releasePhysicalSlot = tryAcquireWorkspaceFileLoadSlot()
+      if (!releasePhysicalSlot) {
+        const waitingSlot = slot
+        waitingSlot.waitingForConcurrency = true
+        waitingSlot.queued = coalesceWorkspaceLoadIntent(waitingSlot.queued, {
+          expand,
+          open,
+          contextGeneration,
+          targetRevision: revision,
+        })
+        enqueueWorkspaceFileLoadWaiter({
+          ownerId: workspaceLoadOwnerIdRef.current,
+          changeSetId,
+          priority: waitingSlot.queued.open,
+          timeoutMs: WORKSPACE_OPERATION_TIMEOUT_MS,
+          shouldDispatch: () => {
+            if (!workspaceOwnerActiveRef.current) return false
+            const currentSlot = workspaceFileLoadsRef.current.get(changeSetId)
+            if (
+              currentSlot !== waitingSlot ||
+              currentSlot.inFlight ||
+              !currentSlot.waitingForConcurrency
+            ) {
+              return false
+            }
+            const intent = currentSlot.queued
+            if (!intent) return false
+            if (!intent.open && currentWorkspaceChangeSetRevision(changeSetId) === undefined) {
+              currentSlot.waitingForConcurrency = false
+              currentSlot.queued = undefined
+              workspaceFileLoadsRef.current.delete(changeSetId)
+              return false
+            }
+            return true
+          },
+          onGrant: () => {
+            const currentSlot = workspaceFileLoadsRef.current.get(changeSetId)
+            if (
+              currentSlot !== waitingSlot ||
+              currentSlot.inFlight ||
+              !currentSlot.waitingForConcurrency
+            ) {
+              return
+            }
+            const intent = currentSlot.queued
+            currentSlot.waitingForConcurrency = false
+            currentSlot.queued = undefined
+            workspaceFileLoadsRef.current.delete(changeSetId)
+            if (intent) {
+              void loadWorkspaceFilesRef.current?.(
+                changeSetId,
+                intent.expand,
+                intent.open,
+                intent.contextGeneration,
+                intent.targetRevision,
+              )
+            }
+          },
+          onReject: (reason) => {
+            const currentSlot = workspaceFileLoadsRef.current.get(changeSetId)
+            if (
+              currentSlot !== waitingSlot ||
+              currentSlot.inFlight ||
+              !currentSlot.waitingForConcurrency
+            ) {
+              return
+            }
+            const intent = currentSlot.queued
+            currentSlot.waitingForConcurrency = false
+            currentSlot.queued = undefined
+            workspaceFileLoadsRef.current.delete(changeSetId)
+            if (!workspaceOwnerActiveRef.current || !intent) return
+            const message =
+              reason === 'queue_full'
+                ? 'Too many changed file lists are loading right now. Try again.'
+                : 'Loading changed files took too long. Try again.'
+            const existingEntry = workspaceFilesMapRef.current.get(changeSetId)
+            const latestRev =
+              currentWorkspaceChangeSetRevision(changeSetId) ?? intent.targetRevision
+            const currentEntry =
+              (existingEntry?.revision ?? 0) === latestRev ? existingEntry : undefined
+            upsertWorkspaceFiles(changeSetId, {
+              changeSetId,
+              revision: latestRev,
+              files: currentEntry?.files ?? [],
+              nextPath: currentEntry?.nextPath ?? null,
+              loading: false,
+              expanded: intent.expand || existingEntry?.expanded || false,
+              error: message,
+            })
+            if (intent.open) onNotice(message)
+          },
+        })
         return
       }
-      if (current && expand && !current.nextPath && !current.error) return
-      const generation = ++workspaceFilesGenerationRef.current
-      workspaceFilesPendingRef.current = true
-      if (workspaceFilesTimeoutRef.current !== undefined)
-        window.clearTimeout(workspaceFilesTimeoutRef.current)
+
+      const activeSlot = slot
+      const generation = ++activeSlot.generation
+      activeSlot.waitingForConcurrency = false
+      activeSlot.inFlight = true
+      activeSlot.inFlightRevision = revision
+      activeSlot.inFlightExpand = expand || existing?.expanded || false
+      activeSlot.inFlightOpen = open
+      activeSlot.inFlightContextGeneration = contextGeneration
+      activeSlot.timedOut = false
+      if (activeSlot.timeout !== undefined) window.clearTimeout(activeSlot.timeout)
       const initial: WorkspaceChangesList = {
         changeSetId,
         revision,
@@ -533,26 +584,57 @@ export function ConversationView({
         loading: true,
         expanded: expand || existing?.expanded || false,
       }
-      installWorkspaceFiles(initial)
-      workspaceFilesTimeoutRef.current = window.setTimeout(() => {
-        if (generation !== workspaceFilesGenerationRef.current) return
-        workspaceFilesGenerationRef.current += 1
-        workspaceFilesTimeoutRef.current = undefined
-        installWorkspaceFiles({
+      upsertWorkspaceFiles(changeSetId, initial)
+      const localTimeout = window.setTimeout(() => {
+        if (
+          !workspaceOwnerActiveRef.current ||
+          workspaceFileLoadsRef.current.get(changeSetId) !== activeSlot ||
+          generation !== activeSlot.generation
+        )
+          return
+        activeSlot.generation += 1
+        activeSlot.timedOut = true
+        activeSlot.timeout = undefined
+        upsertWorkspaceFiles(changeSetId, {
           ...initial,
           loading: false,
           error: 'Loading changed files took too long. Try again.',
         })
+        if (open) onNotice('Loading changed files took too long. Try again.')
       }, WORKSPACE_OPERATION_TIMEOUT_MS)
+      activeSlot.timeout = localTimeout
       try {
         const result = await window.pact.readWorkspaceChanges({
           changeSetId,
           ...(current?.nextPath ? { afterPath: current.nextPath } : {}),
         })
-        if (!workspaceOwnerActiveRef.current || generation !== workspaceFilesGenerationRef.current)
+        if (
+          !workspaceOwnerActiveRef.current ||
+          workspaceFileLoadsRef.current.get(changeSetId) !== activeSlot ||
+          generation !== activeSlot.generation ||
+          activeSlot.timedOut
+        )
           return
+        const latestRevision = currentWorkspaceChangeSetRevision(changeSetId)
+        if (latestRevision !== undefined && latestRevision !== revision) {
+          activeSlot.queued = coalesceWorkspaceLoadIntent(
+            activeSlot.queued,
+            {
+              expand: initial.expanded,
+              open,
+              contextGeneration,
+              targetRevision: latestRevision,
+            },
+            { autoRefresh: true },
+          )
+          return
+        }
         if (!result.ok) {
-          installWorkspaceFiles({ ...initial, loading: false, error: result.error.message })
+          upsertWorkspaceFiles(changeSetId, {
+            ...initial,
+            loading: false,
+            error: result.error.message,
+          })
           if (open) onNotice(result.error.message)
           return
         }
@@ -572,7 +654,7 @@ export function ConversationView({
           throw new Error('Changed file list is incomplete. Try again.')
         if (result.value.nextPath && result.value.nextPath === current?.nextPath)
           throw new Error('Couldn’t load the next page of changed files.')
-        installWorkspaceFiles({
+        upsertWorkspaceFiles(changeSetId, {
           ...initial,
           revision: result.value.changeSet.revision ?? 0,
           files,
@@ -591,33 +673,68 @@ export function ConversationView({
           else onNotice('No changed files were recorded for this turn.')
         }
       } catch (failure) {
-        if (!workspaceOwnerActiveRef.current || generation !== workspaceFilesGenerationRef.current)
+        if (
+          !workspaceOwnerActiveRef.current ||
+          workspaceFileLoadsRef.current.get(changeSetId) !== activeSlot ||
+          generation !== activeSlot.generation ||
+          activeSlot.timedOut
+        )
           return
+        const latestRevision = currentWorkspaceChangeSetRevision(changeSetId)
+        if (latestRevision !== undefined && latestRevision !== revision) {
+          activeSlot.queued = coalesceWorkspaceLoadIntent(
+            activeSlot.queued,
+            {
+              expand: initial.expanded,
+              open,
+              contextGeneration,
+              targetRevision: latestRevision,
+            },
+            { autoRefresh: true },
+          )
+          return
+        }
         const message = failure instanceof Error ? failure.message : 'Couldn’t load changed files.'
-        installWorkspaceFiles({ ...initial, loading: false, error: message })
+        upsertWorkspaceFiles(changeSetId, { ...initial, loading: false, error: message })
         if (open) onNotice(message)
       } finally {
-        workspaceFilesPendingRef.current = false
-        if (
-          generation === workspaceFilesGenerationRef.current &&
-          workspaceFilesTimeoutRef.current !== undefined
-        ) {
-          window.clearTimeout(workspaceFilesTimeoutRef.current)
-          workspaceFilesTimeoutRef.current = undefined
+        window.clearTimeout(localTimeout)
+        let replayIntent: WorkspaceFileLoadIntent | undefined
+        if (workspaceFileLoadsRef.current.get(changeSetId) === activeSlot) {
+          if (activeSlot.timeout === localTimeout) activeSlot.timeout = undefined
+          activeSlot.inFlight = false
+          activeSlot.timedOut = false
+          replayIntent = activeSlot.queued
+          activeSlot.queued = undefined
+          if (!activeSlot.waitingForConcurrency) {
+            workspaceFileLoadsRef.current.delete(changeSetId)
+          }
         }
-        const queued = queuedWorkspaceFilesRef.current
-        queuedWorkspaceFilesRef.current = undefined
-        if (workspaceOwnerActiveRef.current && queued)
-          void loadWorkspaceFiles(
-            queued.changeSetId,
-            queued.expand,
-            queued.open,
-            queued.contextGeneration,
+        releasePhysicalSlot()
+        if (workspaceOwnerActiveRef.current && replayIntent) {
+          void loadWorkspaceFilesRef.current?.(
+            changeSetId,
+            replayIntent.expand,
+            replayIntent.open,
+            replayIntent.contextGeneration,
+            replayIntent.targetRevision,
           )
+        }
       }
     },
-    [installWorkspaceFiles, onNotice, onOpenWorkspaceChanges, session.id],
+    [
+      currentWorkspaceChangeSetRevision,
+      onNotice,
+      onOpenWorkspaceChanges,
+      session.id,
+      upsertWorkspaceFiles,
+    ],
   )
+
+  useLayoutEffect(() => {
+    loadWorkspaceFilesRef.current = loadWorkspaceFiles
+  }, [loadWorkspaceFiles])
+
   const latestChangesRun = history.window?.latestRun
   const newestChangesId = hasVisibleChanges(latestChangesRun)
     ? latestChangesRun?.workspaceChanges?.id
@@ -628,21 +745,41 @@ export function ConversationView({
       void loadWorkspaceFiles(newestChangesId)
     }
   }, [visible, newestChangesId, loadWorkspaceFiles])
-  const undoWorkspaceChanges = (changeSetId: string): void => {
-    if (undoingChangeSetRef.current) return
-    undoingChangeSetRef.current = changeSetId
-    setUndoingChangeSetId(changeSetId)
-    void onUndoWorkspaceChanges(changeSetId).finally(() => {
-      undoingChangeSetRef.current = undefined
-      if (workspaceOwnerActiveRef.current) setUndoingChangeSetId(undefined)
-    })
-  }
-  const [commentEditor, setCommentEditor] = useState<
-    | { commentId?: string; draftId: string; anchor: CommentAnchor; quote: string; body: string }
-    | undefined
-  >(undefined)
+
+  const undoWorkspaceChanges = useCallback(
+    (changeSetId: string): void => {
+      if (undoingChangeSetRef.current || undoingFileRef.current) return
+      undoingChangeSetRef.current = changeSetId
+      setUndoingChangeSetId(changeSetId)
+      void onUndoWorkspaceChanges(changeSetId).finally(() => {
+        undoingChangeSetRef.current = undefined
+        if (workspaceOwnerActiveRef.current) setUndoingChangeSetId(undefined)
+      })
+    },
+    [onUndoWorkspaceChanges],
+  )
+
+  const handleUndoWorkspaceFile = useCallback(
+    async (changeSetId: string, path: string): Promise<boolean> => {
+      if (!onUndoWorkspaceFile || undoingChangeSetRef.current || undoingFileRef.current) {
+        return false
+      }
+      const target = { changeSetId, path }
+      undoingFileRef.current = target
+      setUndoingFile(target)
+      try {
+        return await onUndoWorkspaceFile(changeSetId, path)
+      } finally {
+        undoingFileRef.current = undefined
+        if (workspaceOwnerActiveRef.current) setUndoingFile(undefined)
+      }
+    },
+    [onUndoWorkspaceFile],
+  )
+
+  const [commentEditor, setCommentEditor] = useState<CommentEditorState | undefined>(undefined)
   const [savingComment, setSavingComment] = useState(false)
-  const pendingCommentSave = useRef<typeof commentEditor>(undefined)
+  const pendingCommentSave = useRef<CommentEditorState | undefined>(undefined)
   const gapRetryRef = useRef<{ mode: 'around'; messageId: string } | { mode: 'latest' }>({
     mode: 'latest',
   })
@@ -652,19 +789,19 @@ export function ConversationView({
   const copyFeedbackTimerRef = useRef<number | undefined>(undefined)
   const composerRef = useRef<ComposerEditorHandle>(null)
   const [gallery, setGallery] = useState<{ images: ConversationImage[]; initialId: string }>()
-  const [imageDropActive, setImageDropActive] = useState(false)
-  const openImageGallery = (images: readonly DraftImage[], image: ConversationImage): void =>
-    setGallery({
-      images: images.flatMap((entry) => (entry.image ? [entry.image] : [])),
-      initialId: image.id,
-    })
-  const skillMenuRef = useRef<HTMLDivElement>(null)
-  const skillPopoverOpen = useRef(false)
-  const mentionMenuRef = useRef<HTMLDivElement>(null)
-  const mentionPopoverOpen = useRef(false)
+  const openImageGallery = useCallback(
+    (images: readonly DraftImage[], image: ConversationImage): void =>
+      setGallery({
+        images: images.flatMap((entry) => (entry.image ? [entry.image] : [])),
+        initialId: image.id,
+      }),
+    [],
+  )
+  const openMessageGallery = useCallback(
+    (images: ConversationImage[], initialId: string): void => setGallery({ images, initialId }),
+    [],
+  )
   const dismissedMention = useRef<MentionQuery | undefined>(undefined)
-  const composerBoxRef = useRef<HTMLDivElement>(null)
-  const composerMenuAnchor = `--pact-composer-menu-${useId().replaceAll(':', '')}`
   const [mentionQuery, setMentionQuery] = useState<MentionQuery | undefined>()
   const [activeMentionIndex, setActiveMentionIndex] = useState(0)
   const copyRequestGenerationRef = useRef(0)
@@ -711,22 +848,21 @@ export function ConversationView({
       : cardPlanNavigation?.sessionId === session.id
         ? cardPlanNavigation
         : undefined
-  const openRecordedPlan = (source: {
-    runId: string
-    messageId: string
-    version: number
-  }): void => {
-    setDismissedNavigation(messageNavigation)
-    setCardPlanNavigation({
-      sessionId: session.id,
-      navigationId: crypto.randomUUID(),
-      messageId: source.messageId,
-      startOffset: 0,
-      endOffset: 0,
-      plan: { runId: source.runId, version: source.version },
-    })
-    onOpenPlan?.()
-  }
+  const openRecordedPlan = useCallback(
+    (source: { runId: string; messageId: string; version: number }): void => {
+      setDismissedNavigation(messageNavigation)
+      setCardPlanNavigation({
+        sessionId: session.id,
+        navigationId: crypto.randomUUID(),
+        messageId: source.messageId,
+        startOffset: 0,
+        endOffset: 0,
+        plan: { runId: source.runId, version: source.version },
+      })
+      onOpenPlan?.()
+    },
+    [messageNavigation, onOpenPlan, session.id],
+  )
   const planSourceNavigationRef = useRef(planSourceNavigation)
   planSourceNavigationRef.current = planSourceNavigation
   const openPlanCallback = useRef(onOpenPlan)
@@ -753,6 +889,7 @@ export function ConversationView({
   >(undefined)
   const stickToBottomRef = useRef(true)
   const wasVisibleRef = useRef(visible)
+
   const runsById = useMemo(
     () => new Map((snapshot?.runs ?? []).map((run) => [run.id, run])),
     [snapshot?.runs],
@@ -780,6 +917,7 @@ export function ConversationView({
     return owners
   }, [snapshot?.messages, runsById])
   const latestRun = history.window?.latestRun
+
   const [currentPlan, setCurrentPlan] = useState<{
     sessionId: string
     task?: CollaborationTask | undefined
@@ -811,6 +949,7 @@ export function ConversationView({
   const planAvailableCallback = useRef(onPlanAvailable)
   planAvailableCallback.current = onPlanAvailable
   const planReadKey = `${latestRun?.id ?? ''}:${latestRun?.status ?? ''}:${latestRun && !['starting', 'running', 'recovering'].includes(latestRun.status) ? latestRun.updatedAt : ''}:${snapshot?.queue?.revision ?? ''}:${planRefresh}`
+
   useEffect(() => {
     const owner = planReadOwner.current
     owner.active = true
@@ -819,6 +958,7 @@ export function ConversationView({
       owner.desired = undefined
     }
   }, [])
+
   useEffect(() => {
     const owner = planReadOwner.current
     owner.desired = visible ? { sessionId: session.id, key: planReadKey } : undefined
@@ -869,6 +1009,7 @@ export function ConversationView({
     }
     void read()
   }, [session.id, planReadKey, visible])
+
   const currentTask = currentPlan?.sessionId === session.id ? currentPlan.task : undefined
   const planningTask =
     currentTask && (currentTask.kind === 'plan' || Boolean(currentTask.planReference))
@@ -887,14 +1028,12 @@ export function ConversationView({
     unfinishedTask && decisionSource
       ? `${unfinishedTask.id}:${decisionSource.runId}:${unfinishedTask.inputSequence}`
       : undefined
-  // A successful Send dismisses this notice immediately, including while the
-  // current-task projection is refreshing. A new reply or withdrawn input has
-  // a different identity/version and can ask for a decision again.
   const decisionTakeover = Boolean(decisionSource)
   const nativeRequests = nativeInputRequests(snapshot)
   const nativeQuestions = nativeRequests.filter(
     ({ request }) => request.kind && request.kind !== 'approval',
   )
+
   const relayRequest =
     snapshot?.relaySchedulingDecision?.sessionId === session.id &&
     snapshot.relaySchedulingDecision.decisionId !== history.cancelledInformationDecisionId
@@ -914,6 +1053,7 @@ export function ConversationView({
   >(undefined)
   const relayUiRef = useRef(relayIdentity)
   relayUiRef.current = relayIdentity
+
   const readRelayReceipt = async (): Promise<void> => {
     const owner = relayAnswerOwner.current
     if (!owner || owner.pending || owner.identity !== relayUiRef.current) return
@@ -953,6 +1093,7 @@ export function ConversationView({
       owner.pending = false
     }
   }
+
   const submitRelayAnswer = async (answer: RelayDecisionAnswer['answer']): Promise<void> => {
     if (
       answer.kind === 'cancel' &&
@@ -1007,6 +1148,7 @@ export function ConversationView({
       owner.pending = false
     }
   }
+
   const activeRelayUi = relayUi?.identity === relayIdentity ? relayUi : undefined
   const productionRelayDecision: RelayDecisionPresentation | undefined = relayRequest
     ? {
@@ -1048,7 +1190,7 @@ export function ConversationView({
         : productionRelayDecision
   const inputTakeover =
     decisionTakeover || nativeQuestions.length > 0 || Boolean(currentRelayDecision)
-  // Identity of the current draft contents; any edit invalidates the open confirmation.
+
   const replacementDraftToken = useMemo(
     () => ({}),
     // oxlint-disable-next-line react-hooks/exhaustive-deps -- Deliberate identity token over the draft inputs.
@@ -1062,7 +1204,6 @@ export function ConversationView({
       snapshot?.commentsRevision,
     ],
   )
-  // The confirmation yields to every native/question/Relay takeover above it.
   const replacementTask =
     replacement && replacement.sessionId === session.id && unfinishedTask?.id === replacement.taskId
       ? unfinishedTask
@@ -1085,6 +1226,7 @@ export function ConversationView({
     replacementRestoreFocus.current = false
     composerRef.current?.focus()
   }, [replacement])
+
   const showDecisionNotice = Boolean(
     decisionSource &&
     !planRecovery &&
@@ -1195,10 +1337,9 @@ export function ConversationView({
         (message.content.trim() || history.window?.messageMeta[message.id]?.oversized),
     ),
   )
+
   const isSideChat = Boolean(session.parentSessionId)
   const [btwSubmitting, setBtwSubmitting] = useState(false)
-  const [dismissedArriveKey, setDismissedArriveKey] = useState<string | number | undefined>()
-  const focusedArriveKeyRef = useRef<string | number | undefined>(undefined)
   const [lastMainSync, setLastMainSync] = useState<
     { sideChatId: string; receipt: SideChatSyncMainReceipt } | undefined
   >()
@@ -1331,32 +1472,7 @@ export function ConversationView({
       commentEditor?.body.trim()),
   )
   const commentDraftId = commentEditor?.draftId
-  const isHandoffArriving =
-    handoffArriveKey !== undefined && handoffArriveKey !== dismissedArriveKey
-  useEffect(() => {
-    if (handoffArriveKey === undefined || handoffArriveKey === dismissedArriveKey) {
-      return undefined
-    }
-    const timer = window.setTimeout(() => setDismissedArriveKey(handoffArriveKey), 220)
-    return () => window.clearTimeout(timer)
-  }, [dismissedArriveKey, handoffArriveKey])
-  useLayoutEffect(() => {
-    if (
-      handoffArriveKey === undefined ||
-      !visible ||
-      composerDisabled ||
-      inputTakeover ||
-      focusedArriveKeyRef.current === handoffArriveKey
-    ) {
-      return
-    }
-    focusedArriveKeyRef.current = handoffArriveKey
-    const editor = composerRef.current
-    if (!editor) return
-    const end = editor.document().text.length
-    editor.focus()
-    editor.select(end, end)
-  }, [composerDisabled, handoffArriveKey, inputTakeover, visible])
+
   const defaultRecipient =
     unfinishedTask && !composerPrefix.pact
       ? collaborationActor(unfinishedTask, 'reply')
@@ -1387,36 +1503,7 @@ export function ConversationView({
   const activeMentionId = mentionListOpen
     ? `${mentionListId}-${filteredMentionOptions[activeMentionIndex]?.token.slice(1) ?? 'none'}`
     : undefined
-  const composerMenuKind = skillMenuOpen ? 'skill' : mentionListOpen ? 'mention' : undefined
-  useLayoutEffect(() => {
-    const menu = composerMenuKind === 'skill' ? skillMenuRef.current : mentionMenuRef.current
-    const open = composerMenuKind === 'skill' ? skillPopoverOpen : mentionPopoverOpen
-    const box = composerBoxRef.current
-    if (!composerMenuKind || !menu || !box) return undefined
-    const fit = (): void => {
-      menu.style.setProperty(
-        '--pact-composer-menu-available-height',
-        `${Math.max(0, box.getBoundingClientRect().top - 16)}px`,
-      )
-    }
-    fit()
-    menu.showPopover()
-    const observer = new ResizeObserver(fit)
-    observer.observe(box)
-    window.addEventListener('resize', fit)
-    return () => {
-      observer.disconnect()
-      window.removeEventListener('resize', fit)
-      if (open.current && menu.isConnected) menu.hidePopover()
-    }
-  }, [composerMenuKind, session.id])
-  useLayoutEffect(() => {
-    if (activeSkillId && skillComposer.revealActive)
-      skillMenuRef.current?.querySelector<HTMLElement>(`#skill-${activeSkillId}`)?.scrollIntoView({
-        block: 'nearest',
-        behavior: 'instant',
-      })
-  }, [activeSkillId, skillComposer.revealActive])
+
   const scrollVersion = `${snapshot?.messages.at(-1)?.id ?? ''}:${snapshot?.messages.length ?? 0}:${snapshot?.activities.length ?? 0}:${snapshot?.runs.length ?? 0}:${loading}`
   const residentMessages = snapshot?.messages
   const navigationMessage = messageNavigation
@@ -1427,6 +1514,7 @@ export function ConversationView({
     setMentionQuery(undefined)
     setActiveMentionIndex(0)
   }, [session.id])
+
   const historyLoadingPage = history.loadingPage
   const hasOlderHistory = history.window?.hasOlder
   const hasNewerHistory = Boolean(
@@ -1445,6 +1533,7 @@ export function ConversationView({
   const gapRecoveryPending = history.gapRecoveryPending
   const historyResyncToken = history.historyResyncToken
   const protectReading = history.protectReading
+
   useLayoutEffect(() => {
     messagesRef.current = snapshot?.messages
     messageInteractionRef.current = {
@@ -1454,37 +1543,71 @@ export function ConversationView({
       onOpenProjectFile,
     }
   }, [snapshot, history.window?.messageMeta, onNotice, onOpenProjectFile])
-  const workspaceFilesSummary = snapshot?.runs.find(
-    (run) => run.workspaceChanges?.id === workspaceFiles?.changeSetId,
-  )?.workspaceChanges
-  const workspaceFilesRevision = workspaceFilesSummary?.revision ?? 0
+
+  // Refresh any cached workspace file lists whose changeSet revision advanced (e.g. recording -> settled).
+  const workspaceChangesRevisionKey = useMemo(
+    () =>
+      (snapshot?.runs ?? [])
+        .filter((run) => Boolean(run.workspaceChanges))
+        .map((run) => `${run.workspaceChanges!.id}:${run.workspaceChanges!.revision ?? 0}`)
+        .join('|'),
+    [snapshot?.runs],
+  )
   useEffect(() => {
-    const list = workspaceFilesRef.current
-    if (
-      !workspaceFiles?.changeSetId ||
-      !workspaceFilesSummary?.id ||
-      !list ||
-      list.changeSetId !== workspaceFiles.changeSetId ||
-      (list.revision ?? 0) === workspaceFilesRevision
-    )
-      return
-    // A recording set is mutable. Retire only this existing list/read owner;
-    // its one queued replacement starts at the first page after settlement.
-    workspaceFilesGenerationRef.current += 1
-    if (workspaceFilesTimeoutRef.current !== undefined) {
-      window.clearTimeout(workspaceFilesTimeoutRef.current)
-      workspaceFilesTimeoutRef.current = undefined
+    const runs = messageInteractionRef.current.snapshot?.runs
+    if (!runs?.length) return
+    const trackedIds = new Set<string>([
+      ...workspaceFilesMapRef.current.keys(),
+      ...workspaceFileLoadsRef.current.keys(),
+    ])
+    for (const changeSetId of trackedIds) {
+      const summary = runs.find((run) => run.workspaceChanges?.id === changeSetId)?.workspaceChanges
+      if (!summary) continue
+      const nextRevision = summary.revision ?? 0
+      const list = workspaceFilesMapRef.current.get(changeSetId)
+      const slot = workspaceFileLoadsRef.current.get(changeSetId)
+      if (slot?.inFlight) {
+        if (slot.inFlightRevision === nextRevision) continue
+        slot.generation += 1
+        if (slot.timeout !== undefined) {
+          window.clearTimeout(slot.timeout)
+          slot.timeout = undefined
+        }
+        slot.queued = coalesceWorkspaceLoadIntent(
+          slot.queued,
+          {
+            expand: slot.inFlightExpand || list?.expanded || false,
+            open: slot.inFlightOpen,
+            contextGeneration: slot.inFlightContextGeneration,
+            targetRevision: nextRevision,
+          },
+          { autoRefresh: true },
+        )
+        continue
+      }
+      if (slot?.waitingForConcurrency && slot.queued) {
+        if (slot.queued.targetRevision !== nextRevision) {
+          slot.queued = { ...slot.queued, targetRevision: nextRevision }
+        }
+        continue
+      }
+      if (list && (list.revision ?? 0) !== nextRevision) {
+        void loadWorkspaceFiles(changeSetId, list.expanded)
+      }
     }
-    void loadWorkspaceFiles(list.changeSetId, list.expanded)
-  }, [
-    workspaceFilesRevision,
-    workspaceFilesSummary?.id,
-    workspaceFiles?.changeSetId,
-    loadWorkspaceFiles,
-  ])
+  }, [workspaceChangesRevisionKey, loadWorkspaceFiles])
+
   const openProjectFile = useCallback((target: ProjectFileTarget): void => {
     messageInteractionRef.current.onOpenProjectFile(target)
   }, [])
+  const registerMessageElement = useCallback(
+    (messageId: string, element: HTMLElement | null): void => {
+      if (element) messageRefs.current.set(messageId, element)
+      else messageRefs.current.delete(messageId)
+    },
+    [],
+  )
+
   const visibleReadingSource = useCallback(():
     | {
         messageId: string
@@ -1514,7 +1637,6 @@ export function ConversationView({
       const element = messageRefs.current.get(message.id)
       if (element) consider({ messageId: message.id, element })
     }
-    // A settled Run can publish a plan without an ordinary answer Message.
     for (const document of transcript.querySelectorAll<HTMLElement>('[data-pact-plan-run-id]')) {
       const plan = planSelectionSource(document)
       const messageId = document.dataset.pactPlanMessageId
@@ -1523,6 +1645,7 @@ export function ConversationView({
     }
     return first
   }, [])
+
   const readingPositionLost = history.readingPositionLost
   const hasProtectedSelection = useCallback((): boolean => {
     const selection = window.getSelection()
@@ -1538,6 +1661,7 @@ export function ConversationView({
       !isProjectionHighlightOwned(),
     )
   }, [])
+
   const clearOffscreenOrdinarySelection = useCallback((): void => {
     const selection = window.getSelection()
     const transcript = transcriptRef.current
@@ -1579,6 +1703,7 @@ export function ConversationView({
     selection.removeAllRanges()
     setSelectionMessageIds([])
   }, [selectionMessageIds, selectionPlan])
+
   const snapshotFoldGuard = useCallback(
     (): boolean =>
       visible &&
@@ -1592,6 +1717,7 @@ export function ConversationView({
     history.setSnapshotFoldGuard?.(snapshotFoldGuard)
     return () => history.setSnapshotFoldGuard?.(undefined)
   }, [history, snapshotFoldGuard])
+
   const collapseCompletedOutput = useCallback(() => {
     const runId = history.window?.preserveRunId
     if (!runId) return
@@ -1611,7 +1737,7 @@ export function ConversationView({
   }, [history, runsById, snapshotFoldGuard, snapshot?.messages])
   useEffect(collapseCompletedOutput, [collapseCompletedOutput])
 
-  const rows = useMemo(() => {
+  const rows = useMemo<ConversationTranscriptRow[]>(() => {
     const messages = (snapshot?.messages ?? []).filter(
       (message) =>
         message.role !== 'assistant' ||
@@ -1624,7 +1750,7 @@ export function ConversationView({
             runsById.get(message.runId)?.collaboration),
         ),
     )
-    const result = messages.map((message) => ({
+    const result: ConversationTranscriptRow[] = messages.map((message) => ({
       key:
         message.outputSnapshot && message.outputSnapshot.ordinal > 0
           ? `message:${message.id}`
@@ -1634,14 +1760,9 @@ export function ConversationView({
               ? `reply:${message.replyToMessageId}:${message.agentId ?? 'unknown'}:${message.runId ?? 'unknown'}`
               : `message:${message.id}`,
       message,
-      run: undefined as AgentRun | undefined,
-      context: undefined as ConversationRunContext | undefined,
-    })) as Array<{
-      key: string
-      message: (typeof messages)[number] | undefined
-      run: AgentRun | undefined
-      context?: ConversationRunContext | undefined
-    }>
+      run: undefined,
+      context: undefined,
+    }))
     for (const context of history.window?.runContexts ?? []) {
       const run = runsById.get(context.runId)
       if (run && !isRunResponseComplete(run))
@@ -1730,8 +1851,7 @@ export function ConversationView({
     history.window?.runContexts,
     runsById,
   ])
-  // Body Patches can replace a row without changing its logical key. Keep
-  // measurement callbacks stable across those high-frequency text updates.
+
   const rowKeySignature = useMemo(() => rows.map((row) => row.key).join('\0'), [rows])
   const rowKeys = useMemo(
     () => (rowKeySignature ? rowKeySignature.split('\0') : []),
@@ -1794,20 +1914,17 @@ export function ConversationView({
     activityOwnerMessageByRun,
     runsById,
   ])
-  // TanStack owns mutable measurements; React Compiler must not memoize its methods.
+
   const virtualizer = useVirtualizer({
     count: rows.length,
     getScrollElement: () => transcriptRef.current,
     estimateSize: () => 180,
     getItemKey: getRowKey,
     overscan: TRANSCRIPT_OVERSCAN,
-    // Scroll compensation and spacer positions must commit in the same paint.
     useFlushSync: true,
     measureElement: (element, entry) =>
       entry?.borderBoxSize[0]?.blockSize ?? element.getBoundingClientRect().height,
     scrollMargin: listOffset,
-    // A pinned Selection must survive wheel scrolling. Include its intervening
-    // rows, then bound viewport/overscan + protected rows by the same DOM budget.
     rangeExtractor: useCallback(
       (range) => {
         const indexes = new Set(pinnedIndexes.slice(0, CONVERSATION_WINDOW_MESSAGES))
@@ -1820,11 +1937,7 @@ export function ConversationView({
       [pinnedIndexes],
     ),
   })
-  // Cold card reads can finish after an upward scroll. Compensate changes
-  // entirely above the viewport in either direction; growing the visible
-  // message itself must not move the reader's position.
   virtualizer.shouldAdjustScrollPositionOnItemSizeChange = (item, _delta, instance) => {
-    // Home requests the beginning itself, rather than preserving an earlier visible row.
     if (scrollIntentRef.current === 'start') return false
     const top = transcriptRef.current?.scrollTop ?? instance.scrollOffset ?? 0
     return instance.itemSizeCache.has(item.key) ? item.end <= top : item.start < top
@@ -1852,16 +1965,12 @@ export function ConversationView({
   const mountedRowKeys = virtualRows.map((row) => row.key).join(':')
   const retainedRowKeys = useMemo(() => new Set(rowKeys), [rowKeys])
   const pruneMeasurements = useCallback(() => {
-    // Only evicted keys are removed. Erasing still-resident heights would make
-    // a known reading anchor an estimate again and double its compensation.
     for (const key of virtualizer.itemSizeCache.keys()) {
       if (!retainedRowKeys.has(String(key))) virtualizer.itemSizeCache.delete(key)
     }
   }, [virtualizer, retainedRowKeys])
   const measureRow = useCallback(
     (element: HTMLLIElement | null) => {
-      // Prune before admitting a new measurement, not just after commit: even
-      // transient capacity stays within the bounded resident row keyset.
       if (element) pruneMeasurements()
       virtualizer.measureElement(element)
     },
@@ -1875,6 +1984,7 @@ export function ConversationView({
     prependAnchorRef.current = undefined
     setRestorationMessageIds([])
   }, [])
+
   useEffect(() => {
     const protectSelection = (): void => {
       const selection = window.getSelection()
@@ -1921,6 +2031,7 @@ export function ConversationView({
     document.addEventListener('selectionchange', protectSelection)
     return () => document.removeEventListener('selectionchange', protectSelection)
   }, [])
+
   useEffect(() => {
     if (historyResyncToken === 0) {
       appliedGapResyncRef.current = 0
@@ -1930,11 +2041,13 @@ export function ConversationView({
       setRestorationReport(undefined)
     }
   }, [historyResyncToken])
+
   useLayoutEffect(() => {
     const element = transcriptRef.current
     if (visible && scrollVersion && element && stickToBottomRef.current)
       element.scrollTop = element.scrollHeight
   }, [scrollVersion, visible, mountedRowKeys])
+
   useLayoutEffect(() => {
     if (wasVisibleRef.current === visible) return
     wasVisibleRef.current = visible
@@ -1987,6 +2100,7 @@ export function ConversationView({
     stickToBottomRef.current = false
     scrollIntentRef.current = undefined
   }, [protectReading, snapshot?.messages, visible, cancelPrepend, visibleReadingSource])
+
   useLayoutEffect(() => {
     if (!residentMessages) return undefined
     const anchor = prependAnchorRef.current
@@ -2023,6 +2137,7 @@ export function ConversationView({
     })
     return () => cancelAnimationFrame(frame)
   }, [residentMessages, history.window, rows, virtualizer, virtualRows, isViewportCommitted])
+
   useLayoutEffect(() => {
     const restore = gapRestoreRef.current
     const transcript = transcriptRef.current
@@ -2078,8 +2193,6 @@ export function ConversationView({
         virtualizer.scrollToIndex(index, { align: 'start' })
         return undefined
       }
-      // The user has read past a merely selected Message. Keep the reading
-      // anchor, but let the disposable browser Selection go with its source.
       gapRestoreRef.current = {
         messageId: restore.messageId,
         top: restore.top,
@@ -2148,6 +2261,7 @@ export function ConversationView({
     isViewportCommitted,
     messageNavigation,
   ])
+
   useEffect(() => {
     const token = historyResyncToken
     if (!visible || !token || token === appliedGapResyncRef.current || historyLoading) return
@@ -2228,6 +2342,7 @@ export function ConversationView({
     visibleReadingSource,
     cancelPrepend,
   ])
+
   useEffect(() => {
     if (historyLoadingPage || !focusAfterPageRef.current) return
     const direction = focusAfterPageRef.current
@@ -2237,6 +2352,7 @@ export function ConversationView({
       if (last) messageRefs.current.get(last.id)?.focus({ preventScroll: true })
     }
   }, [historyLoadingPage, hasNewerHistory, residentMessages])
+
   useLayoutEffect(() => {
     const content = transcriptContentRef.current
     if (!content || typeof ResizeObserver === 'undefined') return undefined
@@ -2255,14 +2371,13 @@ export function ConversationView({
     observer.observe(content)
     return () => observer.disconnect()
   }, [])
+
   useEffect(() => {
     if (!visible || !messageNavigation || dismissedNavigation === messageNavigation)
       return undefined
     if (appliedNavigationRef.current === messageNavigation) return undefined
     if (messageNavigation.plan) return undefined
     cancelPrepend()
-    // Navigation must stop tail-following before its around page arrives, not
-    // after that page has already been mounted and scrolled to the bottom.
     stickToBottomRef.current = false
     scrollIntentRef.current = undefined
     gapRestoreRef.current = undefined
@@ -2284,8 +2399,6 @@ export function ConversationView({
       return () => cancelAnimationFrame(frame)
     }
     void ensureMessage(messageNavigation.messageId)
-    // A resident source marker can change the row key. Focus only after that
-    // render has committed, never on a DOM node about to be replaced.
     if (history.window?.sourceMessageId !== messageNavigation.messageId) return undefined
     if (messageNavigation.plan || messageNavigation.report) return undefined
     const message = navigationMessage
@@ -2311,9 +2424,6 @@ export function ConversationView({
           const transcript = transcriptRef.current
           const range = window.getSelection()?.getRangeAt(0).getBoundingClientRect()
           if (transcript && range) {
-            // Register the exact range target with the same virtualizer that
-            // owns height compensation, so an above-viewport measure cannot
-            // cancel a separate native smooth scroll.
             virtualizer.scrollToOffset(
               transcript.scrollTop +
                 range.top -
@@ -2365,7 +2475,9 @@ export function ConversationView({
     virtualizer,
     cancelPrepend,
   ])
+
   useEffect(() => clearProjectionHighlight, [messageNavigation, dismissedNavigation])
+
   useLayoutEffect(() => {
     if (!requestedResponseId || !visible) return
     const index = rows.findIndex((row) => row.message?.id === requestedResponseId)
@@ -2377,10 +2489,12 @@ export function ConversationView({
     setRequestedResponseId(undefined)
     setRestorationMessageIds([])
   }, [requestedResponseId, visible, rows, mountedRowKeys, virtualizer])
+
   useLayoutEffect(() => {
     commentFocusRef.current.visible = visible
     if (!visible) commentFocusRef.current.cancel?.()
   }, [visible])
+
   useLayoutEffect(() => {
     const textarea = commentTextareaRef.current
     if (
@@ -2404,8 +2518,6 @@ export function ConversationView({
       if (frame !== undefined) cancelAnimationFrame(frame)
       frame = undefined
     }
-    // Capture ownership before paint. Any later focus transfer supersedes this request,
-    // including a transfer away and back to the original element.
     commentFocusRef.current.cancel = cancel
     document.addEventListener('focusin', cancel, true)
     window.addEventListener('blur', cancel)
@@ -2434,6 +2546,7 @@ export function ConversationView({
     })
     return cancel
   }, [commentDraftId, planPanelExpanded])
+
   useEffect(() => {
     copyActiveRef.current = true
     return () => {
@@ -2487,8 +2600,6 @@ export function ConversationView({
       )
     })
     const element = firstVisible ? messageRefs.current.get(firstVisible.id) : undefined
-    // A scroll event can precede the virtual range commit. Keep its existing
-    // intent until that commit; never preserve an offscreen overscan/pinned row.
     if (!firstVisible || !element) return
     olderRequestedRef.current = true
     scrollIntentRef.current = undefined
@@ -2510,7 +2621,6 @@ export function ConversationView({
   }, [snapshot, history, hasProtectedSelection, hasOlderHistory])
 
   const loadLatest = async (): Promise<void> => {
-    // Explicit navigation wins over a pending reading/Selection restoration.
     setRequestedResponseId(undefined)
     gapRestoreRef.current = undefined
     setRestorationPlan(undefined)
@@ -2601,6 +2711,7 @@ export function ConversationView({
         ? `${agentName(roles.codeAuthor)} implements.`
         : `${agentName(roles.codeReviewer)} reviews code.`
   })()
+
   const dismissMentionMenu = (): void => {
     dismissedMention.current = mentionQuery
     setMentionQuery(undefined)
@@ -2673,7 +2784,7 @@ export function ConversationView({
       )
     }
   }
-  const chooseSkill = (entry: import('./useSkillComposer').ComposerSkillOption): void => {
+  const chooseSkill = (entry: ComposerSkillOption): void => {
     const skillReplacement = skillComposer.choose(entry)
     if (!skillReplacement) return
     const current = composerRef.current?.document() ?? editorValue
@@ -2888,9 +2999,9 @@ export function ConversationView({
       document.text,
       draftComments.map((comment) => comment.id),
       targetRoute,
-      document.skills.map((entry) => {
-        return Object.assign({}, entry, { start: entry.start - removed, end: entry.end - removed })
-      }),
+      document.skills.map((entry) =>
+        Object.assign({}, entry, { start: entry.start - removed, end: entry.end - removed }),
+      ),
     )
     if (sent) {
       setAnsweredDecisionKey(submittedDecisionKey)
@@ -2927,8 +3038,6 @@ export function ConversationView({
         cancelReplacement()
         return
       }
-      // First confirm freezes the displayed revision; retries reuse the same proof after an
-      // uncertain acknowledgement instead of silently re-authorizing a newer task state.
       replacementAttempt.current ??= { taskId: task.id, revision: task.revision }
       const removed = document.text.length - document.text.trimStart().length
       const { sendRoute } = resolveComposerRoute(document, defaultRecipient, {
@@ -2942,7 +3051,6 @@ export function ConversationView({
           Object.assign({}, entry, { start: entry.start - removed, end: entry.end - removed }),
         ),
         undefined,
-        // The server rechecks this exact current task identity and revision at receipt.
         replacementAttempt.current,
       )
       if (sent) {
@@ -2953,10 +3061,8 @@ export function ConversationView({
         setMentionQuery(undefined)
       } else {
         setReplacementFailed(true)
-        // Refresh the current projection so a stale revision does not trap the confirmation.
         setPlanRefresh((value) => value + 1)
       }
-      // A rejected or uncertain receipt keeps the draft and its pending nonce for an explicit retry.
     } finally {
       setReplacementBusy(false)
     }
@@ -3123,7 +3229,6 @@ export function ConversationView({
         appliedNavigationRef.current = messageNavigation
         return true
       }
-      // The previous navigation's passive cleanup must finish before this source owns a highlight.
       const frame = requestAnimationFrame(() => {
         if (reveal()) onApplied?.()
       })
@@ -3167,6 +3272,7 @@ export function ConversationView({
   const planSourceKey = planSourceNavigation?.plan
     ? `${session.id}:${planSourceNavigation.navigationId ?? ''}:${planSourceNavigation.plan.runId}:${planSourceNavigation.plan.version}:${planSourceNavigation.startOffset}:${planSourceNavigation.endOffset}:${planSourceNavigation.textBasis ?? ''}:${planRefresh}`
     : undefined
+
   useEffect(() => {
     const owner = planSourceRead.current
     owner.active = true
@@ -3175,6 +3281,7 @@ export function ConversationView({
       owner.desired = undefined
     }
   }, [])
+
   useEffect(() => {
     const owner = planSourceRead.current
     const anchor = planSourceNavigationRef.current?.plan
@@ -3246,6 +3353,7 @@ export function ConversationView({
     }
     void read()
   }, [session.id, planSourceKey, visible])
+
   const handlePanelPlanReady = useCallback(
     (host: HTMLElement): (() => void) | undefined => {
       if (
@@ -3276,10 +3384,39 @@ export function ConversationView({
     },
     [visible, planSourceNavigation],
   )
+
   const beginDetailRead = useCallback((): void => {
     stickToBottomRef.current = false
     scrollIntentRef.current = undefined
   }, [])
+
+  const viewSavedResponse = useCallback(
+    (messageId: string): void => {
+      cancelPrepend()
+      stickToBottomRef.current = false
+      scrollIntentRef.current = undefined
+      setRequestedResponseId(messageId)
+      setRestorationMessageIds([messageId])
+      void history.ensureMessage(messageId)
+    },
+    [cancelPrepend, history],
+  )
+
+  const requestForkForMessage = useCallback(
+    (messageId: string): void => {
+      setForkPoint({
+        sourceSessionId: session.id,
+        messageId,
+        opening: onForkSessionStarted?.(),
+      })
+    },
+    [onForkSessionStarted, session.id],
+  )
+
+  const refreshTaskPlan = useCallback((): void => {
+    setPlanRefresh((value) => value + 1)
+  }, [])
+
   const saveComment = async (): Promise<void> => {
     if (!commentEditor?.body.trim() || disabled || savingComment) return
     const submitted =
@@ -3343,810 +3480,103 @@ export function ConversationView({
     }
   }
 
-  const renderWorkspaceChanges = (changeSet: WorkspaceChangeSet): React.JSX.Element => (
-    <WorkspaceChangesCard
-      changeSet={changeSet}
-      list={
-        workspaceFiles?.changeSetId === changeSet.id &&
-        (workspaceFiles.revision ?? 0) === (changeSet.revision ?? 0)
-          ? workspaceFiles
-          : undefined
+  const handleInputHeightDelta = useCallback(
+    (delta: number): void => {
+      if (!visible || !stickToBottomRef.current || hasProtectedSelection()) return
+      const selection = window.getSelection()
+      if (
+        selection &&
+        !selection.isCollapsed &&
+        transcriptRef.current?.contains(selection.anchorNode) &&
+        !isProjectionHighlightOwned()
+      ) {
+        return
       }
-      undoing={undoingChangeSetId === changeSet.id}
-      disabled={Boolean(activeRun || undoingChangeSetId)}
-      onUndo={undoWorkspaceChanges}
-      onView={(id) => void loadWorkspaceFiles(id, false, true, onPrepareWorkspaceChanges())}
-      onShowFiles={(id) => void loadWorkspaceFiles(id, true)}
-      onOpenFile={(id, path) => onOpenWorkspaceChanges(id, path, undefined, changeSet.revision)}
-    />
+      const transcript = transcriptRef.current
+      if (!transcript || !Number.isFinite(delta) || Math.abs(delta) <= 0.5) return
+      scrollIntentRef.current = undefined
+      transcript.scrollTop = Math.max(0, transcript.scrollHeight - transcript.clientHeight)
+    },
+    [hasProtectedSelection, visible],
   )
-  const handoffSourceLabel = (run: AgentRun): string | undefined => {
-    const peerIds = [...new Set(run.handoffSourceAgents ?? [])]
-    if (peerIds.length === 1) return agentName(peerIds[0]!)
-    if (peerIds.length === 2) return `${agentName(peerIds[0]!)} and ${agentName(peerIds[1]!)}`
-    if (peerIds.length > 2) {
-      const names = peerIds.map((id) => agentName(id))
-      return `${names.slice(0, -1).join(', ')}, and ${names.at(-1)!}`
-    }
-    return undefined
-  }
-  const renderChangeMetadata = (run: AgentRun): React.JSX.Element => (
-    <p className="mb-1 px-1 text-caption text-secondary">
-      {agentName(run.agentId)} ·{' '}
-      <time dateTime={run.createdAt}>
-        {messageDateTimeFormatter.format(new Date(run.createdAt))}
-      </time>{' '}
-      ·{' '}
-      {run.controlDisposition === 'abandoned'
-        ? 'Cancelled'
-        : run.status === 'interrupted'
-          ? 'Stopped'
-          : run.status === 'failed'
-            ? 'Failed'
-            : run.nativeEffectsState === 'pending' || run.nativeEffectsState === 'unknown'
-              ? 'Reply finished'
-              : 'Completed'}
-    </p>
+
+  const renderWorkspaceChanges = useCallback(
+    (changeSet: WorkspaceChangeSet): React.JSX.Element => {
+      const cached = workspaceFilesById.get(changeSet.id)
+      const list =
+        cached && (cached.revision ?? 0) === (changeSet.revision ?? 0) ? cached : undefined
+      const activeFilePathForCard = activeWorkspaceDiff
+        ? activeWorkspaceDiff.sessionId === session.id &&
+          activeWorkspaceDiff.changeSetId === changeSet.id
+          ? activeWorkspaceDiff.path
+          : undefined
+        : activeWorkspaceFilePath
+      return (
+        <WorkspaceChangesCard
+          changeSet={changeSet}
+          list={list}
+          undoing={undoingChangeSetId === changeSet.id}
+          disabled={Boolean(activeRun || undoingChangeSetId || undoingFile)}
+          activeFilePath={activeFilePathForCard}
+          undoingPath={undoingFile?.changeSetId === changeSet.id ? undoingFile.path : undefined}
+          onUndo={undoWorkspaceChanges}
+          onUndoFile={onUndoWorkspaceFile ? handleUndoWorkspaceFile : undefined}
+          onView={(id) => void loadWorkspaceFiles(id, false, true, onPrepareWorkspaceChanges())}
+          onShowFiles={(id) => void loadWorkspaceFiles(id, true)}
+          onOpenFile={(id, path) => onOpenWorkspaceChanges(id, path, undefined, changeSet.revision)}
+        />
+      )
+    },
+    [
+      workspaceFilesById,
+      undoingChangeSetId,
+      undoingFile,
+      activeRun,
+      activeWorkspaceDiff,
+      activeWorkspaceFilePath,
+      session.id,
+      undoWorkspaceChanges,
+      onUndoWorkspaceFile,
+      handleUndoWorkspaceFile,
+      loadWorkspaceFiles,
+      onPrepareWorkspaceChanges,
+      onOpenWorkspaceChanges,
+    ],
   )
-  const renderRecordingWarning = (run: AgentRun): React.JSX.Element | null =>
-    hasRecordingWarning(run) ? (
-      <p
-        className="flex items-start gap-2 px-1 py-1 text-caption text-status-warning-foreground"
-        role="status"
-        data-pact-workspace-warning={run.id}
-      >
-        <TriangleAlert aria-hidden="true" className="mt-0.5 size-3.5 shrink-0" strokeWidth={1.75} />
-        <span>{run.workspaceRecordingUnavailableReason}</span>
-      </p>
-    ) : null
-  const renderSavedRunResult = (run: AgentRun): React.JSX.Element | null => {
-    const id = run.responseMessageId
-    if (!id || rows.some((row) => row.message?.id === id)) return null
-    return (
-      <button
-        type="button"
-        onClick={() => {
-          cancelPrepend()
-          stickToBottomRef.current = false
-          scrollIntentRef.current = undefined
-          setRequestedResponseId(id)
-          setRestorationMessageIds([id])
-          void history.ensureMessage(id)
-        }}
-        className="min-h-8 w-fit cursor-pointer rounded-control px-2 text-caption font-medium text-primary hover:bg-surface-muted focus-visible:outline-2 focus-visible:outline-focus"
-      >
-        View response
-      </button>
-    )
-  }
-  const renderChangeGroup = (run: AgentRun): React.JSX.Element => {
-    const group = history.window?.runArtifacts?.find((item) => item.latestRunId === run.id)
-    const previousCount = Math.max(0, (group?.totalCount ?? 1) - 1)
-    const opened = history.window?.artifactHistory
-    const sameGroup = opened?.userMessageId === run.userMessageId && opened.agentId === run.agentId
-    const loadingGroup =
-      history.loadingArtifacts?.userMessageId === run.userMessageId &&
-      history.loadingArtifacts.agentId === run.agentId
-    const failure =
-      history.artifactError?.userMessageId === run.userMessageId &&
-      history.artifactError.agentId === run.agentId
-        ? history.artifactError.message
-        : undefined
-    const expanded = sameGroup || loadingGroup || Boolean(failure)
-    const earlier = sameGroup
-      ? opened.runIds
-          .map((id) => runsById.get(id))
-          .filter((item): item is AgentRun => Boolean(item))
-      : []
-    return (
-      <div className="flex w-full min-w-0 flex-col gap-2">
-        <div className="min-w-0">
-          {renderChangeMetadata(run)}
-          {hasVisibleChanges(run) && run.workspaceChanges
-            ? renderWorkspaceChanges(run.workspaceChanges)
-            : null}
-          {renderRecordingWarning(run)}
-          {run.controlDisposition === 'abandoned' ? renderSavedRunResult(run) : null}
-        </div>
-        {previousCount > 0 ? (
-          <div>
-            <button
-              type="button"
-              aria-expanded={expanded}
-              disabled={Boolean(history.loadingArtifacts) && !loadingGroup}
-              onClick={() =>
-                expanded
-                  ? history.closeRunArtifacts()
-                  : void history.loadRunArtifacts(run.userMessageId, run.agentId)
-              }
-              className="inline-flex min-h-8 cursor-pointer items-center gap-1.5 rounded-control px-2 text-caption text-secondary hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-focus disabled:cursor-default disabled:opacity-45"
-            >
-              Previous {previousCount} {previousCount === 1 ? 'attempt' : 'attempts'}
-              <ChevronDown
-                className={`size-3.5 transition-transform ${expanded ? 'rotate-180' : ''}`}
-                aria-hidden="true"
-              />
-            </button>
-            {expanded ? (
-              <div className="mt-1 flex min-w-0 flex-col gap-group">
-                {earlier.toReversed().map((previous) => (
-                  <div key={previous.id} className="min-w-0">
-                    {renderChangeMetadata(previous)}
-                    {hasVisibleChanges(previous) && previous.workspaceChanges
-                      ? renderWorkspaceChanges(previous.workspaceChanges)
-                      : null}
-                    {renderRecordingWarning(previous)}
-                    {renderSavedRunResult(previous)}
-                  </div>
-                ))}
-                {loadingGroup ? (
-                  <p className="px-2 text-caption text-secondary" aria-busy="true">
-                    Loading earlier attempts…
-                  </p>
-                ) : null}
-                {failure ? (
-                  <p className="px-2 text-caption text-status-warning-foreground" role="alert">
-                    {failure}
-                  </p>
-                ) : null}
-                {failure || (sameGroup && opened.nextBefore) ? (
-                  <button
-                    type="button"
-                    disabled={loadingGroup}
-                    onClick={() =>
-                      void history.loadRunArtifacts(
-                        run.userMessageId,
-                        run.agentId,
-                        failure ? history.artifactError?.before : opened?.nextBefore,
-                      )
-                    }
-                    className="min-h-8 w-fit cursor-pointer rounded-control px-2 text-caption font-medium text-primary hover:bg-surface-muted focus-visible:outline-2 focus-visible:outline-focus disabled:cursor-default disabled:opacity-45"
-                  >
-                    {failure ? 'Try again' : 'Load earlier attempts'}
-                  </button>
-                ) : null}
-              </div>
-            ) : null}
-          </div>
-        ) : null}
-      </div>
-    )
-  }
-  const renderRow = (row: (typeof rows)[number]): React.JSX.Element | null => {
-    const { message } = row
-    const placeholderRun = row.run ?? activeRun
-    if (row.context && row.run) {
-      const run = row.run
-      return (
-        <article className="w-fit max-w-[92%] min-w-0 self-start" data-pact-run-context-id={run.id}>
-          <div className={`rounded-message ${speakerBgClass(run.agentId)} px-4 py-3`}>
-            <p className="flex min-w-0 items-baseline gap-1.5 text-caption text-secondary">
-              <span className="shrink-0 font-medium">{agentName(run.agentId)}</span>
-              <RunConfiguration run={run} />
-            </p>
-            {run.handoffMessageCount ? (
-              <ContextReceipt
-                count={run.handoffMessageCount}
-                source={handoffSourceLabel(run)}
-                accepted={Boolean(run.nativeTurnId)}
-              />
-            ) : null}
-            <RunWorkLog
-              runId={run.id}
-              activities={activitiesByRun.get(run.id) ?? []}
-              active={['starting', 'running', 'recovering'].includes(run.status)}
-              available
-              history={history}
-              onRead={beginDetailRead}
-            />
-          </div>
-        </article>
-      )
-    }
-    if (!message && row.key.startsWith('changes:') && row.run)
-      return (
-        <article className="flex w-full min-w-0 flex-col" data-pact-change-run-id={row.run.id}>
-          {renderChangeGroup(row.run)}
-          {row.run.collaboration &&
-          !['starting', 'running', 'recovering'].includes(row.run.status) &&
-          !snapshot?.messages.some(
-            (candidate) => candidate.role === 'assistant' && candidate.runId === row.run!.id,
-          ) ? (
-            <CollaborationReview
-              session={session}
-              run={row.run}
-              latestRunId={latestRun?.id}
-              disabled={disabled || responseInProgress}
-              continuationBlocked={continuationBlocked}
-              onOpenPlan={openRecordedPlan}
-              onOpenSessionSettings={isSideChat ? undefined : onOpenSessionSettings}
-              nativePresentationSuspended={
-                nativePresentationSuspended ||
-                nativeQuestions.length > 0 ||
-                Boolean(currentRelayDecision) ||
-                !visible
-              }
-              onOpenProjectFile={openProjectFile}
-              onCreateReportComment={
-                recoveryLocked || inputTakeover ? undefined : handleCreatePlanComment
-              }
-              feedbackDraft={feedbackDraft}
-              onTaskChange={() => setPlanRefresh((value) => value + 1)}
-              revealReport={revealReport}
-              revealReportRequestId={revealReportRequestId}
-              revealReportBasis={
-                messageNavigation?.textBasis === 'plain-visible-v1' ? 'plain-visible-v1' : undefined
-              }
-              revealReportOffset={
-                gapRestoreRef.current?.selection?.startOffset ?? messageNavigation?.startOffset
-              }
-              onReportReady={handlePlanReady}
-            />
-          ) : null}
-        </article>
-      )
-    if (!message)
-      return placeholderRun ? (
-        <article
-          className="flex w-full min-w-0 flex-col"
-          data-pact-speaker={placeholderRun.agentId}
-        >
-          <div className="w-fit max-w-[92%] self-start">
-            <div
-              className={`rounded-message ${speakerBgClass(placeholderRun.agentId)} px-4 py-3`}
-              data-pact-message-bubble
-            >
-              <p className="flex min-w-0 items-baseline gap-1.5 text-caption text-secondary">
-                <span className="shrink-0 font-medium">{agentName(placeholderRun.agentId)}</span>
-                <RunConfiguration run={placeholderRun} />
-              </p>
-              {placeholderRun.handoffMessageCount ? (
-                <ContextReceipt
-                  count={placeholderRun.handoffMessageCount}
-                  source={handoffSourceLabel(placeholderRun)}
-                  accepted={Boolean(placeholderRun.nativeTurnId)}
-                />
-              ) : null}
-              <RunWorkLog
-                runId={placeholderRun.id}
-                activities={activitiesByRun.get(placeholderRun.id) ?? []}
-                active={['starting', 'running', 'recovering'].includes(placeholderRun.status)}
-                available={Boolean(activitiesByRun.get(placeholderRun.id)?.length)}
-                history={history}
-                onRead={beginDetailRead}
-              />
-            </div>
-            {['starting', 'running', 'recovering'].includes(placeholderRun.status) ? (
-              <MessageResponseIndicator agentId={placeholderRun.agentId} />
-            ) : null}
-          </div>
-          {placeholderRun.collaboration &&
-          !['starting', 'running', 'recovering'].includes(placeholderRun.status) ? (
-            <CollaborationReview
-              session={session}
-              run={placeholderRun}
-              latestRunId={latestRun?.id}
-              disabled={disabled || responseInProgress}
-              continuationBlocked={continuationBlocked}
-              onOpenPlan={openRecordedPlan}
-              onOpenSessionSettings={isSideChat ? undefined : onOpenSessionSettings}
-              nativePresentationSuspended={
-                nativePresentationSuspended ||
-                nativeQuestions.length > 0 ||
-                Boolean(currentRelayDecision) ||
-                !visible
-              }
-              onOpenProjectFile={openProjectFile}
-              onCreateReportComment={
-                recoveryLocked || inputTakeover ? undefined : handleCreatePlanComment
-              }
-              feedbackDraft={feedbackDraft}
-              onTaskChange={() => setPlanRefresh((value) => value + 1)}
-              revealReport={revealReport}
-              revealReportRequestId={revealReportRequestId}
-              revealReportBasis={
-                messageNavigation?.textBasis === 'plain-visible-v1' ? 'plain-visible-v1' : undefined
-              }
-              revealReportOffset={
-                gapRestoreRef.current?.selection?.startOffset ?? messageNavigation?.startOffset
-              }
-              onReportReady={handlePlanReady}
-            />
-          ) : null}
-        </article>
-      ) : null
-    if (message.role === 'system') {
-      const nativeRebuild = message.content.endsWith('native session rebuilt')
-      return (
-        <div
-          data-pact-message-id={message.id}
-          tabIndex={-1}
-          ref={(element) => {
-            if (element) messageRefs.current.set(message.id, element)
-            else messageRefs.current.delete(message.id)
-          }}
-          className={
-            nativeRebuild
-              ? 'flex items-center gap-3 py-1 text-caption text-tertiary'
-              : 'text-center text-caption text-tertiary'
-          }
-        >
-          {nativeRebuild ? <span aria-hidden="true" className="h-px flex-1 bg-border" /> : null}
-          <span>{message.content}</span>
-          {nativeRebuild ? <span aria-hidden="true" className="h-px flex-1 bg-border" /> : null}
-        </div>
-      )
-    }
-    const backgroundReport = isConversationBackgroundReport(message)
-    const speaker =
-      message.role === 'user' ? 'You' : message.agentId ? agentName(message.agentId) : 'Codex'
-    const background = message.role === 'user' ? 'bg-speaker-user' : speakerBgClass(message.agentId)
-    const retryInThisSlot =
-      activeRun &&
-      message.outputSnapshot?.canonical !== false &&
-      message.replyToMessageId === activeRun.userMessageId &&
-      message.agentId === activeRun.agentId &&
-      history.window?.sourceMessageId !== message.id
-    const messageRun = retryInThisSlot
-      ? activeRun
-      : message.runId
-        ? runsById.get(message.runId)
-        : undefined
-    const replyRecipient =
-      message.role === 'user' && messageRun?.collaboration?.stage === 'reply'
-        ? message.route?.type === 'agent'
-          ? message.route.agentId
-          : messageRun.agentId
-        : undefined
-    const activityRunId = messageRun?.id ?? message.runId
-    const visibleContent = message.content
-    const messageMeta = history.window?.messageMeta[message.id]
-    const sentComments = history.window?.sentCommentsByMessage[message.id]
-    const commentsLoaded = Boolean(history.window?.loadedCommentMessageIds[message.id])
-    const commentOnly = message.role === 'user' && !message.content && messageMeta?.hasComments
-    const ownsRunActivity = Boolean(
-      (message.outputSnapshot?.canonical && isRunResponseComplete(messageRun)) ||
-      (!messageRun?.outputSnapshots &&
-        !history.window?.runContexts?.some((context) => context.runId === activityRunId) &&
-        (retryInThisSlot ||
-          (message.runId && activityOwnerMessageByRun.get(message.runId) === message.id))),
-    )
-    const activities =
-      ownsRunActivity && activityRunId ? (activitiesByRun.get(activityRunId) ?? []) : []
-    const runActive = Boolean(
-      message.outputSnapshot?.canonical !== false &&
-      messageRun &&
-      messageRun.controlDisposition !== 'abandoned' &&
-      (messageRun.id === activeRun?.id ||
-        (snapshot?.nativeContexts ?? []).some(
-          (context) =>
-            context.lastRunId === messageRun.id &&
-            (context.continuationState === 'responding' ||
-              context.continuationState === 'waiting_user'),
-        )),
-    )
-    const pendingPeerAgentId =
-      !activeRun &&
-      !recoveryLocked &&
-      message.role === 'assistant' &&
-      !backgroundReport &&
-      message.outputSnapshot?.canonical !== false &&
-      message.replyToMessageId === pendingRoutedMessage?.id &&
-      message.agentId !== pendingRoutedAgentId
-        ? pendingRoutedAgentId
-        : undefined
-    return (
-      <article
-        tabIndex={-1}
-        className={
-          message.role === 'user'
-            ? `ml-auto flex min-w-0 flex-col ${messageMeta?.oversized ? 'w-full max-w-[min(92%,72ch)]' : 'w-fit max-w-[92%]'}`
-            : 'flex w-full min-w-0 flex-col'
-        }
-        data-pact-speaker={message.role === 'user' ? 'user' : (message.agentId ?? 'codex')}
-        data-pact-message-id={message.id}
-        ref={(element) => {
-          if (element) messageRefs.current.set(message.id, element)
-          else messageRefs.current.delete(message.id)
-        }}
-      >
-        <div
-          className={
-            message.role === 'assistant'
-              ? `min-w-0 self-start ${messageMeta?.oversized ? 'w-full max-w-[min(92%,72ch)]' : 'w-fit max-w-[92%]'}`
-              : 'min-w-0'
-          }
-        >
-          <div className="group/message flex min-w-0 flex-col">
-            <div data-pact-message-bubble className={`rounded-message ${background} px-4 py-3`}>
-              <p className="flex min-w-0 items-baseline gap-1.5 text-caption text-secondary">
-                <span className="shrink-0 font-medium">{speaker}</span>
-                {replyRecipient ? (
-                  <span
-                    className="font-medium text-primary"
-                    aria-label={`Reply to ${agentName(replyRecipient)}`}
-                  >
-                    @{replyRecipient}
-                  </span>
-                ) : null}
-                {backgroundReport ? (
-                  <span>
-                    · Background update{message.historicalBackgroundReport ? ' · Earlier task' : ''}
-                  </span>
-                ) : message.role === 'assistant' && messageRun ? (
-                  <RunConfiguration run={messageRun} />
-                ) : null}
-                {!isSideChat &&
-                message.role === 'user' &&
-                message.originSideChat &&
-                onOpenSideChat ? (
-                  <button
-                    type="button"
-                    className="pact-side-chat-from-badge ml-1 inline-flex items-center gap-1 rounded-pill border border-border bg-surface-raised/90 px-2 py-0.5 text-caption font-medium leading-none text-secondary transition-colors hover:border-border-strong hover:text-primary focus-visible:outline-2 focus-visible:outline-focus"
-                    title={`Open side chat: ${
-                      resolveSideChatTitle
-                        ? resolveSideChatTitle(
-                            message.originSideChat.sideChatId,
-                            message.originSideChat.sideChatTitle,
-                          )
-                        : message.originSideChat.sideChatTitle
-                    }`}
-                    onClick={() => onOpenSideChat(message.originSideChat!.sideChatId)}
-                  >
-                    <CornerUpLeft
-                      aria-hidden="true"
-                      className="size-3 shrink-0"
-                      strokeWidth={1.75}
-                    />
-                    From side chat
-                  </button>
-                ) : null}
-              </p>
-              {ownsRunActivity && messageRun?.handoffMessageCount ? (
-                <ContextReceipt
-                  count={messageRun.handoffMessageCount}
-                  source={handoffSourceLabel(messageRun)}
-                  accepted={Boolean(messageRun.nativeTurnId)}
-                />
-              ) : null}
-              {ownsRunActivity && activityRunId ? (
-                <RunWorkLog
-                  runId={activityRunId}
-                  completed={isRunResponseComplete(messageRun)}
-                  activities={activities}
-                  active={runActive}
-                  available={
-                    retryInThisSlot ? activities.length > 0 : Boolean(messageMeta?.hasActivities)
-                  }
-                  history={history}
-                  onRead={beginDetailRead}
-                />
-              ) : null}
-              <div
-                className={
-                  message.role === 'assistant' && activities.length > 0
-                    ? 'mt-2 border-t border-border/55 pt-2.5'
-                    : 'mt-1'
-                }
-              >
-                {backgroundReport && message.state === 'incomplete' ? (
-                  <p className="text-caption text-secondary">
-                    The background update could not be saved.
-                  </p>
-                ) : messageMeta?.oversized ? (
-                  <LargeMessagePreview preview={messageMeta.oversized.preview} />
-                ) : !commentOnly ? (
-                  <MessageMarkdown
-                    content={visibleContent}
-                    skills={message.role === 'user' ? (message.skills ?? []) : undefined}
-                    onOpenProjectFile={openProjectFile}
-                    messageId={message.id}
-                    onCreateComment={
-                      recoveryLocked || inputTakeover ? undefined : handleCreateMessageComment
-                    }
-                    onAskInSideChat={
-                      !isSideChat &&
-                      !backgroundReport &&
-                      !messageMeta?.oversized &&
-                      message.state !== 'streaming' &&
-                      (message.role === 'user' || message.role === 'assistant')
-                        ? onAskInSideChat
-                        : undefined
-                    }
-                  />
-                ) : null}
-                {message.images?.length ? (
-                  <ConversationImages
-                    sessionId={session.id}
-                    images={message.images.map((image) => ({
-                      id: image.id,
-                      name: image.name,
-                      status: 'ready',
-                      image,
-                    }))}
-                    onOpen={(image) => setGallery({ images: message.images!, initialId: image.id })}
-                  />
-                ) : null}
-                {messageMeta?.hasComments ? (
-                  <SentComments
-                    comments={sentComments}
-                    loading={!commentsLoaded && !history.window?.commentError}
-                    error={commentsLoaded ? undefined : history.window?.commentError}
-                    commentOnly={Boolean(commentOnly)}
-                    onRetry={history.retryComments}
-                    onOpenComment={onOpenComment}
-                    hasMore={history.commentPages?.[message.id]?.hasMore ?? true}
-                    hasEarlier={history.commentPages?.[message.id]?.hasEarlier}
-                    paging={
-                      history.loadingCommentsFor === '*' ||
-                      history.loadingCommentsFor === message.id
-                    }
-                    onNext={() => history.loadCommentPage?.(message.id)}
-                    onFirst={() => history.loadCommentPage?.(message.id, true)}
-                  />
-                ) : null}
-              </div>
-            </div>
-            <MessageHoverActions
-              messageId={message.id}
-              content={visibleContent}
-              longMessage={Boolean(messageMeta?.oversized)}
-              createdAt={message.createdAt}
-              speaker={speaker}
-              isUser={message.role === 'user'}
-              copyResult={copyFeedback?.messageId === message.id ? copyFeedback.result : undefined}
-              onCopy={copyMessage}
-              onFork={
-                !isSideChat &&
-                message.role === 'assistant' &&
-                !backgroundReport &&
-                message.outputSnapshot?.canonical !== false &&
-                message.state === 'complete' &&
-                onForkSessionCreated
-                  ? () =>
-                      setForkPoint({
-                        sourceSessionId: session.id,
-                        messageId: message.id,
-                        opening: onForkSessionStarted?.(),
-                      })
-                  : undefined
-              }
-              forkDisabled={
-                snapshot?.forkBlocked !== false ||
-                sending ||
-                stopping ||
-                responseInProgress ||
-                loading
-              }
-            />
-          </div>
-          {message.role === 'assistant' && runActive && messageRun ? (
-            <MessageResponseIndicator agentId={messageRun.agentId} />
-          ) : pendingPeerAgentId ? (
-            <MessageResponseIndicator agentId={pendingPeerAgentId} />
-          ) : null}
-        </div>
-        {message.role === 'assistant' &&
-        message.outputSnapshot?.canonical !== false &&
-        messageRun?.collaboration &&
-        !['starting', 'running', 'recovering'].includes(messageRun.status) ? (
-          <CollaborationReview
-            session={session}
-            run={messageRun}
-            latestRunId={latestRun?.id}
-            disabled={disabled || responseInProgress}
-            continuationBlocked={continuationBlocked}
-            onOpenPlan={openRecordedPlan}
-            onOpenSessionSettings={onOpenSessionSettings}
-            nativePresentationSuspended={
-              nativePresentationSuspended ||
-              nativeQuestions.length > 0 ||
-              Boolean(currentRelayDecision) ||
-              !visible
-            }
-            onOpenProjectFile={openProjectFile}
-            onCreateReportComment={
-              recoveryLocked || inputTakeover ? undefined : handleCreatePlanComment
-            }
-            feedbackDraft={feedbackDraft}
-            onTaskChange={() => setPlanRefresh((value) => value + 1)}
-            revealReport={revealReport}
-            revealReportRequestId={revealReportRequestId}
-            revealReportBasis={
-              messageNavigation?.textBasis === 'plain-visible-v1' ? 'plain-visible-v1' : undefined
-            }
-            revealReportOffset={
-              gapRestoreRef.current?.selection?.startOffset ?? messageNavigation?.startOffset
-            }
-            onReportReady={handlePlanReady}
-            renderedMessageId={message.id}
-            replyBodyComplete={message.state === 'complete'}
-          />
-        ) : null}
-        {message.role === 'assistant' &&
-        message.outputSnapshot?.canonical !== false &&
-        messageRun?.peerProposal &&
-        messageRun.status === 'completed' &&
-        messageRun.peerProposal.state === 'pending' ? (
-          <PeerProposalAction
-            proposal={messageRun.peerProposal}
-            requester={messageRun.agentId}
-            disabled={disabled}
-            onAccept={onAcceptPeerProposal}
-            onDismiss={onDismissPeerProposal}
-          />
-        ) : null}
-      </article>
-    )
-  }
 
   const commentEditorView = commentEditor ? (
-    <section
-      className="rounded-card border border-border bg-surface-raised p-3"
-      aria-labelledby="comment-editor-title"
-      data-pact-comment-editor
-    >
-      <header className="flex items-start justify-between gap-group">
-        <div className="flex min-w-0 items-start gap-2.5">
-          <span className="grid size-7 shrink-0 place-items-center rounded-control bg-status-info-muted text-status-info-foreground">
-            <MessageSquarePlus aria-hidden="true" className="size-4" strokeWidth={1.75} />
-          </span>
-          <div className="min-w-0">
-            <h2 id="comment-editor-title" className="text-caption font-medium text-primary">
-              {commentEditor.commentId ? 'Edit comment' : 'New comment'}
-            </h2>
-            <p
-              className="mt-0.5 line-clamp-2 text-caption leading-relaxed text-secondary"
-              title={commentEditor.quote}
-            >
-              {commentSourceLabel(commentEditor.anchor, session)} · “{commentEditor.quote}”
-            </p>
-            {commentEditor.anchor.type === 'unavailable' ? (
-              <p className="mt-1 text-caption text-secondary">{commentEditor.anchor.reason}</p>
-            ) : null}
-          </div>
-        </div>
-        <button
-          className="grid size-7 shrink-0 place-items-center rounded-control text-secondary hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus"
-          type="button"
-          aria-label="Close Comment editor"
-          title="Close"
-          disabled={recoveryLocked}
-          onClick={() => setCommentEditor(undefined)}
-        >
-          <X aria-hidden="true" className="size-3.5" strokeWidth={1.75} />
-        </button>
-      </header>
-      <div className="mt-2 flex items-end gap-2 rounded-control bg-surface-muted p-2 focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-focus">
-        <textarea
-          ref={commentTextareaRef}
-          className="field-sizing-content min-h-12 max-h-40 min-w-0 flex-1 resize-none bg-transparent px-1 py-1 text-body leading-relaxed text-primary outline-none placeholder:text-tertiary"
-          value={commentEditor.body}
-          placeholder="What should the Agent notice?"
-          aria-label="Comment"
-          disabled={recoveryLocked}
-          onChange={(event) => setCommentEditor({ ...commentEditor, body: event.target.value })}
-          onKeyDown={(event) => {
-            if (event.key === 'Escape') setCommentEditor(undefined)
-            if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
-              event.preventDefault()
-              void saveComment()
-            }
-          }}
-        />
-        <button
-          className="h-8 shrink-0 rounded-control bg-surface-inverse px-3 text-caption font-medium text-inverse disabled:cursor-default disabled:opacity-40"
-          type="button"
-          disabled={!commentEditor.body.trim() || disabled || savingComment}
-          onClick={() => void saveComment()}
-        >
-          {commentEditor.commentId
-            ? savingComment
-              ? 'Saving…'
-              : 'Save comment'
-            : savingComment
-              ? 'Adding…'
-              : 'Add comment'}
-        </button>
-      </div>
-      <p className="mt-2.5 px-1 text-caption text-tertiary">
-        {commentEditor.commentId
-          ? 'Enter to save · Shift+Enter for a new line'
-          : 'Enter to add · Shift+Enter for a new line'}
-      </p>
-    </section>
+    <CommentEditorCard
+      editor={commentEditor}
+      session={session}
+      textareaRef={commentTextareaRef}
+      recoveryLocked={recoveryLocked}
+      disabled={disabled}
+      saving={savingComment}
+      onChange={setCommentEditor}
+      onSave={saveComment}
+      onClose={() => setCommentEditor(undefined)}
+    />
   ) : null
+
   const commentDraftsView = (
-    <>
-      {draftComments.length > 0 ? (
-        <div
-          className="flex max-h-20 w-full flex-wrap gap-1.5 overflow-y-auto px-2 pt-1"
-          aria-label="Attached Comment drafts"
-        >
-          {draftComments.map((comment) => {
-            const collapsedQuote = comment.anchor.quote.replace(/\s+/gu, ' ').trim()
-            const draftLabel =
-              comment.body.trim() || (collapsedQuote ? `“${collapsedQuote}”` : 'Quoted selection')
-            return (
-              <span
-                key={comment.id}
-                className={`inline-flex max-w-64 items-center gap-1 rounded-pill bg-status-info-muted px-2.5 py-1 text-caption text-status-info-foreground ${recoveryLocked ? 'opacity-55' : ''}`}
-              >
-                <button
-                  className="truncate text-left"
-                  type="button"
-                  title={
-                    comment.anchor.type === 'unavailable'
-                      ? `${comment.anchor.reason}${comment.body ? `\n${comment.body}` : ''}`
-                      : comment.body.trim() || comment.anchor.quote
-                  }
-                  disabled={recoveryLocked}
-                  onClick={() =>
-                    setCommentEditor({
-                      commentId: comment.id,
-                      draftId: crypto.randomUUID(),
-                      anchor: comment.anchor,
-                      quote: comment.anchor.quote,
-                      body: comment.body,
-                    })
-                  }
-                >
-                  {commentSourceLabel(comment.anchor, session)} · {draftLabel}
-                </button>
-                {comment.anchor.type !== 'unavailable' ? (
-                  <button
-                    type="button"
-                    aria-label="Return to Comment source"
-                    title="Return to source"
-                    disabled={recoveryLocked}
-                    onClick={() => onOpenComment(comment)}
-                    className="grid size-6 shrink-0 place-items-center rounded-control hover:bg-status-info/15 focus-visible:outline-2 focus-visible:outline-focus"
-                  >
-                    <CornerUpLeft aria-hidden="true" className="size-3.5" strokeWidth={1.75} />
-                  </button>
-                ) : null}
-                <button
-                  className="grid size-4 shrink-0 place-items-center rounded-full hover:bg-status-info/15"
-                  type="button"
-                  aria-label="Remove Comment draft"
-                  disabled={disabled}
-                  onClick={() => void onRemoveCommentDraft(comment.id)}
-                >
-                  <X aria-hidden="true" className="size-3" />
-                </button>
-              </span>
-            )
-          })}
-        </div>
-      ) : null}
-      {history.draftPage?.hasMore || history.draftPage?.hasEarlier ? (
-        <div
-          aria-label="Comment draft pages"
-          className="flex gap-2 px-2 text-caption text-secondary"
-        >
-          {history.draftPage.hasEarlier ? (
-            <button
-              type="button"
-              disabled={history.draftsLoading}
-              onClick={history.firstDraftPage}
-              className="min-h-7 rounded-control px-1.5 hover:bg-surface-muted focus-visible:outline-2 focus-visible:outline-focus disabled:opacity-45"
-            >
-              First drafts
-            </button>
-          ) : null}
-          {history.draftPage.hasMore ? (
-            <button
-              type="button"
-              disabled={history.draftsLoading}
-              onClick={history.loadMoreDrafts}
-              className="min-h-7 rounded-control px-1.5 hover:bg-surface-muted focus-visible:outline-2 focus-visible:outline-focus disabled:opacity-45"
-            >
-              More drafts
-            </button>
-          ) : null}
-        </div>
-      ) : null}
-    </>
+    <CommentDraftChips
+      draftComments={draftComments}
+      session={session}
+      history={history}
+      recoveryLocked={recoveryLocked}
+      disabled={disabled}
+      onEditComment={(comment) =>
+        setCommentEditor({
+          commentId: comment.id,
+          draftId: crypto.randomUUID(),
+          anchor: comment.anchor,
+          quote: comment.anchor.quote,
+          body: comment.body,
+        })
+      }
+      onOpenComment={onOpenComment}
+      onRemoveCommentDraft={onRemoveCommentDraft}
+    />
   )
 
   const sourcePreview =
@@ -4172,6 +3602,15 @@ export function ConversationView({
     }
     onOpenPlan?.()
   }
+  const showCurrentPlanRef = useRef(showCurrentPlan)
+  useLayoutEffect(() => {
+    showCurrentPlanRef.current = showCurrentPlan
+  })
+  useEffect(() => {
+    if (!onRegisterShowCurrentPlan) return undefined
+    onRegisterShowCurrentPlan(() => showCurrentPlanRef.current())
+    return () => onRegisterShowCurrentPlan(undefined)
+  }, [onRegisterShowCurrentPlan])
 
   return (
     <main className="@container/conversation flex h-full min-h-0 flex-col">
@@ -4215,32 +3654,7 @@ export function ConversationView({
                         content: '',
                         document: planningTask.planReference.document,
                         sessionId: session.id,
-                        status: currentPlan.planSync
-                          ? 'Needs restore'
-                          : planningTask.status === 'running' && planningTask.stage === 'plan'
-                            ? 'Drafting'
-                            : planningTask.status === 'running' &&
-                                planningTask.stage === 'plan_review'
-                              ? 'In review'
-                              : planningTask.review?.stage === 'plan_review' &&
-                                  planningTask.review.planReference?.version ===
-                                    planningTask.planVersion &&
-                                  planningTask.review.planReference?.document.sha256 ===
-                                    planningTask.planReference.document.sha256
-                                ? planningTask.review.verdict === 'accepted'
-                                  ? 'Accepted'
-                                  : planningTask.review.verdict === 'changes_requested'
-                                    ? 'Changes requested'
-                                    : isCollaborationOpenMode(planningTask)
-                                      ? 'Unreviewed'
-                                      : 'In review'
-                                : planningTask.unreviewedPlanActor
-                                  ? 'Unreviewed'
-                                  : isCollaborationOpenMode(planningTask)
-                                    ? 'Accepted'
-                                    : planningTask.stage === 'plan_review'
-                                      ? 'In review'
-                                      : 'Drafting',
+                        status: resolvePlanStatusLabel(planningTask, currentPlan.planSync),
                       }
                     : undefined
               }
@@ -4285,38 +3699,44 @@ export function ConversationView({
             planPanelHost,
           )
         : null}
-      {planAvailable ? (
+
+      {planAvailable && showPlanHeaderButton ? (
         <div className="flex shrink-0 justify-end px-section pt-2">
           <button
             ref={planRestoreFocusRef}
             type="button"
             onClick={showCurrentPlan}
-            className="inline-flex min-h-8 items-center gap-2 rounded-control px-2 text-caption font-medium text-secondary hover:bg-surface-muted focus-visible:outline-2 focus-visible:outline-focus"
+            className="pact-pressable inline-flex min-h-8 cursor-pointer items-center gap-2 rounded-lg px-2.5 text-caption font-medium text-secondary hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-focus"
           >
             <BookOpen aria-hidden="true" className="size-4" strokeWidth={1.75} /> Plan
           </button>
         </div>
       ) : null}
+
       {isSideChat && session.sideChatOrigin === 'btw' && session.sideChatHasContext ? (
         <div
           key={`origin:${session.id}`}
           className="pact-side-chat-origin-enter shrink-0 px-section pt-2.5"
         >
-          <div className="mx-auto flex w-full max-w-[78ch] items-center gap-1.5 text-caption text-tertiary">
+          <div
+            className={`mx-auto flex ${CONVERSATION_WIDTH} items-center gap-1.5 text-caption text-tertiary`}
+          >
             <Info aria-hidden="true" className="size-3.5 shrink-0" strokeWidth={1.75} />
             <span>Context from main chat</span>
           </div>
         </div>
       ) : null}
+
       {/* oxlint-disable-next-line jsx-a11y/no-noninteractive-element-interactions -- The focusable Transcript region uses native wheel and keyboard scrolling. */}
       <section
         ref={transcriptRef}
         data-pact-transcript
+        data-pact-transcript-scroll
         // Keyboard focus lets PageUp/PageDown/Home/End operate the scroll region.
         // oxlint-disable-next-line jsx-a11y/no-noninteractive-tabindex
         tabIndex={0}
         aria-label="Conversation messages"
-        className="min-h-0 flex-1 overflow-auto px-section py-section focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-focus"
+        className="min-h-0 flex-1 overflow-auto px-section pt-5 pb-8 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-focus"
         style={{ overflowAnchor: 'none' }}
         onFocusCapture={(event) => {
           const row = event.target.closest<HTMLElement>('[data-pact-row-key]')
@@ -4393,7 +3813,7 @@ export function ConversationView({
             >
               <span>{history.pageError}</span>
               <button
-                className="font-medium text-primary hover:underline focus-visible:outline-2 focus-visible:outline-focus"
+                className="cursor-pointer font-medium text-primary hover:underline focus-visible:outline-2 focus-visible:outline-focus"
                 type="button"
                 onClick={() => {
                   if (!history.gapRecoveryPending) {
@@ -4410,10 +3830,11 @@ export function ConversationView({
               </button>
             </div>
           ) : null}
+
           {loading && !snapshot ? (
             <div className="space-y-group" aria-busy="true">
-              <div className="h-20 animate-pulse rounded-message bg-surface-muted" />
-              <div className="ml-auto h-16 w-3/4 animate-pulse rounded-message bg-surface-muted" />
+              <div className="h-20 animate-pulse rounded-2xl bg-surface-muted" />
+              <div className="ml-auto h-16 w-3/4 animate-pulse rounded-2xl bg-surface-muted" />
             </div>
           ) : rows.length ? (
             <ol
@@ -4442,9 +3863,69 @@ export function ConversationView({
                       data-pact-row-key={virtualRow.key}
                       aria-posinset={virtualRow.index + 1}
                       aria-setsize={-1}
-                      className="pb-2"
+                      className="pb-5"
                     >
-                      {renderRow(row)}
+                      <EditorialMessageItem
+                        row={row}
+                        rows={rows}
+                        session={session}
+                        snapshot={snapshot}
+                        history={history}
+                        isSideChat={isSideChat}
+                        activeRun={activeRun}
+                        latestRun={latestRun}
+                        runsById={runsById}
+                        activitiesByRun={activitiesByRun}
+                        activityOwnerMessageByRun={activityOwnerMessageByRun}
+                        pendingRoutedMessage={pendingRoutedMessage}
+                        pendingRoutedAgentId={pendingRoutedAgentId}
+                        recoveryLocked={recoveryLocked}
+                        inputTakeover={inputTakeover}
+                        disabled={disabled}
+                        responseInProgress={responseInProgress}
+                        continuationBlocked={continuationBlocked}
+                        feedbackDraft={feedbackDraft}
+                        nativePresentationSuspended={nativePresentationSuspended}
+                        visible={visible}
+                        loading={loading}
+                        sending={sending}
+                        stopping={stopping}
+                        hasNativeQuestions={nativeQuestions.length > 0}
+                        hasRelayDecision={Boolean(currentRelayDecision)}
+                        canFork={Boolean(onForkSessionCreated)}
+                        copyFeedback={copyFeedback}
+                        revealReport={revealReport}
+                        revealReportRequestId={revealReportRequestId}
+                        revealReportBasis={
+                          messageNavigation?.textBasis === 'plain-visible-v1'
+                            ? 'plain-visible-v1'
+                            : undefined
+                        }
+                        revealReportOffset={
+                          gapRestoreRef.current?.selection?.startOffset ??
+                          messageNavigation?.startOffset
+                        }
+                        onRegisterMessageElement={registerMessageElement}
+                        onBeginDetailRead={beginDetailRead}
+                        onCopyMessage={copyMessage}
+                        onRequestFork={requestForkForMessage}
+                        onOpenProjectFile={openProjectFile}
+                        onCreateMessageComment={handleCreateMessageComment}
+                        onCreatePlanComment={handleCreatePlanComment}
+                        onAskInSideChat={onAskInSideChat}
+                        onOpenSideChat={onOpenSideChat}
+                        resolveSideChatTitle={resolveSideChatTitle}
+                        onOpenComment={onOpenComment}
+                        onOpenGallery={openMessageGallery}
+                        onOpenRecordedPlan={openRecordedPlan}
+                        onOpenSessionSettings={onOpenSessionSettings}
+                        onTaskChange={refreshTaskPlan}
+                        onReportReady={handlePlanReady}
+                        onAcceptPeerProposal={onAcceptPeerProposal}
+                        onDismissPeerProposal={onDismissPeerProposal}
+                        onViewSavedResponse={viewSavedResponse}
+                        renderWorkspaceChanges={renderWorkspaceChanges}
+                      />
                     </li>
                   </Fragment>
                 )
@@ -4502,7 +3983,7 @@ export function ConversationView({
           {hasNewerHistory ? (
             <div className="mx-auto mt-group">
               <button
-                className="min-h-8 rounded-control px-2.5 text-caption text-secondary hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-focus disabled:opacity-50"
+                className="pact-pressable min-h-8 cursor-pointer rounded-xl border border-border bg-surface-raised px-3 text-caption font-medium text-secondary hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-focus disabled:opacity-50"
                 type="button"
                 disabled={history.loadingPage}
                 onClick={() => void loadLatest()}
@@ -4518,7 +3999,7 @@ export function ConversationView({
             >
               <span>{history.pageError}</span>
               <button
-                className="font-medium text-primary hover:underline focus-visible:outline-2 focus-visible:outline-focus"
+                className="cursor-pointer font-medium text-primary hover:underline focus-visible:outline-2 focus-visible:outline-focus"
                 type="button"
                 onClick={() => void loadLatest()}
               >
@@ -4531,7 +4012,7 @@ export function ConversationView({
             <p className="mt-group flex items-center gap-2 text-caption text-danger" role="alert">
               <span>{history.readError}</span>
               <button
-                className="min-h-8 font-medium hover:underline disabled:opacity-50"
+                className="min-h-8 cursor-pointer font-medium hover:underline disabled:opacity-50"
                 type="button"
                 aria-label="Retry loading messages"
                 disabled={loading}
@@ -4549,929 +4030,124 @@ export function ConversationView({
         </div>
       </section>
 
-      <div className="pact-conversation-input-dock shrink-0 px-section py-group">
-        <div className={`pact-input-dock-inner mx-auto flex ${CONVERSATION_WIDTH} flex-col gap-2`}>
-          {visibleSessionIssues && visibleSessionIssues.agents.length > 0 ? (
-            <SessionWarningCard
-              value={visibleSessionIssues}
-              enabled={agentActionsEnabled}
-              queuedBackgroundAgent={queuedBackgroundAgent}
-              stoppingAgent={stoppingBackgroundAgent}
-              onRetry={(issue) =>
-                issue.action === 'inspect_rebuild'
-                  ? onRebuildNativeContext(issue.agentId, {
-                      intent: 'inspect',
-                      clientOperationId: issue.rebuildId,
-                      expectedGeneration: issue.generation,
-                    })
-                  : onCheckNativeContext(issue.agentId, issue.runId)
-              }
-              onRebuild={(issue, operationId) =>
-                onRebuildNativeContext(issue.agentId, {
-                  intent: 'create',
-                  clientOperationId: operationId,
-                  expectedGeneration: issue.generation,
-                  ...(issue.nativeSessionId
-                    ? { expectedNativeSessionId: issue.nativeSessionId }
-                    : {}),
-                  expectedRunId: issue.runId ?? null,
-                  expectedRebuildId: issue.rebuildId ?? null,
-                  abandon: issue.abandon,
-                })
-              }
-            />
-          ) : null}
-          <div className="relay-indicator-slot">
-            {onOpenRelaySettings ? (
-              <RelayActivityIndicator
-                state={schedulingState}
-                sessionId={session.id}
-                visible={visible && !nativePresentationSuspended}
-                waitingForUser={inputTakeover || nativeRequests.length > 0}
-                onOpenSettings={onOpenRelaySettings}
-              />
-            ) : null}
-          </div>
-          <div ref={queueDockRef} className="pact-queued-input flex min-h-0 flex-col">
-            {queue && queueActions ? (
-              <QueueMessageBar
-                queue={queue}
-                pending={queueActions.pending}
-                disabled={composerDisabled || sending}
-                canResume={!continuationBlocked}
-                backgroundStatus={
-                  stoppingBackgroundInQueue
-                    ? 'stopping'
-                    : waitingBackgroundIssue?.resultDisposition === 'incomplete'
-                      ? 'waiting_incomplete'
-                      : waitingBackgroundIssue
-                        ? 'waiting'
-                        : undefined
-                }
-                showSteer={
-                  activeRun?.status === 'running' &&
-                  !activeRun.collaboration &&
-                  !unfinishedTask &&
-                  !queuedInput?.workflowCommand
-                }
-                canSteer={!inputTakeover && !stopping && canSteerQueuedInput}
-                steerUnavailableReason={
-                  inputTakeover ? 'Resolve the current interaction first.' : steerUnavailableReason
-                }
-                respondingAgentId={respondingAgentId}
-                onSteer={queueActions.steer}
-                onRemove={queueActions.remove}
-                onEdit={inputTakeover ? undefined : () => returnQueueMessageToComposer(false)}
-                onResume={queueActions.resume}
-                onSetEnabled={queueActions.setEnabled}
-                onCheckStatus={
-                  queuedInput?.state === 'unknown' && queuedInput.delivery
-                    ? queueActions.checkStatus
-                    : undefined
-                }
-              />
-            ) : null}
-            <InputReplacement
-              key={session.id}
-              replacement={
-                nativeQuestions.length
-                  ? {
-                      key: `native:${nativeQuestions.map(({ request }) => `${request.operationId}:${request.id}`).join(':')}`,
-                      content: (
-                        <div className="max-h-[min(60vh,36rem)] space-y-2 overflow-auto">
-                          {nativeQuestions.map(({ agentId, request }) => (
-                            <NativeInputCard
-                              key={`${request.operationId}:${request.id}`}
-                              request={request}
-                              agentId={agentId}
-                              onRespond={onRespondNativeInput}
-                              draft={nativeInputDrafts[request.id]}
-                              onDraftChange={onNativeInputDraftChange}
-                            />
-                          ))}
-                        </div>
-                      ),
-                    }
-                  : decisionTakeover && decisionSource
-                    ? {
-                        key: planRecovery
-                          ? `recovery:${planRecovery.runId}`
-                          : decisionReply
-                            ? `question:${decisionKey}`
-                            : `processing:${decisionKey}`,
-                        content: planRecovery ? (
-                          <section
-                            aria-label="Plan recovery required"
-                            className="rounded-control border border-border bg-surface-muted px-group py-panel text-caption"
-                          >
-                            <p className="font-medium text-primary">Plan recovery required</p>
-                            <p className="mt-1 text-secondary">
-                              Restore the saved plan using the recovery action above. Your previous
-                              answers and message draft are kept.
-                            </p>
-                          </section>
-                        ) : decisionReply ? (
-                          <div className="space-y-2">
-                            {inputGateState === 'incomplete' ? (
-                              <p role="status" className="px-group text-caption text-secondary">
-                                {incompleteCanAnswer
-                                  ? 'Your previous reply was not confirmed. You can send a follow-up answer.'
-                                  : 'Your previous reply needs recovery before another answer can be sent.'}
-                              </p>
-                            ) : null}
-                            <CollaborationQuestionCard
-                              key={decisionKey}
-                              sessionId={session.id}
-                              runId={decisionSource.runId}
-                              messageId={decisionMessageId}
-                              actor={
-                                decisionSource.actor ?? runsById.get(decisionSource.runId)?.agentId
-                              }
-                              decision={decisionReply}
-                              draft={history.decisionDraft}
-                              onDraftChange={history.setDecisionDraft}
-                              onClearDraft={history.clearDecisionDraft}
-                              onSubmit={() => void submitAnswers()}
-                              canSubmit={decisionAnswersReady}
-                              disabled={questionDisabled}
-                              onOpenProjectFile={openProjectFile}
-                            />
-                          </div>
-                        ) : (
-                          <section
-                            aria-label="Answer progress"
-                            className="flex items-center gap-group rounded-control border border-border bg-surface-muted px-group py-panel text-caption"
-                          >
-                            <LoaderCircle
-                              aria-hidden="true"
-                              className="size-4 shrink-0 animate-spin text-secondary motion-reduce:animate-none"
-                            />
-                            <div className="min-w-0 flex-1">
-                              <p className="font-medium text-primary">
-                                {inputGateState === 'queued'
-                                  ? 'Answers queued'
-                                  : responseInProgress
-                                    ? 'Processing your answers'
-                                    : 'Answers sent'}
-                              </p>
-                              <p className="mt-1 text-secondary">
-                                Your message draft is kept until these questions are resolved.
-                              </p>
-                            </div>
-                            {showStop ? (
-                              <button
-                                type="button"
-                                disabled={stopping}
-                                onClick={() => void requestStop()}
-                                className="min-h-8 rounded-control px-3 font-medium text-primary hover:bg-surface-raised focus-visible:outline-2 focus-visible:outline-focus"
-                              >
-                                {stopping ? 'Stopping…' : 'Stop'}
-                              </button>
-                            ) : null}
-                          </section>
-                        ),
-                      }
-                    : currentRelayDecision && !planRecovery && nativeRequests.length === 0
-                      ? {
-                          key: `relay:${currentRelayDecision.request.decisionId}`,
-                          content: (
-                            <RelayDecisionCard
-                              decision={currentRelayDecision}
-                              visible={visible && !nativePresentationSuspended}
-                            />
-                          ),
-                        }
-                      : undefined
-              }
-            >
-              <div className="pact-ordinary-input-stack flex flex-col gap-2">
-                {snapshot?.preparedInputContinuation ? (
-                  <PreparedInputCard
-                    key={`${session.id}:${snapshot.preparedInputContinuation.batchId}`}
-                    sessionId={session.id}
-                    input={snapshot.preparedInputContinuation}
-                    disabled={
-                      sending || stopping || nativeRequests.length > 0 || Boolean(planRecovery)
-                    }
-                    onChanged={() => history.retryRead()}
-                  />
-                ) : null}
-                {!planPanelExpanded ? commentEditorView : null}
-                {skillComposer.warning ? (
-                  <div
-                    id={`skill-warning-${session.id}`}
-                    role="alert"
-                    className="flex items-start gap-2 rounded-control border border-status-danger/30 bg-status-danger-muted px-3 py-2 text-caption text-status-danger-foreground"
-                  >
-                    <TriangleAlert
-                      aria-hidden="true"
-                      className="mt-0.5 size-3.5 shrink-0"
-                      strokeWidth={1.75}
-                    />
-                    <span>{skillComposer.warning}</span>
-                  </div>
-                ) : null}
-                {queue?.returnedInput &&
-                queueActions &&
-                composerReturnedInputOperationId !== queue.returnedInput.operationId ? (
-                  <button
-                    type="button"
-                    className="min-h-7 cursor-pointer self-start rounded-control px-2 text-caption font-medium text-secondary hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-focus disabled:cursor-default disabled:opacity-45"
-                    disabled={composerDisabled || sending || stopping || queueActions.pending}
-                    title="Replace the current draft with the returned message"
-                    onClick={() => void returnQueueMessageToComposer(true)}
-                  >
-                    {history.restoringInput ? 'Restoring…' : 'Restore returned message'}
-                  </button>
-                ) : null}
-                {isSideChat && lastMainSync?.sideChatId === session.id ? (
-                  <div
-                    role="status"
-                    className="pact-side-chat-sync-bar flex items-center justify-between gap-2 rounded-control border border-border bg-surface px-3 py-1.5 text-caption"
-                  >
-                    <span className="flex min-w-0 items-center gap-1.5 text-secondary">
-                      <Check
-                        aria-hidden="true"
-                        className="size-3.5 shrink-0 text-status-ready"
-                        strokeWidth={1.75}
-                      />
-                      <span className="truncate">
-                        Sent to main chat
-                        {lastMainSync.receipt.disposition === 'queued' ? ' (queued)' : ''}
-                      </span>
-                    </span>
-                    <div className="flex shrink-0 items-center gap-2">
-                      {onViewMainMessage ? (
-                        <button
-                          type="button"
-                          className="font-medium text-focus hover:underline focus-visible:outline-2 focus-visible:outline-focus"
-                          onClick={() => onViewMainMessage(lastMainSync.receipt)}
-                        >
-                          View
-                        </button>
-                      ) : null}
-                      <button
-                        type="button"
-                        aria-label="Dismiss main chat notification"
-                        className="grid size-5 place-items-center rounded-control text-tertiary hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-focus"
-                        onClick={() => setLastMainSync(undefined)}
-                      >
-                        <X aria-hidden="true" className="size-3" strokeWidth={1.75} />
-                      </button>
-                    </div>
-                  </div>
-                ) : null}
-                <div
-                  ref={composerBoxRef}
-                  style={{ anchorName: composerMenuAnchor }}
-                  className={`pact-composer-box relative flex flex-col gap-1.5 rounded-card border border-border bg-surface-raised p-2 focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-focus ${isHandoffArriving ? 'pact-composer-handoff-arrive' : ''} ${recoveryLocked ? 'opacity-60' : ''} ${imageDropActive ? 'outline-2 outline-focus outline-offset-4' : ''}`}
-                  onDragEnter={(event) => {
-                    if (
-                      !composerDisabled &&
-                      !inputTakeover &&
-                      event.dataTransfer.types.includes('Files')
-                    ) {
-                      event.preventDefault()
-                      setImageDropActive(true)
-                    }
-                  }}
-                  onDragOver={(event) => {
-                    if (
-                      !composerDisabled &&
-                      !inputTakeover &&
-                      event.dataTransfer.types.includes('Files')
-                    ) {
-                      event.preventDefault()
-                      event.dataTransfer.dropEffect = 'copy'
-                    }
-                  }}
-                  onDragLeave={(event) => {
-                    if (
-                      !event.currentTarget.contains(
-                        event.relatedTarget instanceof Node ? event.relatedTarget : null,
-                      )
-                    )
-                      setImageDropActive(false)
-                  }}
-                  onDropCapture={(event) => {
-                    setImageDropActive(false)
-                    if (
-                      event.dataTransfer.files.length &&
-                      onAddComposerImages &&
-                      !composerDisabled &&
-                      !inputTakeover
-                    ) {
-                      event.preventDefault()
-                      event.stopPropagation()
-                      void onAddComposerImages([...event.dataTransfer.files])
-                    }
-                  }}
+      <ComposerIsland
+        session={session}
+        snapshot={snapshot}
+        history={history}
+        visible={visible}
+        isSideChat={isSideChat}
+        platform={platform}
+        planPanelExpanded={planPanelExpanded}
+        nativePresentationSuspended={nativePresentationSuspended}
+        schedulingState={schedulingState}
+        visibleSessionIssues={visibleSessionIssues}
+        queuedBackgroundAgent={queuedBackgroundAgent}
+        stoppingBackgroundAgent={stoppingBackgroundAgent}
+        stoppingBackgroundInQueue={stoppingBackgroundInQueue}
+        waitingBackgroundIssue={waitingBackgroundIssue}
+        activeRun={activeRun}
+        latestRun={latestRun}
+        runsById={runsById}
+        activePair={activePair}
+        primaryName={primaryName}
+        secondaryName={secondaryName}
+        respondingAgentId={respondingAgentId}
+        responseInProgress={responseInProgress}
+        continuationBlocked={continuationBlocked}
+        agentActionsEnabled={agentActionsEnabled}
+        effectiveMainSyncEnabled={effectiveMainSyncEnabled}
+        sideChatSettingsState={sideChatSettingsState}
+        composerDisabled={composerDisabled}
+        disabled={disabled}
+        commonComposerBlocked={commonComposerBlocked}
+        mainSyncComposerBlocked={mainSyncComposerBlocked}
+        recoveryLocked={recoveryLocked}
+        sending={sending}
+        stopping={stopping}
+        showStop={showStop}
+        stopLabel={stopLabel}
+        showSend={showSend}
+        hasDraft={hasDraft}
+        isBtwReady={isBtwReady}
+        btwSubmitting={btwSubmitting}
+        isMainRoute={isMainRoute}
+        hasUnfinishedTask={Boolean(unfinishedTask)}
+        hasReplacement={Boolean(replacement)}
+        queueEnabled={queueEnabled}
+        canSteerQueuedInput={canSteerQueuedInput}
+        steerUnavailableReason={steerUnavailableReason}
+        inputTakeover={inputTakeover}
+        decisionTakeover={decisionTakeover}
+        decisionSource={decisionSource}
+        decisionKey={decisionKey}
+        decisionMessageId={decisionMessageId}
+        decisionReply={decisionReply}
+        decisionAnswersReady={decisionAnswersReady}
+        inputGateState={inputGateState}
+        incompleteCanAnswer={incompleteCanAnswer}
+        questionDisabled={questionDisabled}
+        planRecovery={planRecovery}
+        nativeRequests={nativeRequests}
+        nativeQuestions={nativeQuestions}
+        nativeInputDrafts={nativeInputDrafts}
+        currentRelayDecision={currentRelayDecision}
+        composer={composer}
+        composerImages={composerImages}
+        choosingImages={choosingImages}
+        composerMention={composerMention}
+        composerReturnedInputOperationId={composerReturnedInputOperationId}
+        editorValue={editorValue}
+        pactCommandHint={pactCommandHint}
+        handoffArriveKey={handoffArriveKey}
+        lastMainSync={lastMainSync}
+        draftComments={draftComments}
+        commentEditorView={commentEditorView}
+        commentDraftsView={commentDraftsView}
+        skillComposer={skillComposer}
+        skillMenuOpen={skillMenuOpen}
+        activeSkillId={activeSkillId}
+        mentionQuery={mentionQuery}
+        filteredMentionOptions={filteredMentionOptions}
+        mentionListOpen={mentionListOpen}
+        mentionListId={mentionListId}
+        activeMentionIndex={activeMentionIndex}
+        activeMentionId={activeMentionId}
+        sessionSettingsSaving={sessionSettingsSaving}
+        queueDockRef={queueDockRef}
+        composerRef={composerRef}
+        onOpenRelaySettings={onOpenRelaySettings}
+        onRebuildNativeContext={onRebuildNativeContext}
+        onCheckNativeContext={onCheckNativeContext}
+        onReturnQueueMessageToComposer={returnQueueMessageToComposer}
+        onRespondNativeInput={onRespondNativeInput}
+        onNativeInputDraftChange={onNativeInputDraftChange}
+        onSubmitAnswers={submitAnswers}
+        onRequestStop={requestStop}
+        onOpenProjectFile={openProjectFile}
+        onOpenSkillDocument={onOpenSkillDocument}
+        onNotice={onNotice}
+        onAddComposerImages={onAddComposerImages}
+        onChooseComposerImages={onChooseComposerImages}
+        onRemoveComposerImage={onRemoveComposerImage}
+        onOpenImageGallery={openImageGallery}
+        onAcceptComposerDocument={acceptComposerDocument}
+        onCursorChanged={cursorChanged}
+        onUpdateComposer={updateComposer}
+        onChooseSkill={chooseSkill}
+        onChooseMention={chooseMention}
+        onDismissMentionMenu={dismissMentionMenu}
+        onClearMentionQuery={() => setMentionQuery(undefined)}
+        onActiveMentionIndexChange={setActiveMentionIndex}
+        onSubmit={submit}
+        onOpenBtwSideChat={onOpenBtwSideChat}
+        onSyncToMain={onSyncToMain}
+        onViewMainMessage={onViewMainMessage}
+        onDismissMainSync={() => setLastMainSync(undefined)}
+        onSaveSessionPermission={onSaveSessionPermission}
+        onSaveSessionSpeed={onSaveSessionSpeed}
+        onInputHeightDelta={handleInputHeightDelta}
+      />
 
-                  aria-disabled={recoveryLocked}
-                >
-                  <div className="pact-composer-editing flex min-h-16 w-full flex-col gap-1.5">
-                    {!planPanelExpanded ? commentDraftsView : null}
-                    {returnedInput ? (
-                      <div className="mb-2 flex flex-wrap items-center gap-2 px-2 text-caption text-secondary">
-                        <span>
-                          {history.restoringInput
-                            ? 'Restoring unsent message…'
-                            : returnedInput.state === 'installed' &&
-                                (composer || composerImages.length || draftComments.length)
-                              ? 'Unsent message restored'
-                              : 'Previous unsent message is available'}
-                        </span>
-                        <span>
-                          ·{' '}
-                          {returnedInput.route.type === 'all'
-                            ? `${agentName(returnedInput.route.firstAgentId)} → ${agentName(returnedInput.route.secondAgentId)}`
-                            : agentName(returnedInput.route.agentId)}
-                        </span>
-                        {returnedInput.state === 'pending' ||
-                        (!composer &&
-                          !composerImages.length &&
-                          !hasDecisionAnswers(history.decisionDraft)) ? (
-                          <>
-                            <button
-                              type="button"
-                              className="rounded-control px-2 py-1 text-primary hover:bg-surface-muted disabled:opacity-40"
-                              disabled={Boolean(
-                                composer ||
-                                hasDecisionAnswers(history.decisionDraft) ||
-                                composerImages.length ||
-                                composerMention ||
-                                draftComments.some(
-                                  (comment) => !returnedInput.commentIds.includes(comment.id),
-                                ) ||
-                                history.restoringInput ||
-                                history.draftsLoading,
-                              )}
-                              onClick={() => void history.restoreReturnedInput?.()}
-                            >
-                              Restore to input
-                            </button>
-                            {returnedInput.state === 'pending' ? (
-                              <button
-                                type="button"
-                                className="rounded-control px-2 py-1 hover:bg-surface-muted disabled:opacity-40"
-                                disabled={Boolean(history.restoringInput)}
-                                onClick={() => void history.discardReturnedInput?.()}
-                              >
-                                Dismiss
-                              </button>
-                            ) : null}
-                            {returnedInput.state === 'pending' &&
-                            (composer ||
-                              composerImages.length ||
-                              composerMention ||
-                              draftComments.length) ? (
-                              <span>Sending your current draft replaces the returned message.</span>
-                            ) : null}
-                          </>
-                        ) : null}
-                      </div>
-                    ) : null}
-                    <ConversationImages
-                      sessionId={session.id}
-                      images={composerImages}
-                      draft
-                      disabled={composerDisabled}
-                      onOpen={(image) => openImageGallery(composerImages, image)}
-                      onRemove={onRemoveComposerImage}
-                    />
-                    <ComposerEditor
-                      editorRef={composerRef}
-                      value={editorValue}
-                      allowPactCommands={!isSideChat}
-                      onChange={acceptComposerDocument}
-                      admitEdit={history.admitComposerEdit}
-                      onCursor={cursorChanged}
-                      onSkillOpen={(skill) => onOpenSkillDocument?.(skill)}
-                      onNotice={onNotice}
-                      onImages={
-                        onAddComposerImages ? (files) => void onAddComposerImages(files) : undefined
-                      }
-                      expanded={mentionListOpen || Boolean(skillComposer.query)}
-                      controls={
-                        skillComposer.query
-                          ? `skills-${session.id}`
-                          : mentionListOpen
-                            ? mentionListId
-                            : undefined
-                      }
-                      describedBy={
-                        skillComposer.warning ? `skill-warning-${session.id}` : undefined
-                      }
-                      activeDescendant={
-                        skillComposer.query && skillComposer.options[skillComposer.active]
-                          ? `skill-${skillComposer.options[skillComposer.active]!.id}`
-                          : activeMentionId
-                      }
-                      placeholder={
-                        isSideChat && sideChatSettingsState === 'loading'
-                          ? 'Loading side chat settings…'
-                          : agentActionsEnabled
-                            ? 'What should we tackle next?'
-                            : isSideChat && effectiveMainSyncEnabled
-                              ? 'Mention @Main to send to main chat'
-                              : 'Agent actions are paused'
-                      }
-                      disabled={composerDisabled || inputTakeover}
-                      onKeyDown={(event) => {
-                        if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
-                          event.preventDefault()
-                          void submit()
-                          return
-                        }
-                        const editingDocument = composerRef.current?.document() ?? editorValue
-                        const selectedMention = editingDocument.mention
-                        const range = composerRef.current?.selection() ?? { start: 0, end: 0 }
-                        if (skillComposer.query) {
-                          if (event.key === 'Escape') {
-                            event.preventDefault()
-                            skillComposer.close()
-                            return
-                          }
-                          if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
-                            event.preventDefault()
-                            const next = skillComposer.active + (event.key === 'ArrowDown' ? 1 : -1)
-                            const current = skillComposer.options[skillComposer.active]
-                            if (
-                              event.key === 'ArrowUp' &&
-                              current &&
-                              current.agentId !== 'pact' &&
-                              (skillComposer.pages[current.agentId]?.startOffset ?? 0) > 0 &&
-                              skillComposer.options[next]?.agentId !== current.agentId
-                            ) {
-                              void skillComposer.more(current.agentId, true)
-                              return
-                            }
-                            if (
-                              event.key === 'ArrowDown' &&
-                              current &&
-                              current.agentId !== 'pact' &&
-                              skillComposer.pages[current.agentId]?.nextOffset != null &&
-                              skillComposer.options[next]?.agentId !== current.agentId
-                            )
-                              void skillComposer.more(current.agentId)
-                            else if (next >= skillComposer.options.length && skillComposer.hasMore)
-                              void skillComposer.more()
-                            else
-                              skillComposer.setActive(
-                                Math.max(0, Math.min(skillComposer.options.length - 1, next)),
-                              )
-                            return
-                          }
-                          if ((event.key === 'Enter' || event.key === 'Tab') && !event.shiftKey) {
-                            // Keep keyboard intent in the Composer while a filtered page is arriving.
-                            event.preventDefault()
-                            const entry = skillComposer.options[skillComposer.active]
-                            if (entry) {
-                              chooseSkill(entry)
-                            }
-                            return
-                          }
-                        }
-                        if (
-                          selectedMention &&
-                          range.start === range.end &&
-                          ((event.key === 'Backspace' && range.start === selectedMention.end) ||
-                            (event.key === 'Delete' && range.start === selectedMention.start))
-                        ) {
-                          event.preventDefault()
-                          const trailingSpace =
-                            editingDocument.text[selectedMention.end] === ' ' ? 1 : 0
-                          const next = `${editingDocument.text.slice(0, selectedMention.start)}${editingDocument.text.slice(selectedMention.end + trailingSpace)}`
-                          const cursor = selectedMention.start
-                          updateComposer(next, cursor, [
-                            {
-                              start: selectedMention.start,
-                              end: selectedMention.end + trailingSpace,
-                              text: '',
-                            },
-                          ])
-                          setMentionQuery(undefined)
-                          return
-                        }
-                        if (mentionQuery && filteredMentionOptions.length > 0) {
-                          if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
-                            event.preventDefault()
-                            const direction = event.key === 'ArrowDown' ? 1 : -1
-                            setActiveMentionIndex(
-                              (index) =>
-                                (index + direction + filteredMentionOptions.length) %
-                                filteredMentionOptions.length,
-                            )
-                            return
-                          }
-                          if ((event.key === 'Enter' || event.key === 'Tab') && !event.shiftKey) {
-                            event.preventDefault()
-                            const option = filteredMentionOptions[activeMentionIndex]
-                            if (option) chooseMention(option)
-                            return
-                          }
-                          if (event.key === 'Escape') {
-                            event.preventDefault()
-                            dismissMentionMenu()
-                            return
-                          }
-                        }
-                        if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
-                          if (
-                            !isBtwReady &&
-                            !isMainRoute &&
-                            responseInProgress &&
-                            !queueEnabled &&
-                            !unfinishedTask
-                          )
-                            return
-                          event.preventDefault()
-                          void submit()
-                        }
-                      }}
-                    />
-                  </div>
-                  {pactCommandHint ? (
-                    <p className="px-2 pb-1 text-caption text-tertiary">{pactCommandHint}</p>
-                  ) : null}
-                  <div className="pact-composer-send-row relative flex items-center justify-between">
-                    <div
-                      ref={skillMenuRef}
-                      popover="auto"
-                      style={{ positionAnchor: composerMenuAnchor }}
-                      onBeforeToggle={(event) => {
-                        skillPopoverOpen.current = event.newState === 'open'
-                        if (event.newState === 'closed' && skillComposer.query)
-                          skillComposer.close()
-                      }}
-                      id={`skills-${session.id}`}
-                      role="listbox"
-                      aria-label="Native Skills"
-                      aria-hidden={!skillMenuOpen}
-                      aria-busy={skillComposer.loading}
-                      inert={!skillMenuOpen}
-                      data-open={skillMenuOpen}
-                      className="pact-skill-menu overflow-y-auto rounded-panel border border-border bg-surface-raised p-1.5 shadow-lg"
-                    >
-                      {skillComposer.pactOptions.length > 0 ? (
-                        <>
-                          <p className="px-2.5 pt-2 pb-1 text-caption font-medium text-tertiary">
-                            Pact
-                          </p>
-                          {skillComposer.pactOptions.map((entry) => {
-                            const index = skillComposer.options.indexOf(entry)
-                            return (
-                              <button
-                                key={entry.id}
-                                id={`skill-${entry.id}`}
-                                type="button"
-                                role="option"
-                                aria-selected={index === skillComposer.active}
-                                className={`flex min-h-10 w-full items-center gap-2 rounded-control px-2.5 py-1.5 text-left text-caption ${index === skillComposer.active ? 'bg-surface-muted text-primary' : 'text-secondary hover:bg-surface-muted'}`}
-                                onMouseEnter={() => skillComposer.setActive(index, false)}
-                                onMouseDown={(event) => event.preventDefault()}
-                                onClick={() => chooseSkill(entry)}
-                              >
-                                <BookOpen
-                                  aria-hidden="true"
-                                  className="size-4 shrink-0"
-                                  strokeWidth={1.75}
-                                />
-                                <span className="min-w-0 flex-1">
-                                  <span className="block font-medium text-primary">
-                                    {entry.name}
-                                  </span>
-                                  <span className="block text-tertiary">{entry.description}</span>
-                                </span>
-                                <span className="text-tertiary">Pact</span>
-                              </button>
-                            )
-                          })}
-                        </>
-                      ) : null}
-                      {skillComposer.agents.map((agent) => (
-                        <Fragment key={agent}>
-                          <p className="px-2.5 pt-2 pb-1 text-caption font-medium text-tertiary">
-                            {agentName(agent)}
-                          </p>
-                          {skillComposer.visibleOptions
-                            .filter((entry) => entry.agentId === agent)
-                            .map((entry) => {
-                              const index = skillComposer.options.indexOf(entry)
-                              return (
-                                <button
-                                  key={entry.id}
-                                  id={`skill-${entry.id}`}
-                                  type="button"
-                                  role="option"
-                                  aria-selected={index === skillComposer.active}
-                                  className={`flex min-h-10 w-full items-center gap-2 rounded-control px-2.5 py-1.5 text-left text-caption ${index === skillComposer.active ? 'bg-surface-muted text-primary' : 'text-secondary hover:bg-surface-muted'}`}
-                                  onMouseEnter={() => skillComposer.setActive(index, false)}
-                                  onMouseDown={(event) => event.preventDefault()}
-                                  onClick={() => {
-                                    chooseSkill(entry)
-                                  }}
-                                >
-                                  <span className="min-w-0 flex-1">
-                                    <span className="block truncate font-medium text-primary">
-                                      /{entry.name}
-                                      {entry.argumentHint ? (
-                                        <span className="ml-2 font-normal text-tertiary">
-                                          {entry.argumentHint}
-                                        </span>
-                                      ) : null}
-                                    </span>
-                                    <span
-                                      className="block truncate text-tertiary"
-                                      title={entry.description}
-                                    >
-                                      {entry.description}
-                                    </span>
-                                  </span>
-                                  <span className="shrink-0 text-tertiary">
-                                    {entry.source === 'native'
-                                      ? 'Native'
-                                      : entry.source[0]!.toUpperCase() + entry.source.slice(1)}
-                                  </span>
-                                </button>
-                              )
-                            })}
-                          {skillComposer.errors[agent] ? (
-                            <p className="px-2.5 py-2 text-caption text-secondary">
-                              {skillComposer.errors[agent]}
-                            </p>
-                          ) : null}
-                          {!skillComposer.loading &&
-                          !skillComposer.errors[agent] &&
-                          !skillComposer.pages[agent]?.skills.length ? (
-                            <p className="px-2.5 py-2 text-caption text-tertiary">
-                              No matching Skills.
-                            </p>
-                          ) : null}
-                          {skillComposer.canPrevious(agent) || skillComposer.canMore(agent) ? (
-                            <div className="flex items-center justify-between gap-2 px-2.5 py-1">
-                              {skillComposer.canPrevious(agent) ? (
-                                <button
-                                  type="button"
-                                  className="min-h-8 rounded-control px-2 text-caption text-secondary hover:bg-surface-muted disabled:opacity-50"
-                                  aria-label={`Previous ${agentName(agent)} Skills`}
-                                  disabled={skillComposer.loading}
-                                  onMouseDown={(event) => event.preventDefault()}
-                                  onClick={() => {
-                                    composerRef.current?.focus()
-                                    void skillComposer.more(agent, true)
-                                  }}
-                                >
-                                  Previous Skills
-                                </button>
-                              ) : (
-                                <span />
-                              )}
-                              <span role="status" className="text-caption text-tertiary">
-                                {skillComposer.rangeLabel(agent)}
-                              </span>
-                              {skillComposer.canMore(agent) ? (
-                                <button
-                                  type="button"
-                                  className="min-h-8 rounded-control px-2 text-caption text-secondary hover:bg-surface-muted disabled:opacity-50"
-                                  aria-label={`More ${agentName(agent)} Skills`}
-                                  disabled={skillComposer.loading}
-                                  onMouseDown={(event) => event.preventDefault()}
-                                  onClick={() => {
-                                    composerRef.current?.focus()
-                                    void skillComposer.more(agent)
-                                  }}
-                                >
-                                  More Skills
-                                </button>
-                              ) : null}
-                            </div>
-                          ) : null}
-                        </Fragment>
-                      ))}
-                      {skillComposer.loading && skillComposer.options.length === 0 ? (
-                        <p
-                          role="status"
-                          className="flex items-center gap-2 px-2.5 py-2 text-caption text-tertiary"
-                        >
-                          <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
-                          Loading native Skills…
-                        </p>
-                      ) : null}
-                    </div>
-                    <div
-                      ref={mentionMenuRef}
-                      id={mentionListId}
-                      popover="auto"
-                      style={{ positionAnchor: composerMenuAnchor }}
-                      data-open={mentionListOpen}
-                      aria-hidden={!mentionListOpen}
-                      inert={!mentionListOpen}
-                      onBeforeToggle={(event) => {
-                        mentionPopoverOpen.current = event.newState === 'open'
-                        if (event.newState === 'closed' && mentionQuery) dismissMentionMenu()
-                      }}
-                      className="pact-mention-menu overflow-y-auto rounded-panel border border-border bg-surface-raised p-1.5 shadow-lg"
-                      role="listbox"
-                      aria-label="Message recipients"
-                    >
-                      {filteredMentionOptions.map((option, index) => {
-                        const Icon = option.icon
-                        const active = index === activeMentionIndex
-                        return (
-                          <button
-                            id={`${mentionListId}-${option.token.slice(1)}`}
-                            key={option.token}
-                            type="button"
-                            role="option"
-                            aria-selected={active}
-                            className={`flex min-h-9 w-full cursor-pointer items-center gap-2.5 rounded-control px-2.5 text-left text-caption ${active ? 'bg-surface-muted text-primary' : 'text-secondary hover:bg-surface-muted/70 hover:text-primary'}`}
-                            onMouseEnter={() => setActiveMentionIndex(index)}
-                            onMouseDown={(event) => event.preventDefault()}
-                            onClick={() => chooseMention(option)}
-                          >
-                            <Icon
-                              aria-hidden="true"
-                              className="size-3.5 shrink-0"
-                              strokeWidth={1.75}
-                            />
-                            <span className="min-w-0 flex-1">
-                              <span className="font-medium text-primary">{option.label}</span>
-                              <span className="ml-2 text-caption text-tertiary">
-                                {option.token === '@all'
-                                  ? `${primaryName}, then ${secondaryName}`
-                                  : option.description}
-                              </span>
-                            </span>
-                            <span className="font-mono text-caption text-tertiary">
-                              {option.token}
-                            </span>
-                          </button>
-                        )
-                      })}
-                    </div>
-
-                    {onChooseComposerImages ? (
-                      <button
-                        type="button"
-                        className="grid size-8 shrink-0 place-items-center rounded-control text-secondary hover:bg-surface-muted hover:text-primary disabled:opacity-40"
-                        aria-label="Add images"
-                        title="Add images · paste or drop also works"
-                        disabled={composerDisabled || choosingImages}
-                        aria-busy={choosingImages}
-                        onClick={() => void onChooseComposerImages()}
-                      >
-                        {choosingImages ? (
-                          <LoaderCircle
-                            className="size-4 animate-spin"
-                            aria-hidden="true"
-                            strokeWidth={1.75}
-                          />
-                        ) : (
-                          <ImagePlus className="size-4" aria-hidden="true" strokeWidth={1.75} />
-                        )}
-                      </button>
-                    ) : null}
-                    <div className="ml-auto flex shrink-0 items-center gap-1.5">
-                      {showStop ? (
-                        <button
-                          type="button"
-                          aria-label={stopLabel}
-                          title={stopLabel}
-                          disabled={stopping || !agentActionsEnabled}
-                          onClick={() => void requestStop()}
-                          className={`grid size-9 place-items-center rounded-control focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus disabled:cursor-default ${showSend ? 'border border-border bg-surface-muted text-secondary enabled:hover:border-border-strong enabled:hover:text-primary' : 'bg-surface-inverse text-inverse hover:opacity-85'}`}
-                        >
-                          {stopping ? (
-                            <LoaderCircle
-                              aria-hidden="true"
-                              className="size-4 animate-spin motion-reduce:animate-none"
-                              strokeWidth={1.8}
-                            />
-                          ) : (
-                            <Square
-                              aria-hidden="true"
-                              className="size-3.5"
-                              fill="currentColor"
-                              strokeWidth={1.5}
-                            />
-                          )}
-                        </button>
-                      ) : null}
-                      {showSend ? (
-                        <button
-                          className="grid size-9 place-items-center rounded-control bg-surface-inverse text-inverse hover:opacity-85 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus disabled:cursor-default disabled:opacity-40"
-                          type="button"
-                          aria-label={isMainRoute ? 'Send to main' : 'Send message'}
-                          title={isMainRoute ? 'Send to main' : 'Send message'}
-                          disabled={
-                            isBtwReady
-                              ? commonComposerBlocked || btwSubmitting || !onOpenBtwSideChat
-                              : isMainRoute
-                                ? mainSyncComposerBlocked || !onSyncToMain
-                                : disabled ||
-                                  !hasDraft ||
-                                  Boolean(replacement) ||
-                                  (responseInProgress && !queueEnabled && !unfinishedTask)
-                          }
-                          onClick={() => void submit()}
-                        >
-                          {isMainRoute ? (
-                            <span
-                              key="send-main"
-                              className="pact-send-icon inline-flex items-center justify-center"
-                            >
-                              <CornerUpLeft
-                                aria-hidden="true"
-                                className="size-4"
-                                strokeWidth={1.9}
-                              />
-                            </span>
-                          ) : (
-                            <span
-                              key="send-normal"
-                              className="pact-send-icon inline-flex items-center justify-center"
-                            >
-                              <ArrowUp aria-hidden="true" className="size-4" strokeWidth={1.9} />
-                            </span>
-                          )}
-                        </button>
-                      ) : null}
-                    </div>
-                  </div>
-                </div>
-                {!isSideChat ? (
-                  <div className="pact-composer-controls flex min-w-0 items-center gap-2">
-                    {onSaveSessionPermission ? (
-                      <>
-                        {activePair.map((agent) => (
-                          <div
-                            key={`${session.id}-${agent}`}
-                            role="group"
-                            aria-label={`${agentName(agent)} settings`}
-                            className="pact-agent-controls text-caption"
-                          >
-                            <PermissionMenu
-                              session={session}
-                              agent={agent}
-                              run={activeRun ?? latestRun}
-                              busy={responseInProgress}
-                              disabled={sessionSettingsSaving}
-                              visible={visible && !nativePresentationSuspended && !inputTakeover}
-                              onSave={onSaveSessionPermission}
-                              onNotice={onNotice}
-                            />
-                            {onSaveSessionSpeed ? (
-                              <>
-                                <span className="pact-agent-divider" aria-hidden="true" />
-                                <SpeedMenu
-                                  session={session}
-                                  agent={agent}
-                                  run={activeRun ?? latestRun}
-                                  busy={responseInProgress}
-                                  disabled={sessionSettingsSaving}
-                                  visible={
-                                    visible && !nativePresentationSuspended && !inputTakeover
-                                  }
-                                  onSave={onSaveSessionSpeed}
-                                  onNotice={onNotice}
-                                />
-                              </>
-                            ) : null}
-                          </div>
-                        ))}
-                      </>
-                    ) : null}
-                    <ProjectContextMenu
-                      key={`${session.id}-${session.projectId}`}
-                      projectId={session.projectId}
-                      platform={platform}
-                      visible={visible && !inputTakeover}
-                      refreshKey={`${latestRun?.id ?? ''}:${latestRun?.status ?? ''}`}
-                      onNotice={onNotice}
-                    />
-                  </div>
-                ) : null}
-                {history.draftError && snapshot ? (
-                  <p
-                    className="flex items-center gap-2 px-2 text-caption text-secondary"
-                    role="alert"
-                  >
-                    Couldn’t load comments.
-                    <button
-                      className="min-h-8 font-medium text-primary hover:underline focus-visible:outline-2 focus-visible:outline-focus"
-                      type="button"
-                      onClick={() => history.retryDrafts()}
-                    >
-                      Retry
-                    </button>
-                  </p>
-                ) : null}
-              </div>
-            </InputReplacement>
-          </div>
-        </div>
-      </div>
       {replacement && replacementTask ? (
         <TaskReplacementConfirmation
           task={replacementTask}
@@ -5492,6 +4168,7 @@ export function ConversationView({
           onConfirm={() => void confirmReplacement()}
         />
       ) : null}
+
       {forkPoint?.sourceSessionId === session.id && onForkSessionCreated ? (
         <SessionForkDialog
           key={`${forkPoint.sourceSessionId}:${forkPoint.messageId}`}
@@ -5506,6 +4183,7 @@ export function ConversationView({
           suspended={nativePresentationSuspended}
         />
       ) : null}
+
       {gallery ? (
         <ImageGallery
           key={gallery.initialId}
@@ -5517,318 +4195,5 @@ export function ConversationView({
         />
       ) : null}
     </main>
-  )
-}
-
-function ContextReceipt({
-  count,
-  source,
-  accepted,
-}: {
-  count: number
-  source?: string | undefined
-  accepted: boolean
-}): React.JSX.Element {
-  const unit = count === 1 ? 'message' : 'messages'
-  return (
-    <p className="mt-1 text-caption text-tertiary">
-      {source
-        ? `${accepted ? 'Shared' : 'Prepared'} ${count} earlier ${unit} from ${source}`
-        : `Included ${count} earlier ${unit}`}
-    </p>
-  )
-}
-
-function MessageResponseIndicator({ agentId }: { agentId: RuntimeAgentId }): React.JSX.Element {
-  const name = agentName(agentId)
-  return (
-    <div className="mt-1.5 flex justify-center">
-      <span
-        className={`inline-flex h-5 items-center gap-1 rounded-pill px-2 text-secondary ${speakerBgClass(agentId)}`}
-        role="status"
-        aria-label={`${name} is responding`}
-      >
-        {[0, 1, 2].map((index) => (
-          <span
-            key={index}
-            aria-hidden="true"
-            className="size-1 rounded-full bg-current animate-[pulse_1.2s_ease-in-out_infinite] motion-reduce:animate-none"
-            style={{ animationDelay: `${index * 160}ms` }}
-          />
-        ))}
-      </span>
-    </div>
-  )
-}
-
-function PeerProposalAction({
-  proposal,
-  requester,
-  disabled,
-  onAccept,
-  onDismiss,
-}: {
-  proposal: PeerRequestProposal
-  requester: RuntimeAgentId
-  disabled: boolean
-  onAccept: (proposalId: string) => Promise<boolean>
-  onDismiss: (proposalId: string) => Promise<boolean>
-}): React.JSX.Element {
-  const [working, setWorking] = useState<'accept' | 'dismiss' | undefined>()
-  const requesterName = agentName(requester)
-  const targetName = agentName(proposal.targetAgentId)
-  const action =
-    proposal.kind === 'fact_check'
-      ? 'fact-check'
-      : proposal.kind === 'supplement'
-        ? 'follow-up'
-        : proposal.kind
-  return (
-    <div className="mt-2 flex w-full min-w-0 flex-wrap items-center gap-2 rounded-control border border-status-info/25 bg-status-info-muted/45 px-3 py-2 text-caption">
-      <MessageSquarePlus
-        aria-hidden="true"
-        className="size-4 shrink-0 text-status-info-foreground"
-        strokeWidth={1.75}
-      />
-      <p className="min-w-48 flex-1 font-medium text-primary">
-        {requesterName} suggests a {targetName} {action}.
-      </p>
-      <div className="ml-auto flex shrink-0 items-center gap-1.5">
-        <button
-          className="h-7 cursor-pointer rounded-control bg-surface-inverse px-2.5 font-medium text-inverse hover:opacity-90 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus disabled:cursor-default disabled:opacity-50"
-          type="button"
-          disabled={disabled || Boolean(working)}
-          onClick={() => {
-            setWorking('accept')
-            void onAccept(proposal.id).finally(() => setWorking(undefined))
-          }}
-        >
-          {working === 'accept' ? 'Sending…' : `Ask ${targetName}`}
-        </button>
-        <button
-          className="h-7 cursor-pointer rounded-control px-2 text-secondary hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus disabled:cursor-default disabled:opacity-50"
-          type="button"
-          aria-label="Dismiss peer suggestion"
-          disabled={disabled || Boolean(working)}
-          onClick={() => {
-            setWorking('dismiss')
-            void onDismiss(proposal.id).finally(() => setWorking(undefined))
-          }}
-        >
-          {working === 'dismiss' ? 'Dismissing…' : 'Not now'}
-        </button>
-      </div>
-    </div>
-  )
-}
-
-function RunWorkLog({
-  runId,
-  activities,
-  active,
-  completed = false,
-  available,
-  history,
-  onRead,
-}: {
-  runId: string
-  activities: AgentActivity[]
-  active: boolean
-  completed?: boolean
-  available: boolean
-  history: ConversationHistoryControls
-  onRead: () => void
-}): React.JSX.Element | null {
-  const detailError =
-    history.activityError?.runId === runId ? history.activityError.message : undefined
-  if (!available && activities.length === 0 && !detailError) {
-    return active ? (
-      <output className="mt-2 flex items-center gap-2 text-caption text-secondary">
-        <span className="primary-action-spinner" aria-hidden="true" />
-        Working
-      </output>
-    ) : null
-  }
-  const viewing = history.window?.activityView?.runId === runId
-  const truncated = viewing && Boolean(history.window?.activityView?.truncated)
-  const loading = history.loadingActivityRunId === runId
-  const canLoad = Boolean(detailError) || (available && !viewing && activities.length === 0)
-
-  return (
-    <div className="mt-1">
-      {activities.length > 0 ? (
-        <>
-          <AgentActivityList
-            key={completed ? 'complete' : 'pending'}
-            activities={activities}
-            active={active}
-            defaultExpanded={
-              viewing && (!completed || Boolean(history.window?.activityView?.manual))
-            }
-            preserveExpanded={viewing && Boolean(history.window?.activityView?.manual)}
-            onExpandedChange={(expanded) => {
-              if (expanded) onRead()
-              history.setActivityReading?.(runId, expanded)
-            }}
-            partial={!viewing || truncated}
-            truncationNotice={truncated ? 'Showing the latest 50 steps.' : undefined}
-            oversizedActivities={history.oversizedActivities}
-            expandedBody={history.expandedActivityBody}
-            onLoadMoreBody={history.loadMoreActivityBody}
-          />
-        </>
-      ) : null}
-      {canLoad ? (
-        <button
-          className="min-h-8 text-caption text-secondary hover:text-primary disabled:opacity-50"
-          type="button"
-          disabled={loading}
-          onClick={() => {
-            onRead()
-            void history.loadActivities(runId)
-          }}
-        >
-          {loading ? 'Loading work log…' : detailError ? 'Retry work log' : 'Show work log'}
-        </button>
-      ) : null}
-      {detailError ? (
-        <p className="mt-1 text-caption text-danger" role="alert">
-          {detailError}
-        </p>
-      ) : null}
-    </div>
-  )
-}
-
-const MessageHoverActions = memo(function MessageHoverActions({
-  messageId,
-  content,
-  longMessage,
-  createdAt,
-  speaker,
-  isUser,
-  copyResult,
-  onCopy,
-  onFork,
-  forkDisabled,
-}: {
-  messageId: string
-  content: string
-  longMessage: boolean
-  createdAt: string
-  speaker: string
-  isUser: boolean
-  copyResult: 'copying' | 'copied' | 'failed' | undefined
-  onCopy: (messageId: string, content: string) => Promise<void>
-  onFork?: (() => void) | undefined
-  forkDisabled: boolean
-}): React.JSX.Element {
-  const date = new Date(createdAt)
-  const fullDate = messageDateTimeFormatter.format(date)
-  const copyLabel = longMessage
-    ? 'Copy unavailable for long messages'
-    : copyResult === 'copying'
-      ? 'Copying message'
-      : copyResult === 'copied'
-        ? 'Message copied'
-        : copyResult === 'failed'
-          ? 'Couldn’t copy message'
-          : isUser
-            ? 'Copy your message'
-            : `Copy ${speaker} message`
-
-  return (
-    <div
-      className={`pointer-events-none mt-1 flex h-6 shrink-0 items-center gap-1 whitespace-nowrap text-caption text-tertiary opacity-0 transition-opacity delay-200 duration-150 ease-out-pact group-hover/message:delay-0 group-hover/message:opacity-100 group-focus-within/message:delay-0 group-focus-within/message:opacity-100 [@media(hover:none)]:opacity-100 ${isUser ? 'self-end' : 'self-start'}`}
-      data-pact-message-actions
-    >
-      <time dateTime={createdAt} title={fullDate} aria-label={fullDate} className="tabular-nums">
-        {messageTimeFormatter.format(date)}
-      </time>
-      <button
-        className="pointer-events-auto grid size-6 shrink-0 place-items-center rounded-control text-secondary transition-colors duration-150 hover:bg-surface-muted hover:text-primary disabled:cursor-default disabled:opacity-40"
-        type="button"
-        disabled={!content || copyResult === 'copying' || longMessage}
-        aria-label={copyLabel}
-        title={copyLabel}
-        onClick={() => void onCopy(messageId, content)}
-      >
-        {copyResult === 'copied' ? (
-          <Check aria-hidden="true" className="size-3.5" strokeWidth={1.8} />
-        ) : copyResult === 'failed' ? (
-          <X aria-hidden="true" className="size-3.5" strokeWidth={1.8} />
-        ) : copyResult === 'copying' ? (
-          <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" strokeWidth={1.8} />
-        ) : (
-          <Copy aria-hidden="true" className="size-3.5" strokeWidth={1.8} />
-        )}
-      </button>
-      {onFork ? (
-        <button
-          type="button"
-          className="pointer-events-auto grid size-6 shrink-0 place-items-center rounded-control text-secondary transition-colors duration-150 hover:bg-surface-muted hover:text-primary disabled:cursor-default disabled:opacity-40"
-          aria-label="Fork conversation from this reply"
-          title={
-            forkDisabled
-              ? 'Wait for this session and native tasks to finish'
-              : 'Fork conversation from this reply'
-          }
-          disabled={forkDisabled}
-          onClick={onFork}
-        >
-          <Split aria-hidden="true" className="size-3.5 rotate-90" strokeWidth={1.8} />
-        </button>
-      ) : null}
-      <output className="sr-only">
-        {copyResult === 'copied' ? 'Message copied' : copyResult === 'failed' ? 'Copy failed' : ''}
-      </output>
-    </div>
-  )
-})
-
-async function sha256Hex(value: string): Promise<string> {
-  const bytes = new TextEncoder().encode(value)
-  const digest = await crypto.subtle.digest('SHA-256', bytes)
-  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
-}
-
-function RunConfiguration({ run }: { run: AgentRun }): React.JSX.Element | null {
-  const tooltipId = useId()
-  const speed = run.observedSpeed
-    ? run.observedSpeed === 'fast'
-      ? 'Fast'
-      : 'Standard speed'
-    : run.speedDetail
-      ? 'Native speed'
-      : run.speed === 'fast'
-        ? 'Fast requested'
-        : run.speed === 'standard'
-          ? 'Standard requested'
-          : undefined
-  const details = [run.model, run.effort, speed].filter((value): value is string => Boolean(value))
-  if (!details.length) return null
-  return (
-    <span className="relative inline-flex min-w-0 items-center gap-1 font-normal text-tertiary">
-      <span className="truncate">· {details.join(' · ')}</span>
-      {run.speedDetail ? (
-        <>
-          <button
-            type="button"
-            aria-label="Speed information"
-            aria-describedby={tooltipId}
-            className="peer grid size-6 shrink-0 place-items-center rounded-control text-secondary hover:bg-surface-raised hover:text-primary focus-visible:outline-2 focus-visible:outline-focus"
-          >
-            <Info aria-hidden="true" className="size-3.5" strokeWidth={1.75} />
-          </button>
-          <span
-            id={tooltipId}
-            role="tooltip"
-            className="pointer-events-none invisible absolute left-0 top-[calc(100%+0.25rem)] z-30 w-80 max-w-[calc(100vw-2rem)] whitespace-normal break-words rounded-control border border-border bg-surface-raised px-3 py-2 text-left text-caption font-normal leading-relaxed text-primary opacity-0 shadow-popover transition-opacity duration-150 peer-hover:visible peer-hover:opacity-100 peer-focus-visible:visible peer-focus-visible:opacity-100"
-          >
-            {run.speedDetail}
-          </span>
-        </>
-      ) : null}
-    </span>
   )
 }

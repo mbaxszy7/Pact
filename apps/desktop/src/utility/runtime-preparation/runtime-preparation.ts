@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { constants } from 'node:fs'
-import { access, opendir, realpath, rm } from 'node:fs/promises'
+import { access, opendir, realpath, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { delimiter, isAbsolute, join } from 'node:path'
 
@@ -21,10 +21,25 @@ import {
   AgyProbeError,
   isAgyProbeSettled,
   isUnsafeWindowsCmdPath,
+  reconcileSettledAgyProbeArtifact,
+  removeDirConfirmed,
+  resolveTrustedWindowsCmdExe,
   runAgyAcpProbe,
+  type AgyAcpSessionContext,
+  type UnconfirmedAgyProbeArtifact,
 } from './agy-acp-probe'
 
 const PROBE_TIMEOUT_MS = 4_000
+const AGY_ACP_INIT_TIMEOUT_MS = 4_000
+const AGY_ACP_SESSION_TIMEOUT_MS = 22_000
+const AGY_ACP_EXTENDED_BUDGET_MS = 38_000
+const AGY_ACP_EXTENDED_SESSION_TIMEOUT_MS = 32_000
+const AGY_ACP_MAX_FRAME_BYTES = 256 * 1024
+const AGY_ACP_MAX_TOTAL_BYTES = 2 * 1024 * 1024
+const READINESS_RPC_BUDGET_MS = 27_500
+const AGY_ACP_CLEANUP_RESERVE_MS = 4_500
+const CLI_PROBE_CLEANUP_RESERVE_MS = 4_000
+const READINESS_REPLY_MARGIN_MS = 500
 const MAX_CAPTURE_BYTES = 64 * 1024
 const INSTALLATION_DISCOVERY_MS = 1_000
 const INSTALLATION_DISCOVERY_ENTRIES = 128
@@ -32,8 +47,63 @@ const INSTALLATION_DISCOVERY_BYTES = 64 * 1024
 const SHELL_EXECUTION_MS = 2_000
 const SHELL_TOTAL_MS = 3_000
 const MAX_PATH_ENTRIES = 128
-const MAX_ACTIVE_AGY_PROBES = 4
+const MAX_ACTIVE_AGY_PROBES = 2
+const MAX_UNCONFIRMED_AGY_PROBE_DIRS = 16
 const MAX_ACTIVE_CLI_PROBES_PER_AGENT = 4
+const CLI_READY_CACHE_TTL_MS = 30_000
+const AGY_READY_CACHE_TTL_MS = 180_000
+const AGY_TRANSIENT_TIMEOUT_GRACE_MS = 10 * 60 * 1000
+const AGY_MAX_CONSECUTIVE_ABSORBED_TIMEOUTS = 1
+const READY_CACHE_MAX_ENTRIES = 3
+const READY_CACHE_MAX_BYTES = 16 * 1024
+
+interface ExecutableFingerprint {
+  readonly executablePath: string
+  readonly size: number
+  readonly mtimeMs: number
+  readonly ctimeMs: number
+  readonly ino: number
+}
+
+interface CachedReadyReadiness {
+  readonly configKey: string
+  readonly generation: number
+  readonly selectedPath: string | undefined
+  readonly fingerprint: ExecutableFingerprint
+  readonly readiness: RuntimeAgentReadiness
+  readonly cachedAt: number
+  expiresAt: number
+  readonly graceExpiresAt: number
+  readonly bytes: number
+  consecutiveTimeouts: number
+}
+
+interface AgentProbeOutcome {
+  readonly raw: RuntimeAgentReadiness
+  readonly gracefulReady?: RuntimeAgentReadiness
+}
+
+export interface AgyReadinessSessionHook {
+  readonly onNotification?: (method: string, params: unknown) => void
+  readonly inspectSession: (
+    context: AgyAcpSessionContext,
+    cliVersion: string | undefined,
+  ) => Promise<void>
+}
+
+interface AttachedAgySessionHook {
+  readonly hook: AgyReadinessSessionHook
+  readonly signal?: AbortSignal | undefined
+}
+
+interface AgySessionHookDispatch {
+  readonly useExtendedTimeout: boolean
+  readonly onNotification: (method: string, params: unknown) => void
+  readonly runHooks: (
+    context: AgyAcpSessionContext,
+    cliVersion: string | undefined,
+  ) => Promise<void>
+}
 
 type FixedCliProbeCommand = 'version' | 'claude_auth' | 'codex_auth'
 type FixedLookupCommand =
@@ -52,8 +122,16 @@ interface ProbeCommandResult {
   closeUnconfirmed?: boolean
 }
 
-interface UnconfirmedAgyProbe {
-  readonly probeCwd: string
+interface InFlightAgentProbe {
+  readonly generation: number
+  readonly selectedPath: string | undefined
+  readonly controller: AbortController
+  readonly subscribers: Set<symbol>
+  closing: boolean
+  agyHooksStarted: boolean
+  readonly agySessionHooks: Set<AttachedAgySessionHook>
+  readonly promise: Promise<AgentProbeOutcome>
+  readonly settled: Promise<void>
 }
 
 export function runtimeAgentDisplayName(agentId: RuntimeAgentId): string {
@@ -91,7 +169,19 @@ export class RuntimePreparation {
   private environmentOwner: OwnedProcessGroup | undefined
   private readonly environmentAbort = new AbortController()
   private readonly agyProbes = new Set<OwnedProcessGroup>()
-  private readonly unconfirmedAgyProbes = new Map<OwnedProcessGroup, UnconfirmedAgyProbe>()
+  private readonly unconfirmedAgyProbes = new Map<OwnedProcessGroup, UnconfirmedAgyProbeArtifact>()
+  private readonly inFlightAgentProbes = new Map<RuntimeAgentId, InFlightAgentProbe>()
+  private readonly closingAgentProbes = new Set<Promise<void>>()
+  private readonly pendingArtifactCleanupsByProvider = new Map<
+    RuntimeAgentId,
+    Set<Promise<unknown>>
+  >([
+    ['claude', new Set()],
+    ['codex', new Set()],
+    ['agy', new Set()],
+  ])
+  private readonly unconfirmedAgyProbeDirs = new Set<string>()
+  private disposeFlushDeadlineAt: number | undefined
   private readonly cliProbes = new Map<RuntimeAgentId, Set<OwnedProcessGroup>>([
     ['claude', new Set()],
     ['codex', new Set()],
@@ -102,6 +192,8 @@ export class RuntimePreparation {
     ['codex', new Set()],
     ['agy', new Set()],
   ])
+  private readonly readyCache = new Map<RuntimeAgentId, CachedReadyReadiness>()
+  private readyCacheBytes = 0
   private lastAcpAgentInfoVersion: string | undefined
   private disposed = false
   private disposal: Promise<void> | undefined
@@ -153,46 +245,139 @@ export class RuntimePreparation {
   }
 
   /** One Utility-lifetime PATH snapshot; authentication and readiness are always checked afresh. */
-  async prepareEnvironment(signal?: AbortSignal): Promise<void> {
+  async prepareEnvironment(signal?: AbortSignal, deadlineAt?: number): Promise<void> {
     signal?.throwIfAborted()
     if (this.disposed) throw new Error('Runtime preparation is shutting down.')
+    if (deadlineAt !== undefined && Date.now() >= deadlineAt) {
+      throw new Error('Runtime preparation deadline reached.')
+    }
     if (!this.options.discoverShellPath || process.platform !== 'darwin') return
     this.environmentTask ??= this.resolveShellPath()
-    if (!signal) await this.environmentTask
+    if (!signal && deadlineAt === undefined) await this.environmentTask
     else {
-      let abort: (() => void) | undefined
-      try {
-        await Promise.race([
-          this.environmentTask,
-          new Promise<never>((_, reject) => {
-            abort = () => reject(signal.reason)
-            signal.addEventListener('abort', abort, { once: true })
-            if (signal.aborted) abort()
-          }),
-        ])
-      } finally {
-        if (abort) signal.removeEventListener('abort', abort)
-      }
+      await RuntimePreparation.waitWithAbortAndDeadline(this.environmentTask, signal, deadlineAt)
     }
     signal?.throwIfAborted()
     if (this.disposed) throw new Error('Runtime preparation is shutting down.')
+    if (deadlineAt !== undefined && Date.now() >= deadlineAt) {
+      throw new Error('Runtime preparation deadline reached.')
+    }
   }
 
-  dispose(): Promise<void> {
+  private static async waitWithAbortAndDeadline(
+    target: Promise<unknown>,
+    signal?: AbortSignal,
+    deadlineAt?: number,
+  ): Promise<void> {
+    signal?.throwIfAborted()
+    const waiters: Array<Promise<never>> = []
+    let onAbort: (() => void) | undefined
+    let timer: ReturnType<typeof setTimeout> | undefined
+    if (signal) {
+      waiters.push(
+        new Promise<never>((_, reject) => {
+          onAbort = () => reject(signal.reason)
+          signal.addEventListener('abort', onAbort, { once: true })
+          if (signal.aborted) onAbort()
+        }),
+      )
+    }
+    if (deadlineAt !== undefined) {
+      const remainingMs = deadlineAt - Date.now()
+      if (remainingMs <= 0) {
+        if (onAbort && signal) signal.removeEventListener('abort', onAbort)
+        throw new Error('Runtime preparation deadline reached.')
+      }
+      waiters.push(
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error('Runtime preparation deadline reached.')),
+            remainingMs,
+          )
+        }),
+      )
+    }
+    try {
+      await Promise.race([target, ...waiters])
+    } finally {
+      if (onAbort && signal) signal.removeEventListener('abort', onAbort)
+      clearTimeout(timer)
+    }
+  }
+
+  private static async awaitAllWithinDeadline(
+    promises: readonly Promise<unknown>[],
+    flushDeadlineAt?: number,
+  ): Promise<boolean> {
+    if (promises.length === 0) return true
+    const allSettled = Promise.allSettled(promises).then(() => true)
+    if (flushDeadlineAt === undefined) {
+      return await allSettled
+    }
+    const remainingMs = flushDeadlineAt - Date.now()
+    if (remainingMs <= 0) return false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      return await Promise.race([
+        allSettled,
+        new Promise<boolean>((resolve) => {
+          timer = setTimeout(() => resolve(false), remainingMs)
+        }),
+      ])
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  dispose(flushDeadlineAt?: number): Promise<void> {
     this.disposed = true
+    this.disposeFlushDeadlineAt = flushDeadlineAt
+    this.deleteReadyCache()
+    const flightWaiters = new Set<Promise<void>>(this.closingAgentProbes)
+    for (const entry of this.inFlightAgentProbes.values()) {
+      entry.closing = true
+      this.closingAgentProbes.add(entry.settled)
+      flightWaiters.add(entry.settled)
+      entry.controller.abort()
+    }
     this.environmentAbort.abort()
     // The in-flight owner retains its original absolute cleanup deadline, including on Quit.
     this.disposal ??= (async () => {
       await this.environmentTask
+      const gracefulDeadlineAt =
+        flushDeadlineAt === undefined
+          ? Date.now() + 2_000
+          : Math.min(
+              flushDeadlineAt,
+              Date.now() + Math.max(0, Math.min(1_250, flushDeadlineAt - Date.now() - 1_250)),
+            )
+      await RuntimePreparation.awaitAllWithinDeadline([...flightWaiters], gracefulDeadlineAt)
       const allCliProbes: OwnedProcessGroup[] = []
       for (const set of this.cliProbes.values()) {
         allCliProbes.push(...set)
       }
       const closeResults = await Promise.allSettled([
-        ...[...this.agyProbes].map((probe) => probe.close()),
-        ...allCliProbes.map((probe) => probe.close()),
+        ...[...this.agyProbes].map((probe) => probe.close(flushDeadlineAt)),
+        ...allCliProbes.map((probe) => probe.close(flushDeadlineAt)),
       ])
+      const flightsSettled = await RuntimePreparation.awaitAllWithinDeadline(
+        [...flightWaiters],
+        flushDeadlineAt,
+      )
       await this.reconcileUnconfirmedAgyProbes()
+      await this.reconcileUnconfirmedAgyProbeDirs()
+      const allArtifactCleanups: Array<Promise<unknown>> = []
+      for (const set of this.pendingArtifactCleanupsByProvider.values()) {
+        allArtifactCleanups.push(...set)
+      }
+      const artifactsSettled = await RuntimePreparation.awaitAllWithinDeadline(
+        allArtifactCleanups,
+        flushDeadlineAt,
+      )
+      await this.reconcileUnconfirmedAgyProbeDirs()
+      const remainingArtifactCleanups = (['claude', 'codex', 'agy'] as const).some(
+        (agentId) => (this.pendingArtifactCleanupsByProvider.get(agentId)?.size ?? 0) > 0,
+      )
       for (const probe of this.agyProbes) {
         if (isAgyProbeSettled(probe)) this.agyProbes.delete(probe)
       }
@@ -207,6 +392,12 @@ export class RuntimePreparation {
       if (this.environmentOwner) throw new Error('The shell process was not released.')
       if (
         closeResults.some((result) => result.status === 'rejected') ||
+        !flightsSettled ||
+        !artifactsSettled ||
+        this.inFlightAgentProbes.size > 0 ||
+        this.closingAgentProbes.size > 0 ||
+        remainingArtifactCleanups ||
+        this.unconfirmedAgyProbeDirs.size > 0 ||
         this.agyProbes.size > 0 ||
         this.unconfirmedAgyProbes.size > 0 ||
         hasRemainingCliProbes
@@ -375,16 +566,20 @@ export class RuntimePreparation {
     }
   }
 
+  hasClosingProbe(provider: RuntimeAgentId): boolean {
+    return (
+      this.inFlightAgentProbes.get(provider)?.closing === true ||
+      (this.pendingArtifactCleanupsByProvider.get(provider)?.size ?? 0) > 0 ||
+      this.unconfirmedProviderProbes(provider).length > 0
+    )
+  }
+
   unconfirmedProviderProbes(provider: RuntimeAgentId): readonly OwnedProcessGroup[] {
     this.pruneSettledCliProbes(provider)
     const unresolved: OwnedProcessGroup[] = [...(this.unconfirmedCliProbes.get(provider) ?? [])]
     if (provider === 'agy') {
-      for (const [probe, metadata] of this.unconfirmedAgyProbes.entries()) {
-        if (isAgyProbeSettled(probe)) {
-          this.unconfirmedAgyProbes.delete(probe)
-          this.agyProbes.delete(probe)
-          void rm(metadata.probeCwd, { recursive: true, force: true }).catch(() => undefined)
-        } else {
+      for (const probe of this.unconfirmedAgyProbes.keys()) {
+        if (!isAgyProbeSettled(probe)) {
           unresolved.push(probe)
         }
       }
@@ -409,11 +604,272 @@ export class RuntimePreparation {
     return executable
   }
 
-  async inspectReadiness(signal?: AbortSignal): Promise<RpcResult<RuntimePreparationSnapshot>> {
+  invalidateAgentReadiness(agentId?: RuntimeAgentId): void {
+    this.deleteReadyCache(agentId)
+  }
+
+  private deleteReadyCache(agentId?: RuntimeAgentId): void {
+    if (agentId !== undefined) {
+      const existing = this.readyCache.get(agentId)
+      if (!existing) return
+      this.readyCacheBytes = Math.max(0, this.readyCacheBytes - existing.bytes)
+      this.readyCache.delete(agentId)
+      return
+    }
+    this.readyCache.clear()
+    this.readyCacheBytes = 0
+  }
+
+  private hasUnconfirmedCleanup(agentId: RuntimeAgentId): boolean {
+    return (
+      this.unconfirmedProviderProbes(agentId).length > 0 ||
+      (agentId === 'agy' &&
+        (this.unconfirmedAgyProbes.size > 0 || this.unconfirmedAgyProbeDirs.size > 0))
+    )
+  }
+
+  private async fingerprintExecutable(
+    executablePath: string,
+  ): Promise<ExecutableFingerprint | undefined> {
+    if (!(await this.isExecutable(executablePath))) return undefined
     try {
-      await this.prepareEnvironment(signal)
+      const info = await stat(executablePath)
+      if (!info.isFile()) return undefined
+      return {
+        executablePath,
+        size: info.size,
+        mtimeMs: info.mtimeMs,
+        ctimeMs: info.ctimeMs,
+        ino: info.ino,
+      }
+    } catch {
+      return undefined
+    }
+  }
+
+  private static fingerprintsMatch(
+    left: ExecutableFingerprint,
+    right: ExecutableFingerprint,
+  ): boolean {
+    return (
+      left.executablePath === right.executablePath &&
+      left.size === right.size &&
+      left.mtimeMs === right.mtimeMs &&
+      left.ctimeMs === right.ctimeMs &&
+      left.ino === right.ino
+    )
+  }
+
+  private storeReadyCache(
+    agentId: RuntimeAgentId,
+    configKey: string,
+    generation: number,
+    selectedPath: string | undefined,
+    fingerprint: ExecutableFingerprint,
+    readiness: RuntimeAgentReadiness,
+  ): void {
+    this.deleteReadyCache(agentId)
+    const now = Date.now()
+    const ttlMs = agentId === 'agy' ? AGY_READY_CACHE_TTL_MS : CLI_READY_CACHE_TTL_MS
+    const bytes =
+      Buffer.byteLength(JSON.stringify(readiness), 'utf8') +
+      Buffer.byteLength(fingerprint.executablePath, 'utf8') +
+      Buffer.byteLength(configKey, 'utf8')
+    if (bytes > READY_CACHE_MAX_BYTES) return
+    while (
+      this.readyCache.size >= READY_CACHE_MAX_ENTRIES ||
+      this.readyCacheBytes + bytes > READY_CACHE_MAX_BYTES
+    ) {
+      const oldestKey = this.readyCache.keys().next().value
+      if (!oldestKey) break
+      this.deleteReadyCache(oldestKey)
+    }
+    if (
+      this.readyCache.size >= READY_CACHE_MAX_ENTRIES ||
+      this.readyCacheBytes + bytes > READY_CACHE_MAX_BYTES
+    ) {
+      return
+    }
+    this.readyCache.set(agentId, {
+      configKey,
+      generation,
+      selectedPath,
+      fingerprint,
+      readiness,
+      cachedAt: now,
+      expiresAt: now + ttlMs,
+      graceExpiresAt: now + AGY_TRANSIENT_TIMEOUT_GRACE_MS,
+      bytes,
+      consecutiveTimeouts: 0,
+    })
+    this.readyCacheBytes += bytes
+  }
+
+  private async lookupReadyCache(
+    agentId: RuntimeAgentId,
+    selectedPath: string | undefined,
+    signal?: AbortSignal,
+    deadlineAt?: number,
+  ): Promise<RuntimeAgentReadiness | undefined> {
+    const cached = this.readyCache.get(agentId)
+    if (!cached) return undefined
+    const configKey = this.providerConfigurationKey(agentId)
+    if (
+      cached.generation !== this.configurationGeneration ||
+      cached.selectedPath !== selectedPath ||
+      cached.configKey !== configKey ||
+      Date.now() >= cached.expiresAt
+    ) {
+      return undefined
+    }
+    const currentFingerprint = await this.fingerprintExecutable(cached.fingerprint.executablePath)
+    signal?.throwIfAborted()
+    if (this.disposed) {
+      throw new Error('Runtime preparation is shutting down.')
+    }
+    if (deadlineAt !== undefined && Date.now() >= deadlineAt) {
+      throw new Error('Runtime preparation deadline reached.')
+    }
+    if (
+      this.readyCache.get(agentId) !== cached ||
+      this.inFlightAgentProbes.has(agentId) ||
+      this.hasUnconfirmedCleanup(agentId) ||
+      cached.generation !== this.configurationGeneration ||
+      this.providerConfigurationKey(agentId) !== configKey
+    ) {
+      return undefined
+    }
+    if (
+      !currentFingerprint ||
+      !RuntimePreparation.fingerprintsMatch(cached.fingerprint, currentFingerprint)
+    ) {
+      this.deleteReadyCache(agentId)
+      return undefined
+    }
+    this.readyCache.delete(agentId)
+    this.readyCache.set(agentId, cached)
+    return { ...cached.readiness }
+  }
+
+  private async evaluateFlightOutcome(
+    agentId: RuntimeAgentId,
+    createdGeneration: number,
+    createdSelectedPath: string | undefined,
+    createdConfigKey: string,
+    startedWithAgyHook: boolean,
+    controller: AbortController,
+    raw: RuntimeAgentReadiness,
+  ): Promise<AgentProbeOutcome> {
+    if (
+      this.disposed ||
+      controller.signal.aborted ||
+      createdGeneration !== this.configurationGeneration ||
+      this.providerConfigurationKey(agentId) !== createdConfigKey
+    ) {
+      return { raw }
+    }
+    if (
+      raw.state === 'ready' &&
+      raw.executablePath &&
+      !startedWithAgyHook &&
+      !this.hasUnconfirmedCleanup(agentId)
+    ) {
+      const fingerprint = await this.fingerprintExecutable(raw.executablePath)
+      if (
+        fingerprint &&
+        !this.disposed &&
+        !controller.signal.aborted &&
+        createdGeneration === this.configurationGeneration &&
+        this.providerConfigurationKey(agentId) === createdConfigKey &&
+        !this.hasUnconfirmedCleanup(agentId)
+      ) {
+        this.storeReadyCache(
+          agentId,
+          createdConfigKey,
+          createdGeneration,
+          createdSelectedPath,
+          fingerprint,
+          raw,
+        )
+      }
+      return { raw }
+    }
+    if (
+      agentId === 'agy' &&
+      raw.state === 'startup_failed' &&
+      raw.detail === 'Authentication check timed out.' &&
+      this.repository.hasCompletedFirstUseSetup() &&
+      !startedWithAgyHook &&
+      !this.hasUnconfirmedCleanup('agy')
+    ) {
+      const prior = this.readyCache.get('agy')
+      const now = Date.now()
+      if (
+        prior &&
+        prior.configKey === createdConfigKey &&
+        prior.generation === createdGeneration &&
+        prior.selectedPath === createdSelectedPath &&
+        now < prior.graceExpiresAt
+      ) {
+        const currentFingerprint = await this.fingerprintExecutable(
+          prior.fingerprint.executablePath,
+        )
+        if (
+          this.readyCache.get('agy') === prior &&
+          currentFingerprint &&
+          RuntimePreparation.fingerprintsMatch(prior.fingerprint, currentFingerprint) &&
+          !this.disposed &&
+          !controller.signal.aborted &&
+          createdGeneration === this.configurationGeneration &&
+          this.providerConfigurationKey('agy') === createdConfigKey &&
+          !this.hasUnconfirmedCleanup('agy')
+        ) {
+          prior.consecutiveTimeouts += 1
+          if (prior.consecutiveTimeouts <= AGY_MAX_CONSECUTIVE_ABSORBED_TIMEOUTS) {
+            // Expire positive TTL immediately so the next check/Send still probes fresh instead of masking sustained hangs.
+            prior.expiresAt = now
+            return { raw, gracefulReady: { ...prior.readiness } }
+          }
+        }
+      }
+      this.deleteReadyCache('agy')
+      return { raw }
+    }
+    if (!startedWithAgyHook || raw.state !== 'ready') {
+      this.deleteReadyCache(agentId)
+    }
+    return { raw }
+  }
+
+  async inspectReadiness(
+    signal?: AbortSignal,
+    agentIds?: readonly RuntimeAgentId[],
+    deadlineAt?: number,
+    options?: {
+      readonly agySessionHook?: AgyReadinessSessionHook
+      readonly forceRefresh?: boolean
+    },
+  ): Promise<RpcResult<RuntimePreparationSnapshot>> {
+    const maxBudgetMs = options?.agySessionHook
+      ? AGY_ACP_EXTENDED_BUDGET_MS
+      : READINESS_RPC_BUDGET_MS
+    const effectiveDeadlineAt =
+      deadlineAt !== undefined
+        ? Math.min(deadlineAt, Date.now() + maxBudgetMs)
+        : Date.now() + READINESS_RPC_BUDGET_MS
+    try {
+      await this.prepareEnvironment(signal, effectiveDeadlineAt)
       signal?.throwIfAborted()
-      return { ok: true, value: await this.collectReadinessSnapshot(signal) }
+      return {
+        ok: true,
+        value: await this.collectReadinessSnapshot(
+          signal,
+          agentIds,
+          effectiveDeadlineAt,
+          options?.agySessionHook,
+          options?.forceRefresh === true,
+        ),
+      }
     } catch {
       return {
         ok: false,
@@ -425,14 +881,19 @@ export class RuntimePreparation {
   async inspectProviderReadiness(
     provider: RuntimeAgentId,
     signal?: AbortSignal,
+    options?: { readonly forceRefresh?: boolean },
   ): Promise<RpcResult<RuntimeAgentReadiness>> {
+    const deadlineAt = Date.now() + READINESS_RPC_BUDGET_MS
     try {
-      await this.prepareEnvironment(signal)
+      await this.prepareEnvironment(signal, deadlineAt)
       signal?.throwIfAborted()
-      const agent = await this.probeAgent(
+      const agent = await this.probeAgentCoalesced(
         provider,
         this.repository.readSelectedExecutablePath(provider),
         signal,
+        deadlineAt,
+        undefined,
+        options?.forceRefresh === true,
       )
       signal?.throwIfAborted()
       const cliVersion = agent.version?.match(/\b\d{1,5}\.\d{1,5}\.\d{1,5}\b/u)?.[0]
@@ -472,21 +933,320 @@ export class RuntimePreparation {
     }
     this.repository.saveSelectedExecutablePath(input.agentId, input.executablePath)
     this.configurationGeneration += 1
-    return this.inspectReadiness()
+    this.deleteReadyCache()
+    const existing = this.inFlightAgentProbes.get(input.agentId)
+    if (existing && existing.subscribers.size === 0) {
+      existing.closing = true
+      this.closingAgentProbes.add(existing.settled)
+      existing.controller.abort()
+    }
+    return this.inspectReadiness(undefined, undefined, undefined, { forceRefresh: true })
+  }
+
+  private static normalizeRequestedAgents(
+    agentIds?: readonly RuntimeAgentId[],
+  ): readonly RuntimeAgentId[] {
+    if (!agentIds) return ['claude', 'codex', 'agy']
+    const unique: RuntimeAgentId[] = []
+    for (const agentId of agentIds) {
+      if (!unique.includes(agentId)) unique.push(agentId)
+    }
+    return unique
+  }
+
+  private async probeAgentCoalesced(
+    agentId: RuntimeAgentId,
+    selectedPath: string | undefined,
+    signal?: AbortSignal,
+    deadlineAt?: number,
+    agySessionHook?: AgyReadinessSessionHook,
+    forceRefresh = false,
+  ): Promise<RuntimeAgentReadiness> {
+    let entry!: InFlightAgentProbe
+    let attachedAgyHookEntry: AttachedAgySessionHook | undefined
+    while (true) {
+      signal?.throwIfAborted()
+      if (this.disposed) {
+        throw new Error('Runtime preparation is shutting down.')
+      }
+      if (deadlineAt !== undefined && Date.now() >= deadlineAt) {
+        throw new Error('Runtime preparation deadline reached.')
+      }
+
+      if (
+        !forceRefresh &&
+        !(agentId === 'agy' && agySessionHook !== undefined) &&
+        !this.inFlightAgentProbes.has(agentId) &&
+        !this.hasUnconfirmedCleanup(agentId)
+      ) {
+        // oxlint-disable-next-line no-await-in-loop -- Verify cached executable metadata on disk before bypassing probe.
+        const cachedReadiness = await this.lookupReadyCache(
+          agentId,
+          selectedPath,
+          signal,
+          deadlineAt,
+        )
+        if (cachedReadiness) {
+          return cachedReadiness
+        }
+        signal?.throwIfAborted()
+        if (this.disposed) {
+          throw new Error('Runtime preparation is shutting down.')
+        }
+        if (deadlineAt !== undefined && Date.now() >= deadlineAt) {
+          throw new Error('Runtime preparation deadline reached.')
+        }
+      }
+
+      const existing = this.inFlightAgentProbes.get(agentId)
+      if (existing) {
+        if (
+          !existing.closing &&
+          existing.generation === this.configurationGeneration &&
+          existing.selectedPath === selectedPath &&
+          !existing.controller.signal.aborted
+        ) {
+          if (agentId === 'agy' && agySessionHook && !existing.agyHooksStarted) {
+            attachedAgyHookEntry = { hook: agySessionHook, signal }
+            existing.agySessionHooks.add(attachedAgyHookEntry)
+          }
+          entry = existing
+          break
+        }
+        // Wait for any closing or superseded physical probe of the same agent to finish before
+        // spawning a replacement so concurrent ACP count stays strictly bounded and stale results
+        // are never reused.
+        // oxlint-disable-next-line no-await-in-loop -- Wait on closing/superseded physical flight before retry.
+        await RuntimePreparation.waitWithAbortAndDeadline(existing.settled, signal, deadlineAt)
+        continue
+      }
+
+      const controller = new AbortController()
+      const subscribers = new Set<symbol>()
+      const agySessionHooks = new Set<AttachedAgySessionHook>()
+      if (agentId === 'agy' && agySessionHook) {
+        attachedAgyHookEntry = { hook: agySessionHook, signal }
+        agySessionHooks.add(attachedAgyHookEntry)
+      }
+      let createdEntry: InFlightAgentProbe | undefined
+      const onEnvAbort = (): void => {
+        if (createdEntry) {
+          createdEntry.closing = true
+          this.closingAgentProbes.add(createdEntry.settled)
+        }
+        controller.abort(this.environmentAbort.signal.reason)
+      }
+      this.environmentAbort.signal.addEventListener('abort', onEnvAbort, { once: true })
+      const flightDeadlineAt = deadlineAt ?? Date.now() + READINESS_RPC_BUDGET_MS
+      const flightCleanupTasks = new Set<Promise<void>>()
+      const trackCleanupTask = (task: Promise<void>): void => {
+        flightCleanupTasks.add(task)
+        void task.finally(() => {
+          flightCleanupTasks.delete(task)
+        })
+      }
+      const agySessionDispatch: AgySessionHookDispatch | undefined =
+        agentId === 'agy'
+          ? {
+              useExtendedTimeout: Boolean(agySessionHook && deadlineAt !== undefined),
+              onNotification: (method, params) => {
+                for (const sub of agySessionHooks) {
+                  if (!sub.signal?.aborted) {
+                    sub.hook.onNotification?.(method, params)
+                  }
+                }
+              },
+              runHooks: async (context, cliVersion) => {
+                if (createdEntry) {
+                  createdEntry.agyHooksStarted = true
+                }
+                const snapshot = [...agySessionHooks]
+                for (const sub of snapshot) {
+                  if (sub.signal?.aborted) continue
+                  try {
+                    // oxlint-disable-next-line no-await-in-loop -- Coalesced hooks run sequentially on one open ACP probe session.
+                    await sub.hook.inspectSession(context, cliVersion)
+                  } catch {
+                    // Isolate hook errors so readiness still reports ready.
+                  }
+                }
+              },
+            }
+          : undefined
+      const createdGeneration = this.configurationGeneration
+      const createdSelectedPath = selectedPath
+      const createdConfigKey = this.providerConfigurationKey(agentId)
+      const startedWithAgyHook = agentId === 'agy' && agySessionHook !== undefined
+      const promise = this.probeAgent(
+        agentId,
+        selectedPath,
+        controller.signal,
+        flightDeadlineAt,
+        trackCleanupTask,
+        agySessionDispatch,
+      ).then((raw) =>
+        this.evaluateFlightOutcome(
+          agentId,
+          createdGeneration,
+          createdSelectedPath,
+          createdConfigKey,
+          startedWithAgyHook,
+          controller,
+          raw,
+        ),
+      )
+      const settled = promise
+        .then(
+          () => undefined,
+          () => undefined,
+        )
+        .then(async () => {
+          if (flightCleanupTasks.size > 0) {
+            if (createdEntry) {
+              createdEntry.closing = true
+              this.closingAgentProbes.add(settled)
+            }
+            await Promise.allSettled(flightCleanupTasks)
+          }
+          return undefined
+        })
+        .finally(() => {
+          this.environmentAbort.signal.removeEventListener('abort', onEnvAbort)
+          if (createdEntry && this.inFlightAgentProbes.get(agentId) === createdEntry) {
+            this.inFlightAgentProbes.delete(agentId)
+          }
+          this.closingAgentProbes.delete(settled)
+        })
+      // Prevent unhandled rejections if every subscriber detaches via AbortSignal before settle.
+      void promise.catch(() => undefined)
+      createdEntry = {
+        generation: this.configurationGeneration,
+        selectedPath,
+        controller,
+        subscribers,
+        closing: false,
+        agyHooksStarted: false,
+        agySessionHooks,
+        promise,
+        settled,
+      }
+      if (this.environmentAbort.signal.aborted) {
+        createdEntry.closing = true
+        this.closingAgentProbes.add(settled)
+        controller.abort(this.environmentAbort.signal.reason)
+      }
+      entry = createdEntry
+      this.inFlightAgentProbes.set(agentId, entry)
+      break
+    }
+
+    const token = Symbol()
+    entry.subscribers.add(token)
+    if (!signal) {
+      try {
+        const outcome = await entry.promise
+        return forceRefresh ? outcome.raw : (outcome.gracefulReady ?? outcome.raw)
+      } finally {
+        entry.subscribers.delete(token)
+        if (attachedAgyHookEntry) {
+          entry.agySessionHooks.delete(attachedAgyHookEntry)
+        }
+      }
+    }
+
+    try {
+      return await new Promise<RuntimeAgentReadiness>((resolve, reject) => {
+        let callerSettled = false
+        const cleanup = (): void => {
+          signal.removeEventListener('abort', onCallerAbort)
+        }
+        const buildAbortError = (): Error => {
+          if (signal.reason instanceof Error) return signal.reason
+          const error = new Error('Runtime preparation probe was aborted.', {
+            cause: signal.reason,
+          })
+          error.name = 'AbortError'
+          return error
+        }
+        const abortCaller = (): void => {
+          if (callerSettled) return
+          callerSettled = true
+          entry.subscribers.delete(token)
+          if (attachedAgyHookEntry) {
+            entry.agySessionHooks.delete(attachedAgyHookEntry)
+          }
+          const abortErr = buildAbortError()
+          if (entry.subscribers.size === 0) {
+            entry.closing = true
+            this.closingAgentProbes.add(entry.settled)
+            entry.controller.abort(signal.reason)
+            void entry.settled.finally(() => reject(abortErr))
+            return
+          }
+          reject(abortErr)
+        }
+        const onCallerAbort = (): void => abortCaller()
+        signal.addEventListener('abort', onCallerAbort, { once: true })
+        if (signal.aborted) {
+          cleanup()
+          abortCaller()
+          return
+        }
+        void (async () => {
+          try {
+            const outcome = await entry.promise
+            cleanup()
+            if (callerSettled) return
+            if (signal.aborted) {
+              abortCaller()
+              return
+            }
+            callerSettled = true
+            resolve(forceRefresh ? outcome.raw : (outcome.gracefulReady ?? outcome.raw))
+          } catch (error: unknown) {
+            cleanup()
+            if (callerSettled) return
+            if (signal.aborted) {
+              abortCaller()
+              return
+            }
+            callerSettled = true
+            reject(error instanceof Error ? error : new Error('Runtime probe failed.'))
+          }
+        })()
+      })
+    } finally {
+      entry.subscribers.delete(token)
+      if (attachedAgyHookEntry) {
+        entry.agySessionHooks.delete(attachedAgyHookEntry)
+      }
+    }
   }
 
   private async collectReadinessSnapshot(
     signal?: AbortSignal,
+    agentIds?: readonly RuntimeAgentId[],
+    deadlineAt?: number,
+    agySessionHook?: AgyReadinessSessionHook,
+    forceRefresh = false,
   ): Promise<RuntimePreparationSnapshot> {
+    const requestedAgents = RuntimePreparation.normalizeRequestedAgents(agentIds)
     // The probes are independent and bounded, so startup latency is the slowest probe rather than
-    // the sum of all three CLIs.
-    const [claude, codex, agy] = await Promise.all([
-      this.probeAgent('claude', this.repository.readSelectedExecutablePath('claude'), signal),
-      this.probeAgent('codex', this.repository.readSelectedExecutablePath('codex'), signal),
-      this.probeAgent('agy', this.repository.readSelectedExecutablePath('agy'), signal),
-    ])
+    // the sum of all active CLIs.
+    const agents = await Promise.all(
+      requestedAgents.map((agentId) =>
+        this.probeAgentCoalesced(
+          agentId,
+          this.repository.readSelectedExecutablePath(agentId),
+          signal,
+          deadlineAt,
+          agentId === 'agy' ? agySessionHook : undefined,
+          forceRefresh,
+        ),
+      ),
+    )
     signal?.throwIfAborted()
-    for (const agent of [claude, codex, agy]) {
+    for (const agent of agents) {
       const cliVersion = agent.version?.match(/\b\d{1,5}\.\d{1,5}\.\d{1,5}\b/u)?.[0]
       recordDiagnostic({
         operation: 'readiness',
@@ -495,13 +1255,16 @@ export class RuntimePreparation {
         ...(cliVersion ? { cliVersion } : {}),
       })
     }
-    return { firstUse: !this.repository.hasCompletedFirstUseSetup(), agents: [claude, codex, agy] }
+    return { firstUse: !this.repository.hasCompletedFirstUseSetup(), agents }
   }
 
   private async probeAgent(
     agentId: RuntimeAgentId,
     selectedPath: string | undefined,
     signal?: AbortSignal,
+    deadlineAt?: number,
+    trackCleanupTask?: (task: Promise<void>) => void,
+    agySessionDispatch?: AgySessionHookDispatch,
   ): Promise<RuntimeAgentReadiness> {
     const checkedAt = new Date().toISOString()
     let executablePath: string | undefined
@@ -516,7 +1279,7 @@ export class RuntimePreparation {
           checkedAt,
         }
       }
-      executablePath = await this.findExecutable(agentId, selectedPath, signal)
+      executablePath = await this.findExecutable(agentId, selectedPath, signal, deadlineAt)
       signal?.throwIfAborted()
       if (!executablePath) {
         return {
@@ -531,7 +1294,13 @@ export class RuntimePreparation {
 
       // --version is both the version source and the bounded "can this executable start?" probe. It
       // deliberately avoids a model request, network quota, or workspace access.
-      const version = await this.runCliProbeCommand(agentId, executablePath, 'version', signal)
+      const version = await this.runCliProbeCommand(
+        agentId,
+        executablePath,
+        'version',
+        signal,
+        deadlineAt,
+      )
       signal?.throwIfAborted()
       if (version.closeUnconfirmed) {
         return {
@@ -571,7 +1340,15 @@ export class RuntimePreparation {
       }
 
       if (agentId === 'agy') {
-        return await this.probeAgyAuthentication(executablePath, versionText, checkedAt, signal)
+        return await this.probeAgyAuthentication(
+          executablePath,
+          versionText,
+          checkedAt,
+          signal,
+          deadlineAt,
+          trackCleanupTask,
+          agySessionDispatch,
+        )
       }
 
       // Each CLI owns its authentication truth. Exit 0 means the CLI accepted an effective login or
@@ -581,6 +1358,7 @@ export class RuntimePreparation {
         executablePath,
         agentId === 'claude' ? 'claude_auth' : 'codex_auth',
         signal,
+        deadlineAt,
       )
       signal?.throwIfAborted()
       if (auth.closeUnconfirmed) {
@@ -644,16 +1422,36 @@ export class RuntimePreparation {
     }
   }
 
+  private recordUnconfirmedAgyProbeDir(dirPath: string): void {
+    this.unconfirmedAgyProbeDirs.add(dirPath)
+  }
+
+  private async reconcileUnconfirmedAgyProbeDirs(): Promise<boolean> {
+    const pending = [...this.unconfirmedAgyProbeDirs]
+    if (pending.length === 0) return false
+    await Promise.allSettled(
+      pending.map(async (dirPath) => {
+        if (await removeDirConfirmed(dirPath)) {
+          this.unconfirmedAgyProbeDirs.delete(dirPath)
+        }
+      }),
+    )
+    return this.unconfirmedAgyProbeDirs.size >= MAX_UNCONFIRMED_AGY_PROBE_DIRS
+  }
+
   private async reconcileUnconfirmedAgyProbes(): Promise<boolean> {
-    const settledEntries: Array<[OwnedProcessGroup, UnconfirmedAgyProbe]> = []
+    const settledEntries: Array<[OwnedProcessGroup, UnconfirmedAgyProbeArtifact]> = []
     for (const entry of this.unconfirmedAgyProbes.entries()) {
       if (isAgyProbeSettled(entry[0])) settledEntries.push(entry)
     }
     await Promise.allSettled(
-      settledEntries.map(async ([probe, metadata]) => {
+      settledEntries.map(async ([probe, artifact]) => {
         this.unconfirmedAgyProbes.delete(probe)
         this.agyProbes.delete(probe)
-        await rm(metadata.probeCwd, { recursive: true, force: true }).catch(() => undefined)
+        const removed = await reconcileSettledAgyProbeArtifact(artifact).catch(() => false)
+        if (!removed) {
+          this.recordUnconfirmedAgyProbeDir(artifact.probeRoot)
+        }
       }),
     )
     return this.unconfirmedAgyProbes.size > 0
@@ -682,14 +1480,37 @@ export class RuntimePreparation {
     cliVersion: string | undefined,
     checkedAt: string,
     signal?: AbortSignal,
+    deadlineAt?: number,
+    trackCleanupTask?: (task: Promise<void>) => void,
+    agySessionDispatch?: AgySessionHookDispatch,
   ): Promise<RuntimeAgentReadiness> {
-    if (await this.reconcileUnconfirmedAgyProbes()) {
+    const [probesUnconfirmed, dirsBlocked] = await Promise.all([
+      this.reconcileUnconfirmedAgyProbes(),
+      this.reconcileUnconfirmedAgyProbeDirs(),
+    ])
+    if (probesUnconfirmed || dirsBlocked) {
       return {
         agentId: 'agy',
         state: 'cannot_verify',
         executablePath,
         ...(cliVersion ? { version: cliVersion } : {}),
         detail: 'Antigravity authentication check could not be confirmed.',
+        checkedAt,
+      }
+    }
+
+    const effectiveDeadlineAt = deadlineAt ?? Date.now() + READINESS_RPC_BUDGET_MS
+    const businessDeadlineAt = effectiveDeadlineAt - AGY_ACP_CLEANUP_RESERVE_MS
+    const closeDeadlineAt = Math.floor(
+      Math.max(Date.now() + 1, effectiveDeadlineAt - READINESS_REPLY_MARGIN_MS),
+    )
+    if (businessDeadlineAt <= Date.now()) {
+      return {
+        agentId: 'agy',
+        state: 'startup_failed',
+        executablePath,
+        ...(cliVersion ? { version: cliVersion } : {}),
+        detail: 'Authentication check timed out.',
         checkedAt,
       }
     }
@@ -703,26 +1524,41 @@ export class RuntimePreparation {
     }
 
     let discoveredAgentInfoVersion: string | undefined
-    let sessionCleanupNote: string | undefined
     try {
       await runAgyAcpProbe<void>({
         executablePath,
         ...(this.options.env ? { env: this.options.env } : {}),
         signal: combinedAbort.signal,
-        timeoutMs: PROBE_TIMEOUT_MS,
-        maxFrameBytes: MAX_CAPTURE_BYTES,
-        maxTotalBytes: MAX_CAPTURE_BYTES,
-        deleteProbeSessionDb: true,
+        initializeTimeoutMs: Math.min(
+          AGY_ACP_INIT_TIMEOUT_MS,
+          Math.max(0, businessDeadlineAt - Date.now()),
+        ),
+        timeoutMs: agySessionDispatch?.useExtendedTimeout
+          ? Math.min(
+              AGY_ACP_EXTENDED_SESSION_TIMEOUT_MS,
+              Math.max(0, businessDeadlineAt - Date.now()),
+            )
+          : AGY_ACP_SESSION_TIMEOUT_MS,
+        businessDeadlineAt,
+        closeDeadlineAt,
+        getShutdownDeadlineAt: () => this.disposeFlushDeadlineAt,
+        maxFrameBytes: AGY_ACP_MAX_FRAME_BYTES,
+        maxTotalBytes: AGY_ACP_MAX_TOTAL_BYTES,
         ownProbe: (probeSignal, onCloseInput) => this.ownAgyProbe(probeSignal, onCloseInput),
         onAgentInfoVersion: (agentInfoVersion) => {
           // Record ACP server version separately; RuntimeAgentReadiness.version always reflects CLI --version.
           discoveredAgentInfoVersion = agentInfoVersion
           this.lastAcpAgentInfoVersion = agentInfoVersion
         },
-        inspectSession: async () => undefined,
-        onCloseError: (_error, probe, probeCwd) => {
+        onNotification: (method, params) => agySessionDispatch?.onNotification(method, params),
+        inspectSession: async (context) => {
+          if (agySessionDispatch) {
+            await agySessionDispatch.runHooks(context, cliVersion)
+          }
+        },
+        onCloseError: (_error, probe, artifact) => {
           if (!isAgyProbeSettled(probe)) {
-            this.unconfirmedAgyProbes.set(probe, { probeCwd })
+            this.unconfirmedAgyProbes.set(probe, artifact)
           }
         },
         onProbeSettled: (probe) => {
@@ -731,14 +1567,34 @@ export class RuntimePreparation {
             this.agyProbes.delete(probe)
           }
         },
-        onSessionCleanupNote: (note) => {
-          sessionCleanupNote = note
-          recordDiagnostic({
-            operation: 'readiness',
-            phase: 'ready',
-            level: 'warn',
-            agentId: 'agy',
-          })
+        reconcileArtifact: async (artifact) => {
+          const agyCleanups = this.pendingArtifactCleanupsByProvider.get('agy')!
+          const task = reconcileSettledAgyProbeArtifact(artifact)
+            .catch(() => false)
+            .then((removed) => {
+              if (!removed) {
+                this.recordUnconfirmedAgyProbeDir(artifact.probeRoot)
+              }
+              return removed
+            })
+            .finally(() => {
+              agyCleanups.delete(task)
+            })
+          agyCleanups.add(task)
+          trackCleanupTask?.(task.then(() => undefined))
+          const remainingForArtifact = effectiveDeadlineAt - Date.now() - 100
+          if (remainingForArtifact <= 0) return false
+          let timer: ReturnType<typeof setTimeout> | undefined
+          try {
+            return await Promise.race([
+              task,
+              new Promise<boolean>((resolve) => {
+                timer = setTimeout(() => resolve(false), remainingForArtifact)
+              }),
+            ])
+          } finally {
+            clearTimeout(timer)
+          }
         },
       })
       signal?.throwIfAborted()
@@ -748,7 +1604,6 @@ export class RuntimePreparation {
         executablePath,
         ...(cliVersion ? { version: cliVersion } : {}),
         ...(discoveredAgentInfoVersion ? { agentInfoVersion: discoveredAgentInfoVersion } : {}),
-        ...(sessionCleanupNote ? { detail: sessionCleanupNote } : {}),
         checkedAt,
       }
     } catch (error) {
@@ -820,6 +1675,7 @@ export class RuntimePreparation {
     agentId: RuntimeAgentId,
     selectedPath: string | undefined,
     signal?: AbortSignal,
+    deadlineAt?: number,
   ): Promise<string | undefined> {
     // An explicit user choice wins while it remains executable; automatic discovery is only the
     // recovery path when no saved choice exists or the saved file disappeared.
@@ -828,7 +1684,7 @@ export class RuntimePreparation {
     return (
       (agentId === 'claude' ? await this.findWindowsDesktopClaude(signal) : undefined) ??
       (await this.findOnInheritedPath(agentId)) ??
-      (await this.findWithPlatformLookup(agentId, signal))
+      (await this.findWithPlatformLookup(agentId, signal, deadlineAt))
     )
   }
 
@@ -929,11 +1785,12 @@ export class RuntimePreparation {
   private async findWithPlatformLookup(
     agentId: RuntimeAgentId,
     signal?: AbortSignal,
+    deadlineAt?: number,
   ): Promise<string | undefined> {
     if (process.platform === 'win32') {
       const lookupCommand: FixedLookupCommand =
         agentId === 'claude' ? 'where_claude' : agentId === 'codex' ? 'where_codex' : 'where_agy'
-      const result = await this.runLookupCommand(agentId, lookupCommand, signal)
+      const result = await this.runLookupCommand(agentId, lookupCommand, signal, deadlineAt)
       if (result.closeUnconfirmed) {
         throw new Error('Platform executable lookup cleanup could not be confirmed.')
       }
@@ -952,7 +1809,7 @@ export class RuntimePreparation {
       if (this.options.discoverShellPath) return undefined
       const lookupCommand: FixedLookupCommand =
         agentId === 'claude' ? 'zsh_claude' : agentId === 'codex' ? 'zsh_codex' : 'zsh_agy'
-      const result = await this.runLookupCommand(agentId, lookupCommand, signal)
+      const result = await this.runLookupCommand(agentId, lookupCommand, signal, deadlineAt)
       if (result.closeUnconfirmed) {
         throw new Error('Platform executable lookup cleanup could not be confirmed.')
       }
@@ -1004,6 +1861,7 @@ export class RuntimePreparation {
     executablePath: string,
     command: FixedCliProbeCommand,
     signal?: AbortSignal,
+    deadlineAt?: number,
   ): Promise<ProbeCommandResult> {
     const spec = fixedCliProbeArgs(command)
     const isWindowsCommand = process.platform === 'win32' && /\.cmd$/iu.test(executablePath)
@@ -1015,14 +1873,26 @@ export class RuntimePreparation {
         failedToStart: true,
       })
     }
+    const targetExecutable = isWindowsCommand
+      ? resolveTrustedWindowsCmdExe(this.effectiveEnv())
+      : executablePath
+    if (isWindowsCommand && !targetExecutable) {
+      return Promise.resolve({
+        exitCode: null,
+        output: '',
+        timedOut: false,
+        failedToStart: true,
+      })
+    }
     return this.spawnBoundedProbe(
       agentId,
-      isWindowsCommand ? (this.effectiveEnv().ComSpec ?? 'cmd.exe') : executablePath,
+      targetExecutable ?? executablePath,
       isWindowsCommand
         ? ['/d', '/s', '/c', `""${executablePath}" ${spec.windowsCmdSuffix}"`]
         : spec.argv,
       isWindowsCommand,
       signal,
+      deadlineAt,
     )
   }
 
@@ -1030,9 +1900,10 @@ export class RuntimePreparation {
     agentId: RuntimeAgentId,
     command: FixedLookupCommand,
     signal?: AbortSignal,
+    deadlineAt?: number,
   ): Promise<ProbeCommandResult> {
     const spec = fixedLookupArgs(command)
-    return this.spawnBoundedProbe(agentId, spec.executable, spec.argv, false, signal)
+    return this.spawnBoundedProbe(agentId, spec.executable, spec.argv, false, signal, deadlineAt)
   }
 
   // Run only fixed CLI probes inside OwnedProcessGroup so timed-out/cancelled children never
@@ -1043,8 +1914,19 @@ export class RuntimePreparation {
     args: readonly string[],
     windowsVerbatimArguments: boolean,
     signal?: AbortSignal,
+    deadlineAt?: number,
   ): Promise<ProbeCommandResult> {
     if (signal?.aborted || this.disposed || this.environmentAbort.signal.aborted) {
+      return { exitCode: null, output: '', timedOut: true, failedToStart: false }
+    }
+    const execBudgetMs =
+      deadlineAt === undefined
+        ? PROBE_TIMEOUT_MS
+        : Math.min(
+            PROBE_TIMEOUT_MS,
+            Math.max(0, deadlineAt - Date.now() - CLI_PROBE_CLEANUP_RESERVE_MS),
+          )
+    if (execBudgetMs <= 0) {
       return { exitCode: null, output: '', timedOut: true, failedToStart: false }
     }
     this.pruneSettledCliProbes(agentId)
@@ -1060,6 +1942,7 @@ export class RuntimePreparation {
       }
     }
 
+    let exitCode: number | null = null
     let output = ''
     let outputBytes = 0
     let failedToStart = false
@@ -1080,72 +1963,70 @@ export class RuntimePreparation {
       if (signal?.aborted || this.disposed || this.environmentAbort.signal.aborted) {
         timedOut = true
         probeAbort.abort()
-        return { exitCode: null, output: '', timedOut: true, failedToStart: false }
-      }
-
-      let child
-      try {
-        child = probe.spawn(targetExecutable, [...args], {
-          ...(this.options.env ? { env: this.options.env } : {}),
-          windowsHide: true,
-          windowsVerbatimArguments,
-        })
-      } catch {
-        failedToStart = true
-        return { exitCode: null, output: '', timedOut: false, failedToStart: true }
-      }
-      if (!child.stdin.destroyed) child.stdin.end()
-
-      const exitCode = await new Promise<number | null>((resolve) => {
-        let settled = false
-        const capture = (chunk: Buffer, isStdout: boolean): void => {
-          const length = Math.min(chunk.length, MAX_CAPTURE_BYTES - outputBytes)
-          if (length > 0) {
-            if (isStdout) output += chunk.subarray(0, length).toString('utf8')
-            outputBytes += length
-          }
-        }
-        const onStdout = (chunk: Buffer): void => capture(chunk, true)
-        const onStderr = (chunk: Buffer): void => capture(chunk, false)
-        const finish = (code: number | null): void => {
-          if (settled) return
-          settled = true
-          clearTimeout(timeout)
-          probeAbort.signal.removeEventListener('abort', onProbeAborted)
-          child.stdout.off('data', onStdout)
-          child.stderr.off('data', onStderr)
-          resolve(code)
-        }
-        const onProbeAborted = (): void => {
-          timedOut = true
-          finish(null)
-        }
-        const timeout = setTimeout(() => {
-          timedOut = true
-          probeAbort.abort()
-          finish(null)
-        }, PROBE_TIMEOUT_MS)
-        child.stdout.on('data', onStdout)
-        child.stderr.on('data', onStderr)
-        child.once('error', () => {
+      } else {
+        let child: ReturnType<OwnedProcessGroup['spawn']> | undefined
+        try {
+          child = probe.spawn(targetExecutable, [...args], {
+            ...(this.options.env ? { env: this.options.env } : {}),
+            windowsHide: true,
+            windowsVerbatimArguments,
+          })
+        } catch {
           failedToStart = true
-          finish(null)
-        })
-        child.once('close', (code) => finish(code))
-        probeAbort.signal.addEventListener('abort', onProbeAborted, { once: true })
-        if (probeAbort.signal.aborted) onProbeAborted()
-      })
+        }
+        if (child) {
+          const spawnedChild = child
+          if (!spawnedChild.stdin.destroyed) spawnedChild.stdin.end()
 
-      return {
-        exitCode,
-        output,
-        timedOut,
-        failedToStart,
+          exitCode = await new Promise<number | null>((resolve) => {
+            let settled = false
+            const capture = (chunk: Buffer, isStdout: boolean): void => {
+              const length = Math.min(chunk.length, MAX_CAPTURE_BYTES - outputBytes)
+              if (length > 0) {
+                if (isStdout) output += chunk.subarray(0, length).toString('utf8')
+                outputBytes += length
+              }
+            }
+            const onStdout = (chunk: Buffer): void => capture(chunk, true)
+            const onStderr = (chunk: Buffer): void => capture(chunk, false)
+            const finish = (code: number | null): void => {
+              if (settled) return
+              settled = true
+              clearTimeout(timeout)
+              probeAbort.signal.removeEventListener('abort', onProbeAborted)
+              spawnedChild.stdout.off('data', onStdout)
+              spawnedChild.stderr.off('data', onStderr)
+              resolve(code)
+            }
+            const onProbeAborted = (): void => {
+              timedOut = true
+              finish(null)
+            }
+            const timeout = setTimeout(() => {
+              timedOut = true
+              probeAbort.abort()
+              finish(null)
+            }, execBudgetMs)
+            spawnedChild.stdout.on('data', onStdout)
+            spawnedChild.stderr.on('data', onStderr)
+            spawnedChild.once('error', () => {
+              failedToStart = true
+              finish(null)
+            })
+            spawnedChild.once('close', (code) => finish(code))
+            probeAbort.signal.addEventListener('abort', onProbeAborted, { once: true })
+            if (probeAbort.signal.aborted) onProbeAborted()
+          })
+        }
       }
     } finally {
       signal?.removeEventListener('abort', onExternalAbort)
       this.environmentAbort.signal.removeEventListener('abort', onExternalAbort)
-      await probe.close().catch(() => {
+      const closeDeadlineAt =
+        deadlineAt === undefined
+          ? undefined
+          : Math.floor(Math.max(Date.now() + 1, deadlineAt - READINESS_REPLY_MARGIN_MS))
+      await probe.close(closeDeadlineAt).catch(() => {
         closeUnconfirmed = true
       })
       if (closeUnconfirmed || !isAgyProbeSettled(probe)) {
@@ -1154,6 +2035,14 @@ export class RuntimePreparation {
       } else {
         activeSet.delete(probe)
       }
+    }
+
+    return {
+      exitCode,
+      output,
+      timedOut,
+      failedToStart,
+      ...(closeUnconfirmed ? { closeUnconfirmed: true } : {}),
     }
   }
 }

@@ -489,5 +489,28 @@ describe('Side-chat DesktopBridge Zod validation at named seams', () => {
     await expect(bridge.discardEmptySideChat({ sideChatId })).rejects.toThrow(/boolean/iu)
     harness.invoke.mockResolvedValueOnce({ ok: true, value: { unexpected: true } })
     await expect(bridge.readCreateSideChatReceipt({ operationId: opId })).rejects.toThrow(/.+/u)
+
+    harness.invoke.mockResolvedValue({
+      ok: true,
+      value: { firstUse: false, agents: [] },
+    })
+    await bridge.getRuntimePreparation()
+    expect(harness.invoke).toHaveBeenLastCalledWith(IPC_CHANNELS.runtimePreparationGet)
+    await bridge.getRuntimePreparation({ forceRefresh: true })
+    expect(harness.invoke).toHaveBeenLastCalledWith(IPC_CHANNELS.runtimePreparationGet, {
+      forceRefresh: true,
+    })
+    const invalidRuntimePrepInput: Record<string, unknown> = { forceRefresh: 'yes' }
+    await expect(
+      Reflect.apply(
+        (input?: Parameters<DesktopBridge['getRuntimePreparation']>[0]) =>
+          bridge.getRuntimePreparation(input),
+        undefined,
+        [invalidRuntimePrepInput],
+      ),
+    ).rejects.toThrow(/.+/u)
+    expect(harness.invoke).toHaveBeenLastCalledWith(IPC_CHANNELS.runtimePreparationGet, {
+      forceRefresh: true,
+    })
   })
 })

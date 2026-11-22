@@ -107,6 +107,7 @@ import {
 import { cutoffSourceNavigator, readFrozenSourceTool } from './frozen-source-reader'
 import { NativeCheckOperation } from './native-check-operation'
 import {
+  anchorNativeFileBeforeEdit,
   claudeFileChanges,
   nativeEffectsUncertain,
   nativeFileChangesSettled,
@@ -4417,68 +4418,81 @@ export class ClaudeAgentAdapter implements AgentAdapter {
                 : {}),
           },
           hooks: {
-            ...(workflow
-              ? {
-                  PreToolUse: [
-                    {
-                      hooks: [
-                        async (hook) => {
-                          if (hook.hook_event_name !== 'PreToolUse') return {}
-                          if (nativePlanning && hook.tool_name === 'AskUserQuestion') {
-                            invalidateTerminalPlanIntent()
-                            if (!hook.agent_id && hook.session_id === resolvedSessionId)
-                              invalidateRetentionForQuestion()
-                          }
-                          if (hook.tool_name === retentionToolName) {
-                            const allowed = observeRetentionIntent(hook)
-                            return allowed
-                              ? {}
-                              : {
-                                  hookSpecificOutput: {
-                                    hookEventName: 'PreToolUse' as const,
-                                    permissionDecision: 'deny' as const,
-                                    permissionDecisionReason:
-                                      'This root cannot retain an unchanged frozen plan.',
-                                  },
-                                }
-                          }
-                          if (
-                            nativePlanning &&
-                            ['Write', 'Edit', 'ExitPlanMode'].includes(hook.tool_name)
-                          )
-                            await observePlanHook(hook, 'begin')
-                          if (nativePlanning && hook.tool_name === 'ExitPlanMode')
-                            return {
-                              hookSpecificOutput: {
-                                hookEventName: 'PreToolUse' as const,
-                                permissionDecision: 'ask' as const,
-                              },
-                            }
-                          const allowed =
-                            !['Agent', 'Task', 'EnterPlanMode', 'ExitPlanMode'].includes(
-                              hook.tool_name,
-                            ) &&
-                            (!collaborationReadOnly(
-                              workflow,
-                              input.promptEnvelope.collaborationAuthorization,
-                            ) ||
-                              nativePlanning ||
-                              collaborationToolAllowed(hook.tool_name, this.peerServerName))
-                          if (allowed) return {}
-                          return {
+            PreToolUse: [
+              {
+                hooks: [
+                  async (hook) => {
+                    if (hook.hook_event_name !== 'PreToolUse') return {}
+                    const anchorWriteOrEdit = async (): Promise<void> => {
+                      if (hook.tool_name !== 'Write' && hook.tool_name !== 'Edit') return
+                      const rawPath =
+                        hook.tool_input && typeof hook.tool_input === 'object'
+                          ? (Reflect.get(hook.tool_input, 'file_path') ??
+                            Reflect.get(hook.tool_input, 'path'))
+                          : undefined
+                      if (typeof rawPath === 'string' && rawPath && rawPath.length <= 4096)
+                        await anchorNativeFileBeforeEdit(input, rawPath, observation.signal)
+                    }
+                    if (!workflow) {
+                      await anchorWriteOrEdit()
+                      return {}
+                    }
+                    if (nativePlanning && hook.tool_name === 'AskUserQuestion') {
+                      invalidateTerminalPlanIntent()
+                      if (!hook.agent_id && hook.session_id === resolvedSessionId)
+                        invalidateRetentionForQuestion()
+                    }
+                    if (hook.tool_name === retentionToolName) {
+                      const allowed = observeRetentionIntent(hook)
+                      return allowed
+                        ? {}
+                        : {
                             hookSpecificOutput: {
                               hookEventName: 'PreToolUse' as const,
                               permissionDecision: 'deny' as const,
                               permissionDecisionReason:
-                                'Stay within this root responsibility. Use native questions for user decisions; Pact schedules independent review and implementation.',
+                                'This root cannot retain an unchanged frozen plan.',
                             },
                           }
+                    }
+                    if (
+                      nativePlanning &&
+                      ['Write', 'Edit', 'ExitPlanMode'].includes(hook.tool_name)
+                    )
+                      await observePlanHook(hook, 'begin')
+                    if (nativePlanning && hook.tool_name === 'ExitPlanMode')
+                      return {
+                        hookSpecificOutput: {
+                          hookEventName: 'PreToolUse' as const,
+                          permissionDecision: 'ask' as const,
                         },
-                      ],
-                    },
-                  ],
-                }
-              : {}),
+                      }
+                    const allowed =
+                      !['Agent', 'Task', 'EnterPlanMode', 'ExitPlanMode'].includes(
+                        hook.tool_name,
+                      ) &&
+                      (!collaborationReadOnly(
+                        workflow,
+                        input.promptEnvelope.collaborationAuthorization,
+                      ) ||
+                        nativePlanning ||
+                        collaborationToolAllowed(hook.tool_name, this.peerServerName))
+                    if (allowed) {
+                      if (!nativePlanning) await anchorWriteOrEdit()
+                      return {}
+                    }
+                    return {
+                      hookSpecificOutput: {
+                        hookEventName: 'PreToolUse' as const,
+                        permissionDecision: 'deny' as const,
+                        permissionDecisionReason:
+                          'Stay within this root responsibility. Use native questions for user decisions; Pact schedules independent review and implementation.',
+                      },
+                    }
+                  },
+                ],
+              },
+            ],
             PostToolUse: [
               {
                 hooks: [

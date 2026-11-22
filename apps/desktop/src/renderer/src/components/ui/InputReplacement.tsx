@@ -1,84 +1,58 @@
-import { useLayoutEffect, useRef, useState, type ReactNode } from 'react'
+import { useEffectEvent, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 
 type Replacement = { key: string; content: ReactNode }
 
+const EXIT_RETENTION_MS = 220
+
 /**
  * One input location, two mutually exclusive interactive surfaces.
- * Keeps the ordinary editor mounted, retains outgoing content for 220 ms, and owns
- * two observed panels, one height animation and one cancellable exit timer.
+ * Keeps the ordinary editor mounted, retains outgoing content for 220 ms,
+ * commits target height synchronously (zero per-frame height reflow),
+ * animates panes via GPU translate3d/opacity/scale in CSS (`--ease-silk-out`),
+ * and reports live height deltas via `onHeightDelta` so the transcript owner
+ * compensates scroll strictly when sticking to bottom.
  * Admission and draft ownership belong to the caller.
  */
 export function InputReplacement({
   replacement,
+  onHeightDelta,
   children,
 }: {
   replacement?: Replacement | undefined
+  onHeightDelta?: ((delta: number) => void) | undefined
   children: ReactNode
 }): React.JSX.Element {
   const [retained, setRetained] = useState(replacement)
   const root = useRef<HTMLDivElement>(null)
   const ordinary = useRef<HTMLDivElement>(null)
   const alternate = useRef<HTMLDivElement>(null)
-  const height = useRef<number | undefined>(undefined)
-  const animation = useRef<Animation | undefined>(undefined)
+  const lastHeight = useRef<number | undefined>(undefined)
   const focusOwner = useRef<'ordinary' | 'alternate' | undefined>(undefined)
   const active = Boolean(replacement)
   const mode = useRef(active)
   const modeKey = useRef(replacement?.key)
-  const measureCurrent = useRef<((interrupt?: boolean) => void) | undefined>(undefined)
+
+  const reportHeightDelta = useEffectEvent((delta: number): void => {
+    onHeightDelta?.(delta)
+  })
 
   useLayoutEffect(() => {
     if (replacement) {
-      // oxlint-disable-next-line react-hooks/set-state-in-effect, react/set-state-in-effect -- Retain only the outgoing surface until its exit animation finishes.
+      // oxlint-disable-next-line react-hooks/set-state-in-effect, react/set-state-in-effect -- Retain only the outgoing surface until its exit transition finishes.
       setRetained(replacement)
       return undefined
     }
-    const timer = window.setTimeout(() => setRetained(undefined), 220)
+    const timer = window.setTimeout(() => setRetained(undefined), EXIT_RETENTION_MS)
     return () => window.clearTimeout(timer)
   }, [replacement])
 
   useLayoutEffect(() => {
     const element = root.current
     if (!element) return undefined
-    const media = window.matchMedia('(prefers-reduced-motion: reduce)')
-    const measure = (interrupt = false): void => {
-      const panel = mode.current ? alternate.current : ordinary.current
-      if (!panel || (animation.current && !interrupt)) return
-      const previous = animation.current ? element.getBoundingClientRect().height : height.current
-      animation.current?.cancel()
-      animation.current = undefined
-      delete element.dataset.transitioning
-      // Measure natural layout after removing our own animated height constraint.
-      const next = panel.getBoundingClientRect().height
-      height.current = next
-      // Typing and validation resize the ordinary editor naturally. Clipping is
-      // reserved for an actual surface replacement, never its focus outline.
-      if (!interrupt && !mode.current) return
-      if (previous === undefined || media.matches || previous === next) return
-      const transition = element.animate([{ height: `${previous}px` }, { height: `${next}px` }], {
-        duration: 220,
-        easing: 'cubic-bezier(0.16, 1, 0.3, 1)',
-      })
-      animation.current = transition
-      element.dataset.transitioning = 'true'
-      transition.onfinish = () => {
-        if (animation.current === transition) {
-          animation.current = undefined
-          delete element.dataset.transitioning
-          measure()
-        }
-      }
-    }
-    measureCurrent.current = measure
-    const observer = new ResizeObserver(() => measure())
-    if (ordinary.current) observer.observe(ordinary.current)
-    if (alternate.current) observer.observe(alternate.current)
-    const reduce = (): void => {
-      if (media.matches) {
-        animation.current?.cancel()
-        animation.current = undefined
-        delete element.dataset.transitioning
-      }
+    const activePanel = mode.current ? alternate.current : ordinary.current
+    if (activePanel) {
+      const initialHeight = activePanel.offsetHeight
+      if (initialHeight > 0) lastHeight.current = initialHeight
     }
     const outside = (event: PointerEvent): void => {
       if (event.target instanceof Node && !element.contains(event.target))
@@ -87,17 +61,9 @@ export function InputReplacement({
     const blur = (): void => {
       focusOwner.current = undefined
     }
-    media.addEventListener('change', reduce)
     document.addEventListener('pointerdown', outside, true)
     window.addEventListener('blur', blur)
-    measure()
     return () => {
-      observer.disconnect()
-      measureCurrent.current = undefined
-      animation.current?.cancel()
-      animation.current = undefined
-      delete element.dataset.transitioning
-      media.removeEventListener('change', reduce)
       document.removeEventListener('pointerdown', outside, true)
       window.removeEventListener('blur', blur)
     }
@@ -108,7 +74,22 @@ export function InputReplacement({
     const previousKey = modeKey.current
     mode.current = active
     modeKey.current = replacement?.key
-    measureCurrent.current?.(previous !== active || previousKey !== replacement?.key)
+
+    const panel = active ? alternate.current : ordinary.current
+    if (panel) {
+      const nextHeight = panel.offsetHeight
+      if (nextHeight > 0) {
+        const prevHeight = lastHeight.current
+        lastHeight.current = nextHeight
+        if (prevHeight !== undefined && (previous !== active || previousKey !== replacement?.key)) {
+          const delta = nextHeight - prevHeight
+          if (Math.abs(delta) > 0.5) {
+            reportHeightDelta(delta)
+          }
+        }
+      }
+    }
+
     if (previous === active && previousKey === replacement?.key) return
     const owner = focusOwner.current
     if (
@@ -116,7 +97,6 @@ export function InputReplacement({
       (!active && owner !== 'alternate')
     )
       return
-    const panel = active ? alternate.current : ordinary.current
     if (!panel) return
     const targets = [
       ...panel.querySelectorAll<HTMLElement>('[contenteditable="true"], textarea, input'),
@@ -137,6 +117,24 @@ export function InputReplacement({
     panel.tabIndex = -1
     panel.focus({ preventScroll: true })
   }, [active, replacement?.key])
+
+  useLayoutEffect(() => {
+    const panel = active ? alternate.current : ordinary.current
+    if (!panel || typeof ResizeObserver === 'undefined') return undefined
+    const observer = new ResizeObserver(() => {
+      const nextHeight = panel.offsetHeight
+      if (nextHeight <= 0) return
+      const prevHeight = lastHeight.current
+      lastHeight.current = nextHeight
+      if (prevHeight === undefined) return
+      const delta = nextHeight - prevHeight
+      if (Math.abs(delta) > 0.5) {
+        reportHeightDelta(delta)
+      }
+    })
+    observer.observe(panel)
+    return () => observer.disconnect()
+  }, [active])
 
   return (
     <div

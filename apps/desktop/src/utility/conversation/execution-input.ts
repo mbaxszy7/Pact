@@ -10,16 +10,41 @@ import { frozenExecutionEnvelopeSchema } from '@pact/contracts'
 const pathlessImages = (values: AgentPromptImage[] | undefined) =>
   values?.map(({ path: _path, ...image }) => image)
 
+const clonePeerWorkspaceChanges = (
+  entries: NonNullable<AgentPromptEnvelope['peerWorkspaceChanges']>,
+) =>
+  entries.map((entry) => ({
+    runId: entry.runId,
+    agentId: entry.agentId,
+    ...(entry.sequence !== undefined ? { sequence: entry.sequence } : {}),
+    ...(entry.truncatedFileCount !== undefined
+      ? { truncatedFileCount: entry.truncatedFileCount }
+      : {}),
+    files: entry.files.map((file) => ({
+      path: file.path,
+      kind: file.kind,
+      additions: file.additions,
+      deletions: file.deletions,
+    })),
+  }))
+
 /** Preserve complete business input while excluding process-local capabilities and image paths. */
 export function pathlessExecutionInput(envelope: AgentPromptEnvelope): FrozenExecutionEnvelope {
-  const { sourceGrant: _sourceGrant, ...base } = envelope
+  const { sourceGrant: _sourceGrant, peerWorkspaceChanges, ...base } = envelope
   const basis = envelope.collaborationBasis
   return frozenExecutionEnvelopeSchema.parse({
     ...base,
+    ...(peerWorkspaceChanges !== undefined
+      ? { peerWorkspaceChanges: clonePeerWorkspaceChanges(peerWorkspaceChanges) }
+      : {}),
     message: { ...envelope.message, images: pathlessImages(envelope.message.images) },
     handoffContext: envelope.handoffContext?.map((entry) => ({
       ...entry,
       images: pathlessImages(entry.images),
+    })),
+    handoffImages: envelope.handoffImages?.map((entry) => ({
+      messageId: entry.messageId,
+      images: pathlessImages(entry.images) ?? [],
     })),
     rebuiltContext: envelope.rebuiltContext?.map((entry) => ({
       ...entry,
@@ -53,6 +78,8 @@ export function restoreExecutionInput(
   const {
     skillInvocation: _capturedSkills,
     handoffContext,
+    handoffImages,
+    peerWorkspaceChanges,
     rebuiltContext,
     collaborationBasis,
     requestSessionTitle,
@@ -74,6 +101,17 @@ export function restoreExecutionInput(
     ...(originalSkills ? { skillInvocation: originalSkills } : {}),
     message: withImages(input.message),
     ...(handoffContext ? { handoffContext: handoffContext.map(withImages) } : {}),
+    ...(handoffImages
+      ? {
+          handoffImages: handoffImages.map((entry) => ({
+            messageId: entry.messageId,
+            images: entry.images.map(resolveImage),
+          })),
+        }
+      : {}),
+    ...(peerWorkspaceChanges !== undefined
+      ? { peerWorkspaceChanges: clonePeerWorkspaceChanges(peerWorkspaceChanges) }
+      : {}),
     ...(rebuiltContext
       ? {
           rebuiltContext: rebuiltContext.map((entry) =>

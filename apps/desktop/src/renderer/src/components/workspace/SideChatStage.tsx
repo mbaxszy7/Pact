@@ -22,7 +22,8 @@ interface StageState {
 }
 
 /**
- * Horizontal push/pop stage animating push (`+12px -> 0`, 180ms) and pop (`-12px -> 0`, 160ms).
+ * Horizontal push/pop stage animating push (`+12px -> 0`, 180ms `--ease-silk-out`)
+ * and pop (`-12px -> 0`, 160ms `--ease-silk-out`).
  * Snapshots the outgoing DOM before commit into an `inert`, `absolute` layer cleared by a single replaceable timer.
  */
 export class SideChatStage extends Component<SideChatStageProps, StageState> {
@@ -139,7 +140,7 @@ export class SideChatStage extends Component<SideChatStageProps, StageState> {
           data-stage-state="outgoing"
           data-direction={outgoingDirection}
           data-animate={hasOutgoing ? 'true' : 'false'}
-          className="pact-side-chat-stage-layer pointer-events-none absolute inset-0 z-0 flex h-full min-h-0 flex-col bg-surface-raised"
+          className="pact-side-chat-stage-layer pointer-events-none absolute inset-0 z-0 flex h-full min-h-0 flex-col bg-surface"
         />
         <div
           key={stageKey}
@@ -147,7 +148,7 @@ export class SideChatStage extends Component<SideChatStageProps, StageState> {
           data-stage-state="active"
           data-direction={direction}
           data-animate={animate ? 'true' : 'false'}
-          className="pact-side-chat-stage-layer relative z-1 flex h-full min-h-0 flex-1 flex-col bg-surface-raised"
+          className="pact-side-chat-stage-layer relative z-1 flex h-full min-h-0 flex-1 flex-col bg-surface"
         >
           {children}
         </div>

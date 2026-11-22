@@ -25,6 +25,7 @@ export interface WorkspaceShellProps {
   navigationAvailable?: boolean
   agentActionsEnabled?: boolean
   isSettingsView?: boolean
+  nativePresentationSuspended?: boolean | undefined
   contextPanel?: ReactNode
   contextPanelOpen?: boolean | undefined
   onContextPanelOpenChange?: ((open: boolean) => void) | undefined
@@ -38,6 +39,10 @@ export interface WorkspaceShellProps {
 type WorkspaceViewport = 'wide' | 'compact' | 'narrow'
 
 const wideNavigationDefaultSize = '23%'
+const wideContextDefaultSize = '29%'
+const SILK_OUT_EASING = 'cubic-bezier(0.22, 1, 0.36, 1)'
+const FLIP_DURATION_MS = 260
+const REDUCED_FADE_MS = 100
 
 const defaultLayoutState: WorkspaceLayoutState = {
   navigationPanel: 'open',
@@ -67,11 +72,47 @@ function freezePanelContent(
   currentWidth: number,
   lastWidth: React.RefObject<number>,
 ): void {
-  if (!element || element.style.getPropertyValue('--workspace-panel-content-width')) return
+  if (!element) return
   if (currentWidth > 1) lastWidth.current = currentWidth
   if (lastWidth.current > 0) {
     element.style.setProperty('--workspace-panel-content-width', `${lastWidth.current}px`)
   }
+}
+
+function prefersReducedMotion(): boolean {
+  return (
+    typeof window !== 'undefined' &&
+    typeof window.matchMedia === 'function' &&
+    window.matchMedia('(prefers-reduced-motion: reduce)').matches
+  )
+}
+
+function cancelActiveAnimations(element: HTMLElement | null): void {
+  if (!element || typeof element.getAnimations !== 'function') return
+  for (const animation of element.getAnimations()) {
+    animation.cancel()
+  }
+}
+
+function runSilkFlip(
+  element: HTMLElement | null,
+  keyframes: Keyframe[],
+  reducedKeyframes?: Keyframe[],
+): void {
+  if (!element || typeof element.animate !== 'function') return
+  cancelActiveAnimations(element)
+  if (prefersReducedMotion()) {
+    if (!reducedKeyframes) return
+    element.animate(reducedKeyframes, {
+      duration: REDUCED_FADE_MS,
+      easing: 'ease-out',
+    })
+    return
+  }
+  element.animate(keyframes, {
+    duration: FLIP_DURATION_MS,
+    easing: SILK_OUT_EASING,
+  })
 }
 
 function useWorkspaceViewport(): WorkspaceViewport {
@@ -129,6 +170,7 @@ export function WorkspaceShell({
   navigationAvailable = true,
   agentActionsEnabled = true,
   isSettingsView = false,
+  nativePresentationSuspended = false,
   contextPanel: providedContextPanel,
   contextPanelOpen,
   onContextPanelOpenChange,
@@ -141,7 +183,6 @@ export function WorkspaceShell({
   const initialViewport = getWorkspaceViewport()
   const hasContextPanel = Boolean(providedContextPanel)
   const [layoutState, setLayoutState] = useState<WorkspaceLayoutState>(initialState)
-  const [isLayoutAnimating, setIsLayoutAnimating] = useState(false)
   const [isContextOverlayRendered, setIsContextOverlayRendered] = useState(
     () =>
       hasContextPanel &&
@@ -149,9 +190,10 @@ export function WorkspaceShell({
       !isSettingsView &&
       initialViewport !== 'wide',
   )
-  const [navigationHeaderWidth, setNavigationHeaderWidth] = useState(0)
   const [navigationPanelElement, setNavigationPanelElement] = useState<HTMLDivElement | null>(null)
+  const [centerPanelElement, setCenterPanelElement] = useState<HTMLDivElement | null>(null)
   const [contextPanelElement, setContextPanelElement] = useState<HTMLDivElement | null>(null)
+  const shellRef = useRef<HTMLElement>(null)
   const navigationPanelRef = usePanelRef()
   const contextPanelRef = usePanelRef()
   const openedWideNavigationPanelRef = useRef<HTMLDivElement | null>(null)
@@ -160,19 +202,21 @@ export function WorkspaceShell({
   const navigationToggleRef = useRef<HTMLButtonElement>(null)
   const toggleButtonRef = useRef<HTMLButtonElement>(null)
   const contextDialogRef = useRef<HTMLDialogElement>(null)
-  const layoutAnimationTimerRef = useRef<number | undefined>(undefined)
   const overlayExitTimerRef = useRef<number | undefined>(undefined)
   const contextFocusScrollPositionRef = useRef({ x: 0, y: 0 })
   const contextReturnFocusRef = useRef<HTMLElement | null>(null)
   const wasContextVisibleRef = useRef(false)
   const restoreNavigationToggleFocus = useRef(false)
+  const hasCommittedNavRef = useRef(false)
+  const hasCommittedContextRef = useRef(false)
+  const skipNextFlipRef = useRef(false)
+
   const isNavigationOpen = layoutState.navigationPanel === 'open'
   const isNavigationVisible = navigationAvailable && isNavigationOpen
   const isContextOpen = contextPanelOpen ?? layoutState.contextPanel === 'open'
   const isContextVisible = hasContextPanel && isContextOpen && !isSettingsView
   const isContextExpanded = isContextVisible && contextPanelExpanded
-  const effectiveNavigationHeaderWidth =
-    navigationPanelElement && !isContextExpanded ? navigationHeaderWidth : 0
+  const isNavigationContentVisible = isNavigationVisible && !isContextExpanded
 
   const viewport = useWorkspaceViewport()
   const canRenderContextOverlay = hasContextPanel && !isSettingsView && viewport !== 'wide'
@@ -198,34 +242,49 @@ export function WorkspaceShell({
     return () => window.clearTimeout(overlayExitTimerRef.current)
   }, [canRenderContextOverlay, isContextOverlayRendered, isContextVisible])
 
+  // Sync navigation width directly to --pact-nav-px without triggering React re-renders during drag.
   useLayoutEffect(() => {
-    let observer: ResizeObserver | undefined
-    if (navigationPanelElement) {
-      const syncWidth = (): void =>
-        setNavigationHeaderWidth(navigationPanelElement.getBoundingClientRect().width)
-      syncWidth()
-      observer = new ResizeObserver(syncWidth)
-      observer.observe(navigationPanelElement)
+    const shell = shellRef.current
+    if (!shell) return undefined
+    const syncNavPx = (): void => {
+      const width =
+        navigationPanelElement && !isContextExpanded
+          ? Math.round(navigationPanelElement.getBoundingClientRect().width)
+          : 0
+      shell.style.setProperty('--pact-nav-px', `${width}px`)
     }
-    return () => observer?.disconnect()
-  }, [navigationPanelElement])
+    syncNavPx()
+    if (!navigationPanelElement || typeof ResizeObserver === 'undefined') return undefined
+    const observer = new ResizeObserver(syncNavPx)
+    observer.observe(navigationPanelElement)
+    return () => observer.disconnect()
+  }, [navigationPanelElement, isContextExpanded])
 
   useEffect(() => {
     return () => {
-      window.clearTimeout(layoutAnimationTimerRef.current)
       window.clearTimeout(overlayExitTimerRef.current)
       contextReturnFocusRef.current = null
     }
   }, [])
 
-  useEffect(() => {
+  // Target-first navigation geometry + interruptible FLIP translate3d (zero flex-grow reflow).
+  useLayoutEffect(() => {
     const panel = navigationPanelRef.current
     if (!panel) return
+    const shouldAnimate = hasCommittedNavRef.current && !skipNextFlipRef.current
+    hasCommittedNavRef.current = true
+    skipNextFlipRef.current = false
+
+    const prevCenterLeft = shouldAnimate
+      ? centerPanelElement?.getBoundingClientRect().left
+      : undefined
     if (!isNavigationVisible) {
+      const currentWidth =
+        navigationPanelElement?.getBoundingClientRect().width || panel.getSize().inPixels
+      freezePanelContent(navigationPanelElement, currentWidth, lastNavigationPanelWidthRef)
       panel.collapse()
-      return
-    }
-    if (viewport === 'wide' && navigationPanelElement) {
+    } else if (viewport === 'wide' && navigationPanelElement) {
+      navigationPanelElement.style.removeProperty('--workspace-panel-content-width')
       const previousWidth =
         openedWideNavigationPanelRef.current === navigationPanelElement
           ? lastNavigationPanelWidthRef.current
@@ -234,17 +293,80 @@ export function WorkspaceShell({
       if (panel.isCollapsed()) {
         // The panel may have mounted at zero before Projects arrived.
         panel.resize(previousWidth > 1 ? previousWidth : wideNavigationDefaultSize)
-        return
+      } else {
+        panel.expand()
+      }
+    } else {
+      navigationPanelElement?.style.removeProperty('--workspace-panel-content-width')
+      panel.expand()
+    }
+
+    if (!shouldAnimate) return
+    if (centerPanelElement && prevCenterLeft !== undefined) {
+      const nextCenterLeft = centerPanelElement.getBoundingClientRect().left
+      const deltaX = prevCenterLeft - nextCenterLeft
+      if (Math.abs(deltaX) > 1) {
+        runSilkFlip(centerPanelElement, [
+          { transform: `translate3d(${deltaX}px, 0, 0)` },
+          { transform: 'translate3d(0, 0, 0)' },
+        ])
       }
     }
-    panel.expand()
-  }, [isNavigationVisible, navigationPanelElement, navigationPanelRef, viewport])
+    if (isNavigationVisible && navigationPanelElement) {
+      const content = navigationPanelElement.querySelector<HTMLElement>('.workspace-panel-content')
+      runSilkFlip(
+        content ?? navigationPanelElement,
+        [
+          { opacity: 0, transform: 'translate3d(-14px, 0, 0)' },
+          { opacity: 1, transform: 'translate3d(0, 0, 0)' },
+        ],
+        [{ opacity: 0 }, { opacity: 1 }],
+      )
+    }
+  }, [
+    isNavigationVisible,
+    navigationPanelElement,
+    centerPanelElement,
+    navigationPanelRef,
+    viewport,
+  ])
 
-  useEffect(() => {
+  // Target-first right ContextInspector geometry + interruptible FLIP translate3d.
+  useLayoutEffect(() => {
     if (viewport !== 'wide') return
-    if (isContextVisible) contextPanelRef.current?.expand()
-    else contextPanelRef.current?.collapse()
-  }, [contextPanelRef, isContextVisible, viewport])
+    const panel = contextPanelRef.current
+    if (!panel) return
+    const shouldAnimate = hasCommittedContextRef.current && !skipNextFlipRef.current
+    hasCommittedContextRef.current = true
+    skipNextFlipRef.current = false
+
+    if (isContextVisible) {
+      contextPanelElement?.style.removeProperty('--workspace-panel-content-width')
+      if (panel.isCollapsed()) {
+        const previousWidth = lastContextPanelWidthRef.current
+        panel.resize(previousWidth > 1 ? previousWidth : wideContextDefaultSize)
+      } else {
+        panel.expand()
+      }
+    } else {
+      const currentWidth =
+        contextPanelElement?.getBoundingClientRect().width || panel.getSize().inPixels
+      freezePanelContent(contextPanelElement, currentWidth, lastContextPanelWidthRef)
+      panel.collapse()
+    }
+
+    if (!shouldAnimate) return
+    if (isContextVisible && contextPanelElement) {
+      runSilkFlip(
+        contextPanelElement,
+        [
+          { opacity: 0.2, transform: 'translate3d(20px, 0, 0)' },
+          { opacity: 1, transform: 'translate3d(0, 0, 0)' },
+        ],
+        [{ opacity: 0 }, { opacity: 1 }],
+      )
+    }
+  }, [contextPanelRef, contextPanelElement, isContextVisible, viewport])
 
   useEffect(() => {
     if (isNavigationVisible || !restoreNavigationToggleFocus.current) return
@@ -287,65 +409,72 @@ export function WorkspaceShell({
     return () => window.cancelAnimationFrame(frame)
   }, [isContextVisible, isContextOverlayRendered, isContextExpanded, viewport])
 
-  const beginLayoutAnimation = (panel: 'navigation' | 'context'): void => {
-    if (panel === 'navigation') {
-      freezePanelContent(
-        navigationPanelElement,
-        navigationPanelRef.current?.getSize().inPixels ?? 0,
-        lastNavigationPanelWidthRef,
-      )
-    } else {
-      freezePanelContent(
-        contextPanelElement,
-        contextPanelRef.current?.getSize().inPixels ?? 0,
-        lastContextPanelWidthRef,
-      )
-    }
-
-    window.clearTimeout(layoutAnimationTimerRef.current)
-    setIsLayoutAnimating(true)
-    layoutAnimationTimerRef.current = window.setTimeout(() => {
-      setIsLayoutAnimating(false)
-      navigationPanelElement?.style.removeProperty('--workspace-panel-content-width')
-      contextPanelElement?.style.removeProperty('--workspace-panel-content-width')
-    }, 240)
-  }
-
   const closeContext = (): void => {
-    beginLayoutAnimation('context')
     setLayoutState((state) => ({ ...state, contextPanel: 'closed' }))
     onContextPanelOpenChange?.(false)
   }
   const openContext = (): void => {
-    beginLayoutAnimation('context')
     setLayoutState((state) => ({ ...state, contextPanel: 'open' }))
     onContextPanelOpenChange?.(true)
   }
   const toggleContext = (): void => (isContextOpen ? closeContext() : openContext())
+
+  // Cmd/Ctrl + J toggles the right ContextInspector cleanly.
+  const handleGlobalShortcut = useEffectEvent((event: KeyboardEvent): void => {
+    if (
+      event.defaultPrevented ||
+      isSettingsView ||
+      !hasContextPanel ||
+      nativePresentationSuspended ||
+      Boolean(shellRef.current?.closest('[inert]')) ||
+      Boolean(document.querySelector('dialog[open]'))
+    ) {
+      return
+    }
+    if (
+      (event.metaKey || event.ctrlKey) &&
+      !event.altKey &&
+      !event.shiftKey &&
+      event.key.toLowerCase() === 'j'
+    ) {
+      event.preventDefault()
+      toggleContext()
+    }
+  })
+
+  useEffect(() => {
+    const listener = (event: KeyboardEvent): void => handleGlobalShortcut(event)
+    window.addEventListener('keydown', listener)
+    return () => window.removeEventListener('keydown', listener)
+  }, [])
+
   const closeNavigation = (): void => {
     if (!navigationAvailable) return
-    beginLayoutAnimation('navigation')
     restoreNavigationToggleFocus.current = true
     setLayoutState((state) => ({ ...state, navigationPanel: 'closed' }))
   }
   const openNavigation = (): void => {
     if (!navigationAvailable) return
-    beginLayoutAnimation('navigation')
     setLayoutState((state) => ({ ...state, navigationPanel: 'open' }))
   }
   const toggleNavigation = (): void => (isNavigationOpen ? closeNavigation() : openNavigation())
+
   const syncPanelStateFromLayout = (
     panel: keyof WorkspaceLayoutState,
     layoutValue: number | undefined,
   ): void => {
     const nextState = (layoutValue ?? 0) <= 0.01 ? 'closed' : 'open'
+    const nextOpen = nextState === 'open'
 
     setLayoutState((state) => {
       if (state[panel] === nextState) return state
+      skipNextFlipRef.current = true
       if (panel === 'navigationPanel') restoreNavigationToggleFocus.current = nextState === 'closed'
       return { ...state, [panel]: nextState }
     })
-    if (panel === 'contextPanel') onContextPanelOpenChange?.(nextState === 'open')
+    if (panel === 'contextPanel' && nextOpen !== isContextOpen) {
+      onContextPanelOpenChange?.(nextOpen)
+    }
   }
   const handleWideLayoutChanged = (layout: Layout, meta: LayoutChangedMeta): void => {
     if (!meta.isUserInteraction) return
@@ -425,8 +554,8 @@ export function WorkspaceShell({
     dialog.addEventListener('keydown', keydown)
     return () => dialog.removeEventListener('keydown', keydown)
   }, [isContextVisible, isContextOverlayRendered, isContextExpanded, viewport])
+
   const contextPanel = providedContextPanel ?? null
-  const isNavigationContentVisible = isNavigationVisible && !isContextExpanded
   const notifyNavigationVisibility = useEffectEvent((visible: boolean): void => {
     onNavigationVisibilityChange?.(visible)
   })
@@ -447,17 +576,18 @@ export function WorkspaceShell({
   if (viewport === 'wide') {
     return (
       <section
-        className="relative flex h-full min-h-0 w-full flex-col overflow-hidden bg-canvas text-primary"
+        ref={shellRef}
+        className="pact-silk-surface relative flex h-full min-h-0 w-full flex-col overflow-hidden bg-canvas text-primary"
         aria-label={workspaceTitle ? undefined : 'Pact workspace'}
         aria-labelledby={workspaceTitle ? 'workspace-title' : undefined}
         data-workspace-shell
         data-workspace-viewport={viewport}
+        data-nav-open={isNavigationContentVisible ? 'true' : 'false'}
         data-agent-actions={agentActionsEnabled ? 'enabled' : 'disabled'}
       >
         <ShellHeader
           isContextOpen={isContextOpen}
-          isNavigationOpen={isNavigationVisible}
-          navigationHeaderWidth={effectiveNavigationHeaderWidth}
+          isNavigationOpen={isNavigationContentVisible}
           contextLabel={contextToggleLabel}
           navigationLabel={navigationToggleLabel}
           onToggleContext={toggleContext}
@@ -472,16 +602,15 @@ export function WorkspaceShell({
         />
         {workspaceNotice}
         <Group
-          className="workspace-layout relative min-h-0 min-w-0 flex-1 bg-surface"
+          className="workspace-layout relative min-h-0 min-w-0 flex-1"
           data-context-expanded={isContextExpanded}
-          data-animating={isLayoutAnimating}
           id="workspace-shell"
           onLayoutChanged={handleWideLayoutChanged}
           orientation="horizontal"
           resizeTargetMinimumSize={{ coarse: 28, fine: 16 }}
         >
           <Panel
-            className="workspace-panel-content min-w-0 overflow-hidden bg-surface-muted"
+            className="workspace-panel-content min-w-0 overflow-hidden bg-transparent"
             collapsedSize="0%"
             collapsible
             data-open={isNavigationVisible}
@@ -507,7 +636,8 @@ export function WorkspaceShell({
             label="Resize navigation"
           />
           <Panel
-            className="min-w-0 bg-surface"
+            className="workspace-sheet min-w-0"
+            elementRef={setCenterPanelElement}
             id="workspace-center"
             minSize="24rem"
             aria-hidden={isContextExpanded}
@@ -520,20 +650,20 @@ export function WorkspaceShell({
             label="Resize context panel"
           />
           <Panel
-            className="workspace-panel-content min-w-0 overflow-hidden bg-surface-raised"
+            className="workspace-panel-content workspace-sheet min-w-0 overflow-hidden"
             collapsedSize="0%"
             collapsible
             data-open={isContextVisible}
-            defaultSize="27%"
+            defaultSize={isContextVisible ? wideContextDefaultSize : '0%'}
             elementRef={setContextPanelElement}
             id="workspace-context"
-            maxSize={contextPanelWidthLimited ? '36%' : undefined}
+            maxSize={contextPanelWidthLimited ? '42%' : undefined}
             minSize="18rem"
             panelRef={contextPanelRef}
             style={{ maxWidth: 'none' }}
           >
             <aside
-              className="h-full overflow-auto"
+              className="h-full overflow-hidden"
               aria-hidden={!isContextVisible}
               aria-label="Context panel"
               inert={!isContextVisible}
@@ -548,17 +678,18 @@ export function WorkspaceShell({
 
   return (
     <section
-      className="relative flex h-full min-h-0 w-full flex-col overflow-hidden bg-canvas text-primary"
+      ref={shellRef}
+      className="pact-silk-surface relative flex h-full min-h-0 w-full flex-col overflow-hidden bg-canvas text-primary"
       aria-label={workspaceTitle ? undefined : 'Pact workspace'}
       aria-labelledby={workspaceTitle ? 'workspace-title' : undefined}
       data-workspace-shell
       data-workspace-viewport={viewport}
+      data-nav-open={isNavigationContentVisible ? 'true' : 'false'}
       data-agent-actions={agentActionsEnabled ? 'enabled' : 'disabled'}
     >
       <ShellHeader
         isContextOpen={isContextOpen}
-        isNavigationOpen={isNavigationVisible}
-        navigationHeaderWidth={effectiveNavigationHeaderWidth}
+        isNavigationOpen={isNavigationContentVisible}
         contextLabel={contextToggleLabel}
         navigationLabel={navigationToggleLabel}
         onToggleContext={toggleContext}
@@ -572,17 +703,16 @@ export function WorkspaceShell({
         subtitle={shellSubtitle}
       />
       {workspaceNotice}
-      <div className="relative min-h-0 min-w-0 flex-1 overflow-hidden bg-surface">
+      <div className="relative min-h-0 min-w-0 flex-1 overflow-hidden">
         <Group
           className="workspace-layout h-full"
-          data-animating={isLayoutAnimating}
           id="workspace-constrained-shell"
           onLayoutChanged={handleConstrainedLayoutChanged}
           orientation="horizontal"
           resizeTargetMinimumSize={{ coarse: 28, fine: 16 }}
         >
           <Panel
-            className="workspace-panel-content min-w-0 overflow-hidden bg-surface-muted"
+            className="workspace-panel-content min-w-0 overflow-hidden bg-transparent"
             collapsedSize="0%"
             collapsible
             data-open={isNavigationVisible}
@@ -608,7 +738,8 @@ export function WorkspaceShell({
             label="Resize navigation"
           />
           <Panel
-            className="min-w-0 bg-surface"
+            className="workspace-sheet min-w-0"
+            elementRef={setCenterPanelElement}
             id="workspace-center"
             minSize="24rem"
             aria-hidden={isContextExpanded}
@@ -624,7 +755,7 @@ export function WorkspaceShell({
             role="presentation"
           >
             <dialog
-              className="workspace-context-dialog border-border bg-surface-raised text-primary shadow-dialog"
+              className="workspace-context-dialog border-border bg-surface text-primary shadow-dialog"
               data-expanded={isContextExpanded}
               data-open={isContextOpen}
               aria-label="Context panel"
@@ -645,7 +776,6 @@ export function WorkspaceShell({
 interface ShellHeaderProps {
   isContextOpen: boolean
   isNavigationOpen: boolean
-  navigationHeaderWidth: number
   contextLabel: string
   navigationLabel: string
   onToggleContext: () => void
@@ -662,7 +792,6 @@ interface ShellHeaderProps {
 function ShellHeader({
   isContextOpen,
   isNavigationOpen,
-  navigationHeaderWidth,
   contextLabel,
   navigationLabel,
   onToggleContext,
@@ -688,31 +817,15 @@ function ShellHeader({
     ) : null
 
   return (
-    <header className="pact-titlebar workspace-titlebar relative h-12 shrink-0 bg-surface">
-      <div
-        aria-hidden="true"
-        className="workspace-titlebar-chat absolute inset-y-0 right-0 border-b border-border bg-surface"
-        style={{ left: `${navigationHeaderWidth}px` }}
-      />
-      <div
-        aria-hidden="true"
-        className="workspace-titlebar-navigation absolute inset-y-0 left-0 bg-surface-muted"
-        style={{ width: `${navigationHeaderWidth}px` }}
-      />
-      {navigationHeaderWidth > 0 ? (
-        <div
-          aria-hidden="true"
-          className="absolute inset-y-0 z-10 w-px bg-border"
-          style={{ left: `${navigationHeaderWidth}px` }}
-        />
-      ) : null}
+    <header className="pact-titlebar workspace-titlebar relative h-12 shrink-0 bg-canvas">
       <div className="pact-titlebar-content relative flex h-full min-w-0 items-center gap-group px-group">
         <div
           className="flex shrink-0 items-center"
           style={
             isNavigationOpen
               ? {
-                  width: `max(2rem, calc(${navigationHeaderWidth}px - env(titlebar-area-x, 0px) - var(--pact-space-group)))`,
+                  width:
+                    'max(2rem, calc(var(--pact-nav-px, 0px) - env(titlebar-area-x, 0px) - var(--pact-space-group)))',
                 }
               : undefined
           }
@@ -720,7 +833,7 @@ function ShellHeader({
           {showNavigationToggle ? (
             <button
               ref={navigationToggleRef}
-              className="grid size-8 shrink-0 place-items-center rounded-control text-secondary hover:bg-surface-muted hover:text-primary"
+              className="pact-pressable grid size-8 shrink-0 place-items-center rounded-xl text-secondary hover:bg-row-hover hover:text-primary"
               type="button"
               aria-expanded={isNavigationOpen}
               aria-label={navigationLabel}
@@ -735,7 +848,7 @@ function ShellHeader({
         {showContextToggle ? (
           <button
             ref={contextToggleRef}
-            className="h-8 shrink-0 rounded-control border border-border bg-surface-raised px-3 text-caption font-medium text-primary hover:bg-surface-muted"
+            className="pact-pressable h-8 shrink-0 rounded-xl border border-border bg-surface-raised px-3 text-caption font-medium text-primary hover:bg-surface-muted"
             type="button"
             aria-expanded={isContextOpen}
             onClick={onToggleContext}

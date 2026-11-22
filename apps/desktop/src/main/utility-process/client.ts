@@ -10,6 +10,8 @@ import type {
   WorkspaceArchivePreview,
   WorkspaceArchiveReceipt,
   AppError,
+  CollaborationAction,
+  CollaborationActionInput,
   CommentDraftRemoveInput,
   CommentDraftSaveInput,
   CommentSourceResolution,
@@ -56,6 +58,7 @@ import type {
   RuntimeExecutablePathUpdate,
   RuntimeHealth,
   RuntimePreparation,
+  RuntimePreparationGetInput,
   SessionArchiveInput,
   SessionSidebarHiddenInput,
   SessionCatalogChange,
@@ -155,18 +158,32 @@ import {
   logicalIpcTrafficSnapshot,
 } from '../../shared/logical-ipc-traffic'
 import { RelayCredentialCrypto } from '../modules/settings/relay-credential-crypto'
+import { AgyStorageOperations } from './agy-storage-operations'
 import { DirectoryFileOperations } from './directory-file-operations'
 
 const REQUEST_TIMEOUT_MS = 2_000
 const STARTUP_TIMEOUT_MS = 10_000
-const RUNTIME_PREPARATION_TIMEOUT_MS = 12_000
-// Send composes optional 15s advice with existing 10s preparation and 2s transport margin.
-const CONVERSATION_SEND_TIMEOUT_MS = 15_000 + RUNTIME_PREPARATION_TIMEOUT_MS
+const RUNTIME_PREPARATION_TIMEOUT_MS = 30_000
+const CONVERSATION_PREPARATION_IPC_TIMEOUT_MS = 40_000
+// Send composes optional 15s advice with preparation (up to 38s for Antigravity) and transport margin.
+const CONVERSATION_SEND_TIMEOUT_MS = 15_000 + CONVERSATION_PREPARATION_IPC_TIMEOUT_MS
 // A sealed input may first use the existing bounded 10s complete body read.
 const CONVERSATION_SEND_BODY_READ_MS = 10_000
-const DEFAULT_SESSION_SETTINGS_TIMEOUT_MS = 25_000
+const DEFAULT_SESSION_SETTINGS_TIMEOUT_MS = 45_000
+const PROVIDER_USAGE_REFRESH_TIMEOUT_MS = 40_000
+const SKILL_OPERATION_TIMEOUT_MS = 40_000
 const WORKSPACE_OPERATION_TIMEOUT_MS = 5_000
 const WORKSPACE_FILE_READ_TIMEOUT_MS = 15_000
+const COLLABORATION_ACTION_TIMEOUT_MS: Record<CollaborationAction, number> = {
+  execute: CONVERSATION_SEND_TIMEOUT_MS,
+  review_plan: CONVERSATION_SEND_TIMEOUT_MS,
+  review_code: CONVERSATION_SEND_TIMEOUT_MS,
+  fix: CONVERSATION_SEND_TIMEOUT_MS,
+  resume: CONVERSATION_SEND_TIMEOUT_MS,
+  retry: CONVERSATION_SEND_TIMEOUT_MS,
+  recover_plan: CONVERSATION_PREPARATION_IPC_TIMEOUT_MS,
+  swap_code_roles: WORKSPACE_OPERATION_TIMEOUT_MS,
+}
 const diagnosticUuid = (value: unknown): value is string =>
   typeof value === 'string' &&
   /^[a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}$/iu.test(value)
@@ -252,7 +269,7 @@ export interface UtilityProcessClient {
   /** Wait for this child to install its request handler; never restarts it. */
   waitUntilReady(): Promise<RpcResult<{ ready: true }>>
   getHealth(): Promise<RpcResult<RuntimeHealth>>
-  getRuntimePreparation(): Promise<RpcResult<RuntimePreparation>>
+  getRuntimePreparation(input?: RuntimePreparationGetInput): Promise<RpcResult<RuntimePreparation>>
   updateRuntimeExecutablePath(
     input: RuntimeExecutablePathUpdate,
   ): Promise<RpcResult<RuntimePreparation>>
@@ -447,6 +464,10 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
   private readonly utilityScriptPath = join(__dirname, 'utility/index.js')
   private readonly directoryOperations = new DirectoryFileOperations(
     join(dirname(this.utilityScriptPath), 'workspace-directory-worker.js'),
+  )
+  private readonly agyStorageOperations = new AgyStorageOperations(
+    join(dirname(this.utilityScriptPath), 'agy-storage-child.js'),
+    { isPackaged: app.isPackaged },
   )
   private readonly directoryRequests = new Map<
     string,
@@ -680,6 +701,7 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
         // An unproved measurement root stays disabled; absence leaves instrumentation disabled.
       }
     }
+    this.agyStorageOperations.configureTraffic(this.traffic)
 
     this.child = startedChild
     this.diagnostics?.attachUtility(startedChild)
@@ -699,6 +721,7 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
       if (this.navigationRead?.child === startedChild) this.navigationRead = undefined
       this.cancelDirectoryRequests(startedChild)
       this.relayCrypto.cancelSource(startedChild)
+      this.agyStorageOperations.cancelSource(startedChild)
       if (this.child !== startedChild) return
       this.child = undefined
       this.readyChild = undefined
@@ -927,10 +950,15 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
       : result
   }
 
-  async getRuntimePreparation(): Promise<RpcResult<RuntimePreparation>> {
+  async getRuntimePreparation(
+    input?: RuntimePreparationGetInput,
+  ): Promise<RpcResult<RuntimePreparation>> {
     return ElectronUtilityProcessClient.toRuntimePreparationResult(
       await this.request(
-        { type: 'runtime-preparation.get.request' },
+        {
+          type: 'runtime-preparation.get.request',
+          ...(input !== undefined ? { input } : {}),
+        },
         'runtime-preparation.response',
         RUNTIME_PREPARATION_TIMEOUT_MS,
       ),
@@ -1182,7 +1210,7 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
     const result = await this.request(
       { type: 'provider-usage.refresh.request', input },
       'provider-usage.snapshot.response',
-      DEFAULT_SESSION_SETTINGS_TIMEOUT_MS,
+      PROVIDER_USAGE_REFRESH_TIMEOUT_MS,
     )
     if (result.kind !== 'response') return { ok: false, error: result.error }
     return result.response.type === 'provider-usage.snapshot.response'
@@ -1836,7 +1864,7 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
     const result = await this.request(
       { type: 'skills.read.request', input },
       'skills.page.response',
-      RUNTIME_PREPARATION_TIMEOUT_MS,
+      SKILL_OPERATION_TIMEOUT_MS,
     )
     if (result.kind !== 'response') return { ok: false, error: result.error }
     return result.response.type === 'skills.page.response'
@@ -1850,7 +1878,7 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
     const result = await this.request(
       { type: 'skill-document.read.request', input },
       'skill-document.read.response',
-      12_000,
+      SKILL_OPERATION_TIMEOUT_MS,
     )
     if (result.kind !== 'response') return { ok: false, error: result.error }
     return result.response.type === 'skill-document.read.response'
@@ -1931,24 +1959,12 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
         }
   }
 
-  async actOnCollaboration(
-    input: import('@pact/contracts').CollaborationActionInput,
-  ): Promise<RpcResult<ConversationPatch>> {
+  async actOnCollaboration(input: CollaborationActionInput): Promise<RpcResult<ConversationPatch>> {
     return ElectronUtilityProcessClient.toConversationPatchResult(
       await this.request(
         { type: 'collaboration.action.request', input },
         'conversation.patch.response',
-        [
-          'continue',
-          'execute',
-          'respond',
-          'repair',
-          'resume',
-          'retry',
-          'confirm_supplement',
-        ].includes(input.action)
-          ? CONVERSATION_SEND_TIMEOUT_MS
-          : WORKSPACE_OPERATION_TIMEOUT_MS,
+        COLLABORATION_ACTION_TIMEOUT_MS[input.action],
       ),
     )
   }
@@ -2053,7 +2069,7 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
       await this.request(
         { type: 'conversation.queue.steer.request', input },
         'conversation.patch.response',
-        RUNTIME_PREPARATION_TIMEOUT_MS,
+        CONVERSATION_PREPARATION_IPC_TIMEOUT_MS,
       ),
     )
   }
@@ -2121,7 +2137,7 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
       await this.request(
         { type: 'peer-proposal.accept.request', input },
         'conversation.patch.response',
-        RUNTIME_PREPARATION_TIMEOUT_MS,
+        CONVERSATION_PREPARATION_IPC_TIMEOUT_MS,
       ),
     )
   }
@@ -2196,7 +2212,7 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
       await this.request(
         { type: 'conversation.retry.request', input },
         'conversation.patch.response',
-        RUNTIME_PREPARATION_TIMEOUT_MS,
+        CONVERSATION_PREPARATION_IPC_TIMEOUT_MS,
       ),
     )
   }
@@ -2208,7 +2224,7 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
       await this.request(
         { type: 'native-context.rebuild.request', input },
         'conversation.patch.response',
-        RUNTIME_PREPARATION_TIMEOUT_MS,
+        CONVERSATION_PREPARATION_IPC_TIMEOUT_MS,
       ),
     )
   }
@@ -2468,6 +2484,14 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
             message: 'Couldn’t confirm that background tasks exited cleanly.',
           },
         }
+      if (!(await this.agyStorageOperations.settlement(deadline)))
+        return {
+          ok: false,
+          error: {
+            code: 'UNCERTAIN',
+            message: 'Couldn’t confirm that background tasks exited cleanly.',
+          },
+        }
       if (target && !(await this.waitForExit(target, deadline)))
         return {
           ok: false,
@@ -2486,6 +2510,7 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
     await Promise.all([
       this.relayCrypto.settlement(),
       this.directoryOperations.settlement(),
+      this.agyStorageOperations.settlement().then(() => undefined),
       target
         ? new Promise<void>((resolve) => target.once('exit', () => resolve()))
         : Promise.resolve(),
@@ -2530,6 +2555,7 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
       })
     for (const request of this.directoryRequests.values()) request.controller.abort()
     void this.directoryOperations.dispose().catch(() => undefined)
+    void this.agyStorageOperations.dispose().catch(() => undefined)
     if (!target || this.terminatingChild === target) return
     this.terminatingChild = target
     this.failChildRequests(
@@ -2734,6 +2760,14 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
   private receiveResponse(source: UtilityProcess, message: unknown): void {
     if (
       this.relayCrypto.receive(
+        source,
+        message,
+        () => source === this.child && !this.terminatingChild,
+      )
+    )
+      return
+    if (
+      this.agyStorageOperations.receive(
         source,
         message,
         () => source === this.child && !this.terminatingChild,

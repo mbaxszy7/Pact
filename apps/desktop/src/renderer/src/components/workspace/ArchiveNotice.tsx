@@ -210,7 +210,7 @@ export function ArchiveNotice({
                       ) : result.state === 'unresolved' ? (
                         <CircleHelp
                           aria-hidden="true"
-                          className="size-3 text-status-warning"
+                          className="size-3 text-status-warning-foreground"
                           strokeWidth={1.75}
                         />
                       ) : null}
@@ -219,7 +219,7 @@ export function ArchiveNotice({
                           result.state === 'failed' && !result.sidebarRemoved
                             ? 'text-danger'
                             : result.state === 'unresolved'
-                              ? 'text-status-warning'
+                              ? 'text-status-warning-foreground'
                               : undefined
                         }
                       >
@@ -232,7 +232,9 @@ export function ArchiveNotice({
                               : 'Status unconfirmed'}
                       </span>
                       {result.sidebarRemoved && result.state === 'unresolved' ? (
-                        <span className="text-status-warning">Hidden; archive unconfirmed</span>
+                        <span className="text-status-warning-foreground">
+                          Hidden; archive unconfirmed
+                        </span>
                       ) : null}
                     </p>
                   </div>

@@ -6,6 +6,15 @@ import { isDeepStrictEqual } from 'node:util'
 import { Worker } from 'node:worker_threads'
 
 import type {
+  AgentAdapter,
+  AgentRunInput,
+  AgentNativeCheckOperation,
+  AgentNativeCheckContext,
+  AgentPromptEnvelope,
+  AgentPromptImage,
+  AgentNativeForkInput,
+} from '@pact/agent-runtime'
+import type {
   AnchoredComment,
   CommentDraftRemoveInput,
   CommentDraftSaveInput,
@@ -31,7 +40,6 @@ import type {
   NativeProbeResult,
   PeerProposalAcceptInput,
   PeerProposalDismissInput,
-  PeerRequestKind,
   RpcResult,
   RuntimeAgentId,
   SessionPermissionMode,
@@ -68,7 +76,6 @@ import type {
   NativeQuitSessionRow,
   DecisionInput,
   DecisionEvaluationOutcome,
-  RelayDecisionMaterial,
   InputRoutingProposal,
   SchedulingHandoff,
   SchedulingState,
@@ -94,43 +101,28 @@ import type {
   ImageReadInput,
   ImageReadPart,
 } from '@pact/contracts/images'
-import type { HandoffBundle } from '@pact/persistence'
 
-import {
-  serializeAgentPromptEnvelope,
-  type AgentAdapter,
-  type AgentRunInput,
-  type AgentNativeCheckOperation,
-  type AgentNativeCheckContext,
-  type AgentPromptEnvelope,
-  type AgentPromptImage,
-  type AgentNativeForkInput,
-} from '@pact/agent-runtime'
 import { conversationStreamTraceSchema, STREAM_TRACE_TTL_MS } from '@pact/contracts'
 import {
   AGENTS,
   agyRebuildInitializationWitnessSchema,
   agentDisplayName,
   agentIdForRouteCandidate,
+  buildBoundedNativePlanId,
   COLLABORATION_PROTOCOL,
+  encodeBoundedOpenPlanCallKey,
+  encodeBoundedOpenPlanProgressToken,
   collaborationTaskSchema,
   collaborationActor,
-  collaborationActionPrompt,
   collaborationAskActor,
   collaborationInitialStage,
-  advanceAutomaticCollaboration,
   defaultTaskStageRoles,
   isAgentInPair,
   pactCommandRouteAllowed,
   pactEntryPrimary,
-  initialTaskRoleCandidateIdSchema,
-  CollaborationTransitionError,
-  deriveCollaborationDecision,
-  isCollaborationOpenMode,
   collaborationInputGate,
   otherAgent,
   resolveActiveAgentPair,
-  resolveMainChatSyncTarget,
   routeCandidateIdSchema,
   collaborationMarkdownPageSchema,
   type CollaborationTask,
@@ -160,7 +152,6 @@ import {
   type SkillDocumentRead,
   parseComposerCommandPrefix,
   skillArguments,
-  validateSideChatMainSyncContent,
   skillCatalogPageSchema,
   SKILL_PAGE_BYTES,
   SKILL_PAGE_ITEMS,
@@ -171,7 +162,6 @@ import {
 } from '@pact/contracts'
 import {
   conversationInterestsSchema,
-  CUTOFF_INLINE_TAIL_MAX_BYTES,
   WORKSPACE_ARCHIVE_PREVIEW_MS,
   WORKSPACE_ARCHIVE_STOP_MS,
   WORKSPACE_ARCHIVE_TASK_LIMIT,
@@ -234,23 +224,58 @@ import { AgentStreamBuffer } from './agent-stream-buffer'
 import { AgyAcpConnectionPool } from './agy-acp-connection'
 import {
   AgyAgentAdapter,
+  buildAgyPactMcpServerName,
   type AgyAgentAdapterOptions,
+  type AgyCompletedPactPublishPlanCall,
   type AgyNativeStorageClient,
 } from './agy-agent-adapter'
 import { ClaudeAgentAdapter } from './claude-agent-adapter'
 import { CodexAgentAdapter } from './codex-agent-adapter'
+import {
+  acceptPeerProposal as acceptPeerProposalHelper,
+  actOnCollaborationAdmitted as actOnCollaborationAdmittedHelper,
+  canDispatchWorkflowContinuation as canDispatchWorkflowContinuationHelper,
+  consultInitialTaskRoles as consultInitialTaskRolesHelper,
+  consultWorkflowAlternatives as consultWorkflowAlternativesHelper,
+  deriveCollaborationNotification,
+  dismissPeerProposal as dismissPeerProposalHelper,
+  dispatchReceivedInput as dispatchReceivedInputHelper,
+  dispatchWorkflowContinuation as dispatchWorkflowContinuationHelper,
+  startWorkflowTurn as startWorkflowTurnHelper,
+  type ConversationCollaborationHost,
+} from './conversation-collaboration'
+import {
+  executeRoutedContinuation as executeRoutedContinuationHelper,
+  loadCollaborationBasis,
+  pendingContinuationFailureCopy,
+  preparePendingRoutedContinuation as preparePendingRoutedContinuationHelper,
+  type ConversationHandoffHost,
+} from './conversation-handoff'
 import { ConversationImages } from './conversation-images'
+import {
+  checkSideChatSyncGateFailure as checkSideChatSyncGateFailureHelper,
+  createSideChat as createSideChatHelper,
+  discardEmptySideChat as discardEmptySideChatHelper,
+  listSideChats as listSideChatsHelper,
+  readCreateSideChatReceipt as readCreateSideChatReceiptHelper,
+  readSyncSideChatReceipt as readSyncSideChatReceiptHelper,
+  syncSideChatToMain as syncSideChatToMainHelper,
+  type ConversationSideChatHost,
+} from './conversation-side-chats'
+import { CrossAgentContextBroker, type CollectedHandoff } from './cross-agent-context-broker'
 import { type DecisionInputLoader } from './decision-runtime'
 import { pathlessExecutionInput, restoreExecutionInput } from './execution-input'
 import { FrozenSourceReader } from './frozen-source-reader'
 import {
   NativeForkFiles,
   resolveAgyAppDataDir,
+  type AgyTrajectoryIdentityClientResult,
+  type AgyTrajectoryIdentityWorkerResult,
   type NativeForkFileResult,
 } from './native-fork-files'
-import { setPromptCutoffSupplement } from './native-image-content'
 import { encodeNativeJsonFrame } from './native-json-encoder'
 import { safeNativePermissionText } from './native-permission-wait'
+import { disposeDefaultAgySkillProbes } from './native-skill-catalog'
 import { NativeWorkingMemory, type NativeMemoryAllocator } from './native-working-memory'
 import { OpenAIDecisionRuntime } from './openai-decision-runtime'
 import { evaluateRelayPolicy, type RelayPolicyAdmission } from './relay-policy'
@@ -262,6 +287,9 @@ const MAX_AGENT_OPERATIONS = 5
 const BACKGROUND_INPUT_REASON = 'Check the background work before sending another message.'
 const MAX_ADAPTER_SLOTS = 5
 const PREPARATION_TIMEOUT_MS = 10_000
+const AGY_PREPARATION_TIMEOUT_MS = 38_000
+const AGY_SKILL_DISCOVERY_OPERATION_MS = 36_000
+const AGY_SKILL_DOCUMENT_OPERATION_MS = 38_000
 const BACKGROUND_STOP_TIMEOUT_MS = 5_000
 const CAPACITY_NOTICE = 'At most 5 Sessions can run Agents at once. Try again when one finishes.'
 
@@ -512,9 +540,54 @@ export interface AgyCapableForkFiles {
           responseHash: string
           plan?: { nativeId: string; text: string } | undefined
           planUnavailable?: true | undefined
+          hasCompletedPactPublishPlan?: boolean | undefined
+          completedPactPublishPlanCalls?: readonly AgyCompletedPactPublishPlanCall[] | undefined
+          completedPactPublishPlanTokens?: readonly string[] | undefined
         }
       | undefined
   }>
+  readAgyTrajectoryIdentity?(
+    input: {
+      cwd: string
+      storageRoot?: string
+      nativeSessionId: string
+    },
+    signal: AbortSignal,
+  ): Promise<AgyTrajectoryIdentityWorkerResult>
+}
+
+function classifyAgyTrajectoryIdentityError(
+  error: unknown,
+): Extract<AgyTrajectoryIdentityClientResult, { status: 'timeout' | 'worker_error' }> {
+  const rawMessage = error instanceof Error ? error.message : String(error)
+  const reason = safeNativePermissionText(rawMessage.trim(), 512) || undefined
+  const isTimeout =
+    (error instanceof Error && error.name === 'TimeoutError') ||
+    /\b(?:timeout|timed out|deadline|already active)\b/iu.test(rawMessage)
+  return {
+    status: isTimeout ? 'timeout' : 'worker_error',
+    ...(reason !== undefined ? { reason } : {}),
+  }
+}
+
+export type AgyColdOpenPlanResolver = (
+  runId: string,
+  terminalState: {
+    executionId: string
+    status: 'completed' | 'failed' | 'canceled' | 'running'
+    hasCompletedPactPublishPlan?: boolean | undefined
+    completedPactPublishPlanCalls?: readonly AgyCompletedPactPublishPlanCall[] | undefined
+    completedPactPublishPlanTokens?: readonly string[] | undefined
+  },
+  nativeSessionId?: string,
+) => { plan: { nativeId: string; text: string } } | { planUnavailable: true } | undefined
+
+function stripCallKeyPrefix(callKey: string): string {
+  return callKey.startsWith('call:')
+    ? callKey.slice('call:'.length)
+    : callKey.startsWith('token:')
+      ? callKey.slice('token:'.length)
+      : callKey
 }
 
 /**
@@ -524,11 +597,88 @@ export interface AgyCapableForkFiles {
 export function createAgyNativeStorageClient(
   capable: AgyCapableForkFiles,
   defaultAppDataDir?: string,
+  resolveColdOpenPlanIntent?: AgyColdOpenPlanResolver,
 ): AgyColdLoadStorageClient {
   return {
+    async inspectRun(input, signal) {
+      const storageRoot = input.appDataDir || defaultAppDataDir
+      return capable.inspectAgyRun(
+        {
+          cwd: input.cwd,
+          ...(storageRoot ? { storageRoot } : {}),
+          nativeSessionId: input.nativeSessionId,
+          ...(input.nativeTurnId ? { nativeTurnId: input.nativeTurnId } : {}),
+          ...(input.includePlan !== undefined ? { includePlan: input.includePlan } : {}),
+        },
+        signal,
+      )
+    },
+    ...(capable.readAgyTrajectoryIdentity
+      ? {
+          async readTrajectoryIdentity(input, signal): Promise<AgyTrajectoryIdentityClientResult> {
+            const storageRoot = input.appDataDir || defaultAppDataDir
+            for (let busyAttempt = 0; busyAttempt < 4; busyAttempt += 1) {
+              try {
+                // oxlint-disable-next-line no-await-in-loop -- Bounded short retry strictly when shared fork worker is momentarily busy.
+                const res = await capable.readAgyTrajectoryIdentity!(
+                  {
+                    cwd: input.cwd,
+                    ...(storageRoot ? { storageRoot } : {}),
+                    nativeSessionId: input.nativeSessionId,
+                  },
+                  signal,
+                )
+                if (res.status === 'ok') {
+                  return {
+                    status: 'ok',
+                    trajectoryId: res.trajectoryId,
+                    stepCount: res.stepCount,
+                  }
+                }
+                return {
+                  status: res.status,
+                  ...(res.reason !== undefined ? { reason: res.reason } : {}),
+                }
+              } catch (error) {
+                if (signal.aborted) throw error
+                if (
+                  busyAttempt < 3 &&
+                  error instanceof Error &&
+                  error.message.includes('already active')
+                ) {
+                  // oxlint-disable-next-line no-await-in-loop -- Bounded 15ms retry for active storage worker.
+                  await new Promise<void>((resolveDelay, rejectDelay) => {
+                    const onAbort = (): void => {
+                      clearTimeout(timer)
+                      rejectDelay(
+                        signal.reason instanceof Error
+                          ? signal.reason
+                          : new Error('Operation was cancelled.'),
+                      )
+                    }
+                    const timer = setTimeout(() => {
+                      signal.removeEventListener('abort', onAbort)
+                      resolveDelay()
+                    }, 15)
+                    timer.unref?.()
+                    signal.addEventListener('abort', onAbort, { once: true })
+                  })
+                  continue
+                }
+                return classifyAgyTrajectoryIdentityError(error)
+              }
+            }
+            return {
+              status: 'timeout',
+              reason: 'Antigravity trajectory identity worker remained busy.',
+            }
+          },
+        }
+      : {}),
     async probeSessionStatus(input, signal): Promise<NativeProbeResult> {
       const storageRoot = input.appDataDir ?? defaultAppDataDir
       const nativeTurnId = input.nativeTurnId ?? input.runId
+      const isPhase1PlanMode = Boolean(input.planSource)
       const inspected = await capable.inspectAgyRun(
         {
           cwd: input.cwd,
@@ -536,7 +686,9 @@ export function createAgyNativeStorageClient(
           nativeSessionId: input.nativeSessionId,
           ...(nativeTurnId ? { nativeTurnId } : {}),
           ...(input.nativeInputIds ? { nativeInputIds: input.nativeInputIds } : {}),
-          includePlan: Boolean(input.planSource || input.inspectMissingPlan),
+          // Route Plan recovery strictly from frozen authorization: Phase 1 inspects Brain artifacts;
+          // Open Mode uses journaled `publish_plan` final intents ONLY (never shadowed by Brain artifacts).
+          includePlan: isPhase1PlanMode,
         },
         signal,
       )
@@ -559,10 +711,12 @@ export function createAgyNativeStorageClient(
         }
       }
       if (inspected.terminalState.status === 'running') {
+        const runningPlan = isPhase1PlanMode ? inspected.terminalState.plan : undefined
+        const runningPlanUnavailable = isPhase1PlanMode
+          ? inspected.terminalState.planUnavailable
+          : undefined
         const hasPartialOutput = Boolean(
-          inspected.terminalState.answer ||
-          inspected.terminalState.plan ||
-          inspected.terminalState.planUnavailable,
+          inspected.terminalState.answer || runningPlan || runningPlanUnavailable,
         )
         return {
           kind: 'no_evidence',
@@ -575,8 +729,8 @@ export function createAgyNativeStorageClient(
                   outputId: inspected.terminalState.executionId,
                   text: inspected.terminalState.answer,
                   completeness: 'partial' as const,
-                  ...(inspected.terminalState.plan ? { plan: inspected.terminalState.plan } : {}),
-                  ...(inspected.terminalState.planUnavailable ? { planUnavailable: true } : {}),
+                  ...(runningPlan ? { plan: runningPlan } : {}),
+                  ...(runningPlanUnavailable ? { planUnavailable: true } : {}),
                 },
               }
             : {}),
@@ -588,25 +742,45 @@ export function createAgyNativeStorageClient(
           : inspected.terminalState.status === 'canceled'
             ? 'interrupted'
             : 'failed'
+      let resolvedPlan = isPhase1PlanMode ? inspected.terminalState.plan : undefined
+      let resolvedPlanUnavailable = isPhase1PlanMode
+        ? inspected.terminalState.planUnavailable
+        : undefined
+      if (
+        !isPhase1PlanMode &&
+        outcome === 'completed' &&
+        input.runId &&
+        resolveColdOpenPlanIntent !== undefined
+      ) {
+        const openPlan = resolveColdOpenPlanIntent(
+          input.runId,
+          inspected.terminalState,
+          input.nativeSessionId,
+        )
+        if (openPlan && 'plan' in openPlan) {
+          resolvedPlan = openPlan.plan
+          resolvedPlanUnavailable = undefined
+        } else if (openPlan && 'planUnavailable' in openPlan) {
+          resolvedPlanUnavailable = true
+        }
+      }
       const hasOutput = Boolean(
-        inspected.terminalState.answer ||
-        inspected.terminalState.plan ||
-        inspected.terminalState.planUnavailable,
+        inspected.terminalState.answer || resolvedPlan || resolvedPlanUnavailable,
       )
       return {
         kind: 'ended',
         identity,
         source: 'stored_terminal',
         outcome,
-        ...(inspected.terminalState.planUnavailable ? { planUnavailable: true } : {}),
+        ...(resolvedPlanUnavailable ? { planUnavailable: true } : {}),
         ...(hasOutput
           ? {
               output: {
                 outputId: inspected.terminalState.executionId,
                 text: inspected.terminalState.answer,
                 completeness: outcome === 'completed' ? 'complete' : 'partial',
-                ...(inspected.terminalState.plan ? { plan: inspected.terminalState.plan } : {}),
-                ...(inspected.terminalState.planUnavailable ? { planUnavailable: true } : {}),
+                ...(resolvedPlan ? { plan: resolvedPlan } : {}),
+                ...(resolvedPlanUnavailable ? { planUnavailable: true } : {}),
               },
             }
           : {}),
@@ -1173,6 +1347,9 @@ export class Conversation {
     }
   >()
   private disposal: Promise<void> | undefined
+  private baseShutdownDone = false
+  private shutdownDeadlineAt: number | undefined
+  private permanentShutdownFailure: Error | undefined
   private decisionRuntime: DecisionInvocationOwner | undefined
   private decisionRecovery: Promise<void> | undefined
   private decisionRecoveryOwner: { operationId: string; sessionId: string | null } | undefined
@@ -1182,6 +1359,9 @@ export class Conversation {
     | undefined
   private schedulingListener: (() => void) | undefined
   private readonly agyConnectionPools = new Map<string, AgyAcpConnectionPool>()
+  private readonly retiringAgyPools = new Set<AgyAcpConnectionPool>()
+  private agyForkFiles: NativeForkFiles | undefined
+  private readonly contextBroker: CrossAgentContextBroker
 
   constructor(
     private readonly conversations: ConversationRepository,
@@ -1197,6 +1377,11 @@ export class Conversation {
       deadlineAt: number
     }) => Promise<string | null> | string | null,
   ) {
+    this.contextBroker = new CrossAgentContextBroker({
+      conversations,
+      workspaceChanges,
+      images,
+    })
     this.conversations.archives.recover(this.archiveOwnerId)
     this.conversations.expireNativePermissions()
     this.conversations.recoverInterruptedRuns()
@@ -1205,6 +1390,99 @@ export class Conversation {
     this.conversations.beginSchedulingRecoveryEpoch(this.utilityEpoch)
     this.schedulePendingRoutedContinuations()
     void this.recoverDecisionReservation()
+  }
+
+  private handoffHost(): ConversationHandoffHost<ActiveExecution> {
+    return {
+      conversations: this.conversations,
+      sessions: this.sessions,
+      images: this.images,
+      contextBroker: this.contextBroker,
+      preparingContinuations: this.preparingContinuations,
+      isDisposed: () => this.disposed,
+      adapterFor: (sessionId, agentId, executablePath, signal, cwd) =>
+        this.adapterFor(sessionId, agentId, executablePath, signal, cwd),
+      skillBindings: (sessionId, agentId, signal, refresh, bypassCache) =>
+        this.skillBindings(sessionId, agentId, signal, refresh, bypassCache),
+      hasBlockingBackgroundWork: (sessionId) => this.hasBlockingBackgroundWork(sessionId),
+      prepareSession: (sessionId, signal, extraRequiredAgents) =>
+        this.prepareSession(sessionId, signal, extraRequiredAgents),
+      publish: (patch, progress) => this.publish(patch, progress),
+      trackExecution: (run, work) => this.trackExecution(run, work),
+      executeAttempts: (execution, run, promptEnvelope, cwd, settings, executablePaths) =>
+        this.executeAttempts(execution, run, promptEnvelope, cwd, settings, executablePaths),
+      schedulePendingRoutedContinuations: (continueWorkflowScan) =>
+        this.schedulePendingRoutedContinuations(continueWorkflowScan),
+    }
+  }
+
+  private sideChatHost(): ConversationSideChatHost {
+    return {
+      conversations: this.conversations,
+      sessions: this.sessions,
+      images: this.images,
+      isDisposed: () => this.disposed,
+      nativeQuitSealed: () => this.nativeQuitSealed(),
+      shuttingDown: () => Conversation.shuttingDown(),
+      quitPrepared: () => Conversation.quitPrepared(),
+      archiveBusy: () => Conversation.archiveBusy(),
+      nativeRecoveryRequired: () => Conversation.nativeRecoveryRequired(),
+      capacityFailure: () => Conversation.capacityFailure(),
+      sendFailure: (error) => Conversation.sendFailure(error),
+      sessionIssues: (sessionId, contexts) => this.sessionIssues(sessionId, contexts),
+      pendingNativeInteractions: (sessionId) => this.pendingNativeInteractions(sessionId),
+      hasBlockingBackgroundWork: (sessionId) => this.hasBlockingBackgroundWork(sessionId),
+      hasSessionOperation: (sessionId, includePreparingContinuation) =>
+        this.hasSessionOperation(sessionId, includePreparingContinuation),
+      hasCachedAdapterForSession: (sessionId) =>
+        [...this.adapters.values()].some((entry) => entry.sessionId === sessionId),
+      activeExecutionRun: (sessionId) => this.activeExecutions.get(sessionId)?.run,
+      operationCount: () => this.operationCount(),
+      nativeMetadataChanged: () => this.nativeMetadataChanged(),
+      publish: (patch, progress) => this.publish(patch, progress),
+      prepareSkillInvocation: (input, targets, signal) =>
+        this.prepareSkillInvocation(input, [...targets], signal),
+      sendWithSyncOptions: (input, ownerKey, options) =>
+        this.sendWithOptions(input, ownerKey, options),
+    }
+  }
+
+  private collaborationHost(): ConversationCollaborationHost {
+    return {
+      conversations: this.conversations,
+      sessions: this.sessions,
+      projects: this.projects,
+      runtimePreparation: this.runtimePreparation,
+      routingOpenInputs: this.routingOpenInputs,
+      isDisposed: () => this.disposed,
+      nativeQuitSealed: () => this.nativeQuitSealed(),
+      shuttingDown: () => Conversation.shuttingDown(),
+      quitPrepared: () => Conversation.quitPrepared(),
+      archiveBusy: () => Conversation.archiveBusy(),
+      nativeRecoveryRequired: () => Conversation.nativeRecoveryRequired(),
+      sendFailure: (error) => Conversation.sendFailure(error),
+      awaitSettlingExecution: (sessionId, runId) => this.awaitSettlingExecution(sessionId, runId),
+      hasSessionOperation: (sessionId, includePreparingContinuation) =>
+        this.hasSessionOperation(sessionId, includePreparingContinuation),
+      operationCount: () => this.operationCount(),
+      pendingNativeInteractions: (sessionId) => this.pendingNativeInteractions(sessionId),
+      checkNativeBinding: (sessionId, agentId, runId) =>
+        this.checkNativeBinding(sessionId, agentId, runId),
+      currentDecisionRuntime: () => this.decisionRuntime,
+      releaseDecisionHandoff: (owner) => this.releaseDecisionHandoff(owner),
+      decisionRuntimeAdmission: () => this.decisionRuntimeAdmission(),
+      hasPreparingSendForHandoff: (handoff) =>
+        [...this.preparingSends.values()].some(
+          ({ options }) =>
+            options.schedulingHandoff?.id === handoff.id &&
+            options.schedulingHandoff.factFingerprint === handoff.factFingerprint,
+        ),
+      evaluateDecision: (request, signal) => this.evaluateDecision(request, signal),
+      enqueueSend: (input, options) => this.enqueueSend(input, options),
+      publish: (patch, progress) => this.publish(patch, progress),
+      schedulePendingRoutedContinuations: (continueWorkflowScan) =>
+        this.schedulePendingRoutedContinuations(continueWorkflowScan),
+    }
   }
 
   private static adapterOwnsExecutor(adapter: AgentAdapter, expectedExecutorId: string): boolean {
@@ -2316,6 +2594,10 @@ export class Conversation {
     owner.expired = true
     this.schedulePendingRoutedContinuations()
     return { ok: true, value: { operationId: input.operationId, cancelled: true } }
+  }
+
+  isQuitSealed(): boolean {
+    return this.nativeQuitSealed()
   }
 
   private nativeQuitSealed(): boolean {
@@ -4449,7 +4731,7 @@ export class Conversation {
           sessionId,
           { id: queued.id, content: queued.content },
           [],
-          [],
+          undefined,
           images,
         )
         if (queued.inputBatchRef)
@@ -4458,6 +4740,11 @@ export class Conversation {
             revision: queued.inputBatchRef.commentsRevision,
             memberCount: queued.inputBatchRef.memberCount,
           }
+        this.contextBroker.inlineCurrentComments(envelope, {
+          sessionId,
+          runId: run.id,
+          batchId: envelope.inputBatchRef?.id,
+        })
         envelope.sourceGrant = { runId: run.id, grant: owner.generation }
         envelope.targetAgentId = run.agentId
         envelope.skillInvocation = invocation
@@ -5165,9 +5452,24 @@ export class Conversation {
     if (this.nativeQuitSealed()) return Conversation.quitPrepared()
     try {
       if (!this.workspaceChanges || this.disposed) throw new Error('Protected Undo is unavailable.')
-      const summary = await this.workspaceChanges.undo(input.changeSetId, (projectId) =>
-        this.projectHasNativeWork(projectId),
-      )
+      const targetPathValue: unknown = Reflect.get(input, 'path')
+      const targetPath = typeof targetPathValue === 'string' ? targetPathValue : undefined
+      const undoTarget: {
+        undo(
+          id: string,
+          projectBusy?: (projectId: string) => boolean,
+          path?: string,
+        ): ReturnType<WorkspaceChanges['undo']>
+      } = this.workspaceChanges
+      const summary = await (targetPath !== undefined
+        ? undoTarget.undo(
+            input.changeSetId,
+            (projectId) => this.projectHasNativeWork(projectId),
+            targetPath,
+          )
+        : this.workspaceChanges.undo(input.changeSetId, (projectId) =>
+            this.projectHasNativeWork(projectId),
+          ))
       const patch = this.conversations.recordWorkspaceChanges(summary)
       this.publish(patch)
       return { ok: true, value: patch }
@@ -5346,122 +5648,10 @@ export class Conversation {
     await activeExecution.completion.catch(() => undefined)
   }
 
-  private async actOnCollaborationAdmitted(
+  private actOnCollaborationAdmitted(
     input: CollaborationActionInput,
   ): Promise<RpcResult<ConversationPatch>> {
-    if (this.disposed) return Conversation.shuttingDown()
-    if (this.nativeQuitSealed()) return Conversation.quitPrepared()
-    if (this.conversations.archives.blocksSession(input.sessionId))
-      return Conversation.archiveBusy()
-    await this.awaitSettlingExecution(input.sessionId)
-    if (this.disposed) return Conversation.shuttingDown()
-    if (this.nativeQuitSealed()) return Conversation.quitPrepared()
-    if (this.conversations.archives.blocksSession(input.sessionId))
-      return Conversation.archiveBusy()
-    try {
-      if (input.action === 'swap_code_roles') {
-        const patch = this.conversations.swapCodeRoles(
-          input,
-          this.hasSessionOperation(input.sessionId, true) ||
-            this.pendingNativeInteractions(input.sessionId).length > 0,
-        )
-        this.publish(patch)
-        return { ok: true, value: patch }
-      }
-      const context = this.sessions.find(input.sessionId)
-      const task = this.conversations.collaboration(input.sessionId)
-      const prior = this.conversations.collaborationActionReceipt(input)
-      if (prior?.boundRunId)
-        return { ok: true, value: this.conversations.runPatch(prior.boundRunId) }
-      if (prior && prior.state !== 'available')
-        return { ok: true, value: this.conversations.metadataPatch(input.sessionId) }
-      if (
-        !context ||
-        !task ||
-        task.id !== input.taskId ||
-        (!prior && task.revision !== input.revision)
-      )
-        throw new RunOperationConflictError('This collaboration action is no longer current.')
-      if (task.status === 'complete')
-        throw new RunOperationConflictError('This collaboration is already complete.')
-      this.conversations.discardUnansweredRelaySchedulingDecision(input.sessionId, false)
-      if (this.conversations.receivedCollaborationInput(input.sessionId))
-        throw new RunOperationConflictError(
-          'Your queued message will be answered before collaboration continues.',
-        )
-      const planRecovery = this.conversations.needsWorkflowPlanRecovery(task.runId)
-      if (input.action === 'recover_plan') {
-        if (!planRecovery || task.automation !== 'paused')
-          throw new RunOperationConflictError('There is no paused native plan source to restore.')
-        const settled = this.conversations.reconcileCompletedCollaboration(task.runId)
-        if (settled) this.publish(settled)
-        if (!this.conversations.workflowPlanSettled(task.runId)) {
-          const checked = await this.checkNativeBinding(
-            input.sessionId,
-            collaborationActor(task, 'plan'),
-            task.runId,
-          )
-          if (!checked.ok) return checked
-        }
-        const recovered = this.conversations.collaboration(input.sessionId)
-        if (
-          !recovered ||
-          recovered.id !== task.id ||
-          recovered.runId !== task.runId ||
-          recovered.inputSequence !== task.inputSequence ||
-          !this.conversations.workflowPlanSettled(task.runId) ||
-          this.conversations.needsWorkflowPlanRecovery(task.runId)
-        )
-          throw new RunOperationConflictError(
-            'The saved native plan could not be restored to this task. Its source is preserved; no Agent task was started.',
-          )
-        if (
-          recovered.stage === 'reply' &&
-          (collaborationInputGate(recovered) ||
-            recovered.inputProcessing?.settled?.runId !== recovered.runId ||
-            recovered.inputProcessing.settled.inputSequence !== recovered.inputSequence)
-        )
-          throw new RunOperationConflictError(
-            'The plan was restored, but your reply still needs confirmation. Check its response or recovery notice before continuing.',
-          )
-        return { ok: true, value: this.conversations.metadataPatch(input.sessionId) }
-      }
-      if (planRecovery)
-        throw new RunOperationConflictError(
-          'Restore the saved native plan before continuing collaboration.',
-        )
-      if (this.conversations.nativeRecoveryBlocksInput(input.sessionId))
-        return Conversation.nativeRecoveryRequired()
-      const prepared = this.conversations.prepareCollaborationAction(input, context.settings)
-      if (prepared.receipt.boundRunId)
-        return { ok: true, value: this.conversations.runPatch(prepared.receipt.boundRunId) }
-      if (!prepared.task || !prepared.next || !prepared.handoff)
-        throw new RunOperationConflictError('The original action preparation is unavailable.')
-      let consultation: DecisionInvocationOwner | undefined
-      try {
-        await this.consultWorkflowAlternatives(prepared.task, prepared.handoff)
-        consultation =
-          this.decisionRuntime?.kind === 'evaluation' &&
-          this.decisionRuntime.handoff?.id === prepared.handoff.id
-            ? this.decisionRuntime
-            : undefined
-        const dispatched = this.startWorkflowTurn(
-          prepared.task,
-          prepared.next,
-          input.clientMessageId,
-          prepared.receipt.id,
-          prepared.handoff,
-          input.action,
-        )
-        this.releaseDecisionHandoff(consultation)
-        return await dispatched
-      } finally {
-        this.releaseDecisionHandoff(consultation)
-        this.conversations.cancelPreparedCollaborationAction(prepared.receipt.id)
-      }
-    } catch (error) {
-      return Conversation.sendFailure(error)
-    }
+    return actOnCollaborationAdmittedHelper(this.collaborationHost(), input)
   }
 
   private abortPreparedWorkflow(sessionId: string): void {
@@ -5475,42 +5665,23 @@ export class Conversation {
         preparing.controller.abort()
   }
 
-  private async startWorkflowTurn(
+  private startWorkflowTurn(
     task: CollaborationTask,
     next: CollaborationTask,
-    clientMessageId: string = randomUUID(),
+    clientMessageId?: string,
     collaborationActionReceiptId?: string,
     schedulingHandoff?: SchedulingHandoff,
     action?: CollaborationActionInput['action'],
   ): Promise<RpcResult<ConversationPatch>> {
-    const options: SendOptions = {
-      preserveDraftComments: true,
-      collaboration: next,
-      expectedCollaborationRevision: task.revision,
+    return startWorkflowTurnHelper(
+      this.collaborationHost(),
+      task,
+      next,
+      clientMessageId,
       collaborationActionReceiptId,
-    }
-    try {
-      options.schedulingHandoff =
-        schedulingHandoff ?? this.conversations.workflowHandoff(task, next.actor)
-      const drafts = this.conversations.readPage({ scope: 'drafts', sessionId: task.sessionId })
-      if (drafts.scope !== 'drafts')
-        return Conversation.sendFailure(new Error('Comment drafts are unavailable.'))
-      const content = `@${next.actor} ${collaborationActionPrompt(next, action)}`
-      return await this.enqueueSend(
-        {
-          sessionId: task.sessionId,
-          clientMessageId,
-          content,
-          route: { type: 'agent', agentId: next.actor },
-          expectedCommentsRevision: drafts.commentsRevision,
-          commentIds: [],
-          freezeDrafts: false,
-        },
-        options,
-      )
-    } finally {
-      options.schedulingHandoff = undefined
-    }
+      schedulingHandoff,
+      action,
+    )
   }
 
   private releaseDecisionHandoff(owner: DecisionInvocationOwner | undefined): void {
@@ -5526,400 +5697,43 @@ export class Conversation {
   }
 
   /** Advisory-only initial-role consult: a choice is an ID only; the host metadata supplies roles. */
-  private async consultInitialTaskRoles(
+  private consultInitialTaskRoles(
     input: ConversationSendInput,
     prepared: PreparedSession,
     controller: AbortController,
     options: SendOptions,
   ): Promise<void> {
-    const settings = this.conversations.schedulingSettings()
-    if (!settings.enabled || !settings.credential.configured) return
-    if (this.decisionRuntimeAdmission() !== 'may_attempt') return
-    const activePair = resolveActiveAgentPair(prepared.session.settings)
-    const orderedPair = (['codex', 'claude', 'agy'] as const).filter((actor) =>
-      isAgentInPair(actor, activePair),
+    return consultInitialTaskRolesHelper(
+      this.collaborationHost(),
+      input,
+      prepared,
+      controller,
+      options,
     )
-    const opportunity = this.conversations.initialTaskRoleOpportunity(input, orderedPair)
-    if (!opportunity) return
-    const configurationKey = this.runtimePreparation.catalogIdentity(prepared.projectDirectory)
-    let material: { inputSha256: string; sourceFingerprint: string } | undefined
-    const outcome = await this.evaluateDecision(
-      {
-        sessionId: input.sessionId,
-        prepare: async (decisionContext) => {
-          const receipt = this.conversations.prepareInputDispatch(
-            input,
-            randomUUID(),
-            orderedPair,
-            decisionContext,
-            'task_roles',
-          )
-          options.preparedInput = receipt
-          this.publish(this.conversations.metadataPatch(input.sessionId, { draftsChanged: true }))
-          const frozen = receipt.metadata.taskRoles!
-          const candidates = frozen.candidates.map((candidate) => ({
-            id: candidate.id,
-            description: `Assign ${candidate.roles.planAuthor} to author plans and ${candidate.roles.planReviewer} to review plans; assign ${candidate.roles.codeAuthor} to implement, respond and repair, and ${candidate.roles.codeReviewer} to review code. Keep the original scope and permissions; implementation after planning and every new repair still require their existing user authorization.`,
-          }))
-          const read = await this.conversations.readPreparedInputDecisionSources(
-            receipt,
-            candidates,
-            decisionContext,
-          )
-          material = {
-            inputSha256: read.inputSha256,
-            sourceFingerprint: read.sourceFingerprint,
-          }
-          return read.input
-        },
-      },
-      controller.signal,
-    )
-    if (outcome.kind === 'selection' && material) {
-      const candidateId = outcome.selection.candidateId
-      if (
-        candidateId === null ||
-        opportunity.candidates.some((candidate) => candidate.id === candidateId)
-      ) {
-        if (candidateId !== null)
-          options.initialTaskRoles = {
-            version: 'initial-task-roles-v1',
-            ...material,
-            ...outcome.evaluationReceipt,
-            candidateId: initialTaskRoleCandidateIdSchema.parse(candidateId),
-          }
-        options.preparedSelectionCurrent = () =>
-          this.runtimePreparation.catalogIdentity(prepared.projectDirectory) === configurationKey
-      }
-    }
   }
 
   /** Advisory-only consult: proposals never execute; false keeps the lawful default step. */
-  private async consultWorkflowAlternatives(
+  private consultWorkflowAlternatives(
     task: CollaborationTask,
     handoff: SchedulingHandoff,
   ): Promise<void> {
-    let material: Omit<RelayDecisionMaterial, 'input'> | undefined
-    let limitAttempt = false
-    try {
-      const preferences = this.conversations.schedulingSettings()
-      if (!preferences.enabled || !preferences.credential.configured) return
-      if (this.conversations.decisionEvaluationReceipt(handoff)) return
-      if (this.conversations.planReviewLimitAdviceConsidered(handoff)) return
-      const runtimeAdmission = this.decisionRuntimeAdmission()
-      if (runtimeAdmission !== 'may_attempt') return
-      const session = this.sessions.find(task.sessionId)
-      const project = session && this.projects.find(session.projectId)
-      if (!project) return
-      const current = this.conversations.relayWorkflowAlternatives(handoff)
-      if (!current?.alternatives.length) return
-      const { alternatives } = current
-      limitAttempt = current.snapshot.node === 'plan_review_limit'
-      const candidates = alternatives.map((entry) =>
-        entry.kind === 'extend_plan_review'
-          ? {
-              id: 'propose_extend_plan_review',
-              description: `Propose one additional read-only review of the current plan by ${entry.actor} despite the exhausted plan-review limit. Recommend it only when the complete current plan, latest review and author response establish that another independent check is useful. User confirmation is required. This permits one review only, preserves all consumed counts and Session defaults, and grants no implementation or repair. Abstain when work is not ready for another review.`,
-            }
-          : {
-              id: 'propose_reassign_roles',
-              description: `Propose swapping future code responsibilities: ${entry.operation.proposedRoles.codeAuthor} implements, responds and repairs; ${entry.operation.proposedRoles.codeReviewer} reviews code. Propose only when the complete accepted Plan and review establish a clear benefit over the current assignment. Preserve the Plan authors, accepted artifacts, original scope and permissions. The user must confirm the role change; this does not start work or grant writing. Choose false when the current assignment remains suitable.`,
-            },
-      )
-      const outcome = await this.evaluateDecision(
-        {
-          handoff,
-          retainHandoff: true,
-          load: async (context) => {
-            const read = await this.conversations.readRelayWorkflowDecisionSources(
-              handoff,
-              candidates,
-              context,
-            )
-            const fresh = this.conversations.relayWorkflowAlternatives(handoff)
-            if (
-              !fresh ||
-              read.sourceFingerprint !== current.snapshot.sourceFingerprint ||
-              fresh.snapshot.sourceFingerprint !== read.sourceFingerprint ||
-              !isDeepStrictEqual(fresh.alternatives, alternatives) ||
-              this.conversations.receivedCollaborationInput(task.sessionId) ||
-              collaborationInputGate(read.snapshot.task) ||
-              this.pendingNativeInteractions(task.sessionId).length > 0
-            )
-              throw new RunOperationConflictError(
-                'This workflow node does not need a decision request.',
-              )
-            material = {
-              basis: read.basis,
-              sources: read.sources,
-              inputSha256: read.inputSha256,
-              sourceFingerprint: read.sourceFingerprint,
-            }
-            return read.input
-          },
-        },
-        new AbortController().signal,
-      )
-      if (
-        outcome.kind === 'unavailable' &&
-        ['busy', 'duplicate', 'cancelled', 'stale'].includes(outcome.reason)
-      )
-        limitAttempt = false
-      if (outcome.kind !== 'selection' || !material || material.basis.kind !== 'workflow') return
-      const chosenProposal = alternatives.find(
-        (entry) => `propose_${entry.kind}` === outcome.selection.candidateId,
-      )
-      if (!chosenProposal || this.pendingNativeInteractions(task.sessionId).length) return
-      // Host evidence only: prefer review, owner response and plan roles from the evaluated snapshot.
-      const sourceIds = material.sources
-        .filter((source) =>
-          (['review', 'owner_response', 'plan'] as const).some((role) =>
-            source.roles.includes(role),
-          ),
-        )
-        .map((source) => source.id)
-      if (!sourceIds.length) return
-      this.conversations.proposeRelayWorkflowAction({
-        handoff,
-        kind: chosenProposal.kind,
-        evaluationId: outcome.evaluationReceipt.evaluationId,
-        configurationGeneration: outcome.evaluationReceipt.configurationGeneration,
-        configurationFingerprint: outcome.evaluationReceipt.configurationFingerprint,
-        deadlineAt: outcome.evaluationReceipt.deadlineAt,
-        inputSha256: material.inputSha256,
-        sourceFingerprint: material.sourceFingerprint,
-        sourceIds,
-      })
-      this.publish(this.conversations.metadataPatch(task.sessionId))
-    } catch {
-      // Advisory consultation never blocks the lawful default step.
-    } finally {
-      if (limitAttempt) this.conversations.recordPlanReviewLimitAdviceConsidered(handoff)
-      material = undefined
-    }
+    return consultWorkflowAlternativesHelper(this.collaborationHost(), task, handoff)
   }
 
   private canDispatchWorkflowContinuation(sessionId: string): boolean {
-    return (
-      !this.disposed &&
-      !this.nativeQuitSealed() &&
-      !this.hasSessionOperation(sessionId, true) &&
-      this.operationCount() < MAX_AGENT_OPERATIONS &&
-      !this.conversations.receivedCollaborationInput(sessionId) &&
-      !this.conversations.nativeRecoveryBlocksInput(sessionId) &&
-      !this.conversations.hasPendingRoutedContinuation(sessionId) &&
-      this.pendingNativeInteractions(sessionId).length === 0 &&
-      !this.conversations.hasRelayDecision(sessionId)
-    )
+    return canDispatchWorkflowContinuationHelper(this.collaborationHost(), sessionId)
   }
 
-  private async dispatchWorkflowContinuation(sessionId: string): Promise<void> {
-    this.conversations.discardStaleRelaySchedulingDecision(sessionId)
-    if (!this.canDispatchWorkflowContinuation(sessionId)) return
-    const task = this.conversations.collaboration(sessionId)
-    const session = this.sessions.find(sessionId)
-    if (
-      !task ||
-      !session ||
-      session.status === 'archived' ||
-      (task.automation !== 'active' && task.pauseReason !== 'limit') ||
-      (task.status !== 'waiting' && task.status !== 'ready')
-    )
-      return
-    if (isCollaborationOpenMode(task)) return
-    const decision = deriveCollaborationDecision(task)
-    if (decision.inputGate) return
-    if (task.automation === 'paused') {
-      const handoff = this.conversations.workflowHandoff(
-        task,
-        collaborationActor(task, 'plan_review'),
-      )
-      await this.consultWorkflowAlternatives(task, handoff)
-      const owner = this.decisionRuntime
-      if (owner?.kind === 'evaluation' && owner.handoff?.id === handoff.id)
-        this.releaseDecisionHandoff(owner)
-      return
-    }
-    if (task.status === 'ready') {
-      const handoff = this.conversations.workflowHandoff(
-        task,
-        collaborationActor(task, 'implement'),
-      )
-      await this.consultWorkflowAlternatives(task, handoff)
-      const owner = this.decisionRuntime
-      if (owner?.kind === 'evaluation' && owner.handoff?.id === handoff.id)
-        this.releaseDecisionHandoff(owner)
-      return
-    }
-    if (!decision.nextStage) {
-      if (!this.pendingNativeInteractions(sessionId).length) {
-        const handoff = this.conversations.workflowHandoff(
-          task,
-          collaborationActor(task, task.stage === 'code_review' ? 'respond' : 'plan'),
-        )
-        await this.consultWorkflowAlternatives(task, handoff)
-        const consultation =
-          this.decisionRuntime?.kind === 'evaluation' &&
-          this.decisionRuntime.handoff?.id === handoff.id
-            ? this.decisionRuntime
-            : undefined
-        this.releaseDecisionHandoff(consultation)
-      }
-      return
-    }
-    let next: CollaborationTask
-    try {
-      next = advanceAutomaticCollaboration(task, session.settings)
-    } catch (error) {
-      const current = this.conversations.collaboration(sessionId)
-      if (current?.id !== task.id || current.revision !== task.revision) return
-      const limitReached =
-        error instanceof CollaborationTransitionError && error.reason.kind === 'limit'
-      const notice = error instanceof Error ? error.message : 'Collaboration could not continue.'
-      this.publish(
-        this.conversations.setCollaborationState({
-          ...task,
-          revision: task.revision + 1,
-          automation: 'paused',
-          pauseReason: limitReached ? 'limit' : 'failure',
-          notice: notice.slice(0, 512),
-        }),
-      )
-      if (limitReached) this.schedulePendingRoutedContinuations()
-      return
-    }
-    let consultation: DecisionInvocationOwner | undefined
-    const settings = this.conversations.schedulingSettings()
-    if (settings.enabled && settings.credential.configured) {
-      const handoff = this.conversations.workflowHandoff(task, next.actor)
-      if (
-        this.decisionRuntime?.kind === 'evaluation' &&
-        this.decisionRuntime.consulting &&
-        this.decisionRuntime.current() &&
-        this.decisionRuntime.handoff?.id === handoff.id
-      )
-        return
-      await this.consultWorkflowAlternatives(task, handoff)
-      consultation =
-        this.decisionRuntime?.kind === 'evaluation' &&
-        this.decisionRuntime.handoff?.id === handoff.id
-          ? this.decisionRuntime
-          : undefined
-      if (this.disposed || this.nativeQuitSealed()) {
-        this.releaseDecisionHandoff(consultation)
-        return
-      }
-      if (this.conversations.hasRelayDecision(sessionId)) {
-        this.releaseDecisionHandoff(consultation)
-        return
-      }
-      if (!this.conversations.evaluationIsCurrent(handoff)) {
-        this.releaseDecisionHandoff(consultation)
-        this.schedulePendingRoutedContinuations()
-        return
-      }
-      if (
-        [...this.preparingSends.values()].some(
-          ({ options }) =>
-            options.schedulingHandoff?.id === handoff.id &&
-            options.schedulingHandoff.factFingerprint === handoff.factFingerprint,
-        )
-      ) {
-        // The original manual claim is preparing; its existing release path wakes automation.
-        this.releaseDecisionHandoff(consultation)
-        return
-      }
-    }
-    const preparation = this.startWorkflowTurn(task, next)
-    // enqueueSend has synchronously registered the original business preparation, or refused it.
-    this.releaseDecisionHandoff(consultation)
-    const result = await preparation
-    if (!result.ok) {
-      const current = this.conversations.collaboration(sessionId)
-      if (current?.id !== task.id || current.revision !== task.revision) return
-      this.publish(
-        this.conversations.setCollaborationState({
-          ...current,
-          revision: current.revision + 1,
-          automation: 'paused',
-          pauseReason: 'failure',
-          notice: result.error.message.slice(0, 512),
-        }),
-      )
-    }
+  private dispatchWorkflowContinuation(sessionId: string): Promise<void> {
+    return dispatchWorkflowContinuationHelper(this.collaborationHost(), sessionId)
   }
 
   acceptPeerProposal(input: PeerProposalAcceptInput): Promise<RpcResult<ConversationPatch>> {
-    if (this.disposed) return Promise.resolve(Conversation.shuttingDown())
-    if (this.nativeQuitSealed()) return Promise.resolve(Conversation.quitPrepared())
-    if (this.conversations.nativeRecoveryBlocksInput(input.sessionId))
-      return Promise.resolve(Conversation.nativeRecoveryRequired())
-    const proposal = this.conversations.peerProposal(input.sessionId, input.proposalId)
-    if (!proposal?.run.peerProposal || proposal.run.peerProposal.state !== 'pending')
-      return Promise.resolve({
-        ok: false,
-        error: { code: 'CONFLICT', message: 'This peer request is no longer available.' },
-      })
-    const targetAgentId = proposal.run.peerProposal.targetAgentId
-    const session = this.sessions.find(input.sessionId)
-    if (
-      !session ||
-      session.status === 'archived' ||
-      !isAgentInPair(targetAgentId, resolveActiveAgentPair(session.settings))
-    ) {
-      return Promise.resolve({
-        ok: false,
-        error: {
-          code: 'CONFLICT',
-          message: `${agentDisplayName(targetAgentId)} is no longer in this Session's active Agent pair.`,
-        },
-      })
-    }
-    const target = targetAgentId
-    const source = agentDisplayName(proposal.run.agentId)
-    const action = Conversation.peerActionCopy(proposal.run.peerProposal.kind, source)
-    const drafts = this.conversations.readPage({ scope: 'drafts', sessionId: input.sessionId })
-    if (drafts.scope !== 'drafts')
-      return Promise.resolve({
-        ok: false,
-        error: { code: 'INTERNAL', message: 'Comment drafts are unavailable.' },
-      })
-    return this.enqueueSend(
-      {
-        sessionId: input.sessionId,
-        clientMessageId: input.clientMessageId,
-        content: `@${target} ${action}`,
-        expectedCommentsRevision: drafts.commentsRevision,
-        commentIds: [],
-        route: { type: 'agent', agentId: targetAgentId },
-      },
-      {
-        preserveDraftComments: true,
-        sourceProposalId: input.proposalId,
-        sourceMessageId: proposal.sourceMessageId,
-        expectedSettingsRevision: session.settingsRevision,
-      },
-    )
+    return acceptPeerProposalHelper(this.collaborationHost(), input)
   }
 
   dismissPeerProposal(input: PeerProposalDismissInput): RpcResult<ConversationPatch> {
-    if (this.disposed) return Conversation.shuttingDown()
-    if (this.conversations.nativeRecoveryBlocksInput(input.sessionId))
-      return Conversation.nativeRecoveryRequired()
-    try {
-      const patch = this.conversations.dismissPeerProposal(input.sessionId, input.proposalId)
-      this.publish(patch)
-      return { ok: true, value: patch }
-    } catch (error) {
-      return {
-        ok: false,
-        error: {
-          code: error instanceof RunOperationConflictError ? 'CONFLICT' : 'INTERNAL',
-          message:
-            error instanceof Error ? error.message : 'The peer request could not be dismissed.',
-        },
-      }
-    }
+    return dismissPeerProposalHelper(this.collaborationHost(), input)
   }
 
   cancelSkillCatalog(sessionId: string): void {
@@ -5952,7 +5766,10 @@ export class Conversation {
         error: { code: 'TIMEOUT', message: 'Skill document reading was cancelled or timed out.' },
       })
     controller.signal.addEventListener('abort', abort, { once: true })
-    const timer = setTimeout(() => controller.abort(), 10_000)
+    const timer = setTimeout(
+      () => controller.abort(),
+      input.agentId === 'agy' ? AGY_SKILL_DOCUMENT_OPERATION_MS : 10_000,
+    )
     const task = (async (): Promise<RpcResult<SkillDocument>> => {
       const catalog = await this.skillBindings(
         input.sessionId,
@@ -6107,7 +5924,10 @@ export class Conversation {
     )
       throw new Error('Native Skill discovery is busy. Try again when current work settles.')
     const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), 10_000)
+    const timer = setTimeout(
+      () => controller.abort(),
+      agentId === 'agy' ? AGY_SKILL_DISCOVERY_OPERATION_MS : 10_000,
+    )
     let currentKey = ''
     const task = (async () => {
       const executablePath = await this.runtimePreparation.findRecoveryExecutable(
@@ -6578,7 +6398,8 @@ export class Conversation {
           'This preparation ended without sending. Your draft is preserved.',
         )
       // PATH preparation shares the existing native-preparation budget, outside advisory time.
-      options.preparationDeadlineAt ??= Date.now() + PREPARATION_TIMEOUT_MS - environmentElapsed
+      options.preparationDeadlineAt ??=
+        Date.now() + this.sessionPreparationTimeoutMs(input.sessionId) - environmentElapsed
       return await this.sendAdmitted(input, controller, options)
     } catch (error) {
       return Conversation.sendFailure(error)
@@ -6616,7 +6437,7 @@ export class Conversation {
     }
     controller.signal.addEventListener('abort', onAbort, { once: true })
     if (controller.signal.aborted) onAbort()
-    options.preparationDeadlineAt ??= Date.now() + PREPARATION_TIMEOUT_MS
+    options.preparationDeadlineAt ??= Date.now() + this.sessionPreparationTimeoutMs(input.sessionId)
     const timeout = setTimeout(
       () => controller.abort(),
       Math.max(0, options.preparationDeadlineAt - Date.now()),
@@ -6869,8 +6690,7 @@ export class Conversation {
         prompt.skillInvocation = skillInvocation
         prompt.targetAgentId = agentId
       }
-      if (Buffer.byteLength(serializeAgentPromptEnvelope(prompt), 'utf8') > HANDOFF_SAFETY_BYTES)
-        throw new HandoffTooLargeError('The Agent context is too large to send safely.')
+      this.contextBroker.assertPromptFitsBudget(prompt, agentId)
       if (!collaboration)
         adapter.preflightPrompt?.({
           runId: input.clientMessageId,
@@ -7039,16 +6859,7 @@ export class Conversation {
         ...(options.syncMainOperationId
           ? { syncMainOperationId: options.syncMainOperationId }
           : {}),
-        handoffSourceRefs: handoff.map((source) =>
-          Object.assign(
-            {
-              id: source.messageId,
-              revision: source.contentRevision,
-              digest: source.digest,
-            },
-            source.contextVersion ? { contextVersion: source.contextVersion } : {},
-          ),
-        ),
+        handoffSourceRefs: handoff.sourceRefs,
         ...(context.value.session.titleSource === 'placeholder' && input.content.trim()
           ? {
               suggestedTitle: Conversation.localTitle(
@@ -7560,6 +7371,11 @@ export class Conversation {
                 ...(run.nativeTurnId ? { nativeTurnId: run.nativeTurnId } : {}),
                 nativeInputIds: this.conversations.nativeInputIdsForRun(run.id),
                 planSource: this.conversations.workflowPlanSourceExpected(run.id),
+                ...(this.conversations.needsWorkflowPlanRecovery(run.id) ||
+                this.conversations.workflowPlanRecoveryState(run.id)?.recoveryRequired ||
+                this.conversations.workflowOpenPlanPublishIntents(run.id).length > 0
+                  ? { inspectMissingPlan: true }
+                  : {}),
                 planCheckpoint: this.conversations.workflowPlanCheckpoint(
                   run.id,
                   run.nativeSessionId!,
@@ -7872,7 +7688,10 @@ export class Conversation {
                       ),
                     }
                   : {}),
-                ...(run && this.conversations.needsWorkflowPlanRecovery(run.id)
+                ...(run &&
+                (this.conversations.needsWorkflowPlanRecovery(run.id) ||
+                  this.conversations.workflowPlanRecoveryState(run.id)?.recoveryRequired ||
+                  this.conversations.workflowOpenPlanPublishIntents(run.id).length > 0)
                   ? { inspectMissingPlan: true }
                   : {}),
                 bindingGeneration: generation,
@@ -7979,6 +7798,14 @@ export class Conversation {
         } catch (error) {
           if (this.disposed) return Conversation.shuttingDown()
           if (!currentTarget()) return changedTarget
+          const classified = classifyAgentError(error)
+          if (
+            classified.kind === 'authentication_required' ||
+            classified.kind === 'runtime_incompatible' ||
+            classified.kind === 'agent_process_crash'
+          ) {
+            this.runtimePreparation.invalidateAgentReadiness(agentId)
+          }
           const patch = this.conversations.setContinuation(
             sessionId,
             agentId,
@@ -7989,7 +7816,7 @@ export class Conversation {
             ),
             generation,
             {
-              kind: classifyAgentError(error).kind,
+              kind: classified.kind,
               message: safeNativePermissionText(
                 error instanceof Error ? error.message : 'No reliable native response.',
                 1024,
@@ -8000,7 +7827,7 @@ export class Conversation {
                 'permission_blocked',
                 'runtime_incompatible',
                 'response_too_large',
-              ].includes(classifyAgentError(error).kind)
+              ].includes(classified.kind)
                 ? 'retry'
                 : 'rebuild',
             },
@@ -8980,6 +8807,167 @@ export class Conversation {
     return () => this.notificationListeners.delete(listener)
   }
 
+  private resolveShutdownDeadlineAt(shutdown?: { flushDeadlineAt?: number }): number | undefined {
+    const raw = shutdown?.flushDeadlineAt
+    if (raw !== undefined && Number.isFinite(raw) && raw > 0) {
+      const candidate = Math.min(Math.trunc(raw), Date.now() + 4000)
+      this.shutdownDeadlineAt =
+        this.shutdownDeadlineAt !== undefined
+          ? Math.min(this.shutdownDeadlineAt, candidate)
+          : candidate
+    }
+    return this.shutdownDeadlineAt
+  }
+
+  private resolveColdOpenPlanIntent(
+    runId: string,
+    terminalState: {
+      executionId: string
+      status: 'completed' | 'failed' | 'canceled' | 'running'
+      hasCompletedPactPublishPlan?: boolean | undefined
+      completedPactPublishPlanCalls?: readonly AgyCompletedPactPublishPlanCall[] | undefined
+      completedPactPublishPlanTokens?: readonly string[] | undefined
+    },
+    nativeSessionId?: string,
+  ): { plan: { nativeId: string; text: string } } | { planUnavailable: true } | undefined {
+    if (terminalState.status !== 'completed') return undefined
+    const intents = this.conversations.workflowOpenPlanPublishIntents(runId)
+    if (intents.length === 0) return undefined
+    if (terminalState.hasCompletedPactPublishPlan !== true) {
+      return { planUnavailable: true }
+    }
+    const eligibleIntents = intents.filter(
+      (intent) =>
+        intent.executionId === undefined ||
+        !terminalState.executionId ||
+        intent.executionId === terminalState.executionId,
+    )
+    if (eligibleIntents.length === 0) {
+      return { planUnavailable: true }
+    }
+    const effectiveNativeSessionId =
+      nativeSessionId ?? this.conversations.findRun(runId)?.nativeSessionId ?? runId
+
+    if (terminalState.completedPactPublishPlanCalls !== undefined) {
+      const expectedServerName = buildAgyPactMcpServerName(runId)
+      const serverCalls = terminalState.completedPactPublishPlanCalls.filter(
+        (call) => call.serverName.trim() === expectedServerName,
+      )
+      if (serverCalls.length === 0) {
+        return { planUnavailable: true }
+      }
+      const latestCall = serverCalls[serverCalls.length - 1]!
+      const rawCallId = latestCall.callId?.trim() || undefined
+      const rawProgressToken = latestCall.progressToken?.trim() || undefined
+      if (!rawCallId && !rawProgressToken) {
+        return { planUnavailable: true }
+      }
+      const callIdKeys = new Set<string>()
+      let normalizedCallIdForNativeId: string | undefined
+      if (rawCallId) {
+        const bareRawCallId = rawCallId.startsWith('call:')
+          ? rawCallId.slice('call:'.length)
+          : rawCallId
+        normalizedCallIdForNativeId = bareRawCallId
+        if (rawCallId.startsWith('call:')) {
+          callIdKeys.add(rawCallId)
+          callIdKeys.add(encodeBoundedOpenPlanCallKey(rawCallId))
+          callIdKeys.add(bareRawCallId)
+        } else {
+          callIdKeys.add(rawCallId)
+          callIdKeys.add(`call:${rawCallId}`)
+          callIdKeys.add(encodeBoundedOpenPlanCallKey(`call:${rawCallId}`))
+        }
+      }
+      const progressTokenKeys = new Set<string>()
+      const provisionalTokenCallKeys = new Set<string>()
+      if (rawProgressToken) {
+        progressTokenKeys.add(rawProgressToken)
+        progressTokenKeys.add(encodeBoundedOpenPlanProgressToken(rawProgressToken))
+        provisionalTokenCallKeys.add(`token:${rawProgressToken}`)
+        provisionalTokenCallKeys.add(encodeBoundedOpenPlanCallKey(`token:${rawProgressToken}`))
+      }
+      // `latestCall.stepId` is intentionally ignored and never cross-matched against `callId` or `progressToken`.
+      const matchedIntents = eligibleIntents.filter((intent) => {
+        if (
+          intent.progressToken !== undefined &&
+          rawProgressToken !== undefined &&
+          !progressTokenKeys.has(intent.progressToken)
+        ) {
+          return false
+        }
+        if (intent.callKey.startsWith('call:')) {
+          if (rawCallId !== undefined) {
+            return callIdKeys.has(intent.callKey)
+          }
+          return intent.progressToken !== undefined && progressTokenKeys.has(intent.progressToken)
+        }
+        if (intent.callKey.startsWith('token:')) {
+          return (
+            (intent.progressToken !== undefined && progressTokenKeys.has(intent.progressToken)) ||
+            provisionalTokenCallKeys.has(intent.callKey)
+          )
+        }
+        if (rawCallId !== undefined) {
+          return callIdKeys.has(intent.callKey)
+        }
+        return intent.progressToken !== undefined && progressTokenKeys.has(intent.progressToken)
+      })
+      if (matchedIntents.length !== 1) {
+        return { planUnavailable: true }
+      }
+      const matchedIntent = matchedIntents[0]!
+      const text = this.conversations.readOpenPlanPublishIntentText(runId, matchedIntent.callKey)
+      if (!text || text.trim().length === 0) {
+        return { planUnavailable: true }
+      }
+      const bareCallKey = stripCallKeyPrefix(matchedIntent.callKey)
+      const nativeId =
+        matchedIntent.nativePlanId ??
+        buildBoundedNativePlanId(
+          effectiveNativeSessionId,
+          matchedIntent.callKey.startsWith('call:')
+            ? bareCallKey
+            : (normalizedCallIdForNativeId ?? bareCallKey),
+        )
+      return { plan: { nativeId, text } }
+    }
+
+    const rawCompletedTokens = (terminalState.completedPactPublishPlanTokens ?? [])
+      .map((token) => token.trim())
+      .filter((token) => token.length > 0)
+    // Never fall back to `intents.length === 1` without positive native final-call proof.
+    if (rawCompletedTokens.length === 0) {
+      return { planUnavailable: true }
+    }
+    const completedTokens = new Set<string>()
+    for (const raw of rawCompletedTokens) {
+      completedTokens.add(raw)
+      completedTokens.add(encodeBoundedOpenPlanProgressToken(raw))
+      completedTokens.add(encodeBoundedOpenPlanCallKey(`call:${raw}`))
+      completedTokens.add(encodeBoundedOpenPlanCallKey(`token:${raw}`))
+    }
+    const matchedIntents = eligibleIntents.filter((intent) => {
+      const bareCallKey = stripCallKeyPrefix(intent.callKey)
+      const callKeyMatches = completedTokens.has(intent.callKey) || completedTokens.has(bareCallKey)
+      const progressTokenMatches =
+        intent.progressToken !== undefined && completedTokens.has(intent.progressToken)
+      return callKeyMatches || progressTokenMatches
+    })
+    if (matchedIntents.length !== 1) {
+      return { planUnavailable: true }
+    }
+    const matchedIntent = matchedIntents[0]!
+    const text = this.conversations.readOpenPlanPublishIntentText(runId, matchedIntent.callKey)
+    if (!text || text.trim().length === 0) {
+      return { planUnavailable: true }
+    }
+    const bareCallKey = stripCallKeyPrefix(matchedIntent.callKey)
+    const nativeId =
+      matchedIntent.nativePlanId ?? buildBoundedNativePlanId(effectiveNativeSessionId, bareCallKey)
+    return { plan: { nativeId, text } }
+  }
+
   dispose(shutdown?: { flushDeadlineAt?: number }): Promise<void> {
     clearTimeout(this.nativeQuitPreparation?.timer)
     this.nativeQuitPreparation = undefined
@@ -8987,8 +8975,61 @@ export class Conversation {
     this.skillDocumentOwner?.controller.abort()
     for (const owner of this.skillDiscoveries.values()) owner.controller.abort()
     this.skillCatalogs.clear()
-    this.disposal ??= this.close(shutdown)
-    return this.disposal
+    if (this.disposal) return this.disposal
+    const attempt = (
+      this.baseShutdownDone ? this.retryPendingCleanup(shutdown) : this.close(shutdown)
+    ).catch((error: unknown) => {
+      if (this.disposal === attempt) {
+        this.disposal = undefined
+      }
+      throw error
+    })
+    this.disposal = attempt
+    return attempt
+  }
+
+  private async retryPendingCleanup(shutdown?: { flushDeadlineAt?: number }): Promise<void> {
+    const flushDeadlineAt = this.resolveShutdownDeadlineAt(shutdown)
+    if (flushDeadlineAt !== undefined) {
+      for (const pool of this.agyConnectionPools.values()) {
+        pool.capShutdownDeadline(flushDeadlineAt)
+      }
+    }
+    const agyPoolEntries = [...this.agyConnectionPools.entries()]
+    const agyForkFiles = this.agyForkFiles
+    const poolResults = await Promise.allSettled([
+      ...agyPoolEntries.map(async ([poolKey, pool]) => {
+        await pool.dispose(flushDeadlineAt)
+        if (pool.occupiedProcessSlotCount === 0) {
+          if (this.agyConnectionPools.get(poolKey) === pool) {
+            this.agyConnectionPools.delete(poolKey)
+          }
+          this.retiringAgyPools.delete(pool)
+        } else {
+          throw new Error('Antigravity connection pool still has unconfirmed process slots.')
+        }
+      }),
+      ...(agyForkFiles
+        ? [
+            (async () => {
+              await agyForkFiles.dispose(flushDeadlineAt)
+              if (this.agyForkFiles === agyForkFiles) {
+                this.agyForkFiles = undefined
+              }
+            })(),
+          ]
+        : []),
+    ])
+    if (this.permanentShutdownFailure) {
+      throw this.permanentShutdownFailure
+    }
+    const rejected = poolResults.find((item) => item.status === 'rejected')
+    if (rejected?.status === 'rejected') {
+      throw new Error(
+        'Pact could not finish all output commits and resource cleanup before shutdown.',
+        { cause: rejected.reason },
+      )
+    }
   }
 
   private async close(shutdown?: { flushDeadlineAt?: number }): Promise<void> {
@@ -9037,18 +9078,13 @@ export class Conversation {
     }
     // This is the first part of Main's existing four-second flush, not a new
     // Stop deadline. One cutoff covers at most the existing execution slots.
-    const flushDeadlineAt =
-      shutdown?.flushDeadlineAt !== undefined &&
-      Number.isSafeInteger(shutdown.flushDeadlineAt) &&
-      shutdown.flushDeadlineAt > 0
-        ? Math.min(shutdown.flushDeadlineAt, Date.now() + 4000)
-        : 0
-    const drainUntil = flushDeadlineAt - 3000
+    const flushDeadlineAt = this.resolveShutdownDeadlineAt(shutdown)
+    const drainUntil = flushDeadlineAt !== undefined ? flushDeadlineAt - 3000 : undefined
     const cutoff = Promise.withResolvers<void>()
     const shutdownOwners: NativeObservation[] = []
     const foregroundDisposals = new Map<AgentAdapter, Promise<void>>()
     let shutdownTimer: ReturnType<typeof setTimeout> | undefined
-    if (drainUntil > Date.now()) {
+    if (drainUntil !== undefined && drainUntil > Date.now() && flushDeadlineAt !== undefined) {
       for (const execution of executions) {
         try {
           const saved = this.conversations.findRun(execution.run.id)
@@ -9100,7 +9136,7 @@ export class Conversation {
         shutdownTimer = setTimeout(() => cutoff.resolve(), Math.max(0, drainUntil - Date.now()))
     }
     // Even late shutdown delivery retains Main's original physical cleanup cap.
-    if (flushDeadlineAt) {
+    if (flushDeadlineAt !== undefined) {
       for (const pool of this.agyConnectionPools.values()) {
         pool.capShutdownDeadline(flushDeadlineAt)
       }
@@ -9132,8 +9168,8 @@ export class Conversation {
     await this.adapterSlotTail
     const adapters = [...this.adapters.values()]
     this.adapters.clear()
-    const agyPools = [...this.agyConnectionPools.values()]
-    this.agyConnectionPools.clear()
+    const agyPoolEntries = [...this.agyConnectionPools.entries()]
+    const agyForkFiles = this.agyForkFiles
     for (const owner of this.nativeObservations.values()) {
       owner.sourceReader?.retire()
       this.clearBackgroundStop(owner)
@@ -9157,29 +9193,41 @@ export class Conversation {
     }
     this.lastSettledStreamTrace?.reservation.release()
     this.lastSettledStreamTrace = undefined
-    const cleanup = await Promise.allSettled([
+
+    // Give zero-input registered Agy sessions one bounded close chance before tearing down
+    // their shared ACP pools, then concurrently await adapters, pools, shared agyForkFiles,
+    // and all remaining tasks so no join deadlocks and no promise can reject unhandled.
+    const zeroInputCloseTasks = adapters.flatMap(({ adapter }) =>
+      adapter instanceof AgyAgentAdapter && typeof adapter.closeZeroInputSessions === 'function'
+        ? [adapter.closeZeroInputSessions(flushDeadlineAt).catch(() => undefined)]
+        : [],
+    )
+    if (zeroInputCloseTasks.length > 0) {
+      await Promise.allSettled(zeroInputCloseTasks)
+    }
+
+    const agyForkDisposal = agyForkFiles
+      ? (async () => {
+          await agyForkFiles.dispose(flushDeadlineAt)
+          if (this.agyForkFiles === agyForkFiles) {
+            this.agyForkFiles = undefined
+          }
+        })()
+      : undefined
+
+    const baseCleanupTasks: Promise<unknown>[] = [
       ...markdownCleanup,
       ...(decisionCleanup ? [decisionCleanup] : []),
-
       ...(this.decisionRecovery ? [this.decisionRecovery] : []),
       ...[...this.collaborationActions.values()].map((owner) => owner.task),
-      (async () => {
-        const adapterResults = await Promise.allSettled(
-          adapters.map(async ({ adapter, disposeExtra }) => {
-            await Promise.all([
-              foregroundDisposals.get(adapter) ?? adapter.dispose(),
-              disposeExtra ? disposeExtra() : Promise.resolve(),
-            ])
-          }),
-        )
-        const poolResults = await Promise.allSettled(
-          agyPools.map((pool) => pool.dispose(flushDeadlineAt)),
-        )
-        const rejected = [...adapterResults, ...poolResults].find(
-          (item) => item.status === 'rejected',
-        )
-        if (rejected?.status === 'rejected') throw rejected.reason
-      })(),
+      ...adapters.map(async ({ adapter, disposeExtra }) => {
+        await Promise.all([
+          foregroundDisposals.get(adapter) ??
+            adapter.dispose(flushDeadlineAt !== undefined ? { flushDeadlineAt } : undefined),
+          disposeExtra ? disposeExtra() : Promise.resolve(),
+        ])
+      }),
+      disposeDefaultAgySkillProbes(flushDeadlineAt),
       ...forkOwners.flatMap((owner) => (owner.completion ? [owner.completion] : [])),
       ...forkPreparations.map((owner) => owner.task),
       ...nativeChecks.map((owner) => owner.physicalCompletion),
@@ -9191,6 +9239,24 @@ export class Conversation {
         continuation.completion ? [continuation.completion] : [],
       ),
       ...nativeRebuilds.flatMap((rebuild) => (rebuild.completion ? [rebuild.completion] : [])),
+    ]
+    const retryablePhysicalTasks: Promise<unknown>[] = [
+      ...agyPoolEntries.map(async ([poolKey, pool]) => {
+        await pool.dispose(flushDeadlineAt)
+        if (pool.occupiedProcessSlotCount === 0) {
+          if (this.agyConnectionPools.get(poolKey) === pool) {
+            this.agyConnectionPools.delete(poolKey)
+          }
+          this.retiringAgyPools.delete(pool)
+        } else {
+          throw new Error('Antigravity connection pool still has unconfirmed process slots.')
+        }
+      }),
+      ...(agyForkDisposal ? [agyForkDisposal] : []),
+    ]
+    const [baseCleanupResults, retryablePhysicalResults] = await Promise.all([
+      Promise.allSettled(baseCleanupTasks),
+      Promise.allSettled(retryablePhysicalTasks),
     ])
     clearTimeout(shutdownTimer)
     if (shutdownOwners.some((owner) => owner.shutdown?.failed)) flushed = false
@@ -9207,45 +9273,55 @@ export class Conversation {
     this.notificationProjector.dispose()
     this.notificationListeners.clear()
     await this.images?.dispose()
-    if (
-      !flushed ||
-      (await decisionCleanup) === false ||
-      cleanup.some((result) => result.status === 'rejected')
-    )
+    const baseRejected = baseCleanupResults.find((result) => result.status === 'rejected')
+    const decisionFailed = (await decisionCleanup) === false
+    if (!flushed || decisionFailed || baseRejected?.status === 'rejected') {
+      this.permanentShutdownFailure = new Error(
+        'Pact could not finish all output commits and resource cleanup before shutdown.',
+        ...(baseRejected?.status === 'rejected' ? [{ cause: baseRejected.reason }] : []),
+      )
+    }
+    this.baseShutdownDone = true
+    if (this.permanentShutdownFailure) {
+      throw this.permanentShutdownFailure
+    }
+    const physicalRejected = retryablePhysicalResults.find((result) => result.status === 'rejected')
+    if (physicalRejected?.status === 'rejected') {
       throw new Error(
         'Pact could not finish all output commits and resource cleanup before shutdown.',
+        { cause: physicalRejected.reason },
       )
+    }
   }
 
-  private async collectHandoff(
+  private collectHandoff(
     sessionId: string,
     targetAgentId: RuntimeAgentId,
     signal: AbortSignal,
     excludeMessageId?: string,
     throughSequence?: number,
     workflow = false,
-  ): Promise<HandoffBundle[]> {
-    const range = this.conversations.handoffRange(sessionId, targetAgentId)
-    const deadline = Date.now() + HANDOFF_READ_DEADLINE_MS
-    const messages: HandoffBundle[] = []
-    let bytes = 0
-    for await (const message of this.conversations.readHandoffSources(
+  ): Promise<CollectedHandoff> {
+    return this.contextBroker.collectHandoff({
       sessionId,
       targetAgentId,
-      range.afterSequence,
-      Math.min(range.throughSequence, throughSequence ?? range.throughSequence),
       signal,
       excludeMessageId,
+      throughSequence,
       workflow,
-    )) {
-      if (signal.aborted || Date.now() >= deadline)
-        throw new HandoffSourceUnavailableError('Reading the Agent handoff timed out.')
-      bytes += Buffer.byteLength(JSON.stringify(message), 'utf8')
-      if (bytes > HANDOFF_SAFETY_BYTES)
-        throw new HandoffTooLargeError('The Agent handoff exceeds its safe processing size.')
-      messages.push(message)
+    })
+  }
+
+  private sessionPreparationTimeoutMs(
+    sessionId: string,
+    extraAgents: readonly RuntimeAgentId[] = [],
+  ): number {
+    if (extraAgents.includes('agy')) return AGY_PREPARATION_TIMEOUT_MS
+    const session = this.sessions.find(sessionId)
+    if (session && resolveActiveAgentPair(session.settings).includes('agy')) {
+      return AGY_PREPARATION_TIMEOUT_MS
     }
-    return messages
+    return PREPARATION_TIMEOUT_MS
   }
 
   private async prepareSession(
@@ -9263,7 +9339,11 @@ export class Conversation {
     if (!project || project.archivedAt) {
       return { ok: false, error: { code: 'VALIDATION', message: 'Project is unavailable.' } }
     }
-    const readiness = await this.runtimePreparation.inspectReadiness(signal)
+    const requiredAgents = new Set<RuntimeAgentId>([
+      ...resolveActiveAgentPair(session.settings),
+      ...extraRequiredAgents,
+    ])
+    const readiness = await this.runtimePreparation.inspectReadiness(signal, [...requiredAgents])
     if (!readiness.ok) return readiness
     if (this.conversations.archives.blocksSession(sessionId)) return Conversation.archiveBusy()
     const discoveredPaths: Partial<Record<RuntimeAgentId, string>> = {}
@@ -9272,10 +9352,6 @@ export class Conversation {
         discoveredPaths[agent.agentId] = agent.executablePath
       }
     }
-    const requiredAgents = new Set<RuntimeAgentId>([
-      ...resolveActiveAgentPair(session.settings),
-      ...extraRequiredAgents,
-    ])
     for (const requiredAgent of requiredAgents) {
       if (!discoveredPaths[requiredAgent]) {
         return {
@@ -9330,7 +9406,7 @@ export class Conversation {
               run.sessionId,
               run.userMessageId,
               targetAgentId,
-              Conversation.pendingContinuationFailureCopy(targetAgentId, error),
+              pendingContinuationFailureCopy(targetAgentId, error),
             ),
           )
         }
@@ -9338,131 +9414,21 @@ export class Conversation {
     })
   }
 
-  private async executeRoutedContinuation(
+  private executeRoutedContinuation(
     execution: ActiveExecution,
     userMessageId: string,
     cwd: string,
     settings: DefaultSessionSettings,
     executablePaths: Record<RuntimeAgentId, string>,
   ): Promise<void> {
-    const message = this.conversations.internalMessage(userMessageId, execution.run.sessionId)
-    if (message?.route?.type !== 'all') return
-    const pending = this.conversations
-      .pendingRoutedContinuations()
-      .find((entry) => entry.userMessageId === userMessageId)
-    if (!pending) {
-      execution.protectedAgentId = undefined
-      return
-    }
-    execution.protectedAgentId = pending.agentId
-    const prepared = await this.beginPendingRoutedContinuation(
-      pending,
-      {
-        cwd,
-        settings,
-        settingsRevision: execution.run.settingsRevision,
-        executablePaths,
-      },
-      execution.abortController.signal,
+    return executeRoutedContinuationHelper(
+      this.handoffHost(),
+      execution,
+      userMessageId,
+      cwd,
+      settings,
+      executablePaths,
     )
-    if (!prepared) return
-    const { started, prompt } = prepared
-    execution.run = started.run
-    execution.protectedAgentId = started.run.agentId
-    this.publish(started.patch)
-    await this.executeAttempts(execution, started.run, prompt, cwd, settings, executablePaths)
-  }
-
-  private async beginPendingRoutedContinuation(
-    pending: { sessionId: string; userMessageId: string; agentId: RuntimeAgentId },
-    context: {
-      cwd: string
-      settings: DefaultSessionSettings
-      settingsRevision: number
-      executablePaths: Record<RuntimeAgentId, string>
-    },
-    signal: AbortSignal,
-  ): Promise<
-    | {
-        started: ReturnType<ConversationRepository['beginRoutedContinuation']>
-        prompt: AgentPromptEnvelope
-      }
-    | undefined
-  > {
-    const message = this.conversations.internalMessage(pending.userMessageId, pending.sessionId)
-    if (message?.route?.type !== 'all') return undefined
-    const agentId = pending.agentId
-    const adapter = await this.adapterFor(
-      pending.sessionId,
-      agentId,
-      context.executablePaths[agentId],
-      signal,
-      context.cwd,
-    )
-    const nativeContext = this.conversations.nativeContext(pending.sessionId, agentId)
-    if (nativeContext && nativeContext.continuationState !== 'ready') {
-      return undefined
-    }
-    const frozen = this.conversations.skillInvocation(pending.userMessageId)
-    if (frozen) {
-      const current = await this.skillBindings(pending.sessionId, agentId, signal, true, true)
-      if (
-        frozen.bindings
-          .filter((entry) => entry.agentId === agentId)
-          .some((entry) => !current.some((item) => item.id === entry.id))
-      )
-        throw new RunOperationConflictError(
-          'The secondary Agent Skill catalog changed. Its stage was not sent; the first answer is preserved.',
-        )
-    }
-    const comments: AnchoredComment[] = []
-    const handoff = await this.collectHandoff(
-      pending.sessionId,
-      agentId,
-      signal,
-      pending.userMessageId,
-      message.sequence - 1,
-    )
-    const prompt = this.promptEnvelope(
-      pending.sessionId,
-      { id: message.id, content: message.content },
-      comments,
-      handoff,
-    )
-    if (Buffer.byteLength(serializeAgentPromptEnvelope(prompt), 'utf8') > HANDOFF_SAFETY_BYTES)
-      throw new HandoffTooLargeError('The Agent context is too large to send safely.')
-    adapter.preflightPrompt?.({
-      runId: randomUUID(),
-      sessionId: pending.sessionId,
-      ...(nativeContext ? { nativeSessionId: nativeContext.nativeSessionId } : {}),
-      peerAssistanceAllowed: false,
-      cwd: context.cwd,
-      promptEnvelope: prompt,
-      model: context.settings.agents[agentId].model,
-      effort: context.settings.agents[agentId].effort,
-    })
-    if (this.hasBlockingBackgroundWork(pending.sessionId)) return undefined
-    return {
-      started: this.conversations.beginRoutedContinuation({
-        sessionId: pending.sessionId,
-        userMessageId: pending.userMessageId,
-        agentId,
-        settingsRevision: context.settingsRevision,
-        model: context.settings.agents[agentId].model,
-        effort: context.settings.agents[agentId].effort,
-        handoffSourceRefs: handoff.map((source) =>
-          Object.assign(
-            {
-              id: source.messageId,
-              revision: source.contentRevision,
-              digest: source.digest,
-            },
-            source.contextVersion ? { contextVersion: source.contextVersion } : {},
-          ),
-        ),
-      }),
-      prompt,
-    }
   }
 
   private schedulePendingRoutedContinuations(continueWorkflowScan = false): void {
@@ -9487,359 +9453,8 @@ export class Conversation {
     })
   }
 
-  private async dispatchReceivedInput(sessionId: string): Promise<void> {
-    if (
-      this.disposed ||
-      this.nativeQuitSealed() ||
-      this.routingOpenInputs.has(sessionId) ||
-      this.hasSessionOperation(sessionId, true) ||
-      this.operationCount() >= MAX_AGENT_OPERATIONS ||
-      this.conversations.nativeRecoveryBlocksInput(sessionId)
-    )
-      return
-    const queue = this.conversations.queueState(sessionId)
-    if (queue.input?.state !== 'queued') return
-    // Preserve the original @all context boundary: queued work cannot enter the
-    // Secondary's native history before its already-authorized independent stage.
-    if (
-      this.conversations
-        .pendingRoutedContinuations()
-        .some((pending) => pending.sessionId === sessionId)
-    )
-      return
-    const input = this.conversations.readReceivedInput(sessionId)
-    const task = this.conversations.collaboration(sessionId),
-      session = this.sessions.find(sessionId)
-    if (
-      !input ||
-      (!queue.enabled && !input.taskId) ||
-      input.state !== 'accepted' ||
-      !session ||
-      session.status === 'archived'
-    )
-      return
-    const prefix = parseComposerCommandPrefix(input.content, input.metadata.skills)
-    const expectedInTaskReview = Boolean(input.metadata.inTaskReview)
-    const actualInTaskReview = Boolean(
-      input.taskId && task && this.conversations.isInTaskReviewCommand(task, prefix.pact),
-    )
-    if (
-      prefix.error ||
-      prefix.btw ||
-      (session.parentSessionId && prefix.pact) ||
-      expectedInTaskReview !== actualInTaskReview ||
-      (Boolean(prefix.pact) && !expectedInTaskReview) !== input.metadata.workflowCommand ||
-      (prefix.pact && input.taskId && !expectedInTaskReview)
-    ) {
-      this.publish(
-        this.conversations.pauseConversationQueue(
-          sessionId,
-          prefix.error ??
-            (prefix.btw
-              ? '/btw opens a side chat instead of sending a regular message.'
-              : session.parentSessionId && prefix.pact
-                ? 'Side chats cannot run /plan, /build, or /review commands.'
-                : 'The queued message no longer matches its frozen task. Edit it before sending.'),
-        ),
-      )
-      return
-    }
-    const anchor = this.conversations.findRun(input.anchorRunId)
-    if (!anchor || (input.taskId && input.taskId !== task?.id)) {
-      this.publish(
-        this.conversations.pauseConversationQueue(
-          sessionId,
-          'The queued message needs its original execution to be checked.',
-        ),
-      )
-      return
-    }
-    if (['starting', 'running', 'recovering'].includes(anchor.status)) return
-    if (
-      !input.manuallyResumed &&
-      !input.taskId &&
-      (anchor.status !== 'completed' ||
-        anchor.nativeOutcome !== 'completed' ||
-        !this.conversations.hasCompleteResponse(anchor.id))
-    ) {
-      this.publish(
-        this.conversations.pauseConversationQueue(
-          sessionId,
-          'The execution did not complete normally. Resume the queued message when ready.',
-        ),
-      )
-      return
-    }
-    if (
-      (anchor.dispatchPhase !== 'ended' &&
-        !(
-          (input.manuallyResumed &&
-            ['not_sent', 'rejected'].includes(anchor.dispatchPhase ?? 'not_sent')) ||
-          (input.taskId && this.conversations.workflowInputWasNotSent(anchor))
-        )) ||
-      (anchor.nativeEffectsState !== 'settled' && anchor.nativeEffectsState !== 'not_dispatched')
-    )
-      return
-    if (input.taskId && task?.status === 'running') return
-    const intent = input.metadata.replyIntentBasis
-    const askOnly = intent?.kind === 'ask_only'
-    if (
-      askOnly &&
-      (!task ||
-        task.id !== input.taskId ||
-        task.revision !== intent.taskRevision + 1 ||
-        task.inputSequence !== intent.priorInputSequence)
-    ) {
-      this.publish(
-        this.conversations.pauseConversationQueue(
-          sessionId,
-          'The task checkpoint changed. Return your question to the composer.',
-        ),
-      )
-      return
-    }
-    if (input.metadata.workflowCommand) {
-      const reference = input.metadata.replaceTask
-      const unfinished = task && task.status !== 'complete' ? task : undefined
-      if (
-        (unfinished && (!reference || reference.taskId !== unfinished.id)) ||
-        (!unfinished && reference && task?.id !== reference.taskId)
-      ) {
-        this.publish(
-          this.conversations.pauseConversationQueue(
-            sessionId,
-            'This command no longer matches the current task. Edit it to confirm the current task, or remove it.',
-          ),
-        )
-        return
-      }
-    }
-    let activeTask = task
-    let targetActor = input.actor
-    let next: CollaborationTask | undefined
-    const requestedRoute = input.metadata.route ?? prefix.route
-    if (expectedInTaskReview && input.taskId && activeTask) {
-      const explicitReviewer = requestedRoute?.type === 'agent' ? requestedRoute.agentId : undefined
-      next = this.conversations.workflowInTaskReview(activeTask, explicitReviewer)
-      next.latestUserMessageId = input.id
-      targetActor = next.actor
-    } else if (input.taskId && activeTask) {
-      const isImplicitOpenMode =
-        isCollaborationOpenMode(activeTask) &&
-        !askOnly &&
-        !input.metadata.replyToDecision &&
-        input.metadata.routeIntent === 'implicit' &&
-        requestedRoute?.type !== 'agent'
-      if (isImplicitOpenMode) {
-        const routingController = new AbortController()
-        this.routingOpenInputs.set(sessionId, routingController)
-        let routingCompleted = false
-        try {
-          targetActor = await this.consultOpenModeInputRouting(
-            sessionId,
-            activeTask,
-            input.id,
-            routingController.signal,
-          )
-          routingCompleted = true
-        } finally {
-          if (this.routingOpenInputs.get(sessionId) === routingController)
-            this.routingOpenInputs.delete(sessionId)
-        }
-        const freshInput = this.conversations.readReceivedInput(sessionId)
-        const freshTask = this.conversations.collaboration(sessionId)
-        if (
-          !routingCompleted ||
-          routingController.signal.aborted ||
-          this.disposed ||
-          this.nativeQuitSealed() ||
-          this.hasSessionOperation(sessionId, true) ||
-          !freshInput ||
-          freshInput.id !== input.id ||
-          freshInput.state !== 'accepted' ||
-          !freshTask ||
-          freshTask.id !== activeTask.id ||
-          freshTask.revision !== activeTask.revision ||
-          freshTask.status === 'running'
-        ) {
-          this.schedulePendingRoutedContinuations()
-          return
-        }
-        activeTask = freshTask
-        if (
-          targetActor !== freshInput.actor &&
-          isAgentInPair(targetActor, [freshTask.owner, freshTask.reviewer])
-        )
-          this.conversations.adoptOpenModeInputRecipient(sessionId, freshInput.id, targetActor)
-      }
-      next = this.conversations.workflowReply(activeTask, targetActor)
-      if (!askOnly) next.latestUserMessageId = input.id
-    }
-    const currentDrafts = this.conversations.readPage({ scope: 'drafts', sessionId })
-    if (currentDrafts.scope !== 'drafts') return
-    const queuedSession = this.sessions.find(sessionId)
-    const queuedPair = queuedSession ? resolveActiveAgentPair(queuedSession.settings) : undefined
-    const result = await this.enqueueSend(
-      {
-        sessionId,
-        clientMessageId: input.id,
-        content: input.content,
-        ...(input.metadata.replyToDecision
-          ? { replyToDecision: input.metadata.replyToDecision }
-          : {}),
-        ...(input.metadata.replaceTask ? { replaceTask: input.metadata.replaceTask } : {}),
-        route:
-          input.metadata.route?.type === 'all'
-            ? { type: 'all' }
-            : { type: 'agent', agentId: targetActor },
-        ...(input.metadata.skills.length ? { skills: input.metadata.skills } : {}),
-        expectedCommentsRevision: currentDrafts.commentsRevision,
-        commentIds: [],
-        ...(input.metadata.batchId ? { batchId: input.metadata.batchId } : {}),
-        freezeDrafts: false,
-        ...(input.metadata.imageIds.length ? { imageIds: input.metadata.imageIds } : {}),
-      },
-      {
-        ...(next
-          ? { collaboration: next, expectedCollaborationRevision: activeTask!.revision }
-          : {}),
-        queuedRolePolicy: input.metadata.rolePolicy,
-        queuedRoute:
-          input.metadata.route?.type === 'all'
-            ? 'firstAgentId' in input.metadata.route && 'secondAgentId' in input.metadata.route
-              ? input.metadata.route
-              : {
-                  type: 'all',
-                  firstAgentId: targetActor,
-                  secondAgentId: otherAgent(targetActor, queuedPair),
-                }
-            : { type: 'agent', agentId: targetActor },
-        preserveDraftComments: true,
-        receivedInputId: input.id,
-        receivedComments: input.comments,
-      },
-    )
-    if (!result.ok && this.conversations.receivedCollaborationInput(sessionId)?.id === input.id)
-      this.publish(this.conversations.pauseConversationQueue(sessionId, result.error.message))
-  }
-
-  private async consultOpenModeInputRouting(
-    sessionId: string,
-    task: CollaborationTask,
-    receivedId: string,
-    signal?: AbortSignal,
-  ): Promise<RuntimeAgentId> {
-    const fallbackActor: RuntimeAgentId =
-      task.lastCodeActor ?? collaborationActor(task, 'implement')
-    const settings = this.conversations.schedulingSettings()
-    const admission = this.decisionRuntimeAdmission()
-    if (
-      !settings.enabled ||
-      !settings.credential.configured ||
-      admission !== 'may_attempt' ||
-      this.pendingNativeInteractions(sessionId).length > 0
-    )
-      return fallbackActor
-    const taskPair: readonly [RuntimeAgentId, RuntimeAgentId] = [task.owner, task.reviewer]
-    const orderedTaskActors = (['codex', 'claude', 'agy'] as const).filter((actor) =>
-      isAgentInPair(actor, taskPair),
-    )
-    const bothReady = orderedTaskActors.every((actor) => {
-      const ctx = this.conversations.nativeContext(sessionId, actor)
-      return !ctx || ctx.continuationState === 'ready'
-    })
-    if (!bothReady) return fallbackActor
-    const handoff = this.conversations.workflowHandoff(task, fallbackActor, receivedId)
-    if (this.conversations.decisionEvaluationReceipt(handoff)) return fallbackActor
-    const candidates = orderedTaskActors.map((actor) => ({
-      id: `route_${actor}`,
-      description: `Send this open-mode task message to ${actor}, preserving its current session permissions and task context.`,
-    }))
-    try {
-      const outcome = await this.evaluateDecision(
-        {
-          handoff,
-          load: async (context) => {
-            const read = await this.conversations.readOpenModeRoutingSources(
-              sessionId,
-              task,
-              receivedId,
-              candidates,
-              context,
-            )
-            const policy = evaluateRelayPolicy({
-              node: 'send',
-              openMode: true,
-              ordinary: false,
-              handoffId: read.handoff.id,
-              budgetSubjectId: read.handoff.budgetSubjectId,
-              primary: fallbackActor,
-              activePair: taskPair,
-              route: 'implicit',
-              inputSourceId: 's0',
-              referencedSourceIds: read.sources
-                .filter((source) => source.actor !== null)
-                .map((source) => source.id),
-              materials: {
-                complete: true,
-                inputBytes: decisionJsonBytes(read.input),
-                sources: read.sources.map((source) => ({
-                  id: source.id,
-                  sha256: source.sha256,
-                  bytes: source.bytes,
-                  roles: source.roles,
-                  actor: source.actor,
-                  complete: true,
-                  settled: true,
-                  frozen: true,
-                })),
-              },
-              legalActions: orderedTaskActors.map((actor) => ({
-                action: 'route_send',
-                actor,
-                authorizationId: read.handoff.id,
-                authorizationCurrent: true,
-                businessBudgetAvailable: true,
-              })),
-              admission: {
-                enabled: settings.enabled,
-                keyConfigured: settings.credential.configured,
-                runtimeAdmission: admission,
-                evaluationResourcesAvailable: true,
-                factAlreadyEvaluated: false,
-                pendingUserInput: false,
-                nativeInteraction: this.pendingNativeInteractions(sessionId).length > 0,
-                newTaskDispatchProtected: false,
-              },
-            })
-            if (policy.kind !== 'eligible')
-              throw new RunOperationConflictError(
-                'Open-mode input is not eligible for Relay routing.',
-              )
-            return read.input
-          },
-        },
-        signal
-          ? AbortSignal.any([AbortSignal.timeout(15_000), signal])
-          : AbortSignal.timeout(15_000),
-      )
-      if (outcome.kind === 'selection') {
-        const parsedRoute = routeCandidateIdSchema.safeParse(outcome.selection.candidateId)
-        if (parsedRoute.success) {
-          const selectedActor = agentIdForRouteCandidate(parsedRoute.data)
-          if (isAgentInPair(selectedActor, taskPair)) return selectedActor
-        }
-      }
-      return fallbackActor
-    } catch {
-      return fallbackActor
-    } finally {
-      if (
-        this.decisionRuntime?.kind === 'evaluation' &&
-        this.decisionRuntime.handoff?.id === handoff.id
-      )
-        this.releaseDecisionHandoff(this.decisionRuntime)
-    }
+  private dispatchReceivedInput(sessionId: string): Promise<void> {
+    return dispatchReceivedInputHelper(this.collaborationHost(), sessionId)
   }
 
   private async resumePendingRoutedContinuations(): Promise<void> {
@@ -10089,6 +9704,44 @@ export class Conversation {
     )
       return
     const snapshot = this.conversations.frozenExecutionEnvelope(original.id)
+    const originalHandoffCount = original.handoffMessageCount ?? 0
+    if (
+      originalHandoffCount > 0 &&
+      (snapshot.handoffContext?.length ?? 0) < originalHandoffCount &&
+      !snapshot.handoffSpine?.length
+    )
+      return
+    if (
+      snapshot.collaboration &&
+      (snapshot.collaboration.planVersion > 0 || Boolean(snapshot.collaboration.review?.verdict)) &&
+      !snapshot.planSummary
+    )
+      return
+    // Newly captured handoff snapshots explicitly freeze peerWorkspaceChanges (including `[]`).
+    // Only legacy pre-upgrade snapshots omit the field (`undefined`) and require a fallback check.
+    if (
+      originalHandoffCount > 0 &&
+      snapshot.peerWorkspaceChanges === undefined &&
+      this.workspaceChanges
+    ) {
+      const peerMessageIds = [
+        ...(snapshot.handoffSpine ?? [])
+          .filter((entry) => entry.speaker !== 'user')
+          .map((entry) => entry.messageId),
+        ...(snapshot.handoffContext ?? [])
+          .filter((entry) => entry.speaker !== 'user')
+          .map((entry) => entry.messageId),
+      ]
+      if (
+        peerMessageIds.length > 0 &&
+        this.conversations.recentPeerWorkspaceChangeCandidates({
+          sessionId: original.sessionId,
+          messageIds: peerMessageIds,
+          limit: 1,
+        }).length > 0
+      )
+        return
+    }
     const prompt = restoreExecutionInput(
       snapshot,
       (image) => {
@@ -10138,80 +9791,11 @@ export class Conversation {
     })
   }
 
-  private async preparePendingRoutedContinuation(
+  private preparePendingRoutedContinuation(
     pending: { sessionId: string; userMessageId: string; agentId: RuntimeAgentId },
     continuation: PreparingContinuation,
   ): Promise<void> {
-    try {
-      const preparedSession = await this.prepareSession(
-        pending.sessionId,
-        continuation.controller.signal,
-        [pending.agentId],
-      )
-      if (!preparedSession.ok)
-        throw new AgentExecutionError('runtime_incompatible', preparedSession.error.message, false)
-      if (
-        this.disposed ||
-        continuation.controller.signal.aborted ||
-        this.preparingContinuations.get(pending.sessionId) !== continuation
-      )
-        return
-      const context = preparedSession.value
-      const source = this.conversations.internalMessage(pending.userMessageId, pending.sessionId)
-      const firstRun = source?.runId ? this.conversations.findRun(source.runId) : undefined
-      const frozenSettings =
-        firstRun && this.sessions.findSettingsRevision(pending.sessionId, firstRun.settingsRevision)
-      if (!firstRun || !frozenSettings)
-        throw new RunOperationConflictError('The original routed task settings are unavailable.')
-      const prepared = await this.beginPendingRoutedContinuation(
-        pending,
-        {
-          cwd: context.projectDirectory,
-          settings: frozenSettings,
-          settingsRevision: firstRun.settingsRevision,
-          executablePaths: context.executablePaths,
-        },
-        continuation.controller.signal,
-      )
-      if (
-        !prepared ||
-        this.disposed ||
-        continuation.controller.signal.aborted ||
-        this.preparingContinuations.get(pending.sessionId) !== continuation
-      )
-        return
-      this.preparingContinuations.delete(pending.sessionId)
-      this.publish(prepared.started.patch)
-      void this.trackExecution(prepared.started.run, (execution) =>
-        this.executeAttempts(
-          execution,
-          prepared.started.run,
-          prepared.prompt,
-          context.projectDirectory,
-          frozenSettings,
-          context.executablePaths,
-        ),
-      )
-    } catch (error) {
-      if (
-        !this.disposed &&
-        !continuation.controller.signal.aborted &&
-        this.preparingContinuations.get(pending.sessionId) === continuation
-      )
-        this.publish(
-          this.conversations.failPendingRoutedContinuation(
-            pending.sessionId,
-            pending.userMessageId,
-            pending.agentId,
-            Conversation.pendingContinuationFailureCopy(pending.agentId, error),
-          ),
-        )
-    } finally {
-      if (this.preparingContinuations.get(pending.sessionId) === continuation)
-        this.preparingContinuations.delete(pending.sessionId)
-      if (!this.disposed) this.publish(this.conversations.metadataPatch(pending.sessionId))
-      this.schedulePendingRoutedContinuations()
-    }
+    return preparePendingRoutedContinuationHelper(this.handoffHost(), pending, continuation)
   }
 
   private trackExecution(
@@ -10641,19 +10225,36 @@ export class Conversation {
       if (marked.length > 0) cutoffsMarked = true
     }
     try {
+      const frozenAuthorization = this.conversations.collaborationTurnAuthorization(run.id)
+      if (
+        frozenAuthorization?.replyIntentBasis?.kind === 'ask_only' &&
+        frozenAuthorization.stage !== 'reply'
+      ) {
+        throw new AgentExecutionError(
+          'protocol_error',
+          'Persisted ask-only authorization requires a read-only reply stage and cannot be dispatched.',
+          false,
+        )
+      }
       this.publish(this.conversations.updateAttempt(run.id, 1, false))
       this.publish(this.conversations.recordNativeEffects(run.id, 'pending'))
       const frozenWorkflow = this.conversations.collaboration(run.sessionId, run.id, false)
       promptEnvelope.collaboration = frozenWorkflow
         ? this.conversations.collaborationPromptState(frozenWorkflow)
         : undefined
-      promptEnvelope.collaborationAuthorization = this.conversations.collaborationTurnAuthorization(
-        run.id,
-      )
+      promptEnvelope.collaborationAuthorization = frozenAuthorization
       const originalInputBatch = this.conversations.inputBatchForRun(run.id)
       promptEnvelope.inputBatchRef = originalInputBatch ?? promptEnvelope.inputBatchRef
       promptEnvelope.requiredInputScopeRef =
         promptEnvelope.collaborationAuthorization?.sourceManifestRef ?? undefined
+      if (!run.reexecutedFromRunId) {
+        this.contextBroker.inlineCurrentComments(promptEnvelope, {
+          sessionId: run.sessionId,
+          runId: run.id,
+          batchId: promptEnvelope.inputBatchRef?.id,
+        })
+        this.contextBroker.attachPlanSummary(promptEnvelope, run.sessionId, run.id)
+      }
       const runSession = this.sessions.find(run.sessionId)
       const authorizedCutoffIds = this.authorizedCutoffsForEnvelope(
         run,
@@ -10673,6 +10274,8 @@ export class Conversation {
         promptEnvelope.collaboration ||
         promptEnvelope.inputBatchRef ||
         promptEnvelope.handoffContext?.some((source) => source.inputBatchRef) ||
+        Boolean(promptEnvelope.handoffSpine?.length) ||
+        Boolean(promptEnvelope.handoffImages?.length) ||
         authorizedCutoffIds.length > 0
           ? { runId: run.id, grant: generation }
           : undefined
@@ -11052,6 +10655,20 @@ export class Conversation {
           recordWorkflowPlan: (plan) => {
             if (stillOwned()) this.conversations.recordWorkflowPlan(run.id, plan)
           },
+          recordOpenPlanFinalIntent: (intent) => {
+            if (!stillOwned()) {
+              throw new RunOperationConflictError(
+                'This open-mode run is no longer owned; plan publish intent was rejected.',
+              )
+            }
+            const committed = this.conversations.recordOpenPlanFinalIntent(run.id, intent)
+            if (committed === undefined) {
+              throw new RunOperationConflictError(
+                'Failed to persist open-mode plan publish intent for this run.',
+              )
+            }
+            return true
+          },
           recordWorkflowPlanRetained: (plan) => {
             if (stillOwned()) this.conversations.recordWorkflowPlanRetained(run.id, plan)
           },
@@ -11063,6 +10680,10 @@ export class Conversation {
           },
           recordWorkflowInputResult: (outcome) => {
             if (stillOwned()) this.conversations.recordWorkflowInputResult(run.id, outcome)
+          },
+          anchorFileBeforeEdit: async (path, ioSignal) => {
+            if (!stillOwned()) return
+            await this.workspaceChanges?.anchorBeforeFirstTouch(run.id, path, ioSignal)
           },
           recordFileChange: async (change, ioSignal) => {
             if (!stillOwned()) return
@@ -11307,6 +10928,13 @@ export class Conversation {
       buffer.flush()
       if (this.disposed) return
       const failure = classifyAgentError(error)
+      if (
+        failure.kind === 'authentication_required' ||
+        failure.kind === 'runtime_incompatible' ||
+        failure.kind === 'agent_process_crash'
+      ) {
+        this.runtimePreparation.invalidateAgentReadiness(run.agentId)
+      }
       if (failure.kind === 'response_too_large') this.failRunOutput(run, error)
       this.conversations.finishCollaboration(run.id, false, failure.message)
       recordDiagnostic({
@@ -11763,79 +11391,26 @@ export class Conversation {
     sessionId: string,
     message: Pick<ConversationSnapshot['messages'][number], 'id' | 'content'>,
     comments: AnchoredComment[],
-    handoff: HandoffBundle[] = [],
+    handoff?: CollectedHandoff,
     pendingImages?: ConversationImage[],
     imageOwner?: string,
   ): AgentPromptEnvelope {
-    const imageMetadata =
-      pendingImages ?? this.conversations.imagesForMessage(message.id, sessionId)
-    const currentImages = imageMetadata.map((image) => {
-      if (!this.images) throw new Error('Image input is unavailable.')
-      return this.images.resolve(sessionId, image, imageOwner)
-    })
-    const skillInvocation = this.conversations.skillInvocation(message.id)
-    return {
-      version: 'pact-agent-prompt-v1',
+    return this.contextBroker.buildPromptEnvelope({
       sessionId,
-      ...(skillInvocation ? { skillInvocation } : {}),
-      message: { ...message, ...(currentImages.length ? { images: currentImages } : {}) },
-      inputBatchRef: this.conversations.inputBatchForMessage(sessionId, message.id) ?? undefined,
-      comments: comments.map(({ id, body, anchor }) => ({ id, body, anchor })),
-      ...(handoff.length > 0
-        ? {
-            handoffContext: handoff.map(
-              ({ messageId, speaker, content, comments: sent, images }) => ({
-                messageId,
-                inputBatchRef:
-                  this.conversations.inputBatchForMessage(sessionId, messageId) ?? undefined,
-                speaker,
-                content,
-                comments: sent,
-                ...(images?.length
-                  ? {
-                      images: images.map((image) => {
-                        if (!this.images) throw new Error('Saved image input is unavailable.')
-                        return this.images.resolve(sessionId, image)
-                      }),
-                    }
-                  : {}),
-              }),
-            ),
-          }
-        : {}),
-    }
+      message,
+      comments,
+      handoff,
+      pendingImages,
+      imageOwner,
+    })
   }
 
-  private async collaborationBasis(
+  private collaborationBasis(
     task: CollaborationTask,
     currentMessageId: string,
     signal: AbortSignal,
   ): Promise<AgentPromptEnvelope['collaborationBasis']> {
-    const read = async (id: string | undefined) => {
-      if (!id || id === currentMessageId) return undefined
-      const source = await this.conversations.readCollaborationSource(task.sessionId, id, signal)
-      const images = (source.images ?? []).map((image) => {
-        if (!this.images) throw new Error('Task images are unavailable.')
-        return this.images.resolve(task.sessionId, image)
-      })
-      return {
-        id,
-        content: source.content,
-        inputBatchRef: this.conversations.inputBatchForMessage(task.sessionId, id) ?? undefined,
-        comments: source.comments.map(({ id: commentId, body, anchor }) => ({
-          id: commentId,
-          body,
-          anchor,
-        })),
-        ...(images.length ? { images } : {}),
-      }
-    }
-    const original = await read(task.taskMessageId)
-    const latest =
-      task.latestUserMessageId !== task.taskMessageId
-        ? await read(task.latestUserMessageId)
-        : undefined
-    return { ...(original ? { original } : {}), ...(latest ? { latest } : {}) }
+    return loadCollaborationBasis(this.conversations, this.images, task, currentMessageId, signal)
   }
 
   private async validateCommentAnchor(
@@ -11969,6 +11544,7 @@ export class Conversation {
             cached.appDataDir === agyAppDataDir &&
             cached.connectionPool !== undefined &&
             cached.poolKey !== undefined &&
+            !this.retiringAgyPools.has(cached.connectionPool) &&
             this.agyConnectionPools.get(cached.poolKey) === cached.connectionPool))
       ) {
         this.adapters.delete(key)
@@ -12070,7 +11646,6 @@ export class Conversation {
       if (this.disposed || signal?.aborted)
         throw new Error('Pact is shutting down or recovery was cancelled.')
       let adapter: AgentAdapter
-      let disposeExtra: (() => Promise<void>) | undefined
       let retireFullAccess:
         | ((options?: { cwd?: string; sessionId?: string }) => Promise<void>)
         | undefined
@@ -12095,41 +11670,104 @@ export class Conversation {
         const resolvedAppDataDir = agyAppDataDir ?? resolveEffectiveAgyAppDataDir()
         const poolKey = JSON.stringify([executablePath, resolvedAppDataDir])
         let connectionPool = this.agyConnectionPools.get(poolKey)
+        if (connectionPool && this.retiringAgyPools.has(connectionPool)) {
+          await connectionPool.dispose().catch(() => undefined)
+          if (connectionPool.occupiedProcessSlotCount === 0) {
+            if (this.agyConnectionPools.get(poolKey) === connectionPool) {
+              this.agyConnectionPools.delete(poolKey)
+            }
+            this.retiringAgyPools.delete(connectionPool)
+            connectionPool = undefined
+          } else {
+            throw new Error('Antigravity connection pool for this configuration is still retiring.')
+          }
+        }
         if (connectionPool) {
           this.agyConnectionPools.delete(poolKey)
           this.agyConnectionPools.set(poolKey, connectionPool)
         } else {
           if (this.agyConnectionPools.size >= 8) {
+            const evictionDeadlineAt = Date.now() + 3_000
             let evictedPool = false
-            for (const [candidatePoolKey, candidatePool] of this.agyConnectionPools) {
-              if (candidatePool.activeLeaseCount > 0) continue
+            const tryEvictCandidatePool = async (
+              candidatePoolKey: string,
+              candidatePool: AgyAcpConnectionPool,
+              referencingEntries: ReadonlyArray<[string, CachedAdapter]>,
+            ): Promise<boolean> => {
+              if (this.retiringAgyPools.has(candidatePool)) {
+                if (candidatePool.activeLeaseCount > 0) {
+                  return false
+                }
+                await candidatePool.dispose(evictionDeadlineAt)
+                if (candidatePool.occupiedProcessSlotCount === 0) {
+                  if (this.agyConnectionPools.get(candidatePoolKey) === candidatePool) {
+                    this.agyConnectionPools.delete(candidatePoolKey)
+                  }
+                  this.retiringAgyPools.delete(candidatePool)
+                  return true
+                }
+                return false
+              }
+              const retirement = candidatePool.tryRetireIdle(evictionDeadlineAt)
+              if (retirement.kind === 'busy') {
+                return false
+              }
+              this.retiringAgyPools.add(candidatePool)
+              void retirement.physical.then(
+                () => {
+                  if (
+                    this.agyConnectionPools.get(candidatePoolKey) === candidatePool &&
+                    candidatePool.occupiedProcessSlotCount === 0
+                  ) {
+                    this.agyConnectionPools.delete(candidatePoolKey)
+                    this.retiringAgyPools.delete(candidatePool)
+                  }
+                  return undefined
+                },
+                () => undefined,
+              )
+              for (const [refKey, refEntry] of referencingEntries) {
+                // oxlint-disable-next-line eslint/no-await-in-loop -- Detach idle cached adapters bound to this retiring pool.
+                await disposeIdleCachedAdapter(refKey, refEntry, false)
+              }
+              await retirement.physical
+              if (candidatePool.occupiedProcessSlotCount === 0) {
+                if (this.agyConnectionPools.get(candidatePoolKey) === candidatePool) {
+                  this.agyConnectionPools.delete(candidatePoolKey)
+                }
+                this.retiringAgyPools.delete(candidatePool)
+                return true
+              }
+              return false
+            }
+            for (const [candidatePoolKey, candidatePool] of Array.from(this.agyConnectionPools)) {
               const referencingEntries = [...this.adapters.entries()].filter(
                 ([, entry]) => entry.connectionPool === candidatePool,
               )
               if (referencingEntries.length === 0) {
-                this.agyConnectionPools.delete(candidatePoolKey)
-                // oxlint-disable-next-line eslint/no-await-in-loop -- Wait for unreferenced pool shutdown before allocating replacement.
-                await candidatePool.dispose().catch(() => undefined)
-                evictedPool = true
-                break
+                // oxlint-disable-next-line no-await-in-loop -- Wait for unreferenced pool retirement before allocating replacement.
+                if (await tryEvictCandidatePool(candidatePoolKey, candidatePool, [])) {
+                  evictedPool = true
+                  break
+                }
               }
             }
             if (!evictedPool) {
-              for (const [candidatePoolKey, candidatePool] of this.agyConnectionPools) {
-                if (candidatePool.activeLeaseCount > 0) continue
+              for (const [candidatePoolKey, candidatePool] of Array.from(this.agyConnectionPools)) {
                 const referencingEntries = [...this.adapters.entries()].filter(
                   ([, entry]) => entry.connectionPool === candidatePool,
                 )
                 if (referencingEntries.every(([, entry]) => isCachedAdapterIdleEligible(entry))) {
-                  for (const [refKey, refEntry] of referencingEntries) {
-                    // oxlint-disable-next-line eslint/no-await-in-loop -- Evict referencing idle adapters completely before disposing their shared pool.
-                    await disposeIdleCachedAdapter(refKey, refEntry, true)
+                  // oxlint-disable-next-line no-await-in-loop -- Retire idle pool atomically and confirm physical release before replacing slot.
+                  const evicted = await tryEvictCandidatePool(
+                    candidatePoolKey,
+                    candidatePool,
+                    referencingEntries,
+                  )
+                  if (evicted) {
+                    evictedPool = true
+                    break
                   }
-                  this.agyConnectionPools.delete(candidatePoolKey)
-                  // oxlint-disable-next-line eslint/no-await-in-loop -- Dispose shared pool only after zero adapter references remain.
-                  await candidatePool.dispose().catch(() => undefined)
-                  evictedPool = true
-                  break
                 }
               }
             }
@@ -12145,15 +11783,22 @@ export class Conversation {
         }
         assignedPoolKey = poolKey
         assignedPool = connectionPool
-        const agyForkFiles = new NativeForkFiles(this.ipcTraffic)
-        disposeExtra = () => agyForkFiles.dispose()
+        this.agyForkFiles ??= new NativeForkFiles(this.ipcTraffic)
+        const sharedForkFiles = this.agyForkFiles
         const agyOptions: AgyAgentAdapterOptions = {
           executablePath,
           appDataDir: resolvedAppDataDir,
           connectionPool,
           ...(this.ipcTraffic ? { ipcTraffic: this.ipcTraffic } : {}),
           ...(expectedAgyPeer ? { peerTargetAgentId: expectedAgyPeer } : {}),
-          storageClient: createAgyNativeStorageClient(agyForkFiles, resolvedAppDataDir),
+          storageClient: createAgyNativeStorageClient(
+            sharedForkFiles,
+            resolvedAppDataDir,
+            (targetRunId, terminalState, nativeSessionId) =>
+              this.resolveColdOpenPlanIntent(targetRunId, terminalState, nativeSessionId),
+          ),
+          subscribeStoragePhysicalOperations: (observer) =>
+            sharedForkFiles.addPhysicalOperationObserver(observer),
         }
         const agyAdapter = new AgyAgentAdapter(agyOptions)
         retireFullAccess = (opts) => agyAdapter.retireFullAccess(opts)
@@ -12169,7 +11814,6 @@ export class Conversation {
         ...(expectedAgyPeer ? { peerTargetAgentId: expectedAgyPeer } : {}),
         ...(assignedPoolKey ? { poolKey: assignedPoolKey } : {}),
         ...(assignedPool ? { connectionPool: assignedPool } : {}),
-        ...(disposeExtra ? { disposeExtra } : {}),
         ...(retireFullAccess ? { retireFullAccess } : {}),
       })
       adapter.setSkillCatalogListener?.(() => {
@@ -12370,63 +12014,7 @@ export class Conversation {
   private collaborationNotification(
     task: CollaborationTask,
   ): ConversationPatch['collaborationNotification'] {
-    if (task.ending) return undefined
-    const currentRun = this.conversations.findRun(task.runId)
-    const runSettled =
-      currentRun?.status === 'completed' &&
-      currentRun.outputSnapshots?.settled !== false &&
-      currentRun.nativeEffectsState !== 'pending' &&
-      currentRun.nativeEffectsState !== 'unknown'
-    if (
-      runSettled &&
-      !task.inputProcessing?.pending &&
-      ((task.inputProcessing?.settled?.runId === task.runId &&
-        Boolean(task.inputProcessing.settled.unchanged)) ||
-        (task.authorization?.runId === task.runId &&
-          task.authorization.replyIntentBasis?.kind === 'ask_only' &&
-          Boolean(task.authorization.replyIntentBasis.askCheckpoint)))
-    ) {
-      return {
-        taskId: task.id,
-        revision: task.revision,
-        runId: task.runId,
-        state: 'complete',
-        agentId: currentRun.agentId,
-      }
-    }
-    const decision = deriveCollaborationDecision(task)
-    type Notification = NonNullable<ConversationPatch['collaborationNotification']>
-    let state: Notification['state'] | undefined
-    if (task.status === 'complete') state = currentRun && !runSettled ? 'working' : 'complete'
-    else if (task.status === 'failed') {
-      if (task.pauseReason !== 'stopped') state = 'failure'
-    } else if (decision.inputGate === 'incomplete') state = 'failure'
-    else if (decision.inputGate === 'needs_reply') state = 'needs_user'
-    else if (decision.inputGate === 'processing' || decision.inputGate === 'queued')
-      state = 'working'
-    else if (task.status === 'running') state = 'working'
-    else if (task.status === 'questions' || task.status === 'ready') state = 'needs_user'
-    else if (!isCollaborationOpenMode(task) && task.automation === 'paused') {
-      if (task.pauseReason === 'user_message') state = 'working'
-      else if (task.pauseReason !== 'stopped')
-        state = task.pauseReason === 'failure' ? 'failure' : 'needs_user'
-    } else if (decision.nextStage) state = 'auto_continue'
-    else
-      state =
-        isCollaborationOpenMode(task) && decision.availableActions.length === 0
-          ? runSettled
-            ? 'complete'
-            : 'working'
-          : 'needs_user'
-    return state
-      ? {
-          taskId: task.id,
-          revision: task.revision,
-          runId: task.runId,
-          state,
-          agentId: task.actor,
-        }
-      : undefined
+    return deriveCollaborationNotification(this.conversations, task)
   }
 
   private sessionIssues(
@@ -12524,502 +12112,48 @@ export class Conversation {
     sideChatId: string,
     parentSessionId: string,
   ): RpcResult<never> | undefined {
-    if (this.disposed) return Conversation.shuttingDown()
-    if (this.nativeQuitSealed()) return Conversation.quitPrepared()
-    if (
-      this.conversations.archives.blocksSession(sideChatId) ||
-      this.conversations.archives.blocksSession(parentSessionId)
-    ) {
-      return Conversation.archiveBusy()
-    }
-    const sideChat = this.sessions.find(sideChatId)
-    if (
-      !sideChat ||
-      sideChat.parentSessionId !== parentSessionId ||
-      sideChat.status === 'archived'
-    ) {
-      throw new RunOperationConflictError('The side chat is unavailable.')
-    }
-    const parent = this.sessions.find(parentSessionId)
-    if (!parent || parent.status === 'archived' || parent.parentSessionId) {
-      throw new RunOperationConflictError('The parent Session is unavailable.')
-    }
-    if (this.pendingNativeInteractions(sideChatId).length > 0) {
-      throw new RunOperationConflictError(
-        'Respond to the pending native permission or question in this side chat first.',
-      )
-    }
-    if (
-      this.conversations.nativeRecoveryBlocksInput(sideChatId) ||
-      this.conversations.nativeRecoveryBlocksInput(parentSessionId)
-    ) {
-      return Conversation.nativeRecoveryRequired()
-    }
-    if (this.hasBlockingBackgroundWork(parentSessionId)) {
-      throw new RunOperationConflictError(BACKGROUND_INPUT_REASON)
-    }
-    this.conversations.assertRelayDecisionResolved(parentSessionId, undefined, true)
-    return undefined
+    return checkSideChatSyncGateFailureHelper(this.sideChatHost(), sideChatId, parentSessionId)
   }
 
-  async createSideChat(input: CreateSideChatInput): Promise<RpcResult<CreateSideChatReceipt>> {
-    if (this.disposed) return Conversation.shuttingDown()
-    if (this.nativeQuitSealed()) return Conversation.quitPrepared()
-    if (this.conversations.archives.blocksSession(input.parentSessionId))
-      return Conversation.archiveBusy()
-    try {
-      const parent = this.sessions.find(input.parentSessionId)
-      if (!parent || parent.status === 'archived') {
-        throw new RunOperationConflictError('The parent Session is unavailable.')
-      }
-      if (parent.parentSessionId) {
-        throw new RunOperationConflictError('Side chats cannot be nested inside another side chat.')
-      }
-      if (
-        input.origin === 'btw' &&
-        !this.conversations.readCreateSideChatReceipt(input.operationId)
-      ) {
-        const issues = this.sessionIssues(
-          input.parentSessionId,
-          this.conversations.nativeContexts(input.parentSessionId),
-        )
-        if (issues.inputGate === 'read_only') {
-          throw new RunOperationConflictError(
-            'Finish or recover the active Fork before running /btw.',
-          )
-        }
-        if (this.conversations.nativeRecoveryBlocksInput(input.parentSessionId)) {
-          return Conversation.nativeRecoveryRequired()
-        }
-        if (issues.inputGate === 'send_blocked') {
-          throw new RunOperationConflictError(
-            'Resolve the pending Session issue before running /btw.',
-          )
-        }
-        if (this.pendingNativeInteractions(input.parentSessionId).length > 0) {
-          throw new RunOperationConflictError(
-            'Respond to the pending native permission or question before running /btw.',
-          )
-        }
-        if (this.hasBlockingBackgroundWork(input.parentSessionId)) {
-          throw new RunOperationConflictError(BACKGROUND_INPUT_REASON)
-        }
-        this.conversations.assertRelayDecisionResolved(input.parentSessionId, undefined, true)
-        const received = this.conversations.receivedCollaborationInput(input.parentSessionId)
-        if (received?.state === 'blocked') {
-          throw new RunOperationConflictError(
-            'Resolve the blocked queued message before running /btw.',
-          )
-        }
-        this.conversations.assertDecisionInput({
-          sessionId: input.parentSessionId,
-          content: '',
-          imageIds: [],
-          commentIds: [],
-          route: { type: 'primary' },
-        })
-        const savedTask = this.conversations.collaboration(input.parentSessionId)
-        const task = savedTask?.status === 'complete' ? undefined : savedTask
-        const taskGate = task ? collaborationInputGate(task) : undefined
-        if (taskGate === 'needs_reply' || taskGate === 'incomplete') {
-          throw new RunOperationConflictError(
-            'Respond to the current workflow question or recovery prompt before running /btw.',
-          )
-        }
-      }
-      const { markdownVisibleProjection } = await import('../../shared/message-anchor-text.js')
-      const receipt = this.conversations.createSideChat(input, {
-        resolveVisibleText: markdownVisibleProjection,
-      })
-      this.nativeMetadataChanged()
-      return { ok: true, value: receipt }
-    } catch (error) {
-      return Conversation.sendFailure(error)
-    }
+  createSideChat(input: CreateSideChatInput): Promise<RpcResult<CreateSideChatReceipt>> {
+    return createSideChatHelper(this.sideChatHost(), input)
   }
 
   async readCreateSideChatReceipt(
     input: ReadSideChatReceiptInput,
   ): Promise<RpcResult<CreateSideChatReceipt | null>> {
-    if (this.disposed) return Conversation.shuttingDown()
-    try {
-      return {
-        ok: true,
-        value: this.conversations.readCreateSideChatReceipt(input.operationId) ?? null,
-      }
-    } catch (error) {
-      return Conversation.sendFailure(error)
-    }
+    return readCreateSideChatReceiptHelper(this.sideChatHost(), input)
   }
 
   async listSideChats(input: ListSideChatsInput): Promise<RpcResult<ListSideChatsPage>> {
-    if (this.disposed) return Conversation.shuttingDown()
-    try {
-      const parent = this.sessions.find(input.parentSessionId)
-      if (!parent) {
-        throw new RunOperationConflictError('The parent Session does not exist.')
-      }
-      if (parent.parentSessionId) {
-        throw new RunOperationConflictError('Side chats cannot contain nested side chats.')
-      }
-      return { ok: true, value: this.sessions.listSideChatsPage(input) }
-    } catch (error) {
-      return Conversation.sendFailure(error)
-    }
+    return listSideChatsHelper(this.sideChatHost(), input)
   }
 
   async discardEmptySideChat(
     input: DiscardEmptySideChatInput,
   ): Promise<RpcResult<DiscardEmptySideChatResult>> {
-    if (this.disposed || this.nativeQuitSealed()) return { ok: true, value: { discarded: false } }
-    if (
-      this.conversations.archives.blocksSession(input.sideChatId) ||
-      this.hasSessionOperation(input.sideChatId, true) ||
-      [...this.adapters.values()].some((entry) => entry.sessionId === input.sideChatId)
-    ) {
-      return { ok: true, value: { discarded: false } }
-    }
-    try {
-      const discarded = this.conversations.discardEmptySideChat(input.sideChatId)
-      if (discarded) this.nativeMetadataChanged()
-      return { ok: true, value: { discarded } }
-    } catch (error) {
-      return Conversation.sendFailure(error)
-    }
+    return discardEmptySideChatHelper(this.sideChatHost(), input)
   }
 
   async readSyncSideChatReceipt(
     input: ReadSideChatReceiptInput,
   ): Promise<RpcResult<SideChatSyncMainReceipt | null>> {
-    if (this.disposed) return Conversation.shuttingDown()
-    try {
-      return {
-        ok: true,
-        value: this.conversations.readSyncSideChatReceipt(input.operationId) ?? null,
-      }
-    } catch (error) {
-      return Conversation.sendFailure(error)
-    }
+    return readSyncSideChatReceiptHelper(this.sideChatHost(), input)
   }
 
-  async syncSideChatToMain(
+  syncSideChatToMain(
     input: SideChatSyncMainInput,
     ownerKey?: string,
   ): Promise<RpcResult<SideChatSyncMainReceipt>> {
-    let releaseSourceImages: (() => void) | undefined
-    let releaseClonedImages: (() => void) | undefined
-    let preparedNeedsRollback = false
-    let preparedCommentCount = 0
-    let sealedInputId: string | undefined
-    const releaseSealedInput = (): void => {
-      if (!sealedInputId || !ownerKey) return
-      const id = sealedInputId
-      sealedInputId = undefined
-      try {
-        this.conversations.writeConversationInput(
-          { type: 'release', sessionId: input.sideChatId, inputId: id },
-          ownerKey,
-        )
-      } catch {
-        // Best-effort cleanup of temporary side-chat @Main input segments.
-      }
-    }
-    const skillController = new AbortController()
-    const skillTimeout = setTimeout(() => skillController.abort(), PREPARATION_TIMEOUT_MS)
-    try {
-      if (this.disposed) return Conversation.shuttingDown()
-      if (input.inputId) {
-        if (!ownerKey) {
-          throw new RunOperationConflictError('Prepared input owner is unavailable.')
-        }
-        if (
-          this.conversations.ownsTemporaryConversationInput(
-            input.sideChatId,
-            input.inputId,
-            ownerKey,
-          )
-        ) {
-          sealedInputId = input.inputId
-        }
-      }
-      if (this.nativeQuitSealed()) return Conversation.quitPrepared()
-      if (this.conversations.archives.blocksSession(input.sideChatId))
-        return Conversation.archiveBusy()
-
-      const sideChat = this.sessions.find(input.sideChatId)
-      if (!sideChat || !sideChat.parentSessionId || sideChat.status === 'archived') {
-        throw new RunOperationConflictError('The side chat is unavailable.')
-      }
-      const parentSessionId = sideChat.parentSessionId
-      if (this.conversations.archives.blocksSession(parentSessionId))
-        return Conversation.archiveBusy()
-      const parent = this.sessions.find(parentSessionId)
-      if (!parent || parent.status === 'archived' || parent.parentSessionId) {
-        throw new RunOperationConflictError('The parent Session is unavailable.')
-      }
-
-      let rawContent = input.content
-      let hasResolvedInput = false
-      if (input.inputId) {
-        if (sealedInputId || !this.conversations.readSyncSideChatReceipt(input.operationId)) {
-          sealedInputId = input.inputId
-          rawContent = this.conversations.resolveConversationInput(
-            input.sideChatId,
-            input.operationId,
-            input.inputId,
-            ownerKey!,
-          )
-          hasResolvedInput = true
-        }
-      }
-      if (input.contentSha256 && (hasResolvedInput || !input.inputId)) {
-        const expectedDigest = input.contentSha256.toLowerCase()
-        const actualDigest = createHash('sha256').update(rawContent, 'utf8').digest('hex')
-        if (actualDigest !== expectedDigest) {
-          throw new RunOperationConflictError('The prepared message changed before sending.')
-        }
-      }
-
-      if (this.conversations.readSyncSideChatReceipt(input.operationId)) {
-        const verified = this.conversations.prepareMainSyncBack(input, ownerKey)
-        if (verified.existingReceipt) return { ok: true, value: verified.existingReceipt }
-      }
-
-      const prePrepGateFailure = this.checkSideChatSyncGateFailure(
-        input.sideChatId,
-        parentSessionId,
-      )
-      if (prePrepGateFailure) return prePrepGateFailure
-
-      const stripped = Conversation.stripLeadingMainToken(rawContent, input.skills)
-      if (
-        !stripped.content.trim() &&
-        !input.imageIds.length &&
-        input.commentIds.length === 0 &&
-        !this.conversations.hasSideChatDrafts(input.sideChatId)
-      ) {
-        throw new RunOperationConflictError(
-          'Write a message, add a Comment, or attach an image before sending to main.',
-        )
-      }
-      const syncValidation = validateSideChatMainSyncContent(stripped.content, stripped.skills)
-      if (!syncValidation.ok) {
-        throw new RunOperationConflictError(syncValidation.message)
-      }
-      const prefix = parseComposerCommandPrefix(stripped.content, stripped.skills)
-
-      const parentSavedTask = this.conversations.collaboration(parentSessionId)
-      const parentTask = parentSavedTask?.status === 'complete' ? undefined : parentSavedTask
-      const parentWaitingForWork =
-        parentTask?.status === 'running' || this.hasSessionOperation(parentSessionId)
-      if (
-        input.userInformation &&
-        (parentTask ||
-          parentWaitingForWork ||
-          stripped.skills.length ||
-          input.imageIds.length ||
-          prefix.skills.length)
-      ) {
-        throw new RunOperationConflictError(
-          'Reserved information supports a new ordinary message only. Remove it before queueing, replying to a workflow, using Skills, images, or @all. Your draft was kept.',
-        )
-      }
-
-      this.conversations.assertRelayDecisionResolved(parentSessionId, undefined, true)
-      this.conversations.assertDecisionInput({
-        sessionId: parentSessionId,
-        content: stripped.content,
-        imageIds: input.imageIds,
-        commentIds: [],
-        skills: stripped.skills,
-        route: { type: 'primary' },
-      })
-      if (this.conversations.receivedCollaborationInput(parentSessionId)) {
-        throw new RunOperationConflictError(
-          'One message is already queued on the parent Session. Your draft was preserved.',
-        )
-      }
-      if (this.conversations.nativeRecoveryBlocksInput(parentSessionId))
-        return Conversation.nativeRecoveryRequired()
-      if (this.hasBlockingBackgroundWork(parentSessionId))
-        throw new RunOperationConflictError(BACKGROUND_INPUT_REASON)
-
-      if (parentTask || parentWaitingForWork) {
-        const parentPatch = this.conversations.metadataPatch(parentSessionId)
-        if (!parentTask && !parentPatch.queue?.enabled) {
-          throw new RunOperationConflictError('The queue is disabled. Your draft was preserved.')
-        }
-        const anchor =
-          this.activeExecutions.get(parentSessionId)?.run ??
-          (parentTask ? this.conversations.findRun(parentTask.runId) : undefined) ??
-          AGENTS.map((agentId) => this.conversations.latestAgentRun(parentSessionId, agentId))
-            .filter((run): run is AgentRun => Boolean(run))
-            .toSorted((left, right) => right.createdAt.localeCompare(left.createdAt))[0]
-        if (!anchor) {
-          throw new RunOperationConflictError(
-            'Wait for the current execution to start before queuing a message.',
-          )
-        }
-      } else {
-        if (this.conversations.hasPendingRoutedContinuation(parentSessionId)) {
-          throw new RunOperationConflictError(
-            'Wait for or stop the remaining @all response before sending another message.',
-          )
-        }
-        if (
-          this.conversations
-            .nativeContexts(parentSessionId)
-            .some(
-              (context) =>
-                context.continuationState === 'responding' ||
-                context.continuationState === 'waiting_user',
-            )
-        )
-          return Conversation.capacityFailure()
-        if (this.operationCount() >= MAX_AGENT_OPERATIONS) return Conversation.capacityFailure()
-      }
-
-      this.conversations.assertTaskReplacement({ sessionId: parentSessionId }, false)
-      const defaultParentActor = resolveMainChatSyncTarget(
-        parent.settings.primaryAgentId,
-        parentTask,
-      )
-      const parentTargets: RuntimeAgentId[] = [defaultParentActor]
-      await this.prepareSkillInvocation(
-        { sessionId: parentSessionId, content: stripped.content, skills: stripped.skills },
-        parentTargets,
-        skillController.signal,
-      )
-
-      const postPrepGateFailure = this.checkSideChatSyncGateFailure(
-        input.sideChatId,
-        parentSessionId,
-      )
-      if (postPrepGateFailure) return postPrepGateFailure
-
-      if (input.imageIds.length) {
-        if (!this.images) throw new Error('Image input is unavailable.')
-        this.conversations.resolveMessageImages(input.sideChatId, input.imageIds, ownerKey)
-        releaseSourceImages = this.images.hold(input.imageIds)
-      }
-
-      const { markdownVisibleProjection } = await import('../../shared/message-anchor-text.js')
-      const prepared = this.conversations.prepareMainSyncBack(input, ownerKey, rawContent, {
-        resolveVisibleText: markdownVisibleProjection,
-      })
-      if (prepared.existingReceipt) {
-        return { ok: true, value: prepared.existingReceipt }
-      }
-      preparedNeedsRollback = true
-      preparedCommentCount = prepared.mainCommentIds.length
-
-      if (prepared.mainImageIds.length && this.images) {
-        releaseClonedImages = this.images.hold(prepared.mainImageIds)
-      }
-
-      const parentDrafts = this.conversations.readPage({
-        scope: 'drafts',
-        sessionId: parentSessionId,
-      })
-      const expectedParentCommentsRevision =
-        parentDrafts.scope === 'drafts' ? parentDrafts.commentsRevision : 0
-      const sendInput: ConversationSendInput = {
-        sessionId: prepared.parentSessionId,
-        clientMessageId: prepared.mainMessageId,
-        content: stripped.content,
-        route: { type: 'primary' },
-        ...(stripped.skills.length ? { skills: stripped.skills } : {}),
-        ...(prepared.mainImageIds.length ? { imageIds: prepared.mainImageIds } : {}),
-        commentIds: prepared.mainCommentIds,
-        expectedCommentsRevision: expectedParentCommentsRevision,
-        ...(input.userInformation ? { userInformation: input.userInformation } : {}),
-      }
-      const sent = await this.sendWithOptions(sendInput, ownerKey, {
-        originSideChat: prepared.originSideChat,
-        syncMainOperationId: input.operationId,
-      })
-      if (!sent.ok) {
-        const finalized = this.conversations.readSyncSideChatReceipt(input.operationId)
-        if (finalized) {
-          preparedNeedsRollback = false
-          if (prepared.mainCommentIds.length > 0) {
-            this.publish(
-              this.conversations.metadataPatch(input.sideChatId, { draftsChanged: true }),
-            )
-          }
-          return { ok: true, value: finalized }
-        }
-        this.conversations.rollbackMainSyncBack(input.operationId)
-        preparedNeedsRollback = false
-        return sent
-      }
-      const receipt = this.conversations.readSyncSideChatReceipt(input.operationId)
-      if (!receipt) {
-        this.conversations.rollbackMainSyncBack(input.operationId)
-        preparedNeedsRollback = false
-        throw new RunOperationConflictError(
-          'The parent Session could not confirm syncing this message.',
-        )
-      }
-      preparedNeedsRollback = false
-      if (prepared.mainCommentIds.length > 0) {
-        this.publish(this.conversations.metadataPatch(input.sideChatId, { draftsChanged: true }))
-      }
-      return { ok: true, value: receipt }
-    } catch (error) {
-      if (preparedNeedsRollback) {
-        const finalized = this.conversations.readSyncSideChatReceipt(input.operationId)
-        if (finalized) {
-          if (preparedCommentCount > 0) {
-            this.publish(
-              this.conversations.metadataPatch(input.sideChatId, { draftsChanged: true }),
-            )
-          }
-          return { ok: true, value: finalized }
-        }
-        try {
-          this.conversations.rollbackMainSyncBack(input.operationId)
-        } catch {
-          // Best-effort cleanup so rejected sends never leave orphaned sync rows.
-        }
-      }
-      return Conversation.sendFailure(error)
-    } finally {
-      clearTimeout(skillTimeout)
-      releaseSealedInput()
-      releaseClonedImages?.()
-      releaseSourceImages?.()
-    }
+    return syncSideChatToMainHelper(this.sideChatHost(), input, ownerKey)
   }
 
   private authorizedCutoffsForEnvelope(
-    run: Pick<AgentRun, 'sessionId' | 'userMessageId'>,
+    run: Pick<AgentRun, 'sessionId' | 'userMessageId'> & { id?: string | undefined },
     envelope: AgentPromptEnvelope,
     isSideChat: boolean,
   ): string[] {
-    if (isSideChat) {
-      const anchor = this.conversations.sideChatAnchorCutoff(run.sessionId)
-      return anchor && anchor.maxMessageSequence >= 0 ? [anchor.cutoffId] : []
-    }
-    const candidateMessageIds = [
-      ...new Set(
-        [
-          run.userMessageId,
-          envelope.message.id,
-          ...(envelope.handoffContext ?? []).map((entry) => entry.messageId),
-          ...(envelope.rebuiltContext ?? []).map((entry) => entry.message.id),
-          envelope.collaborationBasis?.original?.id,
-          envelope.collaborationBasis?.latest?.id,
-        ].filter((id): id is string => Boolean(id)),
-      ),
-    ]
-    if (!candidateMessageIds.length) return []
-    const origins = this.conversations.messageOriginCutoffs(run.sessionId, candidateMessageIds)
-    const unique = new Set<string>()
-    for (const entry of origins) {
-      if (entry.maxMessageSequence >= 0) unique.add(entry.originSideChat.cutoffId)
-    }
-    return [...unique]
+    return this.contextBroker.authorizedCutoffsForEnvelope(run, envelope, isSideChat)
   }
 
   private attachCutoffSupplement(
@@ -13029,58 +12163,13 @@ export class Conversation {
     envelope: AgentPromptEnvelope,
     authorizedCutoffIds: readonly string[],
   ): string[] {
-    if (!authorizedCutoffIds.length) {
-      setPromptCutoffSupplement(envelope, undefined)
-      return []
-    }
-    const delivered = new Set(
-      this.conversations.deliveredCutoffIds(sessionId, agentId, bindingGeneration),
+    return this.contextBroker.attachCutoffSupplement(
+      sessionId,
+      agentId,
+      bindingGeneration,
+      envelope,
+      authorizedCutoffIds,
     )
-    let remainingBytes = CUTOFF_INLINE_TAIL_MAX_BYTES
-    const inlineTails: Array<{ cutoffId: string; text: string }> = []
-    const newlyInjected: string[] = []
-    for (const cutoffId of authorizedCutoffIds) {
-      if (delivered.has(cutoffId)) continue
-      if (remainingBytes < 256) break
-      const tail = this.conversations.buildCutoffInlineTail(cutoffId, remainingBytes)
-      const tailBytes = tail.text ? Buffer.byteLength(tail.text, 'utf8') : 0
-      if (tail.text && tailBytes <= remainingBytes) {
-        inlineTails.push({ cutoffId, text: tail.text })
-        remainingBytes -= tailBytes
-        newlyInjected.push(cutoffId)
-      }
-    }
-    setPromptCutoffSupplement(envelope, {
-      cutoffIds: [...authorizedCutoffIds],
-      inlineTails,
-    })
-    return newlyInjected
-  }
-
-  private static stripLeadingMainToken(
-    content: string,
-    skills: NonNullable<ConversationSendInput['skills']>,
-  ): { content: string; skills: NonNullable<ConversationSendInput['skills']> } {
-    const match = /^([ \t]*@Main)(?=[ \t\r\n]|$)([ \t]*)/iu.exec(content)
-    if (!match) {
-      return { content, skills: skills.map((entry) => ({ ...entry })) }
-    }
-    const removeEnd = match[0].length
-    const nextContent = content.slice(removeEnd)
-    const shiftedSkills = skills.flatMap((entry) => {
-      if (entry.end <= removeEnd) return []
-      if (entry.start < removeEnd) {
-        throw new RunOperationConflictError('Skill selection overlaps the leading @Main mention.')
-      }
-      return [
-        {
-          ...entry,
-          start: entry.start - removeEnd,
-          end: entry.end - removeEnd,
-        },
-      ]
-    })
-    return { content: nextContent, skills: shiftedSkills }
   }
 
   private forkBlocked(sessionId: string): boolean {
@@ -13126,25 +12215,5 @@ export class Conversation {
       title += segment
     }
     return title.trimEnd() || fallback
-  }
-
-  private static peerActionCopy(kind: PeerRequestKind, source: string): string {
-    switch (kind) {
-      case 'supplement':
-        return `Supplement ${source}’s previous response.`
-      case 'fact_check':
-        return `Verify the key facts in ${source}’s previous response.`
-      case 'challenge':
-        return `Challenge the assumptions and conclusions in ${source}’s previous response.`
-      case 'review':
-        return `Review ${source}’s previous response.`
-    }
-    throw new Error('Unsupported peer request kind.')
-  }
-
-  private static pendingContinuationFailureCopy(agentId: RuntimeAgentId, error: unknown): string {
-    const name = agentDisplayName(agentId)
-    const detail = error instanceof Error ? error.message.trim() : ''
-    return `${name} could not start the second @all response.${detail ? ` ${detail.slice(0, 300)}` : ''}`
   }
 }

@@ -15,6 +15,7 @@ import {
   lstat,
   mkdir,
   mkdtemp,
+  open,
   readFile,
   readdir,
   rename,
@@ -1055,6 +1056,156 @@ child.stderr.resume();
       throw error
     } finally {
       await closeObservedUtility(utility, closed, observer, bodyErrors)
+    }
+  })
+
+  it('deletes an allocated zero-byte receipt via abort-allocated on pre-witness failure and rejects non-empty, mismatched, or junction paths', async () => {
+    const root = await scratch(),
+      receipts = join(root, 'receipts'),
+      memory = new NativeWorkingMemory('business')
+
+    // 1. End-to-end pre-witness failure (missing cwd prevents prepare spawn after receipt allocation).
+    const owner = new OwnedProcessGroup({ windows: windows(receipts), memory })
+    const child = owner.spawn(process.execPath, ['-e', 'process.exit(0)'], {
+      cwd: join(root, 'missing-cwd'),
+    })
+    child.stdout.resume()
+    child.stderr.resume()
+    await deadline(once(child, 'error'))
+    await owner.close()
+    await owner.whenReleased()
+    expect(owner.released).toBe(true)
+    expect(memory.bytes).toBe(0)
+    expect(await readdir(receipts)).toEqual([])
+
+    // 2. Direct native abort-allocated bridge verification.
+    const invokeAbortAllocated = async (
+      handle: FileHandle,
+      targetPath: string,
+    ): Promise<{ exitCode: number | null; reply: Buffer }> => {
+      const helper = spawn(bridgeExecutable, ['abort-allocated'], {
+        stdio: ['ignore', 'ignore', 'ignore', 'pipe', handle.fd],
+        shell: false,
+        windowsHide: true,
+      })
+      const pipe = helper.stdio[3]
+      if (!(pipe instanceof Duplex)) throw Error('Missing abort-allocated control pipe')
+      const chunks: Buffer[] = []
+      pipe.on('data', (chunk: Buffer) => chunks.push(chunk))
+      const payload = Buffer.alloc(4 + 58 + targetPath.length * 2)
+      let offset = 4
+      payload.writeUInt8(1, offset)
+      offset += 1
+      payload.writeUInt32LE(process.pid, offset)
+      offset += 4
+      for (let i = 0; i < 3; i++) {
+        payload.write(randomUUID().replaceAll('-', ''), offset, 16, 'hex')
+        offset += 16
+      }
+      payload.writeUInt32LE(targetPath.length, offset)
+      offset += 4
+      if (offset % 2) {
+        payload.writeUInt8(0, offset)
+        offset += 1
+      }
+      payload.write(targetPath, offset, targetPath.length * 2, 'utf16le')
+      offset += targetPath.length * 2
+      payload.writeUInt32LE(offset - 4, 0)
+      pipe.write(payload.subarray(0, offset))
+      const [exitCode] = await deadline(once(helper, 'close'))
+      const raw = Buffer.concat(chunks)
+      const reply = raw.length >= 4 ? raw.subarray(4, 4 + raw.readUInt32LE(0)) : Buffer.alloc(0)
+      return { exitCode: typeof exitCode === 'number' ? exitCode : null, reply }
+    }
+
+    // Valid zero-byte allocated receipt -> [17, 1], exit 0, disappears when handle closes.
+    const validPath = join(receipts, `${randomUUID()}.receipt`)
+    const validHandle = await open(validPath, 'wx+')
+    try {
+      const validResult = await invokeAbortAllocated(validHandle, validPath)
+      expect(validResult.exitCode).toBe(0)
+      expect([...validResult.reply]).toEqual([17, 1])
+    } finally {
+      await validHandle.close()
+    }
+    expect(await stat(validPath).catch(() => undefined)).toBeUndefined()
+
+    // Non-zero-byte receipt -> [17, 0], exit 1, file preserved.
+    const nonEmptyPath = join(receipts, `${randomUUID()}.receipt`)
+    const nonEmptyHandle = await open(nonEmptyPath, 'wx+')
+    try {
+      await nonEmptyHandle.writeFile('data')
+      const nonEmptyResult = await invokeAbortAllocated(nonEmptyHandle, nonEmptyPath)
+      expect(nonEmptyResult.exitCode).toBe(1)
+      expect([...nonEmptyResult.reply]).toEqual([17, 0])
+    } finally {
+      await nonEmptyHandle.close()
+    }
+    expect(await readFile(nonEmptyPath, 'utf8')).toBe('data')
+    await unlink(nonEmptyPath)
+
+    // Mismatched target path -> [17, 0], exit 1, neither file deleted.
+    const fileA = join(receipts, `${randomUUID()}.receipt`)
+    const fileB = join(receipts, `${randomUUID()}.receipt`)
+    const handleA = await open(fileA, 'wx+')
+    await writeFile(fileB, '')
+    try {
+      const mismatchResult = await invokeAbortAllocated(handleA, fileB)
+      expect(mismatchResult.exitCode).toBe(1)
+      expect([...mismatchResult.reply]).toEqual([17, 0])
+    } finally {
+      await handleA.close()
+    }
+    expect((await stat(fileA)).size).toBe(0)
+    expect((await stat(fileB)).size).toBe(0)
+    await unlink(fileA)
+    await unlink(fileB)
+
+    // Junction parent directory -> non-zero exit, target preserved.
+    const realDir = join(root, 'real-dir')
+    const junctionDir = join(root, 'junction-dir')
+    await mkdir(realDir)
+    await symlink(realDir, junctionDir, 'junction')
+    const targetName = `${randomUUID()}.receipt`
+    const realTarget = join(realDir, targetName)
+    const junctionTarget = join(junctionDir, targetName)
+    const realHandle = await open(realTarget, 'wx+')
+    try {
+      const junctionResult = await invokeAbortAllocated(realHandle, junctionTarget)
+      expect(junctionResult.exitCode).toBe(1)
+    } finally {
+      await realHandle.close()
+      await rm(junctionDir, { recursive: true, force: true })
+    }
+    expect((await stat(realTarget)).size).toBe(0)
+  })
+
+  it('notifies whenReleased() and frees working memory once after a tight close deadline converges late on Windows', async () => {
+    const root = await scratch(),
+      receipts = join(root, 'receipts'),
+      memory = new NativeWorkingMemory('business')
+    const owner = new OwnedProcessGroup({ windows: windows(receipts), memory })
+    const child = owner.spawn(process.execPath, [
+      '-e',
+      'console.log("ready");process.stdin.resume();process.stdin.once("end",()=>setTimeout(()=>process.exit(0),120))',
+    ])
+    child.stderr.resume()
+    const observer = vi.fn<() => void>()
+    owner.onReleased(observer)
+    try {
+      expect(await line(child)).toBe('ready')
+      const closing = owner.close(Date.now() + 10)
+      await expect(closing).rejects.toThrow(/Windows process ownership could not be confirmed/u)
+      expect(owner.released).toBe(false)
+      await deadline(owner.whenReleased(), 10_000)
+      expect(owner.released).toBe(true)
+      expect(owner.settledAfterCloseTimeout()).toBe(true)
+      expect(observer).toHaveBeenCalledOnce()
+      expect(memory.bytes).toBe(0)
+      expect(await readdir(receipts)).toEqual([])
+      expect(owner.close()).toBe(closing)
+    } finally {
+      await owner.whenReleased().catch(() => undefined)
     }
   })
 })

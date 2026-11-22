@@ -6,6 +6,8 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
+  type CollaborationAction,
+  collaborationActionSchema,
   conversationSendInputSchema,
   utilityRequestSchema,
   utilityResponseSchema,
@@ -13,13 +15,32 @@ import {
 
 const harness = vi.hoisted(() => {
   type Listener = (...args: unknown[]) => void
+  class FakePort {
+    readonly posted: unknown[] = []
+    closed = false
+    start(): void {}
+    postMessage(message: unknown): void {
+      this.posted.push(message)
+    }
+    close(): void {
+      this.closed = true
+    }
+  }
+  class FakeMessageChannelMain {
+    readonly port1 = new FakePort()
+    readonly port2 = new FakePort()
+  }
   class FakeUtilityProcess {
     readonly handlers = new Map<string, Listener[]>()
     readonly posted: unknown[] = []
+    readonly postedTransfers: Array<unknown[] | undefined> = []
+    readonly stdout = { resume: vi.fn<() => void>() }
+    readonly stderr = { resume: vi.fn<() => void>() }
     throwOnPost = false
     killed = false
     exitOnKill = true
     killCount = 0
+    pid = 60_000
 
     on(event: string, listener: Listener): this {
       const listeners = this.handlers.get(event) ?? []
@@ -28,9 +49,10 @@ const harness = vi.hoisted(() => {
       return this
     }
 
-    postMessage(message: unknown): void {
+    postMessage(message: unknown, transfer?: unknown[]): void {
       if (this.throwOnPost) throw new Error('post failed')
       this.posted.push(message)
+      this.postedTransfers.push(transfer)
     }
 
     removeListener(event: string, listener: Listener): this {
@@ -73,21 +95,24 @@ const harness = vi.hoisted(() => {
   }
 
   const children: InstanceType<typeof FakeUtilityProcess>[] = []
+  const forkPaths: string[] = []
   const storage = {
     isAsyncEncryptionAvailable: vi.fn<() => Promise<boolean>>(),
     encryptStringAsync: vi.fn<(key: string) => Promise<Buffer>>(),
     decryptStringAsync:
       vi.fn<(cipher: Buffer) => Promise<{ result: string; shouldReEncrypt: boolean }>>(),
   }
-  return { FakeUtilityProcess, children, storage }
+  return { FakePort, FakeMessageChannelMain, FakeUtilityProcess, children, forkPaths, storage }
 })
 
 vi.mock('electron', () => ({
   app: { isPackaged: false },
+  MessageChannelMain: harness.FakeMessageChannelMain,
   utilityProcess: {
-    fork: () => {
+    fork: (modulePath: string) => {
       const child = new harness.FakeUtilityProcess()
       harness.children.push(child)
+      harness.forkPaths.push(modulePath)
       return child
     },
   },
@@ -856,6 +881,38 @@ describe('UtilityProcessClient', () => {
     shutdownAck(child)
     await expect(shutdown).resolves.toEqual({ ok: true, value: { flushed: true } })
     expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('honors the full 4s flush window for a single shutdown IPC when Utility converges late on physical release, killing once after ACK', async () => {
+    vi.useFakeTimers()
+    try {
+      const runtime = createUtilityProcessClient()
+      runtime.start(startOptions)
+      const child = harness.children.at(-1)!
+      child.exitOnKill = false
+      const startedAt = Date.now()
+      const shutdown = runtime.shutdown()
+      expect(runtime.shutdown()).toBe(shutdown)
+      expect(child.posted).toHaveLength(1)
+      expect(child.posted[0]).toMatchObject({
+        type: 'runtime.shutdown.request',
+        flushDeadlineAt: startedAt + 4_000,
+      })
+      // Utility waits inside the same shutdown request for late physical process release up to 3.5s.
+      await vi.advanceTimersByTimeAsync(3_500)
+      expect(child.killed).toBe(false)
+      expect(child.posted).toHaveLength(1)
+      shutdownAck(child)
+      await turn()
+      expect(child.killed).toBe(true)
+      expect(child.killCount).toBe(1)
+      child.emit('exit', 0)
+      await expect(shutdown).resolves.toEqual({ ok: true, value: { flushed: true } })
+      expect(child.killCount).toBe(1)
+      expect(vi.getTimerCount()).toBe(0)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('dispose retains the child identity until physical exit and cannot release capacity early', async () => {
@@ -1890,7 +1947,7 @@ describe('Side-chat UtilityProcessClient RPCs', () => {
     },
     {
       name: 'syncSideChatToMain',
-      deadline: 27_000,
+      deadline: 55_000,
       code: 'UNCERTAIN',
       invoke: (client: ReturnType<typeof createUtilityProcessClient>) =>
         client.syncSideChatToMain({
@@ -1937,4 +1994,214 @@ describe('Side-chat UtilityProcessClient RPCs', () => {
       }
     },
   )
+})
+
+describe('Main isolated Antigravity storage child brokering', () => {
+  it('brokers agy-storage.open.request with dedicated MessagePorts, isolates Utility generations, and fences shutdown settlement until storage child exit', async () => {
+    vi.useFakeTimers()
+    const client = createUtilityProcessClient()
+    const traffic = new LogicalIpcWorkerTraffic(['main-utility', 'main-directory'], randomUUID())
+    try {
+      client.start({ ...startOptions, traffic })
+      const utilityGen1 = harness.children.at(-1)!
+      utilityGen1.emit('message', { type: 'runtime.ready.event' })
+
+      const jobKey1 = { version: 1 as const, generation: randomUUID(), requestId: randomUUID() }
+      const deadlineAt1 = Date.now() + 10_000
+      utilityGen1.emit('message', {
+        type: 'agy-storage.open.request',
+        jobKey: jobKey1,
+        action: 'inspect-agy-run',
+        deadlineAt: deadlineAt1,
+        workingBytes: 128 * 1024 * 1024,
+      })
+
+      const storageChild1 = harness.children.at(-1)!
+      expect(storageChild1).not.toBe(utilityGen1)
+      expect(harness.forkPaths.at(-1)).toMatch(/agy-storage-child\.js$/u)
+      storageChild1.exitOnKill = false
+      storageChild1.emit('spawn')
+
+      expect(storageChild1.posted[0]).toEqual({
+        type: 'init',
+        jobKey: jobKey1,
+        action: 'inspect-agy-run',
+        deadlineAt: deadlineAt1,
+      })
+      expect(storageChild1.postedTransfers[0]).toHaveLength(1)
+      expect(utilityGen1.posted.at(-1)).toEqual({
+        type: 'agy-storage.open.response',
+        ok: true,
+        jobKey: jobKey1,
+      })
+      expect(utilityGen1.postedTransfers.at(-1)).toHaveLength(1)
+
+      // Utility generation 1 crashes -> Main kills storageChild1 and starts Utility generation 2.
+      utilityGen1.emit('exit', 1)
+      expect(storageChild1.killed).toBe(true)
+
+      client.start({ ...startOptions, traffic })
+      const utilityGen2 = harness.children.at(-1)!
+      utilityGen2.emit('message', { type: 'runtime.ready.event' })
+
+      // Late exit from storageChild1 MUST NOT emit closed.event to utilityGen2.
+      const gen2PostedBefore = utilityGen2.posted.length
+      storageChild1.emit('exit', 0)
+      expect(utilityGen2.posted.length).toBe(gen2PostedBefore)
+
+      // Start a storage child in generation 2 that hangs during shutdown -> shutdown reports UNCERTAIN,
+      // and client.settlement() waits until the hung storage child confirms physical exit!
+      const jobKey2 = { version: 1 as const, generation: randomUUID(), requestId: randomUUID() }
+      utilityGen2.emit('message', {
+        type: 'agy-storage.open.request',
+        jobKey: jobKey2,
+        action: 'fork',
+        deadlineAt: Date.now() + 10_000,
+        workingBytes: 128 * 1024 * 1024,
+      })
+      const storageChild2 = harness.children.at(-1)!
+      storageChild2.exitOnKill = false
+      storageChild2.emit('spawn')
+
+      const shutdownPromise = client.shutdown()
+      const shutdownReq = utilityRequestSchema.parse(utilityGen2.posted.at(-1))
+      utilityGen2.emit(
+        'message',
+        utilityResponseSchema.parse({
+          type: 'runtime.shutdown.response',
+          requestId: shutdownReq.requestId,
+          result: { ok: true, value: { flushed: true } },
+        }),
+      )
+      await vi.advanceTimersByTimeAsync(5_000)
+      await expect(shutdownPromise).resolves.toMatchObject({
+        ok: false,
+        error: { code: 'UNCERTAIN' },
+      })
+
+      let settled = false
+      const settlementPromise = client.settlement().then(() => {
+        settled = true
+        return undefined
+      })
+      await Promise.resolve()
+      expect(settled).toBe(false)
+
+      storageChild2.emit('exit', 0)
+      await settlementPromise
+      expect(settled).toBe(true)
+    } finally {
+      client.dispose()
+      vi.useRealTimers()
+    }
+  })
+})
+
+describe('Collaboration action IPC timeout budgets', () => {
+  const expectedTimeouts: Record<CollaborationAction, number> = {
+    execute: 55_000,
+    review_plan: 55_000,
+    review_code: 55_000,
+    fix: 55_000,
+    resume: 55_000,
+    retry: 55_000,
+    recover_plan: 40_000,
+    swap_code_roles: 5_000,
+  }
+
+  it.each(
+    collaborationActionSchema.options.map((action) => ({
+      action,
+      deadline: expectedTimeouts[action],
+    })),
+  )(
+    'enforces $deadline ms IPC budget for collaboration action "$action"',
+    async ({ action, deadline }) => {
+      vi.useFakeTimers()
+      const client = createUtilityProcessClient()
+      try {
+        client.start(startOptions)
+        const child = harness.children.at(-1)!
+        child.emit('message', { type: 'runtime.ready.event' })
+        let settled = false
+        const operation = client
+          .actOnCollaboration({
+            sessionId: randomUUID(),
+            taskId: randomUUID(),
+            revision: 1,
+            action,
+            clientMessageId: randomUUID(),
+          })
+          .then((result) => {
+            settled = true
+            return result
+          })
+        await vi.advanceTimersByTimeAsync(deadline - 1)
+        expect(settled).toBe(false)
+        await vi.advanceTimersByTimeAsync(1)
+        expect(settled).toBe(true)
+        await expect(operation).resolves.toMatchObject({
+          ok: false,
+          error: {
+            code: 'UNCERTAIN',
+            message: 'Pact background service request timed out.',
+          },
+        })
+      } finally {
+        client.dispose()
+        vi.useRealTimers()
+      }
+    },
+  )
+})
+
+describe('Runtime preparation forceRefresh RPC contract', () => {
+  it('omits input when absent and forwards forceRefresh when requested', async () => {
+    const client = createUtilityProcessClient()
+    client.start(startOptions)
+    const child = harness.children.at(-1)!
+    child.emit('message', { type: 'runtime.ready.event' })
+    const checkedAt = new Date().toISOString()
+    const payload = {
+      firstUse: false,
+      agents: [
+        { agentId: 'claude' as const, state: 'ready' as const, checkedAt },
+        { agentId: 'codex' as const, state: 'ready' as const, checkedAt },
+      ],
+    }
+
+    try {
+      const defaultRead = client.getRuntimePreparation()
+      const req0 = utilityRequestSchema.parse(child.posted[0])
+      expect(req0).toMatchObject({ type: 'runtime-preparation.get.request' })
+      expect('input' in req0).toBe(false)
+      child.emit(
+        'message',
+        utilityResponseSchema.parse({
+          type: 'runtime-preparation.response',
+          requestId: req0.requestId,
+          result: { ok: true, value: payload },
+        }),
+      )
+      await expect(defaultRead).resolves.toEqual({ ok: true, value: payload })
+
+      const forcedRead = client.getRuntimePreparation({ forceRefresh: true })
+      const req1 = utilityRequestSchema.parse(child.posted[1])
+      expect(req1).toMatchObject({
+        type: 'runtime-preparation.get.request',
+        input: { forceRefresh: true },
+      })
+      child.emit(
+        'message',
+        utilityResponseSchema.parse({
+          type: 'runtime-preparation.response',
+          requestId: req1.requestId,
+          result: { ok: true, value: payload },
+        }),
+      )
+      await expect(forcedRead).resolves.toEqual({ ok: true, value: payload })
+    } finally {
+      client.dispose()
+    }
+  })
 })

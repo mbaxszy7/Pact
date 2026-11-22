@@ -8,8 +8,10 @@ import { afterEach, describe, expect, it } from 'vitest'
 import {
   advanceAutomaticCollaboration,
   advanceCollaboration,
+  COLLABORATION_PLAN_SYNC_FAILURE_NOTICE,
   collaborationActor,
   collaborationActionBasisSchema,
+  collaborationAvailableActions,
   collaborationDocumentSchema,
   CONVERSATION_PATCH_BYTES,
   conversationPatchSchema,
@@ -3667,4 +3669,645 @@ it('settles the original plan after a completed root was applied as a projection
   expect(f.repo.read(f.sessionId).runs).toHaveLength(1)
   f.repo.reconcileCompletedCollaboration(runId)
   expect(f.repo.collaboration(f.sessionId)).toEqual(settled)
+})
+
+describe('Round-4 High #9: open-mode recordWorkflowPlanUnavailable durability and settlement', () => {
+  it('records workflow.plan_unavailable idempotently on open-mode collaborate turns and fails/pauses without losing prior plan or code changes even when newer input is queued', async () => {
+    const f = await fixture()
+    f.finish()
+    f.finish(advance(f).id, { verdict: 'accepted' })
+    const initialImpl = advance(f, 'execute')
+    recordCodeChange(f, initialImpl.id, 'src/open-initial.ts')
+    f.finish(initialImpl.id, { answer: 'Initial open implementation.' })
+    const priorTask = f.repo.collaboration(f.sessionId)!
+    expect(priorTask.openMode).toBe(true)
+    const priorPlanReference = priorTask.planReference!
+    expect(priorPlanReference).toBeDefined()
+
+    f.receive(f.input('Update the implementation and publish a revised plan.'))
+    const colab = f.materialize().run
+    expect(colab.collaboration?.stage).toBe('collaborate')
+    recordCodeChange(f, colab.id, 'src/open-colab-change.ts')
+
+    // Queue a newer user input to ensure supersededInput does not mask plan capture failure.
+    f.receive(f.input('Follow-up question while collaborate turn is running.'))
+
+    // Idempotent calls before settlement record a single workflow.plan_unavailable fact.
+    f.repo.recordWorkflowPlanUnavailable(colab.id)
+    f.repo.recordWorkflowPlanUnavailable(colab.id)
+    const unavailableEvents = f.db.drizzle
+      .select()
+      .from(agentEventJournal)
+      .where(
+        and(
+          eq(agentEventJournal.runId, colab.id),
+          eq(agentEventJournal.eventType, 'workflow.plan_unavailable'),
+        ),
+      )
+      .all()
+    expect(unavailableEvents).toHaveLength(1)
+    expect(f.repo.workflowPlanCaptureFailed(colab.id)).toBe(true)
+
+    f.finish(colab.id, { answer: 'Updated code, but revised plan could not be finalized.' })
+    const settled = f.repo.collaboration(f.sessionId)!
+    expect(settled).toMatchObject({
+      openMode: true,
+      status: 'failed',
+      automation: 'paused',
+      pauseReason: 'failure',
+      notice:
+        'The latest plan has not been synced to Pact. Restore its saved native source before continuing.',
+      planReference: priorPlanReference,
+      codeRunId: colab.id,
+      lastCodeActor: colab.agentId,
+      unreviewedCodeActor: colab.agentId,
+    })
+  })
+
+  it('persists plan capture failure on open-mode work (implement) turns both before and after turn apply', async () => {
+    // Subcase A: recordWorkflowPlanUnavailable called before settlement on open-mode implement turn.
+    {
+      const f = await fixture()
+      f.finish()
+      f.finish(advance(f).id, { verdict: 'accepted' })
+      const priorPlanReference = f.repo.collaboration(f.sessionId)!.planReference!
+      const impl = advance(f, 'execute')
+      expect(impl.collaboration?.stage).toBe('implement')
+      recordCodeChange(f, impl.id, 'src/open-impl-unavail.ts')
+      f.repo.recordWorkflowPlanUnavailable(impl.id)
+      expect(f.repo.workflowPlanCaptureFailed(impl.id)).toBe(true)
+      f.finish(impl.id, { answer: 'Implemented changes, plan capture failed.' })
+      expect(f.repo.collaboration(f.sessionId)).toMatchObject({
+        openMode: true,
+        status: 'failed',
+        automation: 'paused',
+        pauseReason: 'failure',
+        notice:
+          'The latest plan has not been synced to Pact. Restore its saved native source before continuing.',
+        planReference: priorPlanReference,
+        codeRunId: impl.id,
+        lastCodeActor: impl.agentId,
+      })
+    }
+
+    // Subcase B: late recordWorkflowPlanUnavailable after an open-mode work turn was already applied.
+    {
+      const f = await fixture()
+      f.finish()
+      f.finish(advance(f).id, { verdict: 'accepted' })
+      const priorPlanReference = f.repo.collaboration(f.sessionId)!.planReference!
+      const impl = advance(f, 'execute')
+      recordCodeChange(f, impl.id, 'src/open-impl-late.ts')
+      f.finish(impl.id, { answer: 'Implemented changes.' })
+      expect(f.repo.collaboration(f.sessionId)?.status).toBe('waiting')
+
+      f.repo.recordWorkflowPlanUnavailable(impl.id)
+      const afterLate = f.repo.collaboration(f.sessionId)!
+      expect(afterLate).toMatchObject({
+        openMode: true,
+        status: 'failed',
+        automation: 'paused',
+        pauseReason: 'failure',
+        notice:
+          'The latest plan has not been synced to Pact. Restore its saved native source before continuing.',
+        planReference: priorPlanReference,
+        codeRunId: impl.id,
+      })
+      // Repeating late call is idempotent.
+      f.repo.recordWorkflowPlanUnavailable(impl.id)
+      expect(f.repo.collaboration(f.sessionId)).toEqual(afterLate)
+    }
+  })
+})
+
+async function openDiskFixture(roles?: Parameters<typeof fixture>[2]) {
+  const dir = await mkdtemp(join(tmpdir(), 'pact-open-plan-'))
+  directories.push(dir)
+  const filePath = join(dir, 'pact.sqlite')
+  const f = await fixture(filePath, undefined, roles)
+  return { ...f, filePath }
+}
+
+async function reopenDiskFixture(filePath: string) {
+  const db = await PactDatabase.open({
+    filePath,
+    migrationsFolder: resolve(import.meta.dirname, '../drizzle'),
+  })
+  databases.push(db)
+  return db
+}
+
+function recordUnansweredNativeForm(
+  f: Awaited<ReturnType<typeof fixture>>,
+  runId: string,
+  permissionId = randomUUID(),
+) {
+  const createdAt = new Date().toISOString()
+  appendAgentEvent(f.db.drizzle, {
+    sessionId: f.sessionId,
+    runId,
+    eventType: 'native.permission_requested',
+    payload: JSON.stringify({
+      requests: [
+        {
+          id: permissionId,
+          kind: 'questions',
+          title: 'Confirm deployment option',
+          detail: 'Select one option before applying.',
+          createdAt,
+        },
+      ],
+    }),
+    createdAt,
+  })
+}
+
+const openPlanFailureMatrix = [false, true].flatMap((hasDecision) =>
+  [false, true].flatMap((hasCodeChanges) =>
+    [false, true].flatMap((unknownEffectsReported) =>
+      (['pre_apply', 'post_apply'] as const).map((timing) => ({
+        hasDecision,
+        hasCodeChanges,
+        unknownEffectsReported,
+        timing,
+      })),
+    ),
+  ),
+)
+
+describe('Open-mode plan publish intent, recovery, failure matrix, legacy repair, and query plans (on-disk SQLite)', () => {
+  it.each(openPlanFailureMatrix)(
+    'persists matrix case decision=$hasDecision code=$hasCodeChanges unknownEffects=$unknownEffectsReported timing=$timing across SQLite reopen',
+    async ({ hasDecision, hasCodeChanges, unknownEffectsReported, timing }) => {
+      const f = await openDiskFixture({ primary: 'codex', split: true })
+      f.finish()
+      f.finish(advance(f).id, { verdict: 'accepted' })
+      const initialImpl = advance(f, 'execute')
+      expect(initialImpl.agentId).toBe('claude') // distinct from planAuthor ('codex')
+      f.finish(initialImpl.id, { answer: 'Initial open implementation.' })
+      const priorPlanReference = f.repo.collaboration(f.sessionId)!.planReference!
+
+      f.receive(f.input('Iterate in open collaborate mode.'))
+      const colab = f.materialize().run
+      expect(colab.collaboration?.stage).toBe('collaborate')
+      expect(colab.agentId).toBe('claude')
+
+      if (hasCodeChanges) recordCodeChange(f, colab.id, 'src/matrix.ts')
+      if (hasDecision) recordUnansweredNativeForm(f, colab.id)
+      if (unknownEffectsReported) f.repo.recordNativeEffects(colab.id, 'unknown', 'queue_full')
+
+      if (timing === 'pre_apply') {
+        f.repo.recordWorkflowPlanUnavailable(colab.id)
+        // Duplicate pre-apply delivery is idempotent.
+        f.repo.recordWorkflowPlanUnavailable(colab.id)
+      }
+
+      f.finish(colab.id, { answer: 'Collaborate turn answer.' }, !unknownEffectsReported)
+      expect(f.repo.workflowPlanCaptureFailed(colab.id)).toBe(timing === 'pre_apply')
+
+      let revisionAfterFirstLate: number | undefined
+      if (unknownEffectsReported) {
+        if (timing === 'post_apply') {
+          f.repo.recordWorkflowPlanUnavailable(colab.id)
+          f.repo.recordWorkflowPlanUnavailable(colab.id)
+        }
+        // Once effects later settle, reconciliation applies the turn with all facts intact.
+        f.repo.recordNativeEffects(colab.id, 'settled')
+        f.repo.reconcileCompletedCollaboration(colab.id)
+      } else if (timing === 'post_apply') {
+        f.repo.recordWorkflowPlanUnavailable(colab.id)
+        revisionAfterFirstLate = f.repo.collaboration(f.sessionId)!.revision
+        // Duplicate post-apply delivery must NOT bump revision or duplicate journal facts.
+        f.repo.recordWorkflowPlanUnavailable(colab.id)
+      }
+      expect(f.repo.workflowPlanCaptureFailed(colab.id)).toBe(true)
+
+      const expectedStatus = hasDecision ? 'questions' : 'failed'
+      const expectedSnapshot = {
+        openMode: true,
+        status: expectedStatus,
+        automation: 'paused',
+        pauseReason: 'failure',
+        notice: COLLABORATION_PLAN_SYNC_FAILURE_NOTICE,
+        planVersion: priorPlanReference.version,
+        planReference: priorPlanReference,
+        ...(hasCodeChanges
+          ? {
+              codeRunId: colab.id,
+              lastCodeActor: 'claude',
+              unreviewedCodeActor: 'claude',
+            }
+          : {}),
+      }
+
+      const activeBeforeReopen = f.repo.collaboration(f.sessionId)!
+      expect(activeBeforeReopen).toMatchObject(expectedSnapshot)
+      expect(activeBeforeReopen.revision).toBe(
+        revisionAfterFirstLate ?? activeBeforeReopen.revision,
+      )
+      expect(activeBeforeReopen.inputProcessing?.decision?.runId).toBe(
+        hasDecision ? colab.id : undefined,
+      )
+
+      // Journal contains exactly one workflow.plan_unavailable fact for this run.
+      const journalRows = f.db.drizzle
+        .select()
+        .from(agentEventJournal)
+        .where(
+          and(
+            eq(agentEventJournal.runId, colab.id),
+            eq(agentEventJournal.eventType, 'workflow.plan_unavailable'),
+          ),
+        )
+        .all()
+      expect(journalRows).toHaveLength(1)
+
+      // workflowTurns.stateJson matches the failed/questions projection in the same transaction.
+      const turnRow = f.db.drizzle
+        .select()
+        .from(workflowTurns)
+        .where(eq(workflowTurns.runId, colab.id))
+        .get()!
+      expect(turnRow.applied).toBe(true)
+      expect(JSON.parse(turnRow.stateJson)).toMatchObject({
+        status: expectedStatus,
+        automation: 'paused',
+        pauseReason: 'failure',
+        notice: COLLABORATION_PLAN_SYNC_FAILURE_NOTICE,
+      })
+
+      // Recovery state decouples recoveryRequired from canRecoverNow when decision is unanswered.
+      const recoveryState = f.repo.workflowPlanRecoveryState(colab.id)
+      expect(recoveryState).toEqual({
+        recoveryRequired: true,
+        canRecoverNow: !hasDecision,
+        actor: 'claude',
+        kind: 'plan',
+        retainedVersion: priorPlanReference.version,
+      })
+      expect(f.repo.needsWorkflowPlanRecovery(colab.id)).toBe(!hasDecision)
+
+      // Close and reopen on-disk SQLite to prove durable persistence.
+      f.db.close()
+      const reopened = await reopenDiskFixture(f.filePath)
+      const persisted = reopened.conversationRepository.collaboration(f.sessionId)!
+      expect(persisted).toEqual(activeBeforeReopen)
+      expect(reopened.conversationRepository.workflowPlanRecoveryState(colab.id)).toEqual(
+        recoveryState,
+      )
+      expect(reopened.conversationRepository.needsWorkflowPlanRecovery(colab.id)).toBe(!hasDecision)
+    },
+  )
+
+  it('persists open-mode publish_intent without advancing planVersion, survives reopen, and clears failure state upon recovery even when actor !== Phase-1 planAuthor', async () => {
+    const f = await openDiskFixture({ primary: 'codex', split: true })
+    f.finish()
+    f.finish(advance(f).id, { verdict: 'accepted' })
+    const initialImpl = advance(f, 'execute')
+    expect(initialImpl.agentId).toBe('claude')
+    f.finish(initialImpl.id, { answer: 'Initial open implementation.' })
+    const priorPlan = f.repo.collaboration(f.sessionId)!.planReference!
+
+    f.receive(f.input('Refactor module and publish updated plan.'))
+    const colab = f.materialize().run
+    expect(colab.agentId).toBe('claude') // Phase-1 planAuthor is 'codex', open publisher is 'claude'
+    recordCodeChange(f, colab.id, 'src/open-intent.ts')
+
+    const candidateMarkdown = '# Updated Open Plan\n\n- Step 1: Isolate storage\n- Step 2: Verify'
+    const firstIntent = f.repo.recordOpenPlanFinalIntent(colab.id, {
+      executionId: 'exec-open-42',
+      callKey: 'publish-call-1',
+      progressToken: 'prog-tok-1',
+      candidateMarkdown,
+    })
+    expect(firstIntent).toBeDefined()
+    expect(firstIntent!.actor).toBe('claude')
+    expect(firstIntent!.document.bytes).toBe(Buffer.byteLength(candidateMarkdown))
+    // Intent MUST NOT advance planVersion or planReference.
+    expect(f.repo.collaboration(f.sessionId)?.planVersion).toBe(priorPlan.version)
+    expect(f.repo.collaboration(f.sessionId)?.planReference).toEqual(priorPlan)
+
+    // Idempotent per (runId, callKey).
+    const duplicateIntent = f.repo.recordOpenPlanFinalIntent(colab.id, {
+      executionId: 'exec-open-42',
+      callKey: 'publish-call-1',
+      progressToken: 'prog-tok-1',
+      candidateMarkdown,
+    })
+    expect(duplicateIntent).toEqual(firstIntent)
+    expect(f.repo.workflowOpenPlanPublishIntents(colab.id)).toHaveLength(1)
+
+    // Conflicting body for same callKey is rejected.
+    expect(() =>
+      f.repo.recordOpenPlanFinalIntent(colab.id, {
+        executionId: 'exec-open-42',
+        callKey: 'publish-call-1',
+        progressToken: 'prog-tok-1',
+        candidateMarkdown: '# Different conflicting plan',
+      }),
+    ).toThrow(/Conflicting open-mode plan publish intent/)
+
+    // Simulate crash/failure before ACP tool_call completion confirms the plan.
+    f.repo.recordWorkflowPlanUnavailable(colab.id)
+    f.finish(colab.id, { answer: 'Code updated; plan finalization interrupted.' })
+    expect(f.repo.collaboration(f.sessionId)).toMatchObject({
+      status: 'failed',
+      automation: 'paused',
+      pauseReason: 'failure',
+      notice: COLLABORATION_PLAN_SYNC_FAILURE_NOTICE,
+      planVersion: 1,
+      planReference: priorPlan,
+      codeRunId: colab.id,
+      lastCodeActor: 'claude',
+      unreviewedCodeActor: 'claude',
+    })
+    expect(f.repo.needsWorkflowPlanRecovery(colab.id)).toBe(true)
+
+    // Cold restart: close and reopen SQLite from disk.
+    f.db.close()
+    const reopened = await reopenDiskFixture(f.filePath)
+    const repo2 = reopened.conversationRepository
+    const intents = repo2.workflowOpenPlanPublishIntents(colab.id)
+    expect(intents).toEqual([firstIntent])
+    const recoveredBody = repo2.readOpenPlanPublishIntentText(colab.id, intents[0]!.callKey)!
+    expect(recoveredBody).toBe(candidateMarkdown)
+    expect(repo2.needsWorkflowPlanRecovery(colab.id)).toBe(true)
+
+    // Cold recovery promotes the verified candidate and reconciles the applied turn.
+    repo2.recordWorkflowPlan(colab.id, {
+      nativeId: `intent:${intents[0]!.callKey}`,
+      text: recoveredBody,
+    })
+    const patch = repo2.reconcileCompletedCollaboration(colab.id)
+    expect(patch).toBeDefined()
+
+    const recoveredTask = repo2.collaboration(f.sessionId)!
+    expect(recoveredTask).toMatchObject({
+      openMode: true,
+      status: 'waiting',
+      automation: 'active',
+      planVersion: 2,
+      planAuthor: 'claude',
+      unreviewedPlanActor: 'claude',
+      unreviewedCodeActor: 'claude',
+      codeRunId: colab.id,
+      lastCodeActor: 'claude',
+    })
+    expect(recoveredTask.pauseReason).toBeUndefined()
+    expect(recoveredTask.notice).toBeUndefined()
+    expect(recoveredTask.nextStage).toBeUndefined()
+    expect(repo2.workflowPlanSettled(colab.id)).toBe(true)
+    expect(repo2.needsWorkflowPlanRecovery(colab.id)).toBe(false)
+    expect(repo2.workflowPlanRecoveryState(colab.id)).toBeUndefined()
+    expect(collaborationAvailableActions(recoveredTask)).toEqual(['review_plan', 'review_code'])
+
+    // Historical turn snapshot was also updated in the same transaction.
+    const historicalRecovered = repo2.collaboration(f.sessionId, colab.id)!
+    expect(historicalRecovered).toMatchObject({
+      status: 'waiting',
+      automation: 'active',
+      planVersion: 2,
+      unreviewedPlanActor: 'claude',
+    })
+    expect(historicalRecovered.pauseReason).toBeUndefined()
+    expect(historicalRecovered.notice).toBeUndefined()
+  })
+
+  it('rejects superseded Run mutations while updating historical Run snapshot and repairs legacy Journal-failed/Turn-waiting rows on bounded read and reconcile', async () => {
+    const f = await openDiskFixture({ primary: 'codex', split: true })
+    f.finish()
+    f.finish(advance(f).id, { verdict: 'accepted' })
+    const impl1 = advance(f, 'execute')
+    f.finish(impl1.id, { answer: 'First open implementation.' })
+
+    // Start a second open turn so impl1 is superseded as the active Run.
+    f.receive(f.input('Follow-up open request.'))
+    const colab2 = f.materialize().run
+    f.finish(colab2.id, { answer: 'Second open turn finished.' })
+    const activeAfterColab2 = f.repo.collaboration(f.sessionId)!
+    expect(activeAfterColab2.runId).toBe(colab2.id)
+    expect(activeAfterColab2.status).toBe('waiting')
+
+    // Late plan unavailable on superseded impl1 MUST NOT mutate colab2's active task,
+    // but MUST update impl1's own historical workflowTurns.stateJson.
+    f.repo.recordWorkflowPlanUnavailable(impl1.id)
+    expect(f.repo.collaboration(f.sessionId)).toEqual(activeAfterColab2)
+    expect(f.repo.collaboration(f.sessionId, impl1.id)).toMatchObject({
+      status: 'failed',
+      automation: 'paused',
+      pauseReason: 'failure',
+      notice: COLLABORATION_PLAN_SYNC_FAILURE_NOTICE,
+    })
+
+    // Attempting to recover superseded impl1 MUST NOT mutate colab2's active task.
+    f.repo.recordWorkflowPlan(impl1.id, { nativeId: 'late-superseded-plan', text: '# Stale' })
+    f.repo.reconcileCompletedCollaboration(impl1.id)
+    expect(f.repo.collaboration(f.sessionId)).toEqual(activeAfterColab2)
+    expect(f.repo.workflowPlanSettled(impl1.id)).toBe(false)
+
+    // Legacy read-repair & reconcile: simulate an older DB where colab2 has Journal
+    // workflow.plan_unavailable while workflowTurns.stateJson and active task stayed 'waiting'.
+    appendAgentEvent(f.db.drizzle, {
+      sessionId: f.sessionId,
+      runId: colab2.id,
+      eventType: 'workflow.plan_unavailable',
+      payload: JSON.stringify({ reason: 'Legacy unavailable plan.' }),
+      createdAt: new Date().toISOString(),
+    })
+    const activeBeforeReconcile = f.repo.collaboration(f.sessionId)!
+    expect(activeBeforeReconcile.status).toBe('waiting')
+    // Calling reconcileCompletedCollaboration repairs both active task and workflowTurns.stateJson.
+    const repairedPatch = f.repo.reconcileCompletedCollaboration(colab2.id)
+    expect(repairedPatch).toBeDefined()
+    expect(f.repo.collaboration(f.sessionId)).toMatchObject({
+      runId: colab2.id,
+      status: 'failed',
+      automation: 'paused',
+      pauseReason: 'failure',
+      notice: COLLABORATION_PLAN_SYNC_FAILURE_NOTICE,
+    })
+
+    // Also verify bounded read projection on a legacy historical Turn row whose stateJson is still 'waiting'.
+    f.receive(f.input('Third open turn.'))
+    const colab3 = f.materialize().run
+    f.finish(colab3.id, { answer: 'Third turn done.' })
+    const waitingState = JSON.stringify({
+      ...JSON.parse(
+        f.db.drizzle
+          .select({ state: workflowTurns.stateJson })
+          .from(workflowTurns)
+          .where(eq(workflowTurns.runId, colab2.id))
+          .get()!.state,
+      ),
+      status: 'waiting',
+      automation: 'active',
+      pauseReason: undefined,
+      notice: undefined,
+    })
+    f.db.drizzle
+      .update(workflowTurns)
+      .set({ stateJson: waitingState })
+      .where(eq(workflowTurns.runId, colab2.id))
+      .run()
+    expect(f.repo.collaboration(f.sessionId, colab2.id)).toMatchObject({
+      status: 'failed',
+      automation: 'paused',
+      pauseReason: 'failure',
+      notice: COLLABORATION_PLAN_SYNC_FAILURE_NOTICE,
+    })
+  })
+
+  it('uses indexed EXPLAIN QUERY PLAN for workflow.plan_publish_intent and workflow.plan_unavailable lookups', async () => {
+    const f = await openDiskFixture({ primary: 'codex', split: true })
+    const intentPlan = f.db.drizzle.all<{ detail: string }>(
+      sql`EXPLAIN QUERY PLAN
+          SELECT payload FROM agent_event_journal
+          WHERE run_id = ${f.first.run.id} AND event_type = 'workflow.plan_publish_intent'
+          ORDER BY sequence ASC
+          LIMIT 32`,
+    )
+    expect(
+      intentPlan.some((row) =>
+        /USING (?:COVERING )?INDEX agent_event_journal_run_type_sequence/u.test(row.detail),
+      ),
+    ).toBe(true)
+    expect(intentPlan.some((row) => row.detail.includes('SCAN agent_event_journal'))).toBe(false)
+
+    const unavailablePlan = f.db.drizzle.all<{ detail: string }>(
+      sql`EXPLAIN QUERY PLAN
+          SELECT event_type FROM agent_event_journal
+          WHERE run_id = ${f.first.run.id}
+            AND event_type IN ('workflow.plan_observed', 'workflow.plan_unavailable', 'workflow.plan_retained')
+          ORDER BY sequence DESC
+          LIMIT 1`,
+    )
+    expect(
+      unavailablePlan.some((row) =>
+        /USING (?:COVERING )?INDEX agent_event_journal_run_type_sequence/u.test(row.detail),
+      ),
+    ).toBe(true)
+    expect(unavailablePlan.some((row) => row.detail.includes('SCAN agent_event_journal'))).toBe(
+      false,
+    )
+  })
+
+  it('preserves explicit user pause across late Plan-unavailable and Open Mode Plan recovery, and persists nativePlanId separately from callKey', async () => {
+    const f = await openDiskFixture({ primary: 'codex', split: true })
+    f.finish(f.first.run.id, { plan: '# Initial Plan\nStep 1' })
+    f.finish(advance(f).id, { verdict: 'accepted' })
+    const impl = advance(f, 'execute')
+    f.finish(impl.id, { answer: 'Implemented.' })
+
+    // Open Mode collaborate turn where intent records canonical nativePlanId separately from callKey.
+    f.receive(f.input('Update plan and keep collaborating.'))
+    const openRun = f.materialize().run
+    const recorded = f.repo.recordOpenPlanFinalIntent(openRun.id, {
+      executionId: 'exec-open-pause',
+      callKey: 'call:tc-open-pause',
+      progressToken: 'traj-pause:9',
+      nativePlanId: 'native-sess-pause:tc-open-pause',
+      candidateMarkdown: '# Updated Open Plan\nPreserves user pause.',
+    })
+    expect(recorded).toMatchObject({
+      callKey: 'call:tc-open-pause',
+      progressToken: 'traj-pause:9',
+      nativePlanId: 'native-sess-pause:tc-open-pause',
+    })
+    expect(f.repo.workflowOpenPlanPublishIntents(openRun.id)).toEqual([
+      expect.objectContaining({
+        callKey: 'call:tc-open-pause',
+        nativePlanId: 'native-sess-pause:tc-open-pause',
+      }),
+    ])
+
+    f.finish(openRun.id, { answer: 'Done.' })
+
+    // Explicitly pause the task as the user before late Plan-unavailable arrives.
+    f.repo.pauseCollaboration(f.sessionId, 'user')
+    expect(f.repo.collaboration(f.sessionId)).toMatchObject({
+      automation: 'paused',
+      pauseReason: 'user',
+    })
+
+    // Late recordWorkflowPlanUnavailable MUST preserve pauseReason: 'user' and MUST NOT set planSyncPaused.
+    f.repo.recordWorkflowPlanUnavailable(openRun.id)
+    const failedTask = f.repo.collaboration(f.sessionId)
+    expect(failedTask).toMatchObject({
+      status: 'failed',
+      automation: 'paused',
+      pauseReason: 'user',
+      notice: COLLABORATION_PLAN_SYNC_FAILURE_NOTICE,
+    })
+    expect(failedTask?.planSyncPaused).toBeUndefined()
+
+    // Recovering the Plan clears failure status & notice, while keeping the user's explicit pause intact!
+    f.repo.recordWorkflowPlan(openRun.id, {
+      nativeId: 'native-sess-pause:tc-open-pause',
+      text: '# Updated Open Plan\nPreserves user pause.',
+    })
+    f.repo.reconcileCompletedCollaboration(openRun.id)
+    const recoveredTask = f.repo.collaboration(f.sessionId)
+    expect(recoveredTask).toMatchObject({
+      status: 'waiting',
+      automation: 'paused',
+      pauseReason: 'user',
+    })
+    expect(recoveredTask?.planSyncPaused).toBeUndefined()
+    expect(recoveredTask?.notice).toBeUndefined()
+  })
+
+  it('Wave 6: preserves explicit Stop pause persisted while an Open Mode run drains through Plan capture failure and Recover Plan', async () => {
+    const f = await openDiskFixture({ primary: 'codex', split: true })
+    f.finish(f.first.run.id, { plan: '# Initial Plan\nStep 1' })
+    f.finish(advance(f).id, { verdict: 'accepted' })
+    const impl = advance(f, 'execute')
+    f.finish(impl.id, { answer: 'Implemented.' })
+
+    // Start an Open Mode collaborate run.
+    f.receive(f.input('Revise plan while running.'))
+    const openRun = f.materialize().run
+    f.repo.recordOpenPlanFinalIntent(openRun.id, {
+      executionId: 'exec-stop-drain',
+      callKey: 'call:tc-stop-drain',
+      progressToken: 'traj-stop:11',
+      nativePlanId: 'native-sess-stop:tc-stop-drain',
+      candidateMarkdown: '# Revised Plan\nStop pause must survive.',
+    })
+
+    // User clicks Stop while the Open Mode run is STILL draining -> pauseReason: 'stopped' persisted before run completes!
+    f.repo.pauseCollaboration(f.sessionId, 'stopped')
+    expect(f.repo.collaboration(f.sessionId)).toMatchObject({
+      status: 'running',
+      automation: 'paused',
+      pauseReason: 'stopped',
+    })
+
+    // The draining run completes natively with Plan unavailable (`planCaptureFailed: true`).
+    f.repo.recordWorkflowPlanUnavailable(openRun.id)
+    f.finish(openRun.id, { answer: 'Finished while draining.' })
+
+    const failedAfterDrain = f.repo.collaboration(f.sessionId)
+    expect(failedAfterDrain).toMatchObject({
+      status: 'failed',
+      automation: 'paused',
+      pauseReason: 'stopped',
+      notice: COLLABORATION_PLAN_SYNC_FAILURE_NOTICE,
+    })
+    expect(failedAfterDrain?.planSyncPaused).toBeUndefined()
+
+    // Recover Plan clears failure notice and returns to waiting, while strictly preserving `pauseReason: 'stopped'`!
+    f.repo.recordWorkflowPlan(openRun.id, {
+      nativeId: 'native-sess-stop:tc-stop-drain',
+      text: '# Revised Plan\nStop pause must survive.',
+    })
+    f.repo.reconcileCompletedCollaboration(openRun.id)
+    const recoveredAfterStop = f.repo.collaboration(f.sessionId)
+    expect(recoveredAfterStop).toMatchObject({
+      status: 'waiting',
+      automation: 'paused',
+      pauseReason: 'stopped',
+    })
+    expect(recoveredAfterStop?.planSyncPaused).toBeUndefined()
+    expect(recoveredAfterStop?.notice).toBeUndefined()
+  })
 })

@@ -2,6 +2,15 @@ import { z } from 'zod'
 
 export const PROJECT_FILE_PREVIEW_BYTES = 1024 * 1024
 export const PROJECT_FILE_PREVIEW_TIMEOUT_MS = 5_000
+export const MAX_DIRECTORY_DEPTH = 128
+export const MAX_DIRECTORY_REQUEST_BYTES = 64 * 1024
+
+export const directoryIdentitySchema = z.strictObject({
+  path: z.string().min(1).max(4096),
+  device: z.string().regex(/^\d{1,40}$/u),
+  inode: z.string().regex(/^\d{1,40}$/u),
+})
+export type DirectoryIdentity = z.infer<typeof directoryIdentitySchema>
 
 const component = z
   .string()
@@ -17,11 +26,11 @@ const component = z
     'Invalid file-name component.',
   )
 const directoryFileMutationInputSchema = z.strictObject({
-  operation: z.enum(['capture', 'stash', 'install', 'absent']),
+  operation: z.enum(['capture', 'stash', 'install', 'absent', 'mkdir_parents', 'inspect_parents']),
   rootPath: z.string().min(1).max(4096),
   rootDevice: z.string().regex(/^\d{1,40}$/u),
   rootInode: z.string().regex(/^\d{1,40}$/u),
-  directories: z.array(component).max(128),
+  directories: z.array(component).max(MAX_DIRECTORY_DEPTH),
   name: component,
   auxiliaryPath: z.string().min(1).max(4096).optional(),
   /** Only a durable Pact intent may identify this private installation candidate. */
@@ -32,6 +41,16 @@ const directoryFileMutationInputSchema = z.strictObject({
     .positive()
     .max(64 * 1024 * 1024)
     .optional(),
+})
+const directoryFileRemoveDirInputSchema = z.strictObject({
+  operation: z.literal('rmdir_verified'),
+  rootPath: z.string().min(1).max(4096),
+  rootDevice: z.string().regex(/^\d{1,40}$/u),
+  rootInode: z.string().regex(/^\d{1,40}$/u),
+  directories: z.array(component).max(MAX_DIRECTORY_DEPTH - 1),
+  name: component,
+  expectedDevice: z.string().regex(/^\d{1,40}$/u),
+  expectedInode: z.string().regex(/^\d{1,40}$/u),
 })
 const previewComponent = z
   .string()
@@ -46,12 +65,13 @@ const directoryFilePreviewInputSchema = z.strictObject({
   rootPath: z.string().min(1).max(4096),
   rootDevice: z.string().regex(/^\d{1,40}$/u),
   rootInode: z.string().regex(/^\d{1,40}$/u),
-  directories: z.array(previewComponent).max(128),
+  directories: z.array(previewComponent).max(MAX_DIRECTORY_DEPTH),
   name: previewComponent,
   deadlineAt: z.number().int().positive(),
 })
 export const directoryFileOperationInputSchema = z.discriminatedUnion('operation', [
   directoryFileMutationInputSchema,
+  directoryFileRemoveDirInputSchema,
   directoryFilePreviewInputSchema,
 ])
 export type DirectoryFileOperationInput = z.infer<typeof directoryFileOperationInputSchema>
@@ -74,6 +94,8 @@ export const directoryFileOperationResultSchema = z.discriminatedUnion('ok', [
       .string()
       .regex(/^\d{1,40}$/u)
       .optional(),
+    parentDirs: z.array(directoryIdentitySchema).max(MAX_DIRECTORY_DEPTH).optional(),
+    missingDirs: z.array(z.string().min(1).max(4096)).max(MAX_DIRECTORY_DEPTH).optional(),
     preview: z
       .strictObject({
         content: z.string().max(PROJECT_FILE_PREVIEW_BYTES),

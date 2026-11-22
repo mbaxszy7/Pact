@@ -1,7 +1,5 @@
 import type { ModelInfo } from '@anthropic-ai/claude-agent-sdk'
 
-import { rm } from 'node:fs/promises'
-
 import type {
   AgentModelCatalog,
   AgentModelOption,
@@ -21,21 +19,32 @@ import { DefaultSessionSettingsRepository } from '@pact/persistence'
 import { recordDiagnostic } from '../../diagnostics/utility-log'
 import { runClaudeInfoProbe, runCodexInfoProbe } from '../native-info-probe'
 import { OwnedProcessGroup, OwnedProcessIdentityError } from '../owned-process-group'
-import { isAgyProbeSettled, runAgyAcpProbe } from '../runtime-preparation/agy-acp-probe'
 import {
+  AgyProbeError,
+  isAgyProbeSettled,
+  reconcileSettledAgyProbeArtifact,
+  removeDirConfirmed,
+  runAgyAcpProbe,
+  type AgyAcpRpcTransport,
+  type UnconfirmedAgyProbeArtifact,
+} from '../runtime-preparation/agy-acp-probe'
+import {
+  type AgyReadinessSessionHook,
   runtimeAgentDisplayName,
   RuntimePreparation,
 } from '../runtime-preparation/runtime-preparation'
 
 const ALL_RUNTIME_AGENTS: readonly RuntimeAgentId[] = ['claude', 'codex', 'agy']
-const CATALOG_TIMEOUT_MS = 15_000
+const CATALOG_TIMEOUT_MS = 18_000
+const AGY_CATALOG_TIMEOUT_MS = 24_000
 const MAX_CODEX_MESSAGE_BYTES = 1024 * 1024
 const MAX_AGY_FRAME_BYTES = 256 * 1024
 const MAX_AGY_TOTAL_BYTES = 2 * 1024 * 1024
 const MAX_DISCOVERED_MODELS = 200
 const MAX_DISCOVERED_CATALOG_BYTES = 256 * 1024
-const OPERATION_TIMEOUT_MS = 24_000
+const OPERATION_TIMEOUT_MS = 42_000
 const CLEANUP_RESERVE_MS = 4_000
+const MAX_UNCONFIRMED_AGY_PROBE_DIRS = 16
 
 export interface ActiveAgentPair {
   readonly primaryAgentId: RuntimeAgentId
@@ -115,12 +124,18 @@ export class DefaultSessionSettings {
   private readonly operations = new Set<CatalogOperation>()
   private readonly activeScopeStates = new Map<string, ScopedCatalogState>()
   private readonly probes = new Set<OwnedProcessGroup>()
-  private readonly unconfirmedAgyDirs = new Map<OwnedProcessGroup, string>()
+  private readonly unconfirmedAgyArtifacts = new Map<
+    OwnedProcessGroup,
+    UnconfirmedAgyProbeArtifact
+  >()
+  private readonly pendingArtifactCleanups = new Set<Promise<unknown>>()
+  private readonly unconfirmedAgyProbeDirs = new Set<string>()
   private readonly catalogReads = new Map<string, InFlightCatalogRead>()
   private readonly completedCatalogs = new Map<string, CachedEditorStateEntry>()
   private nextSubscriberSeq = 1
   private disposed = false
   private disposal: Promise<void> | undefined
+  private disposeFlushDeadlineAt: number | undefined
 
   constructor(
     private readonly runtimePreparation: RuntimePreparation,
@@ -215,15 +230,50 @@ export class DefaultSessionSettings {
       }
     }
     try {
+      const saveDeadlineAt = Date.now() + OPERATION_TIMEOUT_MS
       const pair: ActiveAgentPair = {
         primaryAgentId: input.settings.primaryAgentId,
         secondaryAgentId: input.settings.secondaryAgentId,
       }
       const { editorState, preparation } = await this.collectEditorState(process.cwd(), pair, {
         allowCache: false,
+        deadlineAt: saveDeadlineAt,
       })
+      let readinessForValidation = preparation
+      if (
+        preparation.firstUse &&
+        preparation.agents.length < 3 &&
+        preparation.agents.filter((agent) => agent.state === 'ready').length === 1
+      ) {
+        const unselectedAgentId = ALL_RUNTIME_AGENTS.find(
+          (agentId) => agentId !== pair.primaryAgentId && agentId !== pair.secondaryAgentId,
+        )
+        const remainingMs = saveDeadlineAt - Date.now()
+        if (unselectedAgentId && remainingMs > CLEANUP_RESERVE_MS) {
+          const extraAbort = new AbortController()
+          const extraTimer = setTimeout(() => extraAbort.abort(), remainingMs)
+          try {
+            const extra = await this.runtimePreparation.inspectReadiness(
+              extraAbort.signal,
+              [unselectedAgentId],
+              saveDeadlineAt,
+            )
+            if (extra.ok) {
+              readinessForValidation = {
+                firstUse: preparation.firstUse,
+                agents: [
+                  ...preparation.agents,
+                  ...extra.value.agents.filter((agent) => agent.agentId === unselectedAgentId),
+                ],
+              }
+            }
+          } finally {
+            clearTimeout(extraTimer)
+          }
+        }
+      }
       const readinessCheck = RuntimePreparation.validateActivePairReadiness(
-        preparation,
+        readinessForValidation,
         pair.primaryAgentId,
         pair.secondaryAgentId,
       )
@@ -267,6 +317,10 @@ export class DefaultSessionSettings {
               },
             }
           : input.settings
+
+      if (Date.now() >= saveDeadlineAt) {
+        throw new Error('Default session settings save deadline was reached.')
+      }
 
       const savedState = this.repository.save(settingsToSave)
       for (const [cacheKey, entry] of this.completedCatalogs) {
@@ -416,9 +470,12 @@ export class DefaultSessionSettings {
   private async collectEditorState(
     workingDirectory: string,
     requestedPair?: ActiveAgentPair,
-    options?: { scopeKey?: string; allowCache?: boolean },
+    options?: { scopeKey?: string; allowCache?: boolean; deadlineAt?: number },
   ): Promise<CollectedEditorState> {
-    const deadline = Date.now() + OPERATION_TIMEOUT_MS
+    const deadline =
+      options?.deadlineAt !== undefined
+        ? Math.min(options.deadlineAt, Date.now() + OPERATION_TIMEOUT_MS)
+        : Date.now() + OPERATION_TIMEOUT_MS
     if (this.disposed) throw new Error('Settings are shutting down.')
 
     const scopeKey = options?.scopeKey ?? workingDirectory
@@ -474,7 +531,7 @@ export class DefaultSessionSettings {
     }
 
     try {
-      await this.runtimePreparation.prepareEnvironment()
+      await this.runtimePreparation.prepareEnvironment(undefined, deadline)
     } catch (error) {
       this.pruneScopeState(scopeKey, scopeState)
       throw error
@@ -482,6 +539,10 @@ export class DefaultSessionSettings {
     if (this.disposed) {
       this.pruneScopeState(scopeKey, scopeState)
       throw new Error('Settings are shutting down.')
+    }
+    if (Date.now() >= deadline) {
+      this.pruneScopeState(scopeKey, scopeState)
+      throw new Error('The settings catalog deadline was reached.')
     }
     if (scopeState.generation !== expectedGeneration) {
       this.pruneScopeState(scopeKey, scopeState)
@@ -562,8 +623,9 @@ export class DefaultSessionSettings {
     scopeState.subscription = { read: inFlight, token }
     scopeState.waiters += 1
     let onGenAbort: (() => void) | undefined
+    let deadlineTimer: ReturnType<typeof setTimeout> | undefined
     try {
-      const shared = await Promise.race([
+      const waiters: Array<Promise<CollectedEditorState>> = [
         inFlight.promise,
         new Promise<never>((_, reject) => {
           onGenAbort = () => {
@@ -574,7 +636,19 @@ export class DefaultSessionSettings {
           generationSignal.addEventListener('abort', onGenAbort, { once: true })
           if (generationSignal.aborted) onGenAbort()
         }),
-      ])
+      ]
+      if (options?.deadlineAt !== undefined) {
+        const remainingMs = Math.max(0, deadline - Date.now())
+        waiters.push(
+          new Promise<never>((_, reject) => {
+            deadlineTimer = setTimeout(
+              () => reject(new Error('The settings catalog deadline was reached.')),
+              remainingMs,
+            )
+          }),
+        )
+      }
+      const shared = await Promise.race(waiters)
       if (scopeState.generation !== expectedGeneration) {
         const aborted = new Error('The settings pair selection was superseded.')
         aborted.name = 'AbortError'
@@ -582,6 +656,7 @@ export class DefaultSessionSettings {
       }
       return this.rebindCollectedState(shared, effectivePair)
     } finally {
+      clearTimeout(deadlineTimer)
       if (onGenAbort) generationSignal.removeEventListener('abort', onGenAbort)
       inFlight.subscribers.delete(token)
       if (scopeState.subscription?.token === token) {
@@ -684,35 +759,102 @@ export class DefaultSessionSettings {
     const timeout = setTimeout(() => controller.abort(), Math.max(0, deadline - Date.now()))
     let phase: DiagnosticEvent['settingsCatalogPhase'] = 'readiness'
     try {
-      // Runtime Preparation remains the single source of truth for executable selection and
-      // readiness. This Module consumes that result instead of rediscovering any CLI.
-      const preparation = await this.runtimePreparation.inspectReadiness(controller.signal)
-      controller.signal.throwIfAborted()
-      if (!preparation.ok) {
-        DefaultSessionSettings.recordFailure('readiness', undefined, 'readiness_failed')
-        throw new Error(preparation.error.message)
-      }
-
       const savedBefore = this.repository.read()
-      const activePair: ActiveAgentPair =
+      const knownPair: ActiveAgentPair | undefined =
         requestedPair ??
         (savedBefore
           ? {
               primaryAgentId: savedBefore.settings.primaryAgentId,
               secondaryAgentId: savedBefore.settings.secondaryAgentId,
             }
-          : DefaultSessionSettings.selectInitialPair(preparation.value.agents))
+          : undefined)
+      const wantsAgyCatalog =
+        knownPair === undefined ||
+        knownPair.primaryAgentId === 'agy' ||
+        knownPair.secondaryAgentId === 'agy'
+      let hookLatestNotified: AgyConfigOption[] | undefined
+      let coalescedAgyCatalog: AgentModelCatalog | undefined
+      let coalescedAgyTimedOut = false
+      const agySessionHook: AgyReadinessSessionHook | undefined = wantsAgyCatalog
+        ? {
+            onNotification: (method, params) => {
+              if (method !== 'session/update' || !params || typeof params !== 'object') return
+              const update = Reflect.get(params, 'update')
+              if (!update || typeof update !== 'object') return
+              const parsedOptions = DefaultSessionSettings.parseAgyConfigOptions(
+                Reflect.get(update, 'configOptions'),
+              )
+              if (parsedOptions) {
+                hookLatestNotified = parsedOptions
+              }
+            },
+            inspectSession: async ({ sessionId, newSessionResult, transport }, cliVersion) => {
+              try {
+                coalescedAgyCatalog = await DefaultSessionSettings.inspectAgySessionCatalog({
+                  sessionId,
+                  newSessionResult,
+                  transport,
+                  cliVersion,
+                  signal: controller.signal,
+                  readLatestNotified: () => hookLatestNotified,
+                  clearLatestNotified: () => {
+                    hookLatestNotified = undefined
+                  },
+                })
+              } catch (error) {
+                if (controller.signal.aborted) return
+                if (error instanceof AgyProbeError && error.kind === 'timeout') {
+                  coalescedAgyTimedOut = true
+                  return
+                }
+                recordDiagnostic({
+                  operation: 'ipc',
+                  phase: 'failed',
+                  level: 'warn',
+                  agentId: 'agy',
+                  code: 'INTERNAL',
+                  settingsCatalogPhase: 'catalogs',
+                  settingsCatalogFailure: 'other',
+                })
+                coalescedAgyCatalog = DefaultSessionSettings.unavailableCatalog(
+                  'agy',
+                  'Antigravity did not provide its model list. CLI default remains available.',
+                  cliVersion,
+                )
+              }
+            },
+          }
+        : undefined
+      // Runtime Preparation remains the single source of truth for executable selection and
+      // readiness. This Module consumes that result instead of rediscovering any CLI.
+      const preparation = knownPair
+        ? await this.runtimePreparation.inspectReadiness(
+            controller.signal,
+            [knownPair.primaryAgentId, knownPair.secondaryAgentId],
+            deadline,
+            agySessionHook ? { agySessionHook } : undefined,
+          )
+        : await this.runtimePreparation.inspectReadiness(controller.signal, undefined, deadline, {
+            agySessionHook: agySessionHook!,
+          })
+      controller.signal.throwIfAborted()
+      if (!preparation.ok) {
+        DefaultSessionSettings.recordFailure('readiness', undefined, 'readiness_failed')
+        throw new Error(preparation.error.message)
+      }
+
+      const activePair: ActiveAgentPair =
+        knownPair ?? DefaultSessionSettings.selectInitialPair(preparation.value.agents)
       const activeMembers = new Set<RuntimeAgentId>([
         activePair.primaryAgentId,
         activePair.secondaryAgentId,
       ])
 
       const byId = new Map(preparation.value.agents.map((agent) => [agent.agentId, agent]))
-      const catalogTimeout = Math.min(
-        CATALOG_TIMEOUT_MS,
-        deadline - Date.now() - CLEANUP_RESERVE_MS,
-      )
-      if (catalogTimeout <= 0) throw new Error('The settings catalog deadline was reached.')
+      const remainingCatalogBudget = deadline - Date.now() - CLEANUP_RESERVE_MS
+      if (remainingCatalogBudget <= 0) throw new Error('The settings catalog deadline was reached.')
+      const catalogTimeout = Math.min(CATALOG_TIMEOUT_MS, remainingCatalogBudget)
+      const agyCatalogTimeout = Math.min(AGY_CATALOG_TIMEOUT_MS, remainingCatalogBudget)
       phase = 'catalogs'
 
       const loadForAgent = (agentId: RuntimeAgentId): Promise<AgentModelCatalog> => {
@@ -747,11 +889,33 @@ export class DefaultSessionSettings {
             catalogTimeout,
           )
         }
+        if (coalescedAgyCatalog !== undefined) {
+          return Promise.resolve(coalescedAgyCatalog)
+        }
+        if (coalescedAgyTimedOut && remainingCatalogBudget <= 6_000) {
+          recordDiagnostic({
+            operation: 'ipc',
+            phase: 'failed',
+            level: 'warn',
+            agentId: 'agy',
+            code: 'INTERNAL',
+            settingsCatalogPhase: 'catalogs',
+            settingsCatalogFailure: 'catalog_deadline',
+          })
+          return Promise.resolve(
+            DefaultSessionSettings.unavailableCatalog(
+              'agy',
+              'Antigravity did not provide its model list. CLI default remains available.',
+              agent.version,
+            ),
+          )
+        }
         return this.inspectAgyModels(
           agent.executablePath,
           agent.version,
           controller.signal,
-          catalogTimeout,
+          agyCatalogTimeout,
+          deadline,
         )
       }
 
@@ -855,30 +1019,110 @@ export class DefaultSessionSettings {
     }
   }
 
-  dispose(): Promise<void> {
+  private static async awaitAllWithinDeadline(
+    promises: readonly Promise<unknown>[],
+    flushDeadlineAt?: number,
+  ): Promise<boolean> {
+    if (promises.length === 0) return true
+    const allSettled = Promise.allSettled(promises).then(() => true)
+    if (flushDeadlineAt === undefined) {
+      return await allSettled
+    }
+    const remainingMs = flushDeadlineAt - Date.now()
+    if (remainingMs <= 0) return false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      return await Promise.race([
+        allSettled,
+        new Promise<boolean>((resolve) => {
+          timer = setTimeout(() => resolve(false), remainingMs)
+        }),
+      ])
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  dispose(flushDeadlineAt?: number): Promise<void> {
     this.disposed = true
+    this.disposeFlushDeadlineAt = flushDeadlineAt
     this.completedCatalogs.clear()
     this.disposal ??= (async () => {
       for (const operation of this.operations) operation.controller.abort()
+      const gracefulDeadlineAt =
+        flushDeadlineAt === undefined
+          ? Date.now() + 2_000
+          : Math.min(
+              flushDeadlineAt,
+              Date.now() + Math.max(0, Math.min(1_250, flushDeadlineAt - Date.now() - 1_250)),
+            )
+      await DefaultSessionSettings.awaitAllWithinDeadline(
+        [...this.operations].map((operation) => operation.done),
+        gracefulDeadlineAt,
+      )
       const results = await Promise.allSettled([
         ...[...this.operations].map((operation) => operation.done),
-        ...[...this.probes].map((probe) => probe.close()),
+        ...[...this.probes].map((probe) => probe.close(flushDeadlineAt)),
       ])
-      const settledDirs: string[] = []
-      for (const [probe, dir] of this.unconfirmedAgyDirs.entries()) {
-        if (isAgyProbeSettled(probe)) {
-          this.unconfirmedAgyDirs.delete(probe)
-          settledDirs.push(dir)
+      await this.reconcileSettledAgyArtifacts()
+      await this.reconcileUnconfirmedAgyProbeDirs()
+      const cleanupsSettled = await DefaultSessionSettings.awaitAllWithinDeadline(
+        [...this.pendingArtifactCleanups],
+        flushDeadlineAt,
+      )
+      await this.reconcileUnconfirmedAgyProbeDirs()
+      for (const probe of this.probes) {
+        if (isAgyProbeSettled(probe) && !this.unconfirmedAgyArtifacts.has(probe)) {
+          this.probes.delete(probe)
         }
       }
-      await Promise.allSettled(settledDirs.map((dir) => rm(dir, { recursive: true, force: true })))
-      for (const probe of this.probes) {
-        if (isAgyProbeSettled(probe)) this.probes.delete(probe)
-      }
-      if (results.some((result) => result.status === 'rejected') || this.probes.size)
+      if (
+        results.some((result) => result.status === 'rejected') ||
+        !cleanupsSettled ||
+        this.probes.size > 0 ||
+        this.unconfirmedAgyArtifacts.size > 0 ||
+        this.pendingArtifactCleanups.size > 0 ||
+        this.unconfirmedAgyProbeDirs.size > 0
+      ) {
         throw new Error('Settings catalog processes did not finish their cleanup.')
+      }
     })()
     return this.disposal
+  }
+
+  private recordUnconfirmedAgyProbeDir(dirPath: string): void {
+    this.unconfirmedAgyProbeDirs.add(dirPath)
+  }
+
+  private async reconcileUnconfirmedAgyProbeDirs(): Promise<boolean> {
+    const pending = [...this.unconfirmedAgyProbeDirs]
+    if (pending.length === 0) return false
+    await Promise.allSettled(
+      pending.map(async (dirPath) => {
+        if (await removeDirConfirmed(dirPath)) {
+          this.unconfirmedAgyProbeDirs.delete(dirPath)
+        }
+      }),
+    )
+    return this.unconfirmedAgyProbeDirs.size >= MAX_UNCONFIRMED_AGY_PROBE_DIRS
+  }
+
+  private async reconcileSettledAgyArtifacts(): Promise<void> {
+    const settledArtifacts: UnconfirmedAgyProbeArtifact[] = []
+    for (const [candidate, artifact] of this.unconfirmedAgyArtifacts.entries()) {
+      if (isAgyProbeSettled(candidate)) {
+        this.unconfirmedAgyArtifacts.delete(candidate)
+        settledArtifacts.push(artifact)
+      }
+    }
+    await Promise.allSettled(
+      settledArtifacts.map(async (artifact) => {
+        const removed = await reconcileSettledAgyProbeArtifact(artifact).catch(() => false)
+        if (!removed) {
+          this.recordUnconfirmedAgyProbeDir(artifact.probeRoot)
+        }
+      }),
+    )
   }
 
   private ownProbe(
@@ -886,12 +1130,10 @@ export class DefaultSessionSettings {
     onCloseInput: () => void | Promise<void>,
   ): OwnedProcessGroup {
     signal.throwIfAborted()
-    for (const [candidate, dir] of this.unconfirmedAgyDirs.entries()) {
-      if (isAgyProbeSettled(candidate)) {
-        this.unconfirmedAgyDirs.delete(candidate)
-        void rm(dir, { recursive: true, force: true }).catch(() => undefined)
-      }
-    }
+    const cleanup = this.reconcileSettledAgyArtifacts().finally(() => {
+      this.pendingArtifactCleanups.delete(cleanup)
+    })
+    this.pendingArtifactCleanups.add(cleanup)
     for (const candidate of this.probes) {
       if (isAgyProbeSettled(candidate)) this.probes.delete(candidate)
     }
@@ -1037,21 +1279,28 @@ export class DefaultSessionSettings {
     cliVersion: string | undefined,
     signal: AbortSignal,
     timeoutMs: number,
+    deadline: number,
   ): Promise<AgentModelCatalog> {
+    if (await this.reconcileUnconfirmedAgyProbeDirs()) {
+      throw new Error('Catalog process capacity is unavailable.')
+    }
     let latestNotifiedConfigOptions: AgyConfigOption[] | undefined
     let closeFailedError: unknown
+    const businessDeadlineAt = deadline - CLEANUP_RESERVE_MS
+    const closeDeadlineAt = Math.floor(Math.max(Date.now() + 1, deadline - 500))
 
     try {
       return await runAgyAcpProbe<AgentModelCatalog>({
         executablePath,
         ...(this.options.env ? { env: this.options.env } : {}),
         signal,
+        initializeTimeoutMs: Math.min(4_000, Math.max(0, businessDeadlineAt - Date.now())),
         timeoutMs,
+        businessDeadlineAt,
+        closeDeadlineAt,
+        getShutdownDeadlineAt: () => this.disposeFlushDeadlineAt,
         maxFrameBytes: MAX_AGY_FRAME_BYTES,
         maxTotalBytes: MAX_AGY_TOTAL_BYTES,
-        // Clean up ONLY the single probe sessionId via session/close without ever scanning or
-        // deleting files inside user conversation DB directories.
-        deleteProbeSessionDb: false,
         ownProbe: (probeSignal, onCloseInput) => this.ownProbe(probeSignal, onCloseInput),
         onNotification: (method, params) => {
           if (method !== 'session/update' || !params || typeof params !== 'object') return
@@ -1064,154 +1313,56 @@ export class DefaultSessionSettings {
             latestNotifiedConfigOptions = parsedOptions
           }
         },
-        inspectSession: async ({ sessionId, newSessionResult, transport }) => {
-          const parsedModels = DefaultSessionSettings.parseAgySessionModels(
-            Reflect.get(newSessionResult, 'models'),
-          )
-          const initialConfigOptions = DefaultSessionSettings.parseAgyConfigOptions(
-            Reflect.get(newSessionResult, 'configOptions'),
-          )
-          const modelConfigOption = initialConfigOptions?.find(
-            (option) => option.id === 'model' || option.category === 'model',
-          )
-          if (!parsedModels && !modelConfigOption?.options?.length) {
-            throw new Error('Antigravity ACP returned an invalid model catalog.')
-          }
-          if (
-            parsedModels &&
-            (parsedModels.availableModels.length > MAX_DISCOVERED_MODELS ||
-              Buffer.byteLength(JSON.stringify(parsedModels.availableModels)) >
-                MAX_DISCOVERED_CATALOG_BYTES)
-          ) {
-            throw new Error('The Antigravity model catalog exceeds its discovery capacity.')
-          }
-          if (
-            modelConfigOption?.options &&
-            (modelConfigOption.options.length > MAX_DISCOVERED_MODELS ||
-              Buffer.byteLength(JSON.stringify(modelConfigOption.options)) >
-                MAX_DISCOVERED_CATALOG_BYTES)
-          ) {
-            throw new Error('The Antigravity model catalog exceeds its discovery capacity.')
-          }
-
-          const modelConfigId = modelConfigOption?.id ?? 'model'
-          let activeModelId =
-            modelConfigOption && modelConfigOption.currentValue.length > 0
-              ? modelConfigOption.currentValue
-              : parsedModels?.currentModelId
-          let activeConfigOptions: readonly AgyConfigOption[] | undefined = initialConfigOptions
-          let setConfigUnsupported = false
-          const resolvedOptions: AgentModelOption[] = []
-          const selectableModelIds = new Set<string>()
-          const configOptionValues = new Set<string>(
-            (modelConfigOption?.options ?? []).map((option) => option.value),
-          )
-
-          const probeModelThoughtLevel = async (
-            targetModelId: string,
-            forcePreferSetModel = false,
-          ): Promise<{ supportedEfforts: string[]; defaultEffort?: string }> => {
-            let modelConfigOptions: readonly AgyConfigOption[] | undefined
-            if (activeModelId === targetModelId && activeConfigOptions !== undefined) {
-              modelConfigOptions = activeConfigOptions
-            } else {
+        inspectSession: async ({ sessionId, newSessionResult, transport }) =>
+          DefaultSessionSettings.inspectAgySessionCatalog({
+            sessionId,
+            newSessionResult,
+            transport,
+            cliVersion,
+            signal,
+            readLatestNotified: () => latestNotifiedConfigOptions,
+            clearLatestNotified: () => {
               latestNotifiedConfigOptions = undefined
-              modelConfigOptions = await DefaultSessionSettings.resolveAgyModelConfigOptions({
-                sessionId,
-                modelId: targetModelId,
-                modelConfigId,
-                transport,
-                preferSetModel: setConfigUnsupported || forcePreferSetModel,
-                readLatestNotified: () => latestNotifiedConfigOptions,
-                onSetConfigUnsupported: () => {
-                  setConfigUnsupported = true
-                },
-              })
-              if (modelConfigOptions !== undefined) {
-                activeModelId = targetModelId
-                activeConfigOptions = modelConfigOptions
-              } else {
-                activeModelId = undefined
-                activeConfigOptions = undefined
-              }
-            }
-            return DefaultSessionSettings.extractAgyThoughtLevel(modelConfigOptions)
-          }
-
-          if (modelConfigOption?.options?.length) {
-            for (const option of modelConfigOption.options) {
-              selectableModelIds.add(option.value)
-              // oxlint-disable-next-line no-await-in-loop -- Each selectable model sequentially inspects configOptions on the single open zero-Turn probe session.
-              const effortMeta = await probeModelThoughtLevel(option.value)
-              resolvedOptions.push({
-                id: option.value,
-                displayName: option.name,
-                supportedEfforts: effortMeta.supportedEfforts,
-                ...(effortMeta.defaultEffort ? { defaultEffort: effortMeta.defaultEffort } : {}),
-              })
-            }
-          }
-
-          const knownPreExpandedVariants = new Set<string>()
-          for (const resolved of resolvedOptions) {
-            for (const effort of resolved.supportedEfforts) {
-              knownPreExpandedVariants.add(`${resolved.id}-${effort}`)
-            }
-          }
-
-          // Pass through ALL real availableModels entries unchanged (without hiding entries via coveredVariantIds).
-          for (const model of parsedModels?.availableModels ?? []) {
-            if (selectableModelIds.has(model.modelId)) {
-              continue
-            }
-            selectableModelIds.add(model.modelId)
-            if (knownPreExpandedVariants.has(model.modelId)) {
-              resolvedOptions.push({
-                id: model.modelId,
-                displayName: model.name,
-                supportedEfforts: [],
-              })
-              continue
-            }
-            // oxlint-disable-next-line no-await-in-loop -- Standalone availableModels entries sequentially inspect configOptions on the single open zero-Turn probe session.
-            const effortMeta = await probeModelThoughtLevel(
-              model.modelId,
-              configOptionValues.size > 0 && !configOptionValues.has(model.modelId),
-            )
-            resolvedOptions.push({
-              id: model.modelId,
-              displayName: model.name,
-              supportedEfforts: effortMeta.supportedEfforts,
-              ...(effortMeta.defaultEffort ? { defaultEffort: effortMeta.defaultEffort } : {}),
-            })
-          }
-
-          if (
-            resolvedOptions.length > MAX_DISCOVERED_MODELS ||
-            Buffer.byteLength(JSON.stringify(resolvedOptions)) > MAX_DISCOVERED_CATALOG_BYTES
-          ) {
-            throw new Error('The Antigravity model catalog exceeds its discovery capacity.')
-          }
-
-          return {
-            agentId: 'agy',
-            status: 'available',
-            ...(cliVersion ? { cliVersion } : {}),
-            models: resolvedOptions,
-            checkedAt: new Date().toISOString(),
-          }
-        },
-        onCloseError: (error, probe, probeCwd) => {
+            },
+          }),
+        onCloseError: (error, probe, artifact) => {
           closeFailedError = error
           if (!isAgyProbeSettled(probe)) {
-            this.unconfirmedAgyDirs.set(probe, probeCwd)
+            this.unconfirmedAgyArtifacts.set(probe, artifact)
           }
           DefaultSessionSettings.recordFailure('catalogs', error)
         },
         onProbeSettled: (probe) => {
           if (isAgyProbeSettled(probe)) {
-            this.unconfirmedAgyDirs.delete(probe)
+            this.unconfirmedAgyArtifacts.delete(probe)
             this.probes.delete(probe)
+          }
+        },
+        reconcileArtifact: async (artifact) => {
+          const task = reconcileSettledAgyProbeArtifact(artifact)
+            .catch(() => false)
+            .then((removed) => {
+              if (!removed) {
+                this.recordUnconfirmedAgyProbeDir(artifact.probeRoot)
+              }
+              return removed
+            })
+            .finally(() => {
+              this.pendingArtifactCleanups.delete(task)
+            })
+          this.pendingArtifactCleanups.add(task)
+          const remainingForArtifact = deadline - Date.now() - 100
+          if (remainingForArtifact <= 0) return false
+          let timer: ReturnType<typeof setTimeout> | undefined
+          try {
+            return await Promise.race([
+              task,
+              new Promise<boolean>((resolve) => {
+                timer = setTimeout(() => resolve(false), remainingForArtifact)
+              }),
+            ])
+          } finally {
+            clearTimeout(timer)
           }
         },
       })
@@ -1221,6 +1372,20 @@ export class DefaultSessionSettings {
       if (error instanceof Error && error.message === 'Catalog process capacity is unavailable.') {
         throw error
       }
+      if (!signal.aborted) {
+        recordDiagnostic({
+          operation: 'ipc',
+          phase: 'failed',
+          level: 'warn',
+          agentId: 'agy',
+          code: 'INTERNAL',
+          settingsCatalogPhase: 'catalogs',
+          settingsCatalogFailure:
+            error instanceof AgyProbeError && error.kind === 'timeout'
+              ? 'catalog_deadline'
+              : 'other',
+        })
+      }
       return DefaultSessionSettings.unavailableCatalog(
         'agy',
         'Antigravity did not provide its model list. CLI default remains available.',
@@ -1229,11 +1394,172 @@ export class DefaultSessionSettings {
     }
   }
 
+  private static async inspectAgySessionCatalog(input: {
+    readonly sessionId: string
+    readonly newSessionResult: Record<string, unknown>
+    readonly transport: AgyAcpRpcTransport
+    readonly cliVersion: string | undefined
+    readonly signal: AbortSignal
+    readonly readLatestNotified: () => AgyConfigOption[] | undefined
+    readonly clearLatestNotified: () => void
+  }): Promise<AgentModelCatalog> {
+    const {
+      sessionId,
+      newSessionResult,
+      transport,
+      cliVersion,
+      signal,
+      readLatestNotified,
+      clearLatestNotified,
+    } = input
+    const parsedModels = DefaultSessionSettings.parseAgySessionModels(
+      Reflect.get(newSessionResult, 'models'),
+    )
+    const initialConfigOptions = DefaultSessionSettings.parseAgyConfigOptions(
+      Reflect.get(newSessionResult, 'configOptions'),
+    )
+    const modelConfigOption = initialConfigOptions?.find(
+      (option) => option.id === 'model' || option.category === 'model',
+    )
+    if (!parsedModels && !modelConfigOption?.options?.length) {
+      throw new Error('Antigravity ACP returned an invalid model catalog.')
+    }
+    if (
+      parsedModels &&
+      (parsedModels.availableModels.length > MAX_DISCOVERED_MODELS ||
+        Buffer.byteLength(JSON.stringify(parsedModels.availableModels)) >
+          MAX_DISCOVERED_CATALOG_BYTES)
+    ) {
+      throw new Error('The Antigravity model catalog exceeds its discovery capacity.')
+    }
+    if (
+      modelConfigOption?.options &&
+      (modelConfigOption.options.length > MAX_DISCOVERED_MODELS ||
+        Buffer.byteLength(JSON.stringify(modelConfigOption.options)) > MAX_DISCOVERED_CATALOG_BYTES)
+    ) {
+      throw new Error('The Antigravity model catalog exceeds its discovery capacity.')
+    }
+
+    const modelConfigId = modelConfigOption?.id ?? 'model'
+    let activeModelId =
+      modelConfigOption && modelConfigOption.currentValue.length > 0
+        ? modelConfigOption.currentValue
+        : parsedModels?.currentModelId
+    let activeConfigOptions: readonly AgyConfigOption[] | undefined = initialConfigOptions
+    let setConfigUnsupported = false
+    const resolvedOptions: AgentModelOption[] = []
+    const selectableModelIds = new Set<string>()
+    const configOptionValues = new Set<string>(
+      (modelConfigOption?.options ?? []).map((option) => option.value),
+    )
+
+    const probeModelThoughtLevel = async (
+      targetModelId: string,
+      forcePreferSetModel = false,
+    ): Promise<{ supportedEfforts: string[]; defaultEffort?: string }> => {
+      let modelConfigOptions: readonly AgyConfigOption[] | undefined
+      if (activeModelId === targetModelId && activeConfigOptions !== undefined) {
+        modelConfigOptions = activeConfigOptions
+      } else {
+        clearLatestNotified()
+        modelConfigOptions = await DefaultSessionSettings.resolveAgyModelConfigOptions({
+          sessionId,
+          modelId: targetModelId,
+          modelConfigId,
+          transport,
+          signal,
+          preferSetModel: setConfigUnsupported || forcePreferSetModel,
+          readLatestNotified,
+          onSetConfigUnsupported: () => {
+            setConfigUnsupported = true
+          },
+        })
+        if (modelConfigOptions !== undefined) {
+          activeModelId = targetModelId
+          activeConfigOptions = modelConfigOptions
+        } else {
+          activeModelId = undefined
+          activeConfigOptions = undefined
+        }
+      }
+      return DefaultSessionSettings.extractAgyThoughtLevel(modelConfigOptions)
+    }
+
+    if (modelConfigOption?.options?.length) {
+      for (const option of modelConfigOption.options) {
+        signal.throwIfAborted()
+        selectableModelIds.add(option.value)
+        // oxlint-disable-next-line no-await-in-loop -- Each selectable model sequentially inspects configOptions on the single open zero-Turn probe session.
+        const effortMeta = await probeModelThoughtLevel(option.value)
+        resolvedOptions.push({
+          id: option.value,
+          displayName: option.name,
+          supportedEfforts: effortMeta.supportedEfforts,
+          ...(effortMeta.defaultEffort ? { defaultEffort: effortMeta.defaultEffort } : {}),
+        })
+      }
+    }
+
+    const knownPreExpandedVariants = new Set<string>()
+    for (const resolved of resolvedOptions) {
+      for (const effort of resolved.supportedEfforts) {
+        knownPreExpandedVariants.add(`${resolved.id}-${effort}`)
+      }
+    }
+
+    // Pass through ALL real availableModels entries unchanged (without hiding entries via coveredVariantIds).
+    for (const model of parsedModels?.availableModels ?? []) {
+      signal.throwIfAborted()
+      if (selectableModelIds.has(model.modelId)) {
+        continue
+      }
+      selectableModelIds.add(model.modelId)
+      if (knownPreExpandedVariants.has(model.modelId)) {
+        resolvedOptions.push({
+          id: model.modelId,
+          displayName: model.name,
+          supportedEfforts: [],
+        })
+        continue
+      }
+      // oxlint-disable-next-line no-await-in-loop -- Standalone availableModels entries sequentially inspect configOptions on the single open zero-Turn probe session.
+      const effortMeta = await probeModelThoughtLevel(
+        model.modelId,
+        configOptionValues.size > 0 && !configOptionValues.has(model.modelId),
+      )
+      resolvedOptions.push({
+        id: model.modelId,
+        displayName: model.name,
+        supportedEfforts: effortMeta.supportedEfforts,
+        ...(effortMeta.defaultEffort ? { defaultEffort: effortMeta.defaultEffort } : {}),
+      })
+    }
+
+    if (
+      resolvedOptions.length > MAX_DISCOVERED_MODELS ||
+      Buffer.byteLength(JSON.stringify(resolvedOptions)) > MAX_DISCOVERED_CATALOG_BYTES
+    ) {
+      throw new Error('The Antigravity model catalog exceeds its discovery capacity.')
+    }
+    if (resolvedOptions.length === 0) {
+      throw new Error('Antigravity ACP returned an empty model catalog.')
+    }
+
+    return {
+      agentId: 'agy',
+      status: 'available',
+      ...(cliVersion ? { cliVersion } : {}),
+      models: resolvedOptions,
+      checkedAt: new Date().toISOString(),
+    }
+  }
+
   private static async resolveAgyModelConfigOptions(input: {
     sessionId: string
     modelId: string
     modelConfigId: string
     transport: { request: (method: string, params: Record<string, unknown>) => Promise<unknown> }
+    signal: AbortSignal
     preferSetModel: boolean
     readLatestNotified: () => AgyConfigOption[] | undefined
     onSetConfigUnsupported: () => void
@@ -1251,6 +1577,9 @@ export class DefaultSessionSettings {
             : undefined
         return fromReply ?? input.readLatestNotified()
       } catch (error) {
+        if (input.signal.aborted || (error instanceof Error && error.name === 'AbortError')) {
+          throw error
+        }
         const rpcCode =
           error && typeof error === 'object' && 'rpcCode' in error ? error.rpcCode : undefined
         if (rpcCode === -32601) {
@@ -1271,7 +1600,10 @@ export class DefaultSessionSettings {
           ? DefaultSessionSettings.parseAgyConfigOptions(Reflect.get(reply, 'configOptions'))
           : undefined
       return fromReply ?? input.readLatestNotified()
-    } catch {
+    } catch (error) {
+      if (input.signal.aborted || (error instanceof Error && error.name === 'AbortError')) {
+        throw error
+      }
       return undefined
     }
   }

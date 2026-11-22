@@ -2,8 +2,14 @@ import { describe, expect, it } from 'vitest'
 
 import type { CollaborationStage, RuntimeAgentId } from '@pact/contracts'
 
+import { resolveAgentCollaborationSourceCapability } from '@pact/agent-runtime'
+
 import { planRunInput } from './collaboration-fixture.test-support.js'
-import { collaborationInstructions } from './collaboration-prompt.js'
+import {
+  buildCollaborationSourceToolDescription,
+  buildSourceInstructions,
+  collaborationInstructions,
+} from './collaboration-prompt.js'
 
 describe('collaboration revision guidance instructions', () => {
   it('reads the current complete manifest and original evidence while preserving turn authority', () => {
@@ -141,5 +147,56 @@ describe('adversarial review instructions', () => {
     expect(phase1Prompt).toContain('ArtifactMetadata')
     expect(phase1Prompt).not.toContain('<proposed_plan>')
     expect(phase1Prompt).toContain('/plan @agy or /plan @claude')
+  })
+
+  it('scopes source-reader tool descriptions and instructions strictly to the resolved 3-tier capability', () => {
+    const baseReader = {
+      identity: { runId: '00000000-0000-4000-8000-000000000001', grant: 'g' },
+      navigation: () => ({
+        runId: '00000000-0000-4000-8000-000000000001',
+        grant: 'g',
+        source: 'inputs' as const,
+        offset: 0,
+      }),
+      read: () => {
+        throw new Error('unused')
+      },
+      retire: () => undefined,
+    }
+    const nativeCap = resolveAgentCollaborationSourceCapability({
+      collaborationSourceReader: { ...baseReader, readNativeRoot: baseReader.read },
+    })
+    const sourceRefCap = resolveAgentCollaborationSourceCapability({
+      collaborationSourceReader: baseReader,
+    })
+    const legacyCap = resolveAgentCollaborationSourceCapability({
+      readCollaborationSourcePart: () => {
+        throw new Error('unused')
+      },
+    })
+    const noneCap = resolveAgentCollaborationSourceCapability({})
+
+    expect(buildCollaborationSourceToolDescription(nativeCap)).toContain('sourceReference')
+    expect(buildCollaborationSourceToolDescription(nativeCap)).toContain('context=native-root-v1')
+
+    expect(buildCollaborationSourceToolDescription(sourceRefCap)).toContain('sourceReference')
+    expect(buildCollaborationSourceToolDescription(sourceRefCap)).not.toContain('native-root-v1')
+    expect(buildSourceInstructions(sourceRefCap)).not.toContain('native-root-v1')
+
+    expect(buildCollaborationSourceToolDescription(legacyCap)).not.toContain('sourceReference')
+    expect(buildCollaborationSourceToolDescription(legacyCap)).not.toContain('native-root-v1')
+    expect(buildSourceInstructions(legacyCap)).toContain('copy runId and grant')
+    expect(buildSourceInstructions(legacyCap)).not.toContain('sourceReference')
+
+    expect(buildCollaborationSourceToolDescription(noneCap)).toBe('')
+    expect(buildSourceInstructions(noneCap)).not.toContain('read_collaboration_source')
+    const input = planRunInput('codex')
+    expect(
+      collaborationInstructions(
+        input.promptEnvelope.collaboration!,
+        input.promptEnvelope.collaborationAuthorization,
+        sourceRefCap,
+      ),
+    ).not.toContain('native-root-v1')
   })
 })

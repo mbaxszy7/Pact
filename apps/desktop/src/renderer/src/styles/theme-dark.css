@@ -1,48 +1,70 @@
 [data-theme='dark'] {
   color-scheme: dark;
 
+  /* Warm Porcelain Atelier — Dark */
   --pact-canvas: #0f1720;
   --pact-surface: #141e28;
   --pact-surface-muted: #192633;
   --pact-surface-raised: #1d2a36;
-  --pact-menu-surface: #2b3d4b;
+  --pact-code-surface: #202f3f;
+  --pact-code-block-surface: #0e1620;
+  --pact-code-foreground: #edf5fc;
+  --pact-code-border: rgb(241 245 249 / 14%);
+  --pact-menu-surface: #252b38;
   --pact-surface-inverse: #edf5fb;
+  --pact-row-hover: rgb(255 255 255 / 4.5%);
   --pact-text-primary: #f2f7fb;
-  --pact-text-secondary: #a9b7c4;
-  --pact-text-tertiary: #8393a1;
+  --pact-text-secondary: #a1adbf;
+  --pact-text-tertiary: #8794a8;
   --pact-text-inverse: #0a0d12;
-  --pact-border: #2b3b49;
-  --pact-border-strong: #627587;
+  --pact-border: rgb(241 245 249 / 7.5%);
+  --pact-border-strong: rgb(241 245 249 / 15%);
   --pact-focus: #67b1ff;
+  --pact-accent-soft: rgb(103 177 255 / 13%);
   --pact-selection: rgb(103 177 255 / 30%);
   --pact-navigation-selected: rgb(242 247 251 / 7%);
 
   --pact-status-ready: #5ee58a;
   --pact-status-ready-muted: #17392b;
   --pact-status-ready-foreground: #5ee58a;
-  --pact-status-warning: #e6b84a;
-  --pact-status-warning-muted: #3d3116;
-  --pact-status-warning-foreground: #e6b84a;
+  --pact-status-warning: #eab308;
+  --pact-status-warning-muted: #382d14;
+  --pact-status-warning-foreground: #f4c753;
   --pact-status-danger: #ff8a80;
   --pact-status-danger-muted: #402421;
-  --pact-status-danger-foreground: #ff8a80;
+  --pact-status-danger-foreground: #ffa8a0;
   --pact-status-info: #67b1ff;
   --pact-status-info-muted: #1d3855;
   --pact-status-info-foreground: #67b1ff;
   --pact-danger: #ff8a80;
   --pact-danger-muted: #402421;
 
+  /* User lavender pill & 3-agent speaker crest + guide tokens */
   --pact-speaker-user: #2b2941;
   --pact-speaker-claude: #382923;
+  --pact-speaker-claude-fg: #f79a72;
+  --pact-speaker-claude-line: rgb(247 154 114 / 32%);
   --pact-speaker-codex: #19372f;
-  --pact-speaker-agy: #17333d;
+  --pact-speaker-codex-fg: #6ee7a8;
+  --pact-speaker-codex-line: rgb(110 231 168 / 32%);
+  --pact-speaker-agy: #162e38;
+  --pact-speaker-agy-fg: #7ad7f0;
+  --pact-speaker-agy-line: rgb(122 215 240 / 32%);
+
   --pact-diff-added: #17392b;
+  --pact-diff-added-gutter: #173328;
   --pact-diff-added-foreground: #9ce7b3;
   --pact-diff-removed: #402421;
+  --pact-diff-removed-gutter: #362022;
   --pact-diff-removed-foreground: #ffaea6;
 
-  --pact-shadow-popover: 0 14px 34px rgb(0 0 0 / 36%);
-  --pact-shadow-dialog: 0 24px 60px rgb(0 0 0 / 52%);
+  --pact-shadow-sheet: 0 4px 20px rgb(0 0 0 / 28%), 0 1px 2px rgb(0 0 0 / 18%);
+  --pact-shadow-island: 0 14px 36px rgb(0 0 0 / 42%), 0 1px 2px rgb(255 255 255 / 4%);
+  --pact-shadow-popover: 0 14px 34px rgb(0 0 0 / 42%), 0 2px 6px rgb(0 0 0 / 24%);
+  --pact-shadow-dialog: 0 24px 60px rgb(0 0 0 / 56%), 0 4px 12px rgb(0 0 0 / 32%);
+
+  --pact-scrollbar-thumb: rgb(148 163 184 / 22%);
+  --pact-scrollbar-thumb-hover: rgb(148 163 184 / 38%);
 
   --pact-material-canvas: rgb(15 23 32 / var(--pact-material-navigation-alpha));
   --pact-material-navigation: rgb(25 38 51 / var(--pact-material-navigation-alpha));
@@ -51,7 +73,15 @@
   --pact-material-user: rgb(43 41 65 / var(--pact-material-message-alpha));
   --pact-material-claude: rgb(56 41 35 / var(--pact-material-message-alpha));
   --pact-material-codex: rgb(25 55 47 / var(--pact-material-message-alpha));
-  --pact-material-agy: rgb(23 51 61 / var(--pact-material-message-alpha));
+  --pact-material-agy: rgb(22 46 56 / var(--pact-material-message-alpha));
+  --pact-material-sheet-border: rgb(255 255 255 / 14%);
+}
+
+[data-theme='dark'][data-material='translucent'] {
+  --pact-code-surface: rgb(32 47 63 / var(--pact-material-code-alpha));
+  --pact-code-block-surface: rgb(14 22 32 / var(--pact-material-code-alpha));
+  --pact-code-foreground: #edf5fc;
+  --pact-code-border: rgb(241 245 249 / 18%);
 }
 
 @media (prefers-color-scheme: dark) {
@@ -62,26 +92,32 @@
     --pact-surface: #141e28;
     --pact-surface-muted: #192633;
     --pact-surface-raised: #1d2a36;
-    --pact-menu-surface: #2b3d4b;
+    --pact-code-surface: #202f3f;
+    --pact-code-block-surface: #0e1620;
+    --pact-code-foreground: #edf5fc;
+    --pact-code-border: rgb(241 245 249 / 14%);
+    --pact-menu-surface: #252b38;
     --pact-surface-inverse: #edf5fb;
+    --pact-row-hover: rgb(255 255 255 / 4.5%);
     --pact-text-primary: #f2f7fb;
-    --pact-text-secondary: #a9b7c4;
-    --pact-text-tertiary: #8393a1;
+    --pact-text-secondary: #a1adbf;
+    --pact-text-tertiary: #8794a8;
     --pact-text-inverse: #0a0d12;
-    --pact-border: #2b3b49;
-    --pact-border-strong: #627587;
+    --pact-border: rgb(241 245 249 / 7.5%);
+    --pact-border-strong: rgb(241 245 249 / 15%);
     --pact-focus: #67b1ff;
+    --pact-accent-soft: rgb(103 177 255 / 13%);
     --pact-selection: rgb(103 177 255 / 30%);
     --pact-navigation-selected: rgb(242 247 251 / 7%);
     --pact-status-ready: #5ee58a;
     --pact-status-ready-muted: #17392b;
     --pact-status-ready-foreground: #5ee58a;
-    --pact-status-warning: #e6b84a;
-    --pact-status-warning-muted: #3d3116;
-    --pact-status-warning-foreground: #e6b84a;
+    --pact-status-warning: #eab308;
+    --pact-status-warning-muted: #382d14;
+    --pact-status-warning-foreground: #f4c753;
     --pact-status-danger: #ff8a80;
     --pact-status-danger-muted: #402421;
-    --pact-status-danger-foreground: #ff8a80;
+    --pact-status-danger-foreground: #ffa8a0;
     --pact-status-info: #67b1ff;
     --pact-status-info-muted: #1d3855;
     --pact-status-info-foreground: #67b1ff;
@@ -89,14 +125,26 @@
     --pact-danger-muted: #402421;
     --pact-speaker-user: #2b2941;
     --pact-speaker-claude: #382923;
+    --pact-speaker-claude-fg: #f79a72;
+    --pact-speaker-claude-line: rgb(247 154 114 / 32%);
     --pact-speaker-codex: #19372f;
-    --pact-speaker-agy: #17333d;
+    --pact-speaker-codex-fg: #6ee7a8;
+    --pact-speaker-codex-line: rgb(110 231 168 / 32%);
+    --pact-speaker-agy: #162e38;
+    --pact-speaker-agy-fg: #7ad7f0;
+    --pact-speaker-agy-line: rgb(122 215 240 / 32%);
     --pact-diff-added: #17392b;
+    --pact-diff-added-gutter: #173328;
     --pact-diff-added-foreground: #9ce7b3;
     --pact-diff-removed: #402421;
+    --pact-diff-removed-gutter: #362022;
     --pact-diff-removed-foreground: #ffaea6;
-    --pact-shadow-popover: 0 14px 34px rgb(0 0 0 / 36%);
-    --pact-shadow-dialog: 0 24px 60px rgb(0 0 0 / 52%);
+    --pact-shadow-sheet: 0 4px 20px rgb(0 0 0 / 28%), 0 1px 2px rgb(0 0 0 / 18%);
+    --pact-shadow-island: 0 14px 36px rgb(0 0 0 / 42%), 0 1px 2px rgb(255 255 255 / 4%);
+    --pact-shadow-popover: 0 14px 34px rgb(0 0 0 / 42%), 0 2px 6px rgb(0 0 0 / 24%);
+    --pact-shadow-dialog: 0 24px 60px rgb(0 0 0 / 56%), 0 4px 12px rgb(0 0 0 / 32%);
+    --pact-scrollbar-thumb: rgb(148 163 184 / 22%);
+    --pact-scrollbar-thumb-hover: rgb(148 163 184 / 38%);
     --pact-material-canvas: rgb(15 23 32 / var(--pact-material-navigation-alpha));
     --pact-material-navigation: rgb(25 38 51 / var(--pact-material-navigation-alpha));
     --pact-material-chat: rgb(20 30 40 / var(--pact-material-chat-alpha));
@@ -104,6 +152,14 @@
     --pact-material-user: rgb(43 41 65 / var(--pact-material-message-alpha));
     --pact-material-claude: rgb(56 41 35 / var(--pact-material-message-alpha));
     --pact-material-codex: rgb(25 55 47 / var(--pact-material-message-alpha));
-    --pact-material-agy: rgb(23 51 61 / var(--pact-material-message-alpha));
+    --pact-material-agy: rgb(22 46 56 / var(--pact-material-message-alpha));
+    --pact-material-sheet-border: rgb(255 255 255 / 14%);
+  }
+
+  :root:not([data-theme])[data-material='translucent'] {
+    --pact-code-surface: rgb(32 47 63 / var(--pact-material-code-alpha));
+    --pact-code-block-surface: rgb(14 22 32 / var(--pact-material-code-alpha));
+    --pact-code-foreground: #edf5fc;
+    --pact-code-border: rgb(241 245 249 / 18%);
   }
 }

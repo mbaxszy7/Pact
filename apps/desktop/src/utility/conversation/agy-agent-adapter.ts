@@ -1,8 +1,7 @@
 import type { ChildProcessWithoutNullStreams } from 'node:child_process'
+import type { Socket as NetSocket } from 'node:net'
 
 import { createHash, randomUUID } from 'node:crypto'
-import { constants } from 'node:fs'
-import { open } from 'node:fs/promises'
 import { createServer, type Server as HttpServer, type ServerResponse } from 'node:http'
 import { homedir } from 'node:os'
 import { basename, isAbsolute, join, relative, resolve as resolvePath } from 'node:path'
@@ -10,7 +9,9 @@ import { isDeepStrictEqual } from 'node:util'
 
 import {
   agentPromptImageGroups,
+  resolveAgentCollaborationSourceCapability,
   type AgentAdapter,
+  type AgentCollaborationSourceCapability,
   type AgentCollaborationSourceReader,
   type AgentNativeCheckContext,
   type AgentNativeCheckOperation,
@@ -26,6 +27,7 @@ import {
   type AgentNativeInputProbeInput,
   type AgentNativeProbeInput,
   type AgentNativeRunProbeInput,
+  type AgentOpenPlanFinalIntent,
   type AgentProbeResult,
   type AgentPromptImage,
   type AgentRunInput,
@@ -38,6 +40,8 @@ import {
   COLLABORATION_PAGE_BYTES,
   COLLABORATION_PLAN_CHUNK_BYTES,
   COLLABORATION_PUBLISHED_PLAN_MAX_BYTES,
+  buildBoundedNativePlanId,
+  codexCollaborationSourceWireReadSchema,
   collaborationActor,
   collaborationAskMode,
   collaborationInputOutcomeAllowed,
@@ -48,7 +52,11 @@ import {
   collaborationPlanRetentionInputSchema,
   collaborationPublishPlanInputSchema,
   collaborationReviewInputSchema,
+  collaborationSourceAnyReadSchema,
   collaborationSourceNativeReadSchema,
+  collaborationSourceWireReadSchema,
+  encodeBoundedOpenPlanCallKey,
+  encodeBoundedOpenPlanProgressToken,
   NATIVE_PERMISSION_REQUESTS,
   nativeBackgroundReportIdentitySchema,
   nativeInputDetailsSchema,
@@ -78,6 +86,7 @@ import {
 } from '@pact/contracts'
 
 import type { LogicalIpcWorkerTraffic } from '../../shared/logical-ipc-traffic'
+import type { AgyTrajectoryIdentityClientResult } from './native-fork-files'
 
 import { recordDiagnostic } from '../../diagnostics/utility-log'
 import { OwnedProcessGroup } from '../owned-process-group'
@@ -94,17 +103,27 @@ import {
   AGY_CONTROL_RPC_TIMEOUT_MS,
   AGY_MAX_CONTEXTS,
   AGY_PROMPT_ACCEPT_TIMEOUT_MS,
+  AGY_SESSION_LIFECYCLE_RPC_TIMEOUT_MS,
   AgyAcpConnection,
   AgyAcpConnectionPool,
   createAgyRootFrameNotWrittenProof,
+  type AgyIngress,
+  type AgyOrderedSessionStream,
   type AgyPoolLease,
   type AgyProcessFactory,
+  type AgyRequestPhysicalCompletion,
   type AgyServerRequestOwnerHandle,
-  type AgySessionNotificationStream,
+  type AgySessionCloseFailureReason,
 } from './agy-acp-connection'
-import { resolveAgyAppDataDir } from './agy-native-storage'
+import {
+  AGY_TRAJECTORY_ID_PATTERN,
+  isValidAgyTrajectoryId,
+  resolveAgyAppDataDir,
+} from './agy-native-storage'
 import { mergeWorkflowInput, mergeWorkflowReview } from './collaboration-answer'
 import {
+  buildCollaborationSourceToolDescription,
+  buildSourceInstructions,
   collaborationInputResultAllowed,
   collaborationInputResultDescription,
   collaborationInputResultReceiptText,
@@ -112,8 +131,6 @@ import {
   collaborationPlanRetentionReceiptText,
   collaborationReadOnly,
   collaborationReviewMode,
-  collaborationSourceToolDescription,
-  frozenSourceInstructions,
 } from './collaboration-prompt'
 import {
   cutoffSourceNavigator,
@@ -129,6 +146,7 @@ import {
   nativeFileChangesSettled,
   recordNativeChanges,
 } from './native-file-changes'
+import { NativeForkFiles } from './native-fork-files'
 import {
   agyPromptInput,
   nativeImagePreparationBytes,
@@ -140,6 +158,7 @@ import {
   safeNativePermissionText,
 } from './native-permission-wait'
 import {
+  AgySkillProbeOwner,
   bindAgySkillSelections,
   discoverAgySkills,
   type AgySkillDiscoveryOptions,
@@ -155,6 +174,9 @@ const AGY_PROBE_TIMEOUT_MS = 4_000
 const AGY_PROBE_MAX_BYTES = 16 * 1024
 const AGY_MAX_TOOL_STATES = 64
 const AGY_MAX_TOOL_STATE_BYTES = 8 * 1024 * 1024
+const AGY_MAX_FOREGROUND_DEDUP_ID_CHARS = 512
+const AGY_MAX_FOREGROUND_DEDUP_ID_COUNT = 4_096
+const AGY_MAX_FOREGROUND_DEDUP_BYTES = 512 * 1024
 const AGY_MAX_REASONING_ITEMS = 64
 const AGY_MAX_REASONING_BYTES = 2 * 1024 * 1024
 const AGY_MAX_STEERING_INPUTS = 63
@@ -165,7 +187,10 @@ const AGY_MCP_REQUEST_BYTES = 64 * 1024
 const AGY_MCP_MAX_CONCURRENT_REQUESTS = 4
 const AGY_MCP_REQUEST_TIMEOUT_MS = 10_000
 const AGY_PHYSICAL_SETTLEMENT_GRACE_MS = 1_500
-const AGY_PROGRESS_TOKEN_PATTERN = /^([A-Za-z0-9_.:-]{1,256}):(\d{1,9})$/u
+const AGY_PROGRESS_TOKEN_PATTERN = new RegExp(
+  `^(${AGY_TRAJECTORY_ID_PATTERN.source.slice(1, -1)}):(\\d{1,9})$`,
+  'u',
+)
 
 const VALID_ACP_STOP_REASONS = new Set<string>([
   'end_turn',
@@ -202,11 +227,54 @@ export interface AgySteerConsumptionReceipt {
   executionId?: string
 }
 
+export function buildAgyPactMcpServerName(runId: string): string {
+  const digest = createHash('sha256').update(`pact-agy-mcp-server-v1:${runId}`).digest('hex')
+  return `pact_peer_${digest.slice(0, 16)}`
+}
+
+export interface AgyCompletedPactPublishPlanCall {
+  readonly serverName: string
+  readonly callId?: string | undefined
+  readonly progressToken?: string | undefined
+  readonly stepId?: string | undefined
+}
+
 /**
  * Clean typed seam between `AgyAgentAdapter` (Modules 3, 4 & 6) and `@agy-storage` (Modules 7 & 8)
  * so cold SQLite/Protobuf inspection, zero-Turn Rebuild seeding, and cut-point Fork plug in cleanly.
  */
 export interface AgyNativeStorageClient {
+  inspectRun?(
+    input: {
+      appDataDir: string
+      cwd: string
+      nativeSessionId: string
+      nativeTurnId?: string | undefined
+      includePlan?: boolean | undefined
+    },
+    signal: AbortSignal,
+  ): Promise<{
+    exists: boolean
+    terminalState?:
+      | {
+          executionId: string
+          status: 'completed' | 'failed' | 'canceled' | 'running'
+          plan?: { nativeId: string; text: string } | undefined
+          planUnavailable?: true | undefined
+          hasCompletedPactPublishPlan?: boolean | undefined
+          completedPactPublishPlanCalls?: readonly AgyCompletedPactPublishPlanCall[] | undefined
+          completedPactPublishPlanTokens?: readonly string[] | undefined
+        }
+      | undefined
+  }>
+  readTrajectoryIdentity?(
+    input: {
+      appDataDir: string
+      cwd: string
+      nativeSessionId: string
+    },
+    signal: AbortSignal,
+  ): Promise<AgyTrajectoryIdentityClientResult>
   probeSessionStatus?(
     input: AgentNativeRunProbeInput & { appDataDir?: string | undefined },
     signal: AbortSignal,
@@ -314,6 +382,9 @@ export interface AgyAgentAdapterOptions {
   ) => OwnedAgyProbeProcess | Promise<OwnedAgyProbeProcess>
   skillDiscoveryOptions?: AgySkillDiscoveryOptions
   storageClient?: AgyNativeStorageClient
+  subscribeStoragePhysicalOperations?: (
+    observer: (signal: AbortSignal, completion: Promise<void>) => void,
+  ) => () => void
   ipcTraffic?: LogicalIpcWorkerTraffic
   /** Optional active-pair peer constraint when supplied by Session host. */
   peerTargetAgentId?: Exclude<RuntimeAgentId, 'agy'>
@@ -340,18 +411,90 @@ interface AcpSessionDescriptor {
   configOptions: AcpConfigOptionEntry[]
 }
 
+type NormalizedAcpToolStatus = 'pending' | 'in_progress' | 'completed' | 'failed' | 'cancelled'
+
+function normalizeAcpToolStatus(raw: unknown): NormalizedAcpToolStatus | undefined {
+  if (typeof raw !== 'string') return undefined
+  switch (raw) {
+    case 'pending':
+    case 'in_progress':
+    case 'completed':
+    case 'failed':
+    case 'cancelled':
+      return raw
+    default:
+      return undefined
+  }
+}
+
+function isEligibleAgyBackgroundReportId(id: string | undefined): id is string {
+  return (
+    id !== undefined &&
+    id.length > 0 &&
+    id.length <= AGY_MAX_FOREGROUND_DEDUP_ID_CHARS &&
+    Buffer.byteLength(id, 'utf8') <= AGY_MCP_MAX_TOOL_CALL_ID_BYTES
+  )
+}
+
+function classifyAgyCloseFailureDiagnostic(reason: AgySessionCloseFailureReason): {
+  failureSource:
+    | 'native_rpc_rejection'
+    | 'transport_failure'
+    | 'timeout'
+    | 'cancelled'
+    | 'classified_error'
+  code:
+    | 'native_rpc_rejected'
+    | 'TIMEOUT'
+    | 'request_cancelled'
+    | 'AGENT_CAPACITY'
+    | 'protocol_error'
+    | 'transport_failure'
+} {
+  switch (reason) {
+    case 'rpc_error':
+      return { failureSource: 'native_rpc_rejection', code: 'native_rpc_rejected' }
+    case 'timeout':
+      return { failureSource: 'timeout', code: 'TIMEOUT' }
+    case 'cancelled':
+      return { failureSource: 'cancelled', code: 'request_cancelled' }
+    case 'capacity':
+      return { failureSource: 'classified_error', code: 'AGENT_CAPACITY' }
+    case 'protocol_error':
+      return { failureSource: 'transport_failure', code: 'protocol_error' }
+    case 'transport_closed':
+      return { failureSource: 'transport_failure', code: 'transport_failure' }
+    default: {
+      const exhaustive: never = reason
+      throw new Error(`Unhandled AgySessionCloseFailureReason: ${String(exhaustive)}`)
+    }
+  }
+}
+
 interface AgyToolState {
   toolCallId: string
   name: string
+  explicitToolName?: string | undefined
   title: string
-  status: string
+  status: NormalizedAcpToolStatus
+  invalidStatus?: boolean | undefined
   progressToken?: string | undefined
+  invalidProgressToken?: boolean | undefined
+  toolIdentityConflicted?: boolean | undefined
   detail?: string | undefined
   args?: Record<string, unknown> | undefined
+  argsBytes?: number | undefined
   rawInput?: Record<string, unknown> | undefined
+  rawInputBytes?: number | undefined
+  mergedArgs?: Record<string, unknown> | undefined
+  mergedArgsBytes?: number | undefined
+  argsConflicted?: boolean | undefined
   rawOutput?: unknown
+  rawOutputBytes?: number | undefined
   content?: unknown[] | undefined
+  contentBytes?: number | undefined
   locations?: unknown[] | undefined
+  locationsBytes?: number | undefined
   reservedBytes: number
   startedEmitted: boolean
   completedEmitted: boolean
@@ -368,6 +511,12 @@ interface AgySteerEntry {
   settled: boolean
 }
 
+interface StagedPreBindFrame {
+  readonly frame: ValidatedAgyFrame
+  readonly bytes: number
+  readonly arrivedDuringForeignTurn: boolean
+}
+
 interface ActiveAgyRun {
   readonly runId: string
   readonly sessionId: string
@@ -379,7 +528,7 @@ interface ActiveAgyRun {
   readonly resumedExistingSession: boolean
   readonly knownForeignExecutionIds: Set<string>
   foreignTurnActiveUntilRootBound: boolean
-  readonly stagedPreBindNotifications: object[]
+  readonly stagedPreBindNotifications: StagedPreBindFrame[]
   readonly bindingGeneration: number
   readonly nativeGeneration: string
   readonly executorId: string
@@ -419,13 +568,13 @@ function asString(value: unknown): string | undefined {
 }
 
 async function awaitPhysicalCompletionBounded(
-  physicalCompletion: Promise<'reply' | 'not_sent' | 'connection_closed'>,
+  physicalOutcome: Promise<AgyRequestPhysicalCompletion>,
   timeoutMs = AGY_PHYSICAL_SETTLEMENT_GRACE_MS,
-): Promise<'reply' | 'not_sent' | 'connection_closed' | 'timeout'> {
+): Promise<AgyRequestPhysicalCompletion | 'timeout'> {
   let timer: ReturnType<typeof setTimeout> | undefined
   try {
     return await Promise.race([
-      physicalCompletion,
+      physicalOutcome,
       new Promise<'timeout'>((resolveTimeout) => {
         timer = setTimeout(() => resolveTimeout('timeout'), timeoutMs)
         timer.unref?.()
@@ -437,10 +586,28 @@ async function awaitPhysicalCompletionBounded(
 }
 
 const AGY_MAX_TOOL_JSON_DEPTH = 16
+const AGY_MAX_TOOL_JSON_NODES = 65_536
 const AGY_CONFIG_OPTION_POST_REPLY_WINDOW_MS = 50
+const AGY_MAX_PENDING_EVENTS = 2_048
+const AGY_MAX_PENDING_EVENT_BYTES = 4 * 1024 * 1024
+const AGY_MAX_STAGED_PRE_BIND_FRAMES = 256
+const AGY_MAX_STAGED_PRE_BIND_BYTES = 2 * 1024 * 1024
+const AGY_MAX_FOREIGN_EXECUTION_IDS = 256
+const AGY_MAX_FOREIGN_EXECUTION_ID_BYTES = 64 * 1024
+const AGY_MAX_POST_CUTOFF_BG_PENDING = 128
+const AGY_MAX_POST_CUTOFF_BG_BYTES = 2 * 1024 * 1024
+const AGY_MCP_MAX_CONCURRENT_SOCKETS = 32
+const AGY_MCP_HEADERS_TIMEOUT_MS = 5_000
+const AGY_MCP_CLOSE_TIMEOUT_MS = 1_500
 
-function estimateJsonPayloadBytes(value: unknown, maxBytes = AGY_MAX_TOOL_STATE_BYTES): number {
+function estimateJsonPayloadBytes(
+  value: unknown,
+  maxBytes = AGY_MAX_TOOL_STATE_BYTES,
+  maxNodes = AGY_MAX_TOOL_JSON_NODES,
+): number {
+  if (value === undefined) return 0
   let total = 0
+  let nodes = 0
   const charge = (delta: number): void => {
     total += delta
     if (total > maxBytes) {
@@ -451,8 +618,22 @@ function estimateJsonPayloadBytes(value: unknown, maxBytes = AGY_MAX_TOOL_STATE_
       )
     }
   }
+  const countNode = (delta = 1): void => {
+    nodes += delta
+    if (nodes > maxNodes) {
+      throw new AgentExecutionError(
+        'response_too_large',
+        'Antigravity tool call payload exceeded maximum JSON node count.',
+        false,
+      )
+    }
+  }
   const visit = (node: unknown, depth: number): void => {
-    if (node === undefined || node === null) return
+    countNode(1)
+    if (node === undefined || node === null) {
+      charge(8)
+      return
+    }
     if (typeof node === 'string') {
       charge(Buffer.byteLength(node, 'utf8') + 16)
       return
@@ -473,8 +654,15 @@ function estimateJsonPayloadBytes(value: unknown, maxBytes = AGY_MAX_TOOL_STATE_
       )
     }
     if (Array.isArray(node)) {
-      charge(32)
-      for (const item of node) visit(item, depth + 1)
+      charge(32 + node.length * 8)
+      if (nodes + node.length > maxNodes) {
+        throw new AgentExecutionError(
+          'response_too_large',
+          'Antigravity tool call payload exceeded maximum JSON node count.',
+          false,
+        )
+      }
+      for (let i = 0; i < node.length; i += 1) visit(node[i], depth + 1)
       return
     }
     if (isPlainObject(node)) {
@@ -489,6 +677,37 @@ function estimateJsonPayloadBytes(value: unknown, maxBytes = AGY_MAX_TOOL_STATE_
   }
   visit(value, 0)
   return total
+}
+
+function estimateNormalizedEventBytes(event: NormalizedAgentEvent): number {
+  let bytes = 160
+  const visit = (val: unknown, depth: number): void => {
+    if (val === null || val === undefined || depth > 6) return
+    if (typeof val === 'string') {
+      bytes += Buffer.byteLength(val, 'utf8') * 2 + 16
+      return
+    }
+    if (typeof val === 'number' || typeof val === 'boolean') {
+      bytes += 16
+      return
+    }
+    if (Array.isArray(val)) {
+      bytes += 32
+      for (const item of val) {
+        visit(item, depth + 1)
+      }
+      return
+    }
+    if (typeof val === 'object') {
+      bytes += 48
+      for (const [k, v] of Object.entries(val)) {
+        bytes += Buffer.byteLength(k, 'utf8') + 16
+        visit(v, depth + 1)
+      }
+    }
+  }
+  visit(event, 0)
+  return bytes
 }
 
 function extractUserChunkPactIdentity(update: Record<string, unknown>): {
@@ -636,17 +855,36 @@ function parseConfigOptions(raw: unknown): AcpConfigOptionEntry[] {
   return entries
 }
 
-function findRejectOnceOptionId(options: unknown): string | undefined {
-  if (!Array.isArray(options) || options.length === 0 || options.length > 32) return undefined
+function collectAmbiguousPermissionOptionIds(options: readonly unknown[]): Set<string> {
+  const seen = new Set<string>()
+  const duplicates = new Set<string>()
   for (const option of options) {
     if (!isPlainObject(option)) continue
     const optionId = asString(option.optionId)
-    const kind = asString(option.kind)
-    if (
-      optionId &&
-      optionId.length <= 80 &&
-      (kind === 'reject_once' || optionId === 'deny' || optionId === 'reject_once')
-    ) {
+    if (!optionId) continue
+    if (seen.has(optionId)) {
+      duplicates.add(optionId)
+    } else {
+      seen.add(optionId)
+    }
+  }
+  return duplicates
+}
+
+function findRejectOnceOptionId(options: unknown): string | undefined {
+  if (!Array.isArray(options) || options.length === 0 || options.length > 32) return undefined
+  const ambiguousIds = collectAmbiguousPermissionOptionIds(options)
+  for (const option of options) {
+    if (!isPlainObject(option)) continue
+    const optionId = asString(option.optionId)
+    if (!optionId || optionId.length > 80 || ambiguousIds.has(optionId)) continue
+    const rawKind = option.kind
+    if (typeof rawKind === 'string' && rawKind.length > 0) {
+      if (rawKind === 'reject_once') return optionId
+      continue
+    }
+    if (rawKind !== undefined) continue
+    if (optionId === 'deny' || optionId === 'reject_once') {
       return optionId
     }
   }
@@ -655,14 +893,20 @@ function findRejectOnceOptionId(options: unknown): string | undefined {
 
 function findAllowOnceOptionId(options: unknown): string | undefined {
   if (!Array.isArray(options) || options.length === 0 || options.length > 32) return undefined
+  const ambiguousIds = collectAmbiguousPermissionOptionIds(options)
   for (const option of options) {
     if (!isPlainObject(option)) continue
     const optionId = asString(option.optionId)
-    const kind = asString(option.kind)
-    if (!optionId || optionId.length > 80) continue
-    // NEVER auto-select or expose `allow_always` as session-scoped because Antigravity persists it globally.
-    if (kind === 'allow_always' || optionId === 'allow_always') continue
-    if (kind === 'allow_once' || optionId === 'allow' || optionId === 'allow_once') {
+    if (!optionId || optionId.length > 80 || ambiguousIds.has(optionId)) continue
+    const rawKind = option.kind
+    if (typeof rawKind === 'string' && rawKind.length > 0) {
+      // NEVER auto-select or expose `allow_always` as session-scoped because Antigravity persists it globally.
+      if (rawKind === 'allow_once') return optionId
+      continue
+    }
+    if (rawKind !== undefined) continue
+    if (optionId === 'allow_always') continue
+    if (optionId === 'allow' || optionId === 'allow_once') {
       return optionId
     }
   }
@@ -956,49 +1200,3358 @@ function isMarkdownBrainPlanArtifact(
   return appDataDirs.some((dir) => isAgyBrainArtifactPath(rawPath, cwd, dir, nativeSessionId))
 }
 
-async function readBoundedMarkdownArtifact(filePath: string, signal: AbortSignal): Promise<string> {
-  const handle = await open(filePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
-  try {
-    const info = await handle.stat({ bigint: true })
-    if (
-      !info.isFile() ||
-      info.nlink !== 1n ||
-      info.size <= 0n ||
-      info.size > BigInt(COLLABORATION_PUBLISHED_PLAN_MAX_BYTES)
-    ) {
-      throw new Error('Brain plan artifact is missing or exceeds the published plan limit.')
-    }
-    const bytes = await handle.readFile({ signal })
-    if (bytes.byteLength > COLLABORATION_PUBLISHED_PLAN_MAX_BYTES) {
-      throw new Error('Brain plan artifact exceeds the published plan limit.')
-    }
-    return bytes.toString('utf8')
-  } finally {
-    await handle.close()
+const AGY_MCP_CORRELATION_WAIT_MS = 150
+const AGY_MCP_MAX_ACTIVE_ACP_CALLS = 256
+const AGY_MCP_MAX_CONSUMED_TOKENS = 4_096
+const AGY_MCP_MAX_RETIRED_CALL_TOMBSTONES = 2_048
+const AGY_MCP_MAX_CORRELATION_BYTES = 256 * 1024
+const AGY_MCP_MAX_TOOL_CALL_ID_BYTES = 1_024
+const AGY_MCP_MAX_PROGRESS_TOKEN_BYTES = 300
+const AGY_MCP_MAX_FINGERPRINT_KEYS = 64
+const AGY_MCP_MAX_FINGERPRINT_BYTES = 8 * 1024
+const AGY_MCP_TERMINAL_STUB_BYTES = 128
+const AGY_MCP_RETIRED_CALL_TOMBSTONE_BYTES = 96
+const AGY_STRICT_STEP_INDEX_PATTERN = /^(0|[1-9]\d{0,8})$/u
+
+interface CanonicalProgressToken {
+  readonly canonical: string
+  readonly structured?: {
+    readonly trajectoryId: string
+    readonly stepIdx: number
+    readonly hasLeadingZeros: boolean
   }
 }
 
-interface StagedMcpCallOutcome {
-  progressToken: string
-  kind:
-    | { type: 'title'; title: string }
-    | {
-        type: 'peer'
-        targetAgentId: Exclude<RuntimeAgentId, 'agy'>
-        proposalKind: 'supplement' | 'fact_check' | 'challenge' | 'review'
-        reason?: string | undefined
+interface StructuredProgressToken {
+  readonly canonical: string
+  readonly structured: {
+    readonly trajectoryId: string
+    readonly stepIdx: number
+    readonly hasLeadingZeros: false
+  }
+}
+
+function hashCallIdDigest(toolCallId: string): string {
+  return createHash('sha256').update(toolCallId, 'utf8').digest('hex')
+}
+
+function canonicalizeProgressToken(raw: unknown): CanonicalProgressToken | undefined {
+  const rawStr =
+    typeof raw === 'string'
+      ? raw
+      : typeof raw === 'number' && Number.isSafeInteger(raw)
+        ? String(raw)
+        : undefined
+  if (
+    !rawStr ||
+    rawStr.length === 0 ||
+    Buffer.byteLength(rawStr, 'utf8') > AGY_MCP_MAX_PROGRESS_TOKEN_BYTES
+  ) {
+    return undefined
+  }
+  const match = AGY_PROGRESS_TOKEN_PATTERN.exec(rawStr)
+  if (!match) {
+    return { canonical: rawStr }
+  }
+  const trajectoryId = match[1]!
+  const digits = match[2]!
+  const stepIdx = Number(digits)
+  if (!isValidAgyTrajectoryId(trajectoryId) || !Number.isSafeInteger(stepIdx) || stepIdx < 0) {
+    return undefined
+  }
+  const hasLeadingZeros = !AGY_STRICT_STEP_INDEX_PATTERN.test(digits)
+  return {
+    canonical: `${trajectoryId}:${stepIdx}`,
+    structured: {
+      trajectoryId,
+      stepIdx,
+      hasLeadingZeros,
+    },
+  }
+}
+
+function parseRootProgressToken(raw: unknown): StructuredProgressToken | undefined {
+  const parsed = canonicalizeProgressToken(raw)
+  if (
+    !parsed ||
+    !parsed.structured ||
+    parsed.structured.hasLeadingZeros ||
+    !isValidAgyTrajectoryId(parsed.structured.trajectoryId)
+  ) {
+    return undefined
+  }
+  return {
+    canonical: parsed.canonical,
+    structured: {
+      trajectoryId: parsed.structured.trajectoryId,
+      stepIdx: parsed.structured.stepIdx,
+      hasLeadingZeros: false,
+    },
+  }
+}
+
+const PACT_SEMANTIC_ARG_KEYS = new Set([
+  'verdict',
+  'questions',
+  'outcome',
+  'title',
+  'target',
+  'kind',
+  'reason',
+  'text',
+  'offset',
+  'complete',
+  'source',
+  'part',
+  'document',
+  'batchId',
+  'cutoffId',
+  'messageId',
+  'commentId',
+  'sourceReference',
+  'ordinal',
+  'context',
+  'runId',
+  'grant',
+])
+
+const AGY_CANONICAL_HASH_MAX_DEPTH = 12
+const AGY_CANONICAL_HASH_MAX_NODES = 16_384
+
+function updateCanonicalJsonHash(
+  hasher: ReturnType<typeof createHash>,
+  value: unknown,
+  depth = 0,
+  budget: { remaining: number } = { remaining: AGY_CANONICAL_HASH_MAX_NODES },
+): boolean {
+  if (depth > AGY_CANONICAL_HASH_MAX_DEPTH || budget.remaining <= 0) {
+    return false
+  }
+  budget.remaining -= 1
+  if (value === null || typeof value !== 'object') {
+    hasher.update(JSON.stringify(value) ?? 'null')
+    return true
+  }
+  if (Array.isArray(value)) {
+    hasher.update('[')
+    for (let i = 0; i < value.length; i += 1) {
+      if (i > 0) hasher.update(',')
+      if (!updateCanonicalJsonHash(hasher, value[i], depth + 1, budget)) {
+        return false
       }
-    | { type: 'review'; observation: CollaborationReviewObservation }
-    | { type: 'input_result'; observation: CollaborationInputObservation }
-    | { type: 'retain_plan' }
-    | { type: 'publish_plan'; markdown: string }
+    }
+    hasher.update(']')
+    return true
+  }
+  const entries: Array<[string, unknown]> = []
+  let seenKeys = 0
+  for (const key in value) {
+    if (!Object.hasOwn(value, key)) continue
+    seenKeys += 1
+    if (seenKeys > budget.remaining) {
+      budget.remaining = -1
+      return false
+    }
+    const entryVal: unknown = Reflect.get(value, key)
+    if (entryVal !== undefined) {
+      entries.push([key, entryVal])
+    }
+  }
+  entries.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+  hasher.update('{')
+  for (let i = 0; i < entries.length; i += 1) {
+    const [key, entryVal] = entries[i]!
+    if (i > 0) hasher.update(',')
+    hasher.update(JSON.stringify(key))
+    hasher.update(':')
+    if (!updateCanonicalJsonHash(hasher, entryVal, depth + 1, budget)) {
+      return false
+    }
+  }
+  hasher.update('}')
+  return true
+}
+
+function computeFullDigestFromKeyDigests(keyDigests: ReadonlyMap<string, string>): string {
+  const sorted = [...keyDigests.entries()].toSorted(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+  const hasher = createHash('sha256')
+  hasher.update('{')
+  for (let i = 0; i < sorted.length; i += 1) {
+    const [key, digest] = sorted[i]!
+    if (i > 0) hasher.update(',')
+    hasher.update(JSON.stringify(key))
+    hasher.update(':')
+    hasher.update(digest)
+  }
+  hasher.update('}')
+  return hasher.digest('hex')
+}
+
+interface CompactArgsFingerprint {
+  readonly fullDigest: string
+  readonly keyDigests: ReadonlyMap<string, string>
+  readonly approxBytes: number
+}
+
+function buildCompactArgsFingerprint(
+  rawRecord: Record<string, unknown>,
+  stripToolSummary: boolean,
+): CompactArgsFingerprint | undefined {
+  const filtered: Array<[string, unknown]> = []
+  let inspectedKeys = 0
+  for (const key in rawRecord) {
+    if (!Object.hasOwn(rawRecord, key)) continue
+    inspectedKeys += 1
+    if (inspectedKeys > AGY_CANONICAL_HASH_MAX_NODES) return undefined
+    const val = rawRecord[key]
+    if (val === undefined) continue
+    if (stripToolSummary && key === 'toolSummary') continue
+    if (key.length > 128) return undefined
+    filtered.push([key, val])
+    if (filtered.length > AGY_MCP_MAX_FINGERPRINT_KEYS) return undefined
+  }
+  const keyDigests = new Map<string, string>()
+  let approxBytes = 128
+  const budget = { remaining: AGY_CANONICAL_HASH_MAX_NODES }
+  for (const [key, val] of filtered) {
+    const hasher = createHash('sha256')
+    if (!updateCanonicalJsonHash(hasher, val, 0, budget)) {
+      return undefined
+    }
+    const digest = hasher.digest('hex')
+    keyDigests.set(key, digest)
+    approxBytes += Buffer.byteLength(key, 'utf8') + digest.length + 32
+    if (approxBytes > AGY_MCP_MAX_FINGERPRINT_BYTES) return undefined
+  }
+  const fullDigest = computeFullDigestFromKeyDigests(keyDigests)
+  return { fullDigest, keyDigests, approxBytes }
+}
+
+function mergeArgsFingerprints(
+  existing: CompactArgsFingerprint | undefined,
+  incoming: CompactArgsFingerprint | undefined,
+):
+  | { readonly kind: 'ok'; readonly fingerprint: CompactArgsFingerprint | undefined }
+  | { readonly kind: 'conflict' } {
+  if (incoming === undefined) return { kind: 'ok', fingerprint: existing }
+  if (existing === undefined) return { kind: 'ok', fingerprint: incoming }
+  if (fingerprintsConflict(existing, incoming)) return { kind: 'conflict' }
+  if (incoming.keyDigests.size === 0) {
+    // Summary-only update retains all previously observed semantic keys!
+    return { kind: 'ok', fingerprint: existing }
+  }
+  if (existing.keyDigests.size === 0) {
+    return { kind: 'ok', fingerprint: incoming }
+  }
+  const merged = new Map<string, string>(existing.keyDigests)
+  let approxBytes = existing.approxBytes
+  for (const [key, digest] of incoming.keyDigests) {
+    if (!merged.has(key)) {
+      merged.set(key, digest)
+      if (merged.size > AGY_MCP_MAX_FINGERPRINT_KEYS) return { kind: 'conflict' }
+      approxBytes += Buffer.byteLength(key, 'utf8') + digest.length + 32
+      if (approxBytes > AGY_MCP_MAX_FINGERPRINT_BYTES) return { kind: 'conflict' }
+    }
+  }
+  return {
+    kind: 'ok',
+    fingerprint: {
+      fullDigest: computeFullDigestFromKeyDigests(merged),
+      keyDigests: merged,
+      approxBytes,
+    },
+  }
+}
+
+function mergePlainArgsRecords(
+  existing: Record<string, unknown> | undefined,
+  incoming: Record<string, unknown>,
+): { readonly kind: 'ok'; readonly args: Record<string, unknown> } | { readonly kind: 'conflict' } {
+  if (!existing) return { kind: 'ok', args: { ...incoming } }
+  const merged: Record<string, unknown> = { ...existing }
+  for (const [key, value] of Object.entries(incoming)) {
+    if (value === undefined) continue
+    if (key === 'toolSummary') {
+      merged[key] = value
+      continue
+    }
+    if (Object.hasOwn(existing, key) && existing[key] !== undefined) {
+      if (!isDeepStrictEqual(existing[key], value)) {
+        return { kind: 'conflict' }
+      }
+    } else {
+      merged[key] = value
+    }
+  }
+  return { kind: 'ok', args: merged }
+}
+
+function compareArgsFingerprints(
+  acp: CompactArgsFingerprint | undefined,
+  http: CompactArgsFingerprint,
+): 'exact' | 'subset' | 'missing_acp_args' | 'mismatch' {
+  if (acp === undefined) return 'missing_acp_args'
+  if (acp.fullDigest === http.fullDigest) return 'exact'
+  for (const [key, httpDigest] of http.keyDigests) {
+    if (acp.keyDigests.get(key) !== httpDigest) {
+      return 'mismatch'
+    }
+  }
+  for (const key of acp.keyDigests.keys()) {
+    if (!http.keyDigests.has(key) && PACT_SEMANTIC_ARG_KEYS.has(key)) {
+      return 'mismatch'
+    }
+  }
+  return 'subset'
+}
+
+function fingerprintsConflict(a: CompactArgsFingerprint, b: CompactArgsFingerprint): boolean {
+  for (const [key, hashA] of a.keyDigests) {
+    const hashB = b.keyDigests.get(key)
+    if (hashB !== undefined && hashB !== hashA) {
+      return true
+    }
+  }
+  return false
+}
+
+function resolveFrameArgsEvidence(
+  frameArgs: Record<string, unknown> | undefined,
+  frameRawInput: Record<string, unknown> | undefined,
+):
+  | { readonly kind: 'none' }
+  | { readonly kind: 'conflict' }
+  | {
+      readonly kind: 'present'
+      readonly args: Record<string, unknown>
+      readonly fingerprint: CompactArgsFingerprint
+    } {
+  if (frameArgs === undefined && frameRawInput === undefined) {
+    return { kind: 'none' }
+  }
+  if (frameArgs !== undefined && frameRawInput === undefined) {
+    const fpArgs = buildCompactArgsFingerprint(frameArgs, true)
+    return fpArgs ? { kind: 'present', args: frameArgs, fingerprint: fpArgs } : { kind: 'conflict' }
+  }
+  if (frameArgs === undefined && frameRawInput !== undefined) {
+    const fpRaw = buildCompactArgsFingerprint(frameRawInput, true)
+    return fpRaw
+      ? { kind: 'present', args: frameRawInput, fingerprint: fpRaw }
+      : { kind: 'conflict' }
+  }
+  const fpArgs = buildCompactArgsFingerprint(frameArgs!, true)
+  const fpRaw = buildCompactArgsFingerprint(frameRawInput!, true)
+  if (!fpArgs || !fpRaw || fingerprintsConflict(fpArgs, fpRaw)) {
+    return { kind: 'conflict' }
+  }
+  if (fpArgs.keyDigests.size > 0 && fpRaw.keyDigests.size > 0) {
+    if (fpArgs.keyDigests.size !== fpRaw.keyDigests.size) {
+      return { kind: 'conflict' }
+    }
+    for (const [key, digest] of fpArgs.keyDigests) {
+      if (fpRaw.keyDigests.get(key) !== digest) {
+        return { kind: 'conflict' }
+      }
+    }
+  }
+  const merged = { ...frameRawInput!, ...frameArgs! }
+  const mergedFp = mergeArgsFingerprints(fpRaw, fpArgs)
+  return mergedFp.kind === 'ok' && mergedFp.fingerprint
+    ? { kind: 'present', args: merged, fingerprint: mergedFp.fingerprint }
+    : { kind: 'conflict' }
+}
+
+const TRAJECTORY_IDENTITY_KEYS = [
+  'trajectoryId',
+  'trajectory_id',
+  'antigravity.google/trajectory_id',
+  'root_trajectory_id',
+  'antigravity.google/root_trajectory_id',
+] as const
+
+const STEP_INDEX_KEYS = ['stepIdx', 'step_idx'] as const
+
+const SESSION_IDENTITY_KEYS = [
+  'sessionId',
+  'session_id',
+  'antigravity.google/conversation_id',
+  'conversation_id',
+  'antigravity.google/root_conversation_id',
+  'root_conversation_id',
+] as const
+
+const EXECUTION_IDENTITY_KEYS = ['executionId', 'execution_id'] as const
+
+function extractSuppliedTrajectoryAndStepEvidence(
+  containers: ReadonlyArray<Record<string, unknown> | undefined>,
+): {
+  readonly trajectoryId?: string
+  readonly stepIdx?: number
+  readonly contradicted: boolean
+} {
+  let trajectoryId: string | undefined
+  let stepIdx: number | undefined
+  let contradicted = false
+
+  for (const container of containers) {
+    if (!container) continue
+    for (const key of TRAJECTORY_IDENTITY_KEYS) {
+      if (!Object.hasOwn(container, key)) continue
+      const raw = container[key]
+      if (raw === undefined) continue
+      if (typeof raw !== 'string' || !isValidAgyTrajectoryId(raw)) {
+        contradicted = true
+        continue
+      }
+      if (trajectoryId !== undefined && trajectoryId !== raw) {
+        contradicted = true
+      } else {
+        trajectoryId = raw
+      }
+    }
+    for (const key of STEP_INDEX_KEYS) {
+      if (!Object.hasOwn(container, key)) continue
+      const raw = container[key]
+      if (raw === undefined) continue
+      if (typeof raw !== 'number' || !Number.isSafeInteger(raw) || raw < 0) {
+        contradicted = true
+        continue
+      }
+      if (stepIdx !== undefined && stepIdx !== raw) {
+        contradicted = true
+      } else {
+        stepIdx = raw
+      }
+    }
+  }
+
+  return {
+    ...(trajectoryId !== undefined ? { trajectoryId } : {}),
+    ...(stepIdx !== undefined ? { stepIdx } : {}),
+    contradicted,
+  }
+}
+
+interface ValidatedAgyTokenEvidence {
+  readonly suppliedCount: number
+  readonly allCanonicalTokens: readonly string[]
+  readonly hasInvalidToken: boolean
+  readonly hasConflictingTokens: boolean
+  readonly resolvedToken?: CanonicalProgressToken | undefined
+}
+
+interface ValidatedAgyFrame {
+  readonly seq: number
+  readonly kind: 'notification' | 'server_request'
+  readonly method: string
+  readonly rpcId?: string | number | undefined
+  readonly message: Record<string, unknown>
+  readonly params: Record<string, unknown>
+  readonly payload: Record<string, unknown> | undefined
+  readonly sessionUpdate?: string | undefined
+  readonly sessionAttribution: 'matching' | 'absent' | 'pure_foreign' | 'invalid_or_conflicting'
+  readonly isAttributableToCurrentSession: boolean
+  readonly hasForeignOrInvalidSessionMeta: boolean
+  readonly executionId?: string | undefined
+  readonly executionIdInvalid: boolean
+  readonly trajectoryId?: string | undefined
+  readonly stepIdx?: number | undefined
+  readonly rootEvidenceContradicted: boolean
+  readonly tokens: ValidatedAgyTokenEvidence
+  readonly toolCallId?: string | undefined
+  readonly toolCallIdInvalid: boolean
+  readonly explicitToolName?: string | undefined
+  readonly explicitToolNameInvalid: boolean
+  readonly status?: NormalizedAcpToolStatus | undefined
+  readonly statusPresent: boolean
+  readonly statusInvalid: boolean
+  readonly argsEvidence:
+    | { readonly kind: 'absent' }
+    | {
+        readonly kind: 'present'
+        readonly args: Record<string, unknown>
+        readonly fingerprint: CompactArgsFingerprint
+      }
+    | { readonly kind: 'invalid_or_conflict' }
+  readonly rawArgsPresent: boolean
+  readonly rawInputPresent: boolean
+  readonly frameArgs?: Record<string, unknown> | undefined
+  readonly frameRawInput?: Record<string, unknown> | undefined
+}
+
+function validateAgyFrame(
+  ingress: Extract<AgyIngress, { kind: 'notification' | 'server_request' }>,
+  expectedSessionId: string | undefined,
+  pinnedTrajectory: string | undefined,
+  minStepIdx: number | undefined,
+): ValidatedAgyFrame {
+  const message = ingress.message
+  const method =
+    ingress.kind === 'server_request'
+      ? ingress.method
+      : (asString(Reflect.get(message, 'method')) ?? '')
+  const rawParams = Reflect.get(message, 'params')
+  const params = isPlainObject(rawParams) ? rawParams : {}
+  const rawParamsMeta = Reflect.get(params, '_meta')
+  const paramsMeta = isPlainObject(rawParamsMeta) ? rawParamsMeta : undefined
+
+  const isUpdate = ingress.kind === 'notification' && method === 'session/update'
+  const isPermission = ingress.kind === 'server_request' && method === 'session/request_permission'
+  const rawPayload = isUpdate
+    ? Reflect.get(params, 'update')
+    : isPermission
+      ? Reflect.get(params, 'toolCall')
+      : undefined
+  const payload = isPlainObject(rawPayload) ? rawPayload : undefined
+  const rawPayloadMeta = payload ? Reflect.get(payload, '_meta') : undefined
+  const payloadMeta = isPlainObject(rawPayloadMeta) ? rawPayloadMeta : undefined
+  const sessionUpdate = isUpdate && payload ? asString(payload.sessionUpdate) : undefined
+
+  // 1. Full forensic session/root conversation identity check across params, payload, and _meta.
+  let sawMatchingSessionId = false
+  let sawForeignSessionId = false
+  let sawMalformedSessionId = false
+  if (rawParamsMeta !== undefined && !isPlainObject(rawParamsMeta)) {
+    sawMalformedSessionId = true
+  }
+  if (payload && rawPayloadMeta !== undefined && !isPlainObject(rawPayloadMeta)) {
+    sawMalformedSessionId = true
+  }
+  const suppliedSessionIds: string[] = []
+  const sessionContainers: Array<Record<string, unknown> | undefined> = [
+    params,
+    paramsMeta,
+    payload,
+    payloadMeta,
+  ]
+  for (const container of sessionContainers) {
+    if (!container) continue
+    for (const key of SESSION_IDENTITY_KEYS) {
+      if (!Object.hasOwn(container, key)) continue
+      const raw = container[key]
+      if (raw === undefined) continue
+      if (typeof raw !== 'string' || raw.trim().length === 0) {
+        sawMalformedSessionId = true
+        continue
+      }
+      suppliedSessionIds.push(raw)
+      if (expectedSessionId !== undefined) {
+        if (raw === expectedSessionId) {
+          sawMatchingSessionId = true
+        } else {
+          sawForeignSessionId = true
+        }
+      }
+    }
+  }
+  for (let i = 1; i < suppliedSessionIds.length; i += 1) {
+    if (suppliedSessionIds[i] !== suppliedSessionIds[0]) {
+      sawMalformedSessionId = true
+    }
+  }
+  const sessionAttribution: ValidatedAgyFrame['sessionAttribution'] = sawMalformedSessionId
+    ? 'invalid_or_conflicting'
+    : sawForeignSessionId && !sawMatchingSessionId
+      ? 'pure_foreign'
+      : sawForeignSessionId && sawMatchingSessionId
+        ? 'invalid_or_conflicting'
+        : sawMatchingSessionId
+          ? 'matching'
+          : 'absent'
+  const isAttributableToCurrentSession =
+    sessionAttribution === 'matching' || sessionAttribution === 'absent'
+  const hasForeignOrInvalidSessionMeta =
+    sessionAttribution === 'pure_foreign' || sessionAttribution === 'invalid_or_conflicting'
+
+  // 2. Execution ID forensic extraction.
+  let executionId: string | undefined
+  let executionIdInvalid = false
+  for (const container of [payload, payloadMeta, params, paramsMeta]) {
+    if (!container) continue
+    for (const key of EXECUTION_IDENTITY_KEYS) {
+      if (!Object.hasOwn(container, key)) continue
+      const raw = container[key]
+      if (raw === undefined) continue
+      if (typeof raw !== 'string' || raw.trim().length === 0) {
+        executionIdInvalid = true
+        continue
+      }
+      if (executionId !== undefined && executionId !== raw) {
+        executionIdInvalid = true
+      } else {
+        executionId = raw
+      }
+    }
+  }
+
+  // 3. Trajectory ID & Step Index forensic extraction across all containers.
+  const trajStep = extractSuppliedTrajectoryAndStepEvidence([
+    payload,
+    payloadMeta,
+    params,
+    paramsMeta,
+  ])
+
+  // 4. Progress tokens: inspect EVERY container slot (never short-circuit with `??`)!
+  const allCanonicalTokens: string[] = []
+  let suppliedCount = 0
+  let hasInvalidToken = false
+  let hasConflictingTokens = false
+  let firstParsedToken: CanonicalProgressToken | undefined
+  for (const container of [payload, payloadMeta, params, paramsMeta]) {
+    if (!container || !Object.hasOwn(container, 'progressToken')) continue
+    const rawPt = container.progressToken
+    if (rawPt === undefined) continue
+    suppliedCount += 1
+    const parsedPt = canonicalizeProgressToken(rawPt)
+    if (!parsedPt) {
+      hasInvalidToken = true
+      continue
+    }
+    if (!allCanonicalTokens.includes(parsedPt.canonical)) {
+      allCanonicalTokens.push(parsedPt.canonical)
+    }
+    if (parsedPt.structured?.hasLeadingZeros) {
+      hasInvalidToken = true
+    }
+    if (firstParsedToken === undefined) {
+      firstParsedToken = parsedPt
+    } else if (firstParsedToken.canonical !== parsedPt.canonical) {
+      hasConflictingTokens = true
+    }
+  }
+  const resolvedToken =
+    !hasInvalidToken && !hasConflictingTokens && firstParsedToken !== undefined
+      ? firstParsedToken
+      : undefined
+
+  // 5. Intra-frame root consistency + pinned trajectory / minStepIdx check (BEFORE any pinning!).
+  let rootEvidenceContradicted =
+    trajStep.contradicted || executionIdInvalid || hasInvalidToken || hasConflictingTokens
+  if (trajStep.trajectoryId !== undefined && pinnedTrajectory !== undefined) {
+    if (trajStep.trajectoryId !== pinnedTrajectory) {
+      rootEvidenceContradicted = true
+    }
+  }
+  if (trajStep.stepIdx !== undefined && minStepIdx !== undefined) {
+    if (trajStep.stepIdx < minStepIdx) {
+      rootEvidenceContradicted = true
+    }
+  }
+  if (resolvedToken?.structured) {
+    if (
+      trajStep.trajectoryId !== undefined &&
+      resolvedToken.structured.trajectoryId !== trajStep.trajectoryId
+    ) {
+      rootEvidenceContradicted = true
+    }
+    if (trajStep.stepIdx !== undefined && resolvedToken.structured.stepIdx !== trajStep.stepIdx) {
+      rootEvidenceContradicted = true
+    }
+    if (
+      pinnedTrajectory !== undefined &&
+      resolvedToken.structured.trajectoryId !== pinnedTrajectory
+    ) {
+      rootEvidenceContradicted = true
+    }
+    if (minStepIdx !== undefined && resolvedToken.structured.stepIdx < minStepIdx) {
+      rootEvidenceContradicted = true
+    }
+  }
+  // Even when a token is conflicted/leading-zero, check if any normalizable structured token conflicts
+  // with trajectory/step to ensure full intra-frame contradiction detection.
+  if (hasConflictingTokens || hasInvalidToken) {
+    rootEvidenceContradicted = true
+  }
+
+  // 6. Tool call ID extraction.
+  let toolCallId: string | undefined
+  let toolCallIdInvalid = false
+  if (payload) {
+    const hasToolCallIdField =
+      Object.hasOwn(payload, 'toolCallId') && payload.toolCallId !== undefined
+    const hasIdField = Object.hasOwn(payload, 'id') && payload.id !== undefined
+    const rawTcId = hasToolCallIdField ? payload.toolCallId : hasIdField ? payload.id : undefined
+    if (rawTcId !== undefined) {
+      if (
+        typeof rawTcId !== 'string' ||
+        rawTcId.length === 0 ||
+        Buffer.byteLength(rawTcId, 'utf8') > AGY_MCP_MAX_TOOL_CALL_ID_BYTES
+      ) {
+        toolCallIdInvalid = true
+      } else {
+        toolCallId = rawTcId
+      }
+    }
+    if (
+      hasToolCallIdField &&
+      hasIdField &&
+      typeof payload.toolCallId === 'string' &&
+      typeof payload.id === 'string' &&
+      payload.toolCallId !== payload.id
+    ) {
+      toolCallIdInvalid = true
+    }
+  }
+
+  // 7. Exact explicit tool name (strictly payload.name; NEVER display-only payload.kind!).
+  let explicitToolName: string | undefined
+  let explicitToolNameInvalid = false
+  if (payload && Object.hasOwn(payload, 'name') && payload.name !== undefined) {
+    if (typeof payload.name !== 'string' || payload.name.length === 0) {
+      explicitToolNameInvalid = true
+    } else {
+      explicitToolName = payload.name.slice(0, 120)
+    }
+  }
+
+  // 8. Tool status (checked on BOTH session/update AND session/request_permission!).
+  const statusPresent = Boolean(
+    payload && Object.hasOwn(payload, 'status') && payload.status !== undefined,
+  )
+  const status = statusPresent ? normalizeAcpToolStatus(payload!.status) : undefined
+  const statusInvalid = statusPresent && status === undefined
+
+  // 9. Args / rawInput forensic extraction (distinguish absent vs plain object vs explicit non-object!).
+  const rawArgsPresent = Boolean(
+    payload && Object.hasOwn(payload, 'args') && payload.args !== undefined,
+  )
+  const rawInputPresent = Boolean(
+    payload && Object.hasOwn(payload, 'rawInput') && payload.rawInput !== undefined,
+  )
+  const frameArgs = rawArgsPresent && isPlainObject(payload!.args) ? payload!.args : undefined
+  const frameRawInput =
+    rawInputPresent && isPlainObject(payload!.rawInput) ? payload!.rawInput : undefined
+  let argsEvidence: ValidatedAgyFrame['argsEvidence']
+  if ((rawArgsPresent && !frameArgs) || (rawInputPresent && !frameRawInput)) {
+    argsEvidence = { kind: 'invalid_or_conflict' }
+  } else {
+    const resolved = resolveFrameArgsEvidence(frameArgs, frameRawInput)
+    argsEvidence =
+      resolved.kind === 'none'
+        ? { kind: 'absent' }
+        : resolved.kind === 'present'
+          ? { kind: 'present', args: resolved.args, fingerprint: resolved.fingerprint }
+          : { kind: 'invalid_or_conflict' }
+  }
+
+  return {
+    seq: ingress.seq,
+    kind: ingress.kind,
+    method,
+    ...(ingress.kind === 'server_request' ? { rpcId: ingress.rpcId } : {}),
+    message,
+    params,
+    payload,
+    ...(sessionUpdate !== undefined ? { sessionUpdate } : {}),
+    sessionAttribution,
+    isAttributableToCurrentSession,
+    hasForeignOrInvalidSessionMeta,
+    ...(executionId !== undefined ? { executionId } : {}),
+    executionIdInvalid,
+    ...(trajStep.trajectoryId !== undefined ? { trajectoryId: trajStep.trajectoryId } : {}),
+    ...(trajStep.stepIdx !== undefined ? { stepIdx: trajStep.stepIdx } : {}),
+    rootEvidenceContradicted,
+    tokens: {
+      suppliedCount,
+      allCanonicalTokens,
+      hasInvalidToken,
+      hasConflictingTokens,
+      ...(resolvedToken !== undefined ? { resolvedToken } : {}),
+    },
+    ...(toolCallId !== undefined ? { toolCallId } : {}),
+    toolCallIdInvalid,
+    ...(explicitToolName !== undefined ? { explicitToolName } : {}),
+    explicitToolNameInvalid,
+    ...(status !== undefined ? { status } : {}),
+    statusPresent,
+    statusInvalid,
+    argsEvidence,
+    rawArgsPresent,
+    rawInputPresent,
+    ...(frameArgs !== undefined ? { frameArgs } : {}),
+    ...(frameRawInput !== undefined ? { frameRawInput } : {}),
+  }
+}
+
+/**
+ * Single-pass root-boundary recheck for staged pre-bind frames: reuses the already-validated
+ * identity fields and argument fingerprint without re-parsing or re-hashing the raw frame.
+ */
+function recheckValidatedFrameAgainstRootBoundary(
+  validated: ValidatedAgyFrame,
+  pinnedTrajectory: string | undefined,
+  minStepIdx: number | undefined,
+): ValidatedAgyFrame {
+  if (validated.rootEvidenceContradicted) return validated
+  let contradicted = false
+  if (
+    validated.trajectoryId !== undefined &&
+    pinnedTrajectory !== undefined &&
+    validated.trajectoryId !== pinnedTrajectory
+  ) {
+    contradicted = true
+  }
+  if (
+    validated.stepIdx !== undefined &&
+    minStepIdx !== undefined &&
+    validated.stepIdx < minStepIdx
+  ) {
+    contradicted = true
+  }
+  const structured = validated.tokens.resolvedToken?.structured
+  if (structured) {
+    if (pinnedTrajectory !== undefined && structured.trajectoryId !== pinnedTrajectory) {
+      contradicted = true
+    }
+    if (minStepIdx !== undefined && structured.stepIdx < minStepIdx) {
+      contradicted = true
+    }
+  }
+  if (!contradicted) return validated
+  return { ...validated, rootEvidenceContradicted: true }
+}
+
+type ParsedAgyPromptTerminalReply =
+  | {
+      readonly ok: true
+      readonly stopReason: string
+      readonly executionId?: string | undefined
+    }
+  | {
+      readonly ok: false
+      readonly reason: string
+      readonly message: string
+    }
+
+const AGY_MAX_EXECUTION_ID_BYTES = 256
+
+function parseAgyPromptTerminalReply(
+  res: object | undefined,
+  expectedSessionId: string | undefined,
+): ParsedAgyPromptTerminalReply {
+  const rpcError = res ? Reflect.get(res, 'error') : undefined
+  const rpcResult = res ? Reflect.get(res, 'result') : undefined
+  if (rpcError || !isPlainObject(rpcResult)) {
+    return {
+      ok: false,
+      reason: 'Antigravity returned an invalid session/prompt response.',
+      message: rpcError
+        ? safeNativePermissionText(JSON.stringify(rpcError), 240)
+        : 'Antigravity returned an invalid session/prompt result.',
+    }
+  }
+  const rawStopReason = asString(rpcResult.stopReason)?.trim()
+  if (!rawStopReason || !VALID_ACP_STOP_REASONS.has(rawStopReason)) {
+    return {
+      ok: false,
+      reason: 'Antigravity returned a session/prompt result without a valid stopReason.',
+      message: rawStopReason
+        ? `Antigravity returned an unrecognized session/prompt stopReason "${safeNativePermissionText(rawStopReason, 80)}".`
+        : 'Antigravity returned a session/prompt result without a stopReason.',
+    }
+  }
+  const rawMeta: unknown = Object.hasOwn(rpcResult, '_meta')
+    ? Reflect.get(rpcResult, '_meta')
+    : undefined
+  if (rawMeta !== undefined && !isPlainObject(rawMeta)) {
+    return {
+      ok: false,
+      reason: 'Antigravity returned a session/prompt result with malformed _meta.',
+      message: 'Antigravity returned a session/prompt result with malformed _meta.',
+    }
+  }
+  const containers: Array<Record<string, unknown> | undefined> = [
+    rpcResult,
+    isPlainObject(rawMeta) ? rawMeta : undefined,
+  ]
+  let seenSessionId: string | undefined
+  for (const container of containers) {
+    if (!container) continue
+    for (const key of SESSION_IDENTITY_KEYS) {
+      if (!Object.hasOwn(container, key)) continue
+      const raw = container[key]
+      if (raw === undefined) continue
+      if (typeof raw !== 'string' || raw.trim().length === 0) {
+        return {
+          ok: false,
+          reason: 'Antigravity returned a session/prompt result with invalid session identity.',
+          message: 'Antigravity returned a session/prompt result with invalid session identity.',
+        }
+      }
+      if (expectedSessionId !== undefined && raw !== expectedSessionId) {
+        return {
+          ok: false,
+          reason:
+            'Antigravity returned a session/prompt result for a different native session identity.',
+          message:
+            'Antigravity returned a session/prompt result for a different native session identity.',
+        }
+      }
+      if (seenSessionId !== undefined && seenSessionId !== raw) {
+        return {
+          ok: false,
+          reason: 'Antigravity returned a session/prompt result with conflicting session aliases.',
+          message: 'Antigravity returned a session/prompt result with conflicting session aliases.',
+        }
+      }
+      seenSessionId = raw
+    }
+  }
+  let executionId: string | undefined
+  for (const container of containers) {
+    if (!container) continue
+    for (const key of EXECUTION_IDENTITY_KEYS) {
+      if (!Object.hasOwn(container, key)) continue
+      const raw = container[key]
+      if (raw === undefined) continue
+      if (
+        typeof raw !== 'string' ||
+        raw.trim().length === 0 ||
+        Buffer.byteLength(raw, 'utf8') > AGY_MAX_EXECUTION_ID_BYTES
+      ) {
+        return {
+          ok: false,
+          reason:
+            'Antigravity returned a session/prompt result with an invalid or oversized execution_id.',
+          message:
+            'Antigravity returned a session/prompt result with an invalid or oversized execution_id.',
+        }
+      }
+      if (executionId !== undefined && executionId !== raw) {
+        return {
+          ok: false,
+          reason:
+            'Antigravity returned a session/prompt result with conflicting executionId / execution_id aliases.',
+          message:
+            'Antigravity returned a session/prompt result with conflicting executionId / execution_id aliases.',
+        }
+      }
+      executionId = raw
+    }
+  }
+  return {
+    ok: true,
+    stopReason: rawStopReason,
+    ...(executionId !== undefined ? { executionId } : {}),
+  }
+}
+
+interface ValidatedBackgroundOwnership {
+  readonly valid: boolean
+  readonly executionId?: string | undefined
+  readonly trajectoryId?: string | undefined
+  readonly stepIdx?: number | undefined
+}
+
+function validateBackgroundUpdateForRun(
+  params: Record<string, unknown>,
+  update: Record<string, unknown>,
+  trackedRun: ActiveAgyRun,
+  pinnedTrajectory: string | undefined,
+  minStepIdx: number | undefined,
+): ValidatedBackgroundOwnership {
+  const rawParamsMeta: unknown = Object.hasOwn(params, '_meta')
+    ? Reflect.get(params, '_meta')
+    : undefined
+  const rawUpdateMeta: unknown = Object.hasOwn(update, '_meta')
+    ? Reflect.get(update, '_meta')
+    : undefined
+  if (
+    (rawParamsMeta !== undefined && !isPlainObject(rawParamsMeta)) ||
+    (rawUpdateMeta !== undefined && !isPlainObject(rawUpdateMeta))
+  ) {
+    return { valid: false }
+  }
+  const paramsMeta = isPlainObject(rawParamsMeta) ? rawParamsMeta : undefined
+  const updateMeta = isPlainObject(rawUpdateMeta) ? rawUpdateMeta : undefined
+  const containers = [update, updateMeta, params, paramsMeta]
+  for (const container of containers) {
+    if (!container) continue
+    for (const key of SESSION_IDENTITY_KEYS) {
+      if (!Object.hasOwn(container, key)) continue
+      const raw = container[key]
+      if (raw === undefined) continue
+      if (
+        typeof raw !== 'string' ||
+        raw.trim().length === 0 ||
+        raw !== trackedRun.nativeSessionId
+      ) {
+        return { valid: false }
+      }
+    }
+  }
+  let executionId: string | undefined
+  for (const container of containers) {
+    if (!container) continue
+    for (const key of EXECUTION_IDENTITY_KEYS) {
+      if (!Object.hasOwn(container, key)) continue
+      const raw = container[key]
+      if (raw === undefined) continue
+      if (
+        typeof raw !== 'string' ||
+        raw.trim().length === 0 ||
+        Buffer.byteLength(raw, 'utf8') > AGY_MAX_EXECUTION_ID_BYTES
+      ) {
+        return { valid: false }
+      }
+      if (executionId !== undefined && executionId !== raw) {
+        return { valid: false }
+      }
+      executionId = raw
+    }
+  }
+  if (executionId !== undefined) {
+    if (trackedRun.knownForeignExecutionIds.has(executionId)) {
+      return { valid: false }
+    }
+    if (
+      trackedRun.providerExecutionId !== undefined &&
+      executionId !== trackedRun.providerExecutionId
+    ) {
+      return { valid: false }
+    }
+  }
+  const trajStep = extractSuppliedTrajectoryAndStepEvidence(containers)
+  if (trajStep.contradicted) {
+    return { valid: false }
+  }
+  if (
+    trajStep.trajectoryId !== undefined &&
+    pinnedTrajectory !== undefined &&
+    trajStep.trajectoryId !== pinnedTrajectory
+  ) {
+    return { valid: false }
+  }
+  if (trajStep.stepIdx !== undefined && minStepIdx !== undefined && trajStep.stepIdx < minStepIdx) {
+    return { valid: false }
+  }
+
+  // Validate progressToken under the exact same rules as foreground frames.
+  let firstParsedToken: CanonicalProgressToken | undefined
+  for (const container of containers) {
+    if (!container || !Object.hasOwn(container, 'progressToken')) continue
+    const rawPt = container.progressToken
+    if (rawPt === undefined) continue
+    const parsedPt = canonicalizeProgressToken(rawPt)
+    if (!parsedPt || parsedPt.structured?.hasLeadingZeros) {
+      return { valid: false }
+    }
+    if (firstParsedToken === undefined) {
+      firstParsedToken = parsedPt
+    } else if (firstParsedToken.canonical !== parsedPt.canonical) {
+      return { valid: false }
+    }
+  }
+  if (firstParsedToken?.structured) {
+    if (
+      trajStep.trajectoryId !== undefined &&
+      firstParsedToken.structured.trajectoryId !== trajStep.trajectoryId
+    ) {
+      return { valid: false }
+    }
+    if (
+      trajStep.stepIdx !== undefined &&
+      firstParsedToken.structured.stepIdx !== trajStep.stepIdx
+    ) {
+      return { valid: false }
+    }
+    if (
+      pinnedTrajectory !== undefined &&
+      firstParsedToken.structured.trajectoryId !== pinnedTrajectory
+    ) {
+      return { valid: false }
+    }
+    if (minStepIdx !== undefined && firstParsedToken.structured.stepIdx < minStepIdx) {
+      return { valid: false }
+    }
+  }
+
+  const effectiveTrajectoryId = trajStep.trajectoryId ?? firstParsedToken?.structured?.trajectoryId
+  const effectiveStepIdx = trajStep.stepIdx ?? firstParsedToken?.structured?.stepIdx
+  return {
+    valid: true,
+    ...(executionId !== undefined ? { executionId } : {}),
+    ...(effectiveTrajectoryId !== undefined ? { trajectoryId: effectiveTrajectoryId } : {}),
+    ...(effectiveStepIdx !== undefined ? { stepIdx: effectiveStepIdx } : {}),
+  }
+}
+
+interface CompactPostCutoffBackgroundRecord {
+  readonly ownership: {
+    readonly executionId?: string | undefined
+    readonly trajectoryId?: string | undefined
+    readonly stepIdx?: number | undefined
+  }
+  readonly sessionUpdate: string
+  readonly status?: string | undefined
+  readonly outOfTurn: boolean
+  readonly taskId?: string | undefined
+  readonly toolCallId?: string | undefined
+  readonly explicitMsgId?: string | undefined
+  readonly rawText?: string | undefined
+}
+
+function buildCompactPostCutoffBackgroundRecord(
+  update: Record<string, unknown>,
+  ownership: ValidatedBackgroundOwnership,
+): CompactPostCutoffBackgroundRecord | undefined {
+  const sessionUpdate = asString(update.sessionUpdate)
+  if (!sessionUpdate) return undefined
+  const status = asString(update.status)
+  const outOfTurn = update.outOfTurn === true
+  const rawOutput = isPlainObject(update.rawOutput) ? update.rawOutput : undefined
+  const taskId =
+    asString(update.taskId ?? update.backgroundTaskId) ??
+    (rawOutput ? asString(rawOutput.taskId ?? rawOutput.backgroundTaskId) : undefined)
+  const toolCallId = asString(update.toolCallId ?? update.id)
+  const explicitMsgId = asString(update.messageId ?? update.stepId)
+  const isOutOfTurnCompletion =
+    (sessionUpdate === 'agent_message_chunk' && outOfTurn) ||
+    sessionUpdate === 'background_task_completed' ||
+    (sessionUpdate === 'tool_call_update' && status === 'completed' && outOfTurn)
+  const rawText = isOutOfTurnCompletion
+    ? isPlainObject(update.content)
+      ? asString(update.content.text)
+      : asString(update.text ?? update.summary)
+    : undefined
+  return {
+    ownership: {
+      ...(ownership.executionId !== undefined ? { executionId: ownership.executionId } : {}),
+      ...(ownership.trajectoryId !== undefined ? { trajectoryId: ownership.trajectoryId } : {}),
+      ...(ownership.stepIdx !== undefined ? { stepIdx: ownership.stepIdx } : {}),
+    },
+    sessionUpdate,
+    ...(status !== undefined ? { status } : {}),
+    outOfTurn,
+    ...(taskId !== undefined ? { taskId } : {}),
+    ...(toolCallId !== undefined ? { toolCallId } : {}),
+    ...(explicitMsgId !== undefined ? { explicitMsgId } : {}),
+    ...(rawText !== undefined ? { rawText } : {}),
+  }
+}
+
+function estimateCompactBackgroundRecordBytes(record: CompactPostCutoffBackgroundRecord): number {
+  let bytes = 256
+  const charge = (val: string | undefined): void => {
+    if (val !== undefined) bytes += Buffer.byteLength(val, 'utf8') * 2 + 16
+  }
+  charge(record.ownership.executionId)
+  charge(record.ownership.trajectoryId)
+  charge(record.sessionUpdate)
+  charge(record.status)
+  charge(record.taskId)
+  charge(record.toolCallId)
+  charge(record.explicitMsgId)
+  charge(record.rawText)
+  return bytes
+}
+
+type AcpMcpCallLifecycle = 'open' | 'completed' | 'failed' | 'revoked'
+
+interface ActiveAcpMcpCall {
+  readonly toolCallId: string
+  readonly toolName: string
+  lifecycle: AcpMcpCallLifecycle
+  sawPreTerminal: boolean
+  promoted?: boolean | undefined
+  trajectoryId?: string | undefined
+  stepIdx?: number | undefined
+  argsFingerprint: CompactArgsFingerprint | undefined
+  explicitProgressToken: string | undefined
+  correlatedProgressToken: string | undefined
+  claimedViaTokenless?: boolean | undefined
+  claimedHttpArgsFingerprint: CompactArgsFingerprint | undefined
+}
+
+type TokenLedgerEntry =
+  | { readonly kind: 'in_flight_http' }
+  | { readonly kind: 'non_mcp' }
+  | { readonly kind: 'claimed'; ownerKey: string }
+  | { readonly kind: 'consumed' }
+
+interface ProvisionalTokenOwner {
+  readonly toolName: string
+  readonly httpFingerprint: CompactArgsFingerprint
+}
+
+type StagedMcpOutcomeKind =
+  | { type: 'title'; title: string }
+  | {
+      type: 'peer'
+      targetAgentId: Exclude<RuntimeAgentId, 'agy'>
+      proposalKind: 'supplement' | 'fact_check' | 'challenge' | 'review'
+      reason?: string | undefined
+    }
+  | { type: 'review'; observation: CollaborationReviewObservation }
+  | { type: 'input_result'; observation: CollaborationInputObservation }
+  | { type: 'retain_plan' }
+  | { type: 'publish_plan_chunk'; offset: number; byteLength: number; complete: boolean }
+
+interface StagedMcpOutcomeRecord {
+  ownerKey: string
+  readonly progressToken: string
+  readonly httpFingerprint: CompactArgsFingerprint
+  readonly kind: StagedMcpOutcomeKind
+  readonly payloadBytes: number
+}
+
+type PromotedMcpOutcome =
+  | { type: 'title'; title: string }
+  | {
+      type: 'peer'
+      targetAgentId: Exclude<RuntimeAgentId, 'agy'>
+      proposalKind: 'supplement' | 'fact_check' | 'challenge' | 'review'
+      reason?: string | undefined
+    }
+  | { type: 'review'; observation: CollaborationReviewObservation }
+  | { type: 'input_result'; observation: CollaborationInputObservation }
+  | { type: 'retain_plan' }
+  | { type: 'publish_plan'; markdown: string; finalToolCallId: string }
+  | { type: 'publish_plan_failed'; reason: string }
+
+function computePlanConversionWorkspaceBytes(totalPlanBytes: number): number {
+  // Budget temporary merged UTF-8 buffer (`totalPlanBytes`) + worst-case UTF-16 decoded string (`totalPlanBytes * 2`) + header.
+  return totalPlanBytes + totalPlanBytes * 2 + 64
+}
+
+function computeRetainedPlanTextBytes(text: string): number {
+  return text.length * 2 + 64
+}
+
+interface PendingPlanChunk {
+  ownerKey: string
+  readonly offset: number
+  readonly bytes: Buffer
+  readonly hasNonWhitespace: boolean
+  readonly complete: boolean
+  confirmed: boolean
+  confirmedToolCallId?: string | undefined
+  invalidated: boolean
+}
+
+function estimateStagedOutcomePayloadBytes(kind: StagedMcpOutcomeKind): number {
+  switch (kind.type) {
+    case 'title':
+      return Buffer.byteLength(kind.title, 'utf8') + 32
+    case 'peer':
+      return (
+        Buffer.byteLength(kind.targetAgentId, 'utf8') +
+        Buffer.byteLength(kind.proposalKind, 'utf8') +
+        (kind.reason ? Buffer.byteLength(kind.reason, 'utf8') : 0) +
+        48
+      )
+    case 'review':
+    case 'input_result':
+      return Buffer.byteLength(JSON.stringify(kind.observation), 'utf8') + 32
+    case 'retain_plan':
+    case 'publish_plan_chunk':
+      return 48
+    default:
+      return 48
+  }
+}
+
+type AcpToolCallAdmissionResult = 'admitted' | 'already_retired' | 'rejected_capacity'
+
+type RootProofCheckResult = 'ok' | 'wait' | { readonly kind: 'reject'; readonly error: string }
+
+type HttpClaimAttempt =
+  | { readonly kind: 'claimed'; readonly ownerKey: string }
+  | { readonly kind: 'wait' }
+  | { readonly kind: 'reject'; readonly error: string }
+
+/**
+ * Cohesive per-Run MCP call correlation state machine.
+ * Owns canonical `tokenLedger`, irreversible `ActiveAcpMcpCall` lifecycles with bounded retired
+ * call tombstones, provisional `token:<pt>` -> `call:<id>` atomic migration, staged outcomes,
+ * plan chunk reassembly, and strict admit-before-insert correlation/plan byte reservation accounting.
+ */
+class McpCallCorrelator {
+  private closed = false
+  private revoked = false
+  private tokenCapacityExhausted = false
+  private correlatorCapacityExhausted = false
+  private tokenlessCorrelationCompromised = false
+  private pinnedTrajectoryId: string | undefined
+  private trajectoryIdSource: 'acp' | 'storage_db' | undefined
+  private hostMinStepIdx: number | undefined
+  private allowLazyStorageDbPin = true
+
+  private readonly activeAcpToolCalls = new Map<string, ActiveAcpMcpCall>()
+  private readonly retiredCallIdDigests = new Set<string>()
+  private readonly tokenLedger = new Map<string, TokenLedgerEntry>()
+  private readonly inFlightHttpFingerprints = new Map<string, number>()
+  private readonly provisionalTokenOwners = new Map<string, ProvisionalTokenOwner>()
+  private readonly stagedOutcomes = new Map<string, StagedMcpOutcomeRecord>()
+  private readonly activeCallWaiters = new Set<() => void>()
+  private wakeBatchDepth = 0
+  private wakePending = false
+  private recomputingProvisionalDepth = 0
+
+  private titleConfirmed = false
+  private pendingTitleOwner: string | undefined
+  private peerConfirmed = false
+  private pendingPeerOwner: string | undefined
+  private openPlanFinalized = false
+  private acknowledgedFinalOpenPlan = false
+  private readonly confirmedPlanChunks: Buffer[] = []
+  private confirmedPlanBytes = 0
+  private confirmedPlanHasNonWhitespace = false
+  private planConversionWorkspaceBytes = 0
+  private pendingTransferredPlanBytes = 0
+  private readonly pendingPlanChunks: PendingPlanChunk[] = []
+
+  constructor(
+    private readonly reserveCorrelationBytes?: (nextBytes: number) => boolean,
+    private readonly getMinRootStepIdx?: () => number | undefined,
+  ) {}
+
+  get isClosed(): boolean {
+    return this.closed
+  }
+
+  get isRevoked(): boolean {
+    return this.revoked
+  }
+
+  get isTokenCapacityExhausted(): boolean {
+    return this.tokenCapacityExhausted
+  }
+
+  get pinnedTrajectory(): string | undefined {
+    return this.pinnedTrajectoryId
+  }
+
+  get pinnedTrajectorySource(): 'acp' | 'storage_db' | undefined {
+    return this.trajectoryIdSource
+  }
+
+  get minHostStepIdx(): number | undefined {
+    return this.hostMinStepIdx
+  }
+
+  get canLazyPinStorageDb(): boolean {
+    return this.allowLazyStorageDbPin
+  }
+
+  get isTitleSlotTaken(): boolean {
+    return this.titleConfirmed || this.pendingTitleOwner !== undefined
+  }
+
+  get isPeerSlotTaken(): boolean {
+    return this.peerConfirmed || this.pendingPeerOwner !== undefined
+  }
+
+  get isOpenPlanFinalizedOrPendingFinal(): boolean {
+    return (
+      this.openPlanFinalized ||
+      this.pendingPlanChunks.some((chunk) => !chunk.invalidated && chunk.complete)
+    )
+  }
+
+  get hasAcknowledgedFinalOpenPlan(): boolean {
+    return this.acknowledgedFinalOpenPlan
+  }
+
+  private effectiveMinStepIdx(): number | undefined {
+    return this.getMinRootStepIdx?.() ?? this.hostMinStepIdx
+  }
+
+  private validatesAgainstRootEvidence(
+    trajectoryId: string | undefined,
+    stepIdx: number | undefined,
+    parsedPt: CanonicalProgressToken | undefined,
+  ): boolean {
+    const minStepIdx = this.effectiveMinStepIdx()
+    if (trajectoryId !== undefined) {
+      if (!isValidAgyTrajectoryId(trajectoryId)) return false
+      if (this.pinnedTrajectoryId !== undefined && trajectoryId !== this.pinnedTrajectoryId) {
+        return false
+      }
+    }
+    if (stepIdx !== undefined) {
+      if (!Number.isSafeInteger(stepIdx) || stepIdx < 0) return false
+      if (minStepIdx !== undefined && stepIdx < minStepIdx) {
+        return false
+      }
+    }
+    if (parsedPt?.structured) {
+      if (parsedPt.structured.hasLeadingZeros) return false
+      if (
+        this.pinnedTrajectoryId !== undefined &&
+        parsedPt.structured.trajectoryId !== this.pinnedTrajectoryId
+      ) {
+        return false
+      }
+      if (trajectoryId !== undefined && parsedPt.structured.trajectoryId !== trajectoryId) {
+        return false
+      }
+      if (minStepIdx !== undefined && parsedPt.structured.stepIdx < minStepIdx) {
+        return false
+      }
+      if (stepIdx !== undefined && parsedPt.structured.stepIdx !== stepIdx) {
+        return false
+      }
+    }
+    return true
+  }
+
+  get pendingPlanChunkCount(): number {
+    return this.pendingPlanChunks.length
+  }
+
+  get confirmedPlanByteCount(): number {
+    return this.confirmedPlanBytes
+  }
+
+  disallowLazyStorageDbPin(): void {
+    this.allowLazyStorageDbPin = false
+  }
+
+  notifyRootProofUpdated(): void {
+    this.wakeAllWaiters()
+  }
+
+  clearPendingTransferredPlanBytes(): void {
+    if (this.pendingTransferredPlanBytes === 0) return
+    this.pendingTransferredPlanBytes = 0
+    this.syncReservationAfterShrink()
+  }
+
+  pinHostTrajectoryId(trajectoryId: string, stepCount?: number): void {
+    if (!isValidAgyTrajectoryId(trajectoryId)) return
+    let updated = false
+    if (this.pinnedTrajectoryId === undefined) {
+      this.pinnedTrajectoryId = trajectoryId
+      this.trajectoryIdSource = 'storage_db'
+      updated = true
+    }
+    if (stepCount !== undefined && this.hostMinStepIdx === undefined) {
+      this.hostMinStepIdx = stepCount
+      updated = true
+    }
+    if (updated) {
+      this.wakeAllWaiters()
+    }
+  }
+
+  pinRootTrajectoryId(trajectoryId: string): void {
+    if (!isValidAgyTrajectoryId(trajectoryId)) return
+    if (this.pinnedTrajectoryId === undefined) {
+      this.pinnedTrajectoryId = trajectoryId
+      this.trajectoryIdSource = 'acp'
+      this.wakeAllWaiters()
+    }
+  }
+
+  pendingPlanBufferBytes(): number {
+    let total = 0
+    for (const chunk of this.pendingPlanChunks) {
+      if (!chunk.invalidated) total += chunk.bytes.byteLength
+    }
+    return total
+  }
+
+  hasNonWhitespacePlanContent(extraHasNonWhitespace: boolean): boolean {
+    if (extraHasNonWhitespace || this.confirmedPlanHasNonWhitespace) {
+      return true
+    }
+    return this.pendingPlanChunks.some((chunk) => !chunk.invalidated && chunk.hasNonWhitespace)
+  }
+
+  private matchesCallRootEvidence(entry: ActiveAcpMcpCall, canonicalPt: string): boolean {
+    const parsed = canonicalizeProgressToken(canonicalPt)
+    if (!parsed?.structured) return true
+    if (entry.trajectoryId !== undefined && parsed.structured.trajectoryId !== entry.trajectoryId) {
+      return false
+    }
+    if (entry.stepIdx !== undefined && parsed.structured.stepIdx !== entry.stepIdx) {
+      return false
+    }
+    return true
+  }
+
+  lookupVerifiedCallToolName(toolCallId: string): string | undefined {
+    return this.activeAcpToolCalls.get(toolCallId)?.toolName
+  }
+
+  private computeAcpCallBytes(entry: ActiveAcpMcpCall): number {
+    let bytes =
+      AGY_MCP_TERMINAL_STUB_BYTES +
+      Buffer.byteLength(entry.toolCallId, 'utf8') +
+      (entry.trajectoryId ? Buffer.byteLength(entry.trajectoryId, 'utf8') + 16 : 0) +
+      (entry.stepIdx !== undefined ? 16 : 0) +
+      (entry.explicitProgressToken
+        ? Buffer.byteLength(entry.explicitProgressToken, 'utf8') + 16
+        : 0) +
+      (entry.correlatedProgressToken
+        ? Buffer.byteLength(entry.correlatedProgressToken, 'utf8') + 16
+        : 0)
+    if (entry.lifecycle === 'open') {
+      bytes +=
+        (entry.argsFingerprint?.approxBytes ?? 0) +
+        (entry.claimedHttpArgsFingerprint?.approxBytes ?? 0)
+    }
+    return bytes
+  }
+
+  computeCorrelationHeldBytes(): {
+    metadataBytes: number
+    planBufferBytes: number
+    extraPlanBytes: number
+    totalBytes: number
+  } {
+    let metadataBytes = this.retiredCallIdDigests.size * AGY_MCP_RETIRED_CALL_TOMBSTONE_BYTES
+    for (const entry of this.activeAcpToolCalls.values()) {
+      metadataBytes += this.computeAcpCallBytes(entry)
+    }
+    for (const [token, ledgerEntry] of this.tokenLedger) {
+      metadataBytes += Buffer.byteLength(token, 'utf8') + 32
+      if (ledgerEntry.kind === 'claimed') {
+        metadataBytes += Buffer.byteLength(ledgerEntry.ownerKey, 'utf8') + 16
+      }
+    }
+    for (const inFlightBytes of this.inFlightHttpFingerprints.values()) {
+      metadataBytes += inFlightBytes
+    }
+    for (const [token, prov] of this.provisionalTokenOwners) {
+      metadataBytes += Buffer.byteLength(token, 'utf8') + prov.httpFingerprint.approxBytes + 32
+    }
+    for (const [ownerKey, rec] of this.stagedOutcomes) {
+      metadataBytes +=
+        Buffer.byteLength(ownerKey, 'utf8') +
+        Buffer.byteLength(rec.progressToken, 'utf8') +
+        rec.httpFingerprint.approxBytes +
+        rec.payloadBytes +
+        32
+    }
+    let planBufferBytes = 0
+    for (const chunk of this.pendingPlanChunks) {
+      if (!chunk.invalidated) {
+        metadataBytes +=
+          Buffer.byteLength(chunk.ownerKey, 'utf8') +
+          (chunk.confirmedToolCallId ? Buffer.byteLength(chunk.confirmedToolCallId, 'utf8') : 0) +
+          48
+        planBufferBytes += chunk.bytes.byteLength
+      }
+    }
+    for (const buf of this.confirmedPlanChunks) {
+      planBufferBytes += buf.byteLength
+    }
+    const extraPlanBytes = this.planConversionWorkspaceBytes + this.pendingTransferredPlanBytes
+    return {
+      metadataBytes,
+      planBufferBytes,
+      extraPlanBytes,
+      totalBytes: metadataBytes + planBufferBytes + extraPlanBytes,
+    }
+  }
+
+  private tryAdmitBytes(
+    nextMetadataBytes: number,
+    nextPlanBufferBytes: number,
+    nextExtraPlanBytes = this.planConversionWorkspaceBytes + this.pendingTransferredPlanBytes,
+  ): boolean {
+    if (
+      nextMetadataBytes > AGY_MCP_MAX_CORRELATION_BYTES ||
+      nextPlanBufferBytes > COLLABORATION_PUBLISHED_PLAN_MAX_BYTES
+    ) {
+      return false
+    }
+    const nextTotal = nextMetadataBytes + nextPlanBufferBytes + nextExtraPlanBytes
+    if (this.reserveCorrelationBytes && !this.reserveCorrelationBytes(nextTotal)) {
+      return false
+    }
+    return true
+  }
+
+  private syncReservationAfterShrink(): void {
+    const { totalBytes } = this.computeCorrelationHeldBytes()
+    this.reserveCorrelationBytes?.(totalBytes)
+  }
+
+  beginWakeBatch(): void {
+    this.wakeBatchDepth += 1
+  }
+
+  endWakeBatch(): void {
+    if (this.wakeBatchDepth > 0) {
+      this.wakeBatchDepth -= 1
+    }
+    if (this.wakeBatchDepth === 0 && this.wakePending) {
+      this.wakePending = false
+      this.wakeAllWaiters()
+    }
+  }
+
+  private wakeAllWaiters(): void {
+    if (this.wakeBatchDepth > 0) {
+      this.wakePending = true
+      return
+    }
+    for (const wake of Array.from(this.activeCallWaiters)) {
+      wake()
+    }
+  }
+
+  private invalidateToken(canonicalToken: string): void {
+    const prev = this.tokenLedger.get(canonicalToken)
+    if (prev?.kind === 'claimed') {
+      const prevOwner = prev.ownerKey
+      this.tokenLedger.set(canonicalToken, { kind: 'consumed' })
+      this.revokeOwner(prevOwner)
+    } else if (prev?.kind === 'in_flight_http') {
+      this.tokenLedger.set(canonicalToken, { kind: 'consumed' })
+      this.provisionalTokenOwners.delete(canonicalToken)
+      this.syncReservationAfterShrink()
+    } else if (prev?.kind === 'non_mcp' || prev?.kind === 'consumed') {
+      this.provisionalTokenOwners.delete(canonicalToken)
+      this.syncReservationAfterShrink()
+    } else {
+      if (this.tokenLedger.size >= AGY_MCP_MAX_CONSUMED_TOKENS) {
+        this.tokenCapacityExhausted = true
+      } else {
+        const current = this.computeCorrelationHeldBytes()
+        const delta = Buffer.byteLength(canonicalToken, 'utf8') + 32
+        if (!this.tryAdmitBytes(current.metadataBytes + delta, current.planBufferBytes)) {
+          this.tokenCapacityExhausted = true
+        } else {
+          this.tokenLedger.set(canonicalToken, { kind: 'consumed' })
+        }
+      }
+    }
+    for (const entry of Array.from(this.activeAcpToolCalls.values())) {
+      if (
+        entry.explicitProgressToken === canonicalToken ||
+        entry.correlatedProgressToken === canonicalToken
+      ) {
+        this.retireCallId(entry.toolCallId)
+      }
+    }
+  }
+
+  private markExplicitTokenConsumed(canonicalToken: string): void {
+    const prev = this.tokenLedger.get(canonicalToken)
+    if (prev !== undefined) {
+      if (prev.kind === 'in_flight_http') {
+        this.tokenLedger.set(canonicalToken, { kind: 'consumed' })
+      }
+      return
+    }
+    if (this.tokenLedger.size >= AGY_MCP_MAX_CONSUMED_TOKENS) {
+      this.tokenCapacityExhausted = true
+      return
+    }
+    const current = this.computeCorrelationHeldBytes()
+    const delta = Buffer.byteLength(canonicalToken, 'utf8') + 32
+    if (!this.tryAdmitBytes(current.metadataBytes + delta, current.planBufferBytes)) {
+      this.tokenCapacityExhausted = true
+      return
+    }
+    this.tokenLedger.set(canonicalToken, { kind: 'consumed' })
+  }
+
+  private retireCallId(toolCallId: string): void {
+    const digest = hashCallIdDigest(toolCallId)
+    const existing = this.activeAcpToolCalls.get(toolCallId)
+    if (existing) {
+      const explicitPt = existing.explicitProgressToken
+      const retiredToolName = existing.toolName
+      this.cancelStagedOwner(`call:${toolCallId}`)
+      this.activeAcpToolCalls.delete(toolCallId)
+      if (!this.retiredCallIdDigests.has(digest)) {
+        if (this.retiredCallIdDigests.size >= AGY_MCP_MAX_RETIRED_CALL_TOMBSTONES) {
+          this.correlatorCapacityExhausted = true
+          this.tokenlessCorrelationCompromised = true
+        } else {
+          // Deleting `existing` freed >= AGY_MCP_TERMINAL_STUB_BYTES + 1 (> tombstone bytes).
+          this.retiredCallIdDigests.add(digest)
+        }
+      }
+      this.syncReservationAfterShrink()
+      if (explicitPt !== undefined) {
+        this.markExplicitTokenConsumed(explicitPt)
+      }
+      this.recomputeProvisionalMigrationsForTool(retiredToolName)
+      return
+    }
+    if (this.retiredCallIdDigests.has(digest)) {
+      return
+    }
+    if (this.retiredCallIdDigests.size >= AGY_MCP_MAX_RETIRED_CALL_TOMBSTONES) {
+      this.correlatorCapacityExhausted = true
+      this.tokenlessCorrelationCompromised = true
+      return
+    }
+    const current = this.computeCorrelationHeldBytes()
+    if (
+      !this.tryAdmitBytes(
+        current.metadataBytes + AGY_MCP_RETIRED_CALL_TOMBSTONE_BYTES,
+        current.planBufferBytes,
+      )
+    ) {
+      this.correlatorCapacityExhausted = true
+      this.tokenlessCorrelationCompromised = true
+      return
+    }
+    this.retiredCallIdDigests.add(digest)
+  }
+
+  private evictTerminalCallIfNeeded(): boolean {
+    if (this.activeAcpToolCalls.size < AGY_MCP_MAX_ACTIVE_ACP_CALLS) return true
+    for (const [key, candidate] of this.activeAcpToolCalls) {
+      if (candidate.lifecycle === 'open') continue
+      const ownerKey = `call:${candidate.toolCallId}`
+      if (this.stagedOutcomes.has(ownerKey)) continue
+      const digest = hashCallIdDigest(candidate.toolCallId)
+      if (
+        !this.retiredCallIdDigests.has(digest) &&
+        this.retiredCallIdDigests.size >= AGY_MCP_MAX_RETIRED_CALL_TOMBSTONES
+      ) {
+        this.correlatorCapacityExhausted = true
+        this.tokenlessCorrelationCompromised = true
+        return false
+      }
+      if (candidate.correlatedProgressToken !== undefined) {
+        const ledger = this.tokenLedger.get(candidate.correlatedProgressToken)
+        if (ledger?.kind === 'claimed' && ledger.ownerKey === ownerKey) {
+          this.tokenLedger.set(candidate.correlatedProgressToken, { kind: 'consumed' })
+        }
+      }
+      const explicitPt = candidate.explicitProgressToken
+      this.activeAcpToolCalls.delete(key)
+      this.retiredCallIdDigests.add(digest)
+      this.syncReservationAfterShrink()
+      if (explicitPt !== undefined) {
+        this.markExplicitTokenConsumed(explicitPt)
+      }
+      return true
+    }
+    return false
+  }
+
+  private markClaimedTokenConsumedForOwner(ownerKey: string, knownToken?: string): void {
+    if (knownToken !== undefined) {
+      const ledger = this.tokenLedger.get(knownToken)
+      if (ledger?.kind === 'claimed' && ledger.ownerKey === ownerKey) {
+        this.tokenLedger.set(knownToken, { kind: 'consumed' })
+      }
+      this.provisionalTokenOwners.delete(knownToken)
+      return
+    }
+    if (ownerKey.startsWith('token:')) {
+      const pt = ownerKey.slice('token:'.length)
+      const ledger = this.tokenLedger.get(pt)
+      if (ledger?.kind === 'claimed' && ledger.ownerKey === ownerKey) {
+        this.tokenLedger.set(pt, { kind: 'consumed' })
+      }
+      this.provisionalTokenOwners.delete(pt)
+      return
+    }
+    if (ownerKey.startsWith('call:')) {
+      const tcId = ownerKey.slice('call:'.length)
+      const call = this.activeAcpToolCalls.get(tcId)
+      if (call?.correlatedProgressToken !== undefined) {
+        const ledger = this.tokenLedger.get(call.correlatedProgressToken)
+        if (ledger?.kind === 'claimed' && ledger.ownerKey === ownerKey) {
+          this.tokenLedger.set(call.correlatedProgressToken, { kind: 'consumed' })
+        }
+      }
+    }
+  }
+
+  private cancelStagedOwner(ownerKey: string): void {
+    const staged = this.stagedOutcomes.get(ownerKey)
+    this.stagedOutcomes.delete(ownerKey)
+    if (this.pendingTitleOwner === ownerKey) {
+      this.pendingTitleOwner = undefined
+    }
+    if (this.pendingPeerOwner === ownerKey) {
+      this.pendingPeerOwner = undefined
+    }
+    this.markClaimedTokenConsumedForOwner(ownerKey, staged?.progressToken)
+    const failedChunkIdx = this.pendingPlanChunks.findIndex(
+      (chunk) => chunk.ownerKey === ownerKey && !chunk.invalidated,
+    )
+    if (failedChunkIdx >= 0) {
+      const failedOffset = this.pendingPlanChunks[failedChunkIdx]!.offset
+      let cancelledFinalChunk = false
+      for (let i = this.pendingPlanChunks.length - 1; i >= 0; i -= 1) {
+        const candidate = this.pendingPlanChunks[i]!
+        if (candidate.ownerKey === ownerKey || candidate.offset >= failedOffset) {
+          if (candidate.complete) {
+            cancelledFinalChunk = true
+          }
+          candidate.invalidated = true
+          const depStaged = this.stagedOutcomes.get(candidate.ownerKey)
+          this.stagedOutcomes.delete(candidate.ownerKey)
+          this.markClaimedTokenConsumedForOwner(candidate.ownerKey, depStaged?.progressToken)
+          this.pendingPlanChunks.splice(i, 1)
+        }
+      }
+      if (cancelledFinalChunk) {
+        this.planConversionWorkspaceBytes = 0
+      }
+    }
+    this.syncReservationAfterShrink()
+  }
+
+  private revokeOwner(ownerKey: string): void {
+    if (ownerKey.startsWith('call:')) {
+      this.retireCallId(ownerKey.slice('call:'.length))
+      return
+    }
+    if (ownerKey.startsWith('token:')) {
+      this.provisionalTokenOwners.delete(ownerKey.slice('token:'.length))
+    }
+    this.cancelStagedOwner(ownerKey)
+  }
+
+  private migrateProvisionalTokenOwner(
+    canonicalPt: string,
+    targetCall: ActiveAcpMcpCall,
+  ): 'migrated' | 'rejected_capacity' | 'invalid_ledger' {
+    const provisional = this.provisionalTokenOwners.get(canonicalPt)
+    if (!provisional) return 'invalid_ledger'
+    const oldOwnerKey = `token:${canonicalPt}`
+    const newOwnerKey = `call:${targetCall.toolCallId}`
+    const ledger = this.tokenLedger.get(canonicalPt)
+    if (ledger?.kind !== 'claimed' || ledger.ownerKey !== oldOwnerKey) {
+      this.provisionalTokenOwners.delete(canonicalPt)
+      this.syncReservationAfterShrink()
+      return 'invalid_ledger'
+    }
+
+    const tokenBytes = Buffer.byteLength(canonicalPt, 'utf8')
+    const oldOwnerBytes = Buffer.byteLength(oldOwnerKey, 'utf8')
+    const newOwnerBytes = Buffer.byteLength(newOwnerKey, 'utf8')
+    const ownerDiff = newOwnerBytes - oldOwnerBytes
+    const matchingChunks = this.pendingPlanChunks.filter(
+      (chunk) => !chunk.invalidated && chunk.ownerKey === oldOwnerKey,
+    ).length
+    const hasStaged = this.stagedOutcomes.has(oldOwnerKey)
+    const metadataDelta =
+      -(tokenBytes + provisional.httpFingerprint.approxBytes + 32) +
+      (tokenBytes + 16 + provisional.httpFingerprint.approxBytes) +
+      ownerDiff +
+      (hasStaged ? ownerDiff : 0) +
+      matchingChunks * ownerDiff
+
+    const current = this.computeCorrelationHeldBytes()
+    if (!this.tryAdmitBytes(current.metadataBytes + metadataDelta, current.planBufferBytes)) {
+      this.revokeOwner(oldOwnerKey)
+      this.retireCallId(targetCall.toolCallId)
+      return 'rejected_capacity'
+    }
+
+    this.provisionalTokenOwners.delete(canonicalPt)
+    targetCall.correlatedProgressToken = canonicalPt
+    targetCall.claimedViaTokenless = targetCall.explicitProgressToken !== canonicalPt
+    targetCall.claimedHttpArgsFingerprint = provisional.httpFingerprint
+    this.tokenLedger.set(canonicalPt, { kind: 'claimed', ownerKey: newOwnerKey })
+
+    const staged = this.stagedOutcomes.get(oldOwnerKey)
+    if (staged) {
+      this.stagedOutcomes.delete(oldOwnerKey)
+      staged.ownerKey = newOwnerKey
+      this.stagedOutcomes.set(newOwnerKey, staged)
+    }
+    if (this.pendingTitleOwner === oldOwnerKey) {
+      this.pendingTitleOwner = newOwnerKey
+    }
+    if (this.pendingPeerOwner === oldOwnerKey) {
+      this.pendingPeerOwner = newOwnerKey
+    }
+    for (const chunk of this.pendingPlanChunks) {
+      if (chunk.ownerKey === oldOwnerKey) {
+        chunk.ownerKey = newOwnerKey
+      }
+    }
+    return 'migrated'
+  }
+
+  private recomputeProvisionalMigrationsForTool(toolName: string): void {
+    if (this.provisionalTokenOwners.size === 0 || this.recomputingProvisionalDepth > 0) return
+    this.recomputingProvisionalDepth += 1
+    try {
+      let progressed = true
+      let iterations = 0
+      while (progressed && this.provisionalTokenOwners.size > 0 && iterations < 16) {
+        progressed = false
+        iterations += 1
+        for (const candidate of Array.from(this.activeAcpToolCalls.values())) {
+          if (
+            candidate.toolName !== toolName ||
+            candidate.lifecycle !== 'open' ||
+            candidate.correlatedProgressToken !== undefined
+          ) {
+            continue
+          }
+          const beforeToken = candidate.correlatedProgressToken
+          this.tryMigrateProvisionalToOpenCall(candidate)
+          if (candidate.correlatedProgressToken !== beforeToken) {
+            progressed = true
+          }
+        }
+      }
+    } finally {
+      this.recomputingProvisionalDepth -= 1
+    }
+  }
+
+  private tryMigrateProvisionalToOpenCall(
+    entry: ActiveAcpMcpCall,
+  ): 'ok' | 'already_retired' | 'rejected_capacity' {
+    if (
+      entry.lifecycle !== 'open' ||
+      entry.correlatedProgressToken !== undefined ||
+      this.provisionalTokenOwners.size === 0
+    ) {
+      return 'ok'
+    }
+    if (entry.explicitProgressToken !== undefined) {
+      const prov = this.provisionalTokenOwners.get(entry.explicitProgressToken)
+      if (!prov) return 'ok'
+      const conflict =
+        prov.toolName !== entry.toolName ||
+        !this.matchesCallRootEvidence(entry, entry.explicitProgressToken) ||
+        (entry.argsFingerprint !== undefined &&
+          compareArgsFingerprints(entry.argsFingerprint, prov.httpFingerprint) === 'mismatch')
+      if (conflict) {
+        this.revokeOwner(`token:${entry.explicitProgressToken}`)
+        this.retireCallId(entry.toolCallId)
+        return 'already_retired'
+      }
+      const migrated = this.migrateProvisionalTokenOwner(entry.explicitProgressToken, entry)
+      return migrated === 'rejected_capacity' ? 'rejected_capacity' : 'ok'
+    }
+    if (
+      this.tokenlessCorrelationCompromised ||
+      this.correlatorCapacityExhausted ||
+      this.tokenCapacityExhausted ||
+      entry.argsFingerprint === undefined
+    ) {
+      return 'ok'
+    }
+    const compatibleProvisionals: string[] = []
+    for (const [pt, prov] of this.provisionalTokenOwners) {
+      if (prov.toolName !== entry.toolName) continue
+      const ledger = this.tokenLedger.get(pt)
+      if (ledger?.kind !== 'claimed' || ledger.ownerKey !== `token:${pt}`) continue
+      if (!this.matchesCallRootEvidence(entry, pt)) continue
+      const verdict = compareArgsFingerprints(entry.argsFingerprint, prov.httpFingerprint)
+      if (verdict === 'exact' || verdict === 'subset') {
+        compatibleProvisionals.push(pt)
+      }
+    }
+    if (compatibleProvisionals.length === 1) {
+      const pt = compatibleProvisionals[0]!
+      const prov = this.provisionalTokenOwners.get(pt)
+      if (!prov) return 'ok'
+      let compatibleCalls = 0
+      let missingArgsCount = 0
+      for (const other of this.activeAcpToolCalls.values()) {
+        if (
+          other.toolName !== prov.toolName ||
+          other.lifecycle !== 'open' ||
+          other.correlatedProgressToken !== undefined
+        ) {
+          continue
+        }
+        if (!this.matchesCallRootEvidence(other, pt)) {
+          continue
+        }
+        if (other.explicitProgressToken !== undefined) {
+          if (other.explicitProgressToken === pt && other.toolCallId !== entry.toolCallId) {
+            return 'ok'
+          }
+          if (other.explicitProgressToken !== pt) {
+            continue
+          }
+        }
+        const verdict = compareArgsFingerprints(other.argsFingerprint, prov.httpFingerprint)
+        if (verdict === 'exact' || verdict === 'subset') {
+          compatibleCalls += 1
+        } else if (verdict === 'missing_acp_args') {
+          missingArgsCount += 1
+        }
+      }
+      if (compatibleCalls === 1 && missingArgsCount === 0) {
+        const migrated = this.migrateProvisionalTokenOwner(pt, entry)
+        return migrated === 'rejected_capacity' ? 'rejected_capacity' : 'ok'
+      }
+    }
+    return 'ok'
+  }
+
+  observeNonMcpProgressToken(rawToken: unknown): void {
+    if (this.closed) return
+    const parsed = canonicalizeProgressToken(rawToken)
+    if (!parsed) return
+    const canonical = parsed.canonical
+    const prev = this.tokenLedger.get(canonical)
+    if (prev?.kind === 'claimed') {
+      const prevOwner = prev.ownerKey
+      this.tokenLedger.set(canonical, { kind: 'non_mcp' })
+      this.revokeOwner(prevOwner)
+    } else if (prev === undefined) {
+      if (this.tokenLedger.size >= AGY_MCP_MAX_CONSUMED_TOKENS) {
+        this.tokenCapacityExhausted = true
+      } else {
+        const current = this.computeCorrelationHeldBytes()
+        const delta = Buffer.byteLength(canonical, 'utf8') + 32
+        if (!this.tryAdmitBytes(current.metadataBytes + delta, current.planBufferBytes)) {
+          this.tokenCapacityExhausted = true
+        } else {
+          this.tokenLedger.set(canonical, { kind: 'non_mcp' })
+        }
+      }
+    } else {
+      this.tokenLedger.set(canonical, { kind: 'non_mcp' })
+      this.syncReservationAfterShrink()
+    }
+    this.wakeAllWaiters()
+  }
+
+  observeNonPactCall(toolCallId: string | undefined, allCanonicalTokens: readonly string[]): void {
+    if (this.closed) return
+    this.beginWakeBatch()
+    try {
+      if (
+        toolCallId !== undefined &&
+        toolCallId.length > 0 &&
+        Buffer.byteLength(toolCallId, 'utf8') <= AGY_MCP_MAX_TOOL_CALL_ID_BYTES
+      ) {
+        this.retireCallId(toolCallId)
+      }
+      for (const token of allCanonicalTokens) {
+        this.observeNonMcpProgressToken(token)
+      }
+      this.wakeAllWaiters()
+    } finally {
+      this.endWakeBatch()
+    }
+  }
+
+  revokeDisputedTokens(
+    toolCallId: string | undefined,
+    allCanonicalTokens: readonly string[],
+  ): void {
+    if (this.closed) return
+    this.beginWakeBatch()
+    try {
+      if (
+        toolCallId !== undefined &&
+        toolCallId.length > 0 &&
+        Buffer.byteLength(toolCallId, 'utf8') <= AGY_MCP_MAX_TOOL_CALL_ID_BYTES
+      ) {
+        this.retireCallId(toolCallId)
+      }
+      for (const token of allCanonicalTokens) {
+        const parsedPt = canonicalizeProgressToken(token)
+        if (parsedPt) {
+          this.invalidateToken(parsedPt.canonical)
+        }
+      }
+      this.wakeAllWaiters()
+    } finally {
+      this.endWakeBatch()
+    }
+  }
+
+  revokeAcpToolCall(toolCallId?: string, rawProgressToken?: unknown): void {
+    if (this.closed) return
+    this.beginWakeBatch()
+    try {
+      if (
+        toolCallId !== undefined &&
+        toolCallId.length > 0 &&
+        Buffer.byteLength(toolCallId, 'utf8') <= AGY_MCP_MAX_TOOL_CALL_ID_BYTES
+      ) {
+        this.retireCallId(toolCallId)
+      }
+      if (rawProgressToken !== undefined) {
+        const parsedPt = canonicalizeProgressToken(rawProgressToken)
+        if (parsedPt) {
+          this.invalidateToken(parsedPt.canonical)
+        }
+      }
+      this.wakeAllWaiters()
+    } finally {
+      this.endWakeBatch()
+    }
+  }
+
+  revokeIfKnownMcpCall(toolCallId: string, rawProgressToken?: unknown): void {
+    if (this.closed) return
+    if (
+      toolCallId.length === 0 ||
+      Buffer.byteLength(toolCallId, 'utf8') > AGY_MCP_MAX_TOOL_CALL_ID_BYTES
+    ) {
+      return
+    }
+    if (!this.activeAcpToolCalls.has(toolCallId)) {
+      return
+    }
+    this.revokeAcpToolCall(toolCallId, rawProgressToken)
+  }
+
+  observeAcpToolCall(entry: {
+    toolCallId: string
+    toolName: string
+    status: string
+    invalidStatus?: boolean | undefined
+    args?: Record<string, unknown> | undefined
+    argsFingerprint?: CompactArgsFingerprint | undefined
+    invalidArgs?: boolean | undefined
+    progressToken?: unknown
+    disputedTokens?: readonly string[] | undefined
+    invalidProgressToken?: boolean | undefined
+    trajectoryId?: string | undefined
+    stepIdx?: number | undefined
+    rootEvidenceContradicted?: boolean | undefined
+  }): AcpToolCallAdmissionResult {
+    if (this.closed) return 'rejected_capacity'
+    if (
+      entry.toolCallId.length === 0 ||
+      Buffer.byteLength(entry.toolCallId, 'utf8') > AGY_MCP_MAX_TOOL_CALL_ID_BYTES
+    ) {
+      if (entry.disputedTokens && entry.disputedTokens.length > 0) {
+        this.revokeDisputedTokens(undefined, entry.disputedTokens)
+      }
+      return 'already_retired'
+    }
+
+    const invalidateAllDisputed = (extraToken?: string): void => {
+      if (extraToken !== undefined) {
+        this.invalidateToken(extraToken)
+      }
+      if (entry.disputedTokens) {
+        for (const disputed of entry.disputedTokens) {
+          if (disputed !== extraToken) {
+            this.invalidateToken(disputed)
+          }
+        }
+      }
+    }
+
+    this.beginWakeBatch()
+    try {
+      const digest = hashCallIdDigest(entry.toolCallId)
+      if (this.retiredCallIdDigests.has(digest)) {
+        if (
+          entry.rootEvidenceContradicted ||
+          entry.invalidProgressToken ||
+          entry.invalidArgs ||
+          entry.invalidStatus
+        ) {
+          invalidateAllDisputed()
+        }
+        return 'already_retired'
+      }
+
+      const existing = this.activeAcpToolCalls.get(entry.toolCallId)
+      // Terminal states (`completed | failed | revoked`) are strictly irreversible!
+      if (existing && existing.lifecycle !== 'open') {
+        return 'already_retired'
+      }
+
+      // S1-#4: Conflicting tool identity on an established MCP call immediately revokes it!
+      if (existing && existing.toolName !== entry.toolName) {
+        this.retireCallId(entry.toolCallId)
+        const parsedPt =
+          entry.progressToken !== undefined
+            ? canonicalizeProgressToken(entry.progressToken)
+            : undefined
+        invalidateAllDisputed(parsedPt?.canonical)
+        this.wakeAllWaiters()
+        return 'already_retired'
+      }
+
+      let incomingCanonicalPt: string | undefined
+      let parsedPt: CanonicalProgressToken | undefined
+      let shouldRevoke =
+        entry.invalidProgressToken === true ||
+        entry.invalidStatus === true ||
+        entry.invalidArgs === true ||
+        entry.rootEvidenceContradicted === true
+      let invalidateContestedToken = shouldRevoke
+      if (entry.progressToken !== undefined) {
+        parsedPt = canonicalizeProgressToken(entry.progressToken)
+        if (!parsedPt) {
+          shouldRevoke = true
+          invalidateContestedToken = true
+        } else {
+          incomingCanonicalPt = parsedPt.canonical
+          if (parsedPt.structured?.hasLeadingZeros) {
+            shouldRevoke = true
+            invalidateContestedToken = true
+          }
+        }
+      }
+
+      const normalizedStatus = normalizeAcpToolStatus(entry.status)
+      if (!normalizedStatus) {
+        shouldRevoke = true
+        invalidateContestedToken = true
+      }
+
+      if (!this.validatesAgainstRootEvidence(entry.trajectoryId, entry.stepIdx, parsedPt)) {
+        shouldRevoke = true
+        invalidateContestedToken = true
+      }
+
+      // Monotonic trajectoryId and stepIdx retention & cross-frame consistency (even when tokenless!).
+      const resolvedTrajectoryId =
+        entry.trajectoryId ??
+        (parsedPt?.structured && !parsedPt.structured.hasLeadingZeros
+          ? parsedPt.structured.trajectoryId
+          : undefined)
+      const resolvedStepIdx =
+        entry.stepIdx ??
+        (parsedPt?.structured && !parsedPt.structured.hasLeadingZeros
+          ? parsedPt.structured.stepIdx
+          : undefined)
+      if (
+        existing?.trajectoryId !== undefined &&
+        resolvedTrajectoryId !== undefined &&
+        existing.trajectoryId !== resolvedTrajectoryId
+      ) {
+        shouldRevoke = true
+        invalidateContestedToken = true
+      }
+      if (
+        existing?.stepIdx !== undefined &&
+        resolvedStepIdx !== undefined &&
+        existing.stepIdx !== resolvedStepIdx
+      ) {
+        shouldRevoke = true
+        invalidateContestedToken = true
+      }
+      const nextTrajectoryId = existing?.trajectoryId ?? resolvedTrajectoryId
+      const nextStepIdx = existing?.stepIdx ?? resolvedStepIdx
+      if (existing?.correlatedProgressToken !== undefined) {
+        const claimedPt = canonicalizeProgressToken(existing.correlatedProgressToken)
+        if (claimedPt?.structured) {
+          if (
+            nextTrajectoryId !== undefined &&
+            claimedPt.structured.trajectoryId !== nextTrajectoryId
+          ) {
+            shouldRevoke = true
+            invalidateContestedToken = true
+          }
+          if (nextStepIdx !== undefined && claimedPt.structured.stepIdx !== nextStepIdx) {
+            shouldRevoke = true
+            invalidateContestedToken = true
+          }
+        }
+      }
+
+      if (!existing && this.correlatorCapacityExhausted) {
+        this.tokenlessCorrelationCompromised = true
+        invalidateAllDisputed(incomingCanonicalPt)
+        this.wakeAllWaiters()
+        return 'rejected_capacity'
+      }
+
+      const nextLifecycle: AcpMcpCallLifecycle =
+        normalizedStatus === 'completed'
+          ? 'completed'
+          : normalizedStatus === 'failed' || normalizedStatus === 'cancelled'
+            ? 'failed'
+            : 'open'
+
+      // Monotonic per-key argsFingerprint merge (summary-only updates keep existing semantic keys!).
+      let mergedFp: CompactArgsFingerprint | undefined = existing?.argsFingerprint
+      if (entry.argsFingerprint !== undefined || entry.args !== undefined) {
+        const incomingFp =
+          entry.argsFingerprint ??
+          (entry.args !== undefined ? buildCompactArgsFingerprint(entry.args, true) : undefined)
+        if (!incomingFp) {
+          shouldRevoke = true
+          invalidateContestedToken = true
+        } else {
+          const merged = mergeArgsFingerprints(existing?.argsFingerprint, incomingFp)
+          if (merged.kind === 'conflict') {
+            shouldRevoke = true
+            invalidateContestedToken = true
+          } else {
+            mergedFp = merged.fingerprint
+            if (
+              existing?.claimedHttpArgsFingerprint !== undefined &&
+              mergedFp !== undefined &&
+              compareArgsFingerprints(mergedFp, existing.claimedHttpArgsFingerprint) === 'mismatch'
+            ) {
+              shouldRevoke = true
+              invalidateContestedToken = true
+            }
+          }
+        }
+      }
+
+      let explicitToken = existing?.explicitProgressToken
+      const conflictingCallsToRetire: string[] = []
+      if (incomingCanonicalPt !== undefined) {
+        const conflictingCalls = [...this.activeAcpToolCalls.values()].filter(
+          (other) =>
+            other.toolCallId !== entry.toolCallId &&
+            (other.explicitProgressToken === incomingCanonicalPt ||
+              other.correlatedProgressToken === incomingCanonicalPt),
+        )
+        if (conflictingCalls.length > 0) {
+          shouldRevoke = true
+          invalidateContestedToken = true
+          for (const other of conflictingCalls) {
+            conflictingCallsToRetire.push(other.toolCallId)
+          }
+        }
+        if (this.tokenLedger.get(incomingCanonicalPt)?.kind === 'non_mcp') {
+          shouldRevoke = true
+        } else if (
+          existing?.correlatedProgressToken !== undefined &&
+          existing.correlatedProgressToken !== incomingCanonicalPt
+        ) {
+          shouldRevoke = true
+          invalidateContestedToken = true
+        } else if (explicitToken === undefined) {
+          if (conflictingCalls.length === 0 && !shouldRevoke) {
+            explicitToken = incomingCanonicalPt
+          }
+        } else if (explicitToken !== incomingCanonicalPt) {
+          shouldRevoke = true
+          invalidateContestedToken = true
+        }
+      }
+
+      if (shouldRevoke) {
+        for (const otherId of conflictingCallsToRetire) {
+          this.retireCallId(otherId)
+        }
+        this.retireCallId(entry.toolCallId)
+        if (invalidateContestedToken) {
+          invalidateAllDisputed(incomingCanonicalPt)
+        }
+        this.wakeAllWaiters()
+        return 'already_retired'
+      }
+
+      if (parsedPt?.structured && !parsedPt.structured.hasLeadingZeros) {
+        this.pinRootTrajectoryId(parsedPt.structured.trajectoryId)
+      }
+
+      if (!existing && !this.evictTerminalCallIfNeeded()) {
+        this.tokenlessCorrelationCompromised = true
+        this.retireCallId(entry.toolCallId)
+        invalidateAllDisputed(incomingCanonicalPt)
+        this.wakeAllWaiters()
+        return 'rejected_capacity'
+      }
+
+      const isTerminal = nextLifecycle !== 'open'
+      // Before committing a `completed` terminal on an unclaimed open call, discharge any unique
+      // surviving provisional match onto this call using its monotonically merged evidence!
+      if (
+        nextLifecycle === 'completed' &&
+        existing !== undefined &&
+        existing.lifecycle === 'open' &&
+        existing.correlatedProgressToken === undefined &&
+        this.provisionalTokenOwners.size > 0
+      ) {
+        existing.trajectoryId = nextTrajectoryId
+        existing.stepIdx = nextStepIdx
+        existing.explicitProgressToken = explicitToken
+        existing.argsFingerprint = mergedFp
+        const preTermMigration = this.tryMigrateProvisionalToOpenCall(existing)
+        if (preTermMigration !== 'ok') {
+          this.wakeAllWaiters()
+          return preTermMigration
+        }
+      }
+
+      const candidate: ActiveAcpMcpCall = {
+        toolCallId: entry.toolCallId,
+        toolName: existing?.toolName ?? entry.toolName,
+        lifecycle: nextLifecycle,
+        sawPreTerminal: (existing?.sawPreTerminal ?? false) || !isTerminal,
+        ...(nextTrajectoryId !== undefined ? { trajectoryId: nextTrajectoryId } : {}),
+        ...(nextStepIdx !== undefined ? { stepIdx: nextStepIdx } : {}),
+        argsFingerprint: !isTerminal ? mergedFp : undefined,
+        explicitProgressToken: explicitToken,
+        correlatedProgressToken: existing?.correlatedProgressToken,
+        ...(existing?.claimedViaTokenless !== undefined
+          ? { claimedViaTokenless: existing.claimedViaTokenless }
+          : {}),
+        claimedHttpArgsFingerprint: !isTerminal ? existing?.claimedHttpArgsFingerprint : undefined,
+      }
+
+      const current = this.computeCorrelationHeldBytes()
+      const oldEntryBytes = existing ? this.computeAcpCallBytes(existing) : 0
+      const newEntryBytes = this.computeAcpCallBytes(candidate)
+      const nextMetadataBytes = current.metadataBytes - oldEntryBytes + newEntryBytes
+      if (!this.tryAdmitBytes(nextMetadataBytes, current.planBufferBytes)) {
+        this.tokenlessCorrelationCompromised = true
+        this.retireCallId(entry.toolCallId)
+        invalidateAllDisputed(incomingCanonicalPt)
+        this.wakeAllWaiters()
+        return 'rejected_capacity'
+      }
+
+      this.activeAcpToolCalls.set(entry.toolCallId, candidate)
+      let admissionResult: AcpToolCallAdmissionResult = 'admitted'
+      if (nextLifecycle === 'failed') {
+        this.retireCallId(entry.toolCallId)
+        invalidateAllDisputed(incomingCanonicalPt)
+        admissionResult = 'already_retired'
+      } else if (nextLifecycle === 'open') {
+        const migration = this.tryMigrateProvisionalToOpenCall(candidate)
+        if (migration !== 'ok') {
+          admissionResult = migration
+        }
+        this.recomputeProvisionalMigrationsForTool(candidate.toolName)
+      }
+
+      this.wakeAllWaiters()
+      return admissionResult
+    } finally {
+      this.endWakeBatch()
+    }
+  }
+
+  beginInFlightToken(
+    canonicalPt: string,
+    httpFingerprint: CompactArgsFingerprint,
+  ): { ok: true } | { ok: false; error: string } {
+    if (this.tokenCapacityExhausted || this.correlatorCapacityExhausted) {
+      return {
+        ok: false,
+        error: 'Antigravity MCP replay protection token capacity reached for this turn.',
+      }
+    }
+    const existing = this.tokenLedger.get(canonicalPt)
+    if (existing?.kind === 'non_mcp') {
+      return {
+        ok: false,
+        error: 'Antigravity MCP progressToken belongs to a non-Pact ACP tool call.',
+      }
+    }
+    if (existing !== undefined) {
+      return {
+        ok: false,
+        error: 'Duplicate or already consumed Antigravity MCP progressToken.',
+      }
+    }
+    if (this.tokenLedger.size >= AGY_MCP_MAX_CONSUMED_TOKENS) {
+      this.tokenCapacityExhausted = true
+      this.wakeAllWaiters()
+      return {
+        ok: false,
+        error: 'Antigravity MCP replay protection token capacity reached for this turn.',
+      }
+    }
+    const inFlightBytes = httpFingerprint.approxBytes + 64
+    const ledgerBytes = Buffer.byteLength(canonicalPt, 'utf8') + 32
+    const current = this.computeCorrelationHeldBytes()
+    if (
+      !this.tryAdmitBytes(
+        current.metadataBytes + ledgerBytes + inFlightBytes,
+        current.planBufferBytes,
+      )
+    ) {
+      return {
+        ok: false,
+        error: 'Antigravity MCP correlation memory budget exceeded for this turn.',
+      }
+    }
+    this.tokenLedger.set(canonicalPt, { kind: 'in_flight_http' })
+    this.inFlightHttpFingerprints.set(canonicalPt, inFlightBytes)
+    return { ok: true }
+  }
+
+  releaseInFlightToken(canonicalPt: string): void {
+    let changed = this.inFlightHttpFingerprints.delete(canonicalPt)
+    const existing = this.tokenLedger.get(canonicalPt)
+    if (existing?.kind === 'in_flight_http') {
+      this.tokenLedger.delete(canonicalPt)
+      changed = true
+    }
+    if (changed) {
+      this.syncReservationAfterShrink()
+    }
+  }
+
+  private findExplicitEntryForToken(canonicalPt: string): ActiveAcpMcpCall | undefined {
+    for (const entry of this.activeAcpToolCalls.values()) {
+      if (entry.explicitProgressToken === canonicalPt) return entry
+    }
+    return undefined
+  }
+
+  private tryClaimForHttp(
+    toolName: string,
+    httpFingerprint: CompactArgsFingerprint,
+    canonicalPt: string,
+    allowExplicitMissingArgs: boolean,
+    checkRootProof: () => RootProofCheckResult,
+  ): HttpClaimAttempt {
+    if (this.closed || this.revoked) {
+      return { kind: 'reject', error: 'This Pact tool capability belongs to a retired root turn.' }
+    }
+    if (this.tokenCapacityExhausted || this.correlatorCapacityExhausted) {
+      return {
+        kind: 'reject',
+        error: 'Antigravity MCP replay protection token capacity reached for this turn.',
+      }
+    }
+    const ledger = this.tokenLedger.get(canonicalPt)
+    if (ledger?.kind === 'non_mcp') {
+      return {
+        kind: 'reject',
+        error: 'Antigravity MCP progressToken belongs to a non-Pact ACP tool call.',
+      }
+    }
+    if (ledger?.kind !== 'in_flight_http') {
+      return {
+        kind: 'reject',
+        error: 'Duplicate or already consumed Antigravity MCP progressToken.',
+      }
+    }
+    const rootProof = checkRootProof()
+    if (rootProof !== 'ok') {
+      return rootProof === 'wait' ? { kind: 'wait' } : rootProof
+    }
+
+    const explicitEntry = this.findExplicitEntryForToken(canonicalPt)
+    if (explicitEntry !== undefined) {
+      if (
+        explicitEntry.lifecycle !== 'open' ||
+        explicitEntry.toolName !== toolName ||
+        explicitEntry.correlatedProgressToken !== undefined ||
+        !this.matchesCallRootEvidence(explicitEntry, canonicalPt)
+      ) {
+        return {
+          kind: 'reject',
+          error: 'Antigravity MCP explicit progressToken does not match an active call.',
+        }
+      }
+      const verdict = compareArgsFingerprints(explicitEntry.argsFingerprint, httpFingerprint)
+      if (verdict === 'mismatch') {
+        return {
+          kind: 'reject',
+          error: 'Antigravity MCP arguments conflict with the ACP-authorized tool call.',
+        }
+      }
+      if (verdict === 'missing_acp_args') {
+        if (!allowExplicitMissingArgs || toolName === 'read_collaboration_source') {
+          return { kind: 'wait' }
+        }
+      }
+      return this.commitCallClaim(explicitEntry, canonicalPt, httpFingerprint)
+    }
+
+    if (this.tokenlessCorrelationCompromised) {
+      return {
+        kind: 'reject',
+        error:
+          'Antigravity MCP tokenless call correlation is unavailable after capacity saturation.',
+      }
+    }
+
+    const unclaimed = [...this.activeAcpToolCalls.values()].filter(
+      (entry) =>
+        entry.toolName === toolName &&
+        entry.lifecycle === 'open' &&
+        entry.correlatedProgressToken === undefined &&
+        (entry.explicitProgressToken === undefined ||
+          entry.explicitProgressToken === canonicalPt) &&
+        this.matchesCallRootEvidence(entry, canonicalPt),
+    )
+    if (unclaimed.length === 0) return { kind: 'wait' }
+
+    const exactMatches: ActiveAcpMcpCall[] = []
+    const subsetMatches: ActiveAcpMcpCall[] = []
+    let missingArgsCount = 0
+    for (const entry of unclaimed) {
+      const verdict = compareArgsFingerprints(entry.argsFingerprint, httpFingerprint)
+      if (verdict === 'exact') {
+        exactMatches.push(entry)
+      } else if (verdict === 'subset') {
+        subsetMatches.push(entry)
+      } else if (verdict === 'missing_acp_args') {
+        missingArgsCount += 1
+      }
+    }
+
+    const compatible = [...exactMatches, ...subsetMatches]
+    if (compatible.length > 1) {
+      return {
+        kind: 'reject',
+        error: 'Antigravity MCP call matches multiple ambiguous ACP root tool calls.',
+      }
+    }
+    if (missingArgsCount > 0 || compatible.length !== 1) {
+      return { kind: 'wait' }
+    }
+    return this.commitCallClaim(compatible[0]!, canonicalPt, httpFingerprint)
+  }
+
+  private commitCallClaim(
+    chosen: ActiveAcpMcpCall,
+    canonicalPt: string,
+    httpFingerprint: CompactArgsFingerprint,
+  ): HttpClaimAttempt {
+    const ownerKey = `call:${chosen.toolCallId}`
+    const releasedInFlight = this.inFlightHttpFingerprints.get(canonicalPt) ?? 0
+    const deltaMetadata =
+      -releasedInFlight +
+      Buffer.byteLength(canonicalPt, 'utf8') +
+      16 +
+      httpFingerprint.approxBytes +
+      Buffer.byteLength(ownerKey, 'utf8') +
+      16
+    const current = this.computeCorrelationHeldBytes()
+    if (!this.tryAdmitBytes(current.metadataBytes + deltaMetadata, current.planBufferBytes)) {
+      return {
+        kind: 'reject',
+        error: 'Antigravity MCP correlation memory budget exceeded for this turn.',
+      }
+    }
+    this.inFlightHttpFingerprints.delete(canonicalPt)
+    chosen.correlatedProgressToken = canonicalPt
+    chosen.claimedViaTokenless = chosen.explicitProgressToken !== canonicalPt
+    chosen.claimedHttpArgsFingerprint = httpFingerprint
+    this.tokenLedger.set(canonicalPt, { kind: 'claimed', ownerKey })
+    return { kind: 'claimed', ownerKey }
+  }
+
+  private hasBlockingPreTerminalCall(toolName: string): boolean {
+    for (const entry of this.activeAcpToolCalls.values()) {
+      if (
+        entry.sawPreTerminal &&
+        entry.lifecycle === 'open' &&
+        entry.correlatedProgressToken === undefined &&
+        (entry.explicitProgressToken === undefined || entry.toolName === toolName)
+      ) {
+        return true
+      }
+    }
+    return false
+  }
+
+  async claimOrWaitForHttp(
+    toolName: string,
+    httpFingerprint: CompactArgsFingerprint,
+    canonicalPt: string,
+    isCurrent: () => boolean,
+    checkRootProof: () => RootProofCheckResult,
+    timeoutMs = AGY_MCP_CORRELATION_WAIT_MS,
+  ): Promise<{ ok: true; ownerKey: string } | { ok: false; error: string }> {
+    const immediate = this.tryClaimForHttp(
+      toolName,
+      httpFingerprint,
+      canonicalPt,
+      false,
+      checkRootProof,
+    )
+    if (immediate.kind === 'claimed') {
+      return { ok: true, ownerKey: immediate.ownerKey }
+    }
+    if (immediate.kind === 'reject') {
+      return { ok: false, error: immediate.error }
+    }
+    if (this.closed || this.revoked || !isCurrent()) {
+      return { ok: false, error: 'This Pact tool capability belongs to a retired root turn.' }
+    }
+
+    const waitOutcome = await new Promise<HttpClaimAttempt>((resolveWait) => {
+      let settled = false
+      const cleanup = (timer: ReturnType<typeof setTimeout>): void => {
+        clearTimeout(timer)
+        this.activeCallWaiters.delete(onSignal)
+      }
+      const finish = (outcome: HttpClaimAttempt, timer: ReturnType<typeof setTimeout>): void => {
+        if (settled) return
+        settled = true
+        cleanup(timer)
+        resolveWait(outcome)
+      }
+      const timer = setTimeout(
+        () => {
+          if (this.closed || this.revoked || !isCurrent()) {
+            finish(
+              {
+                kind: 'reject',
+                error: 'This Pact tool capability belongs to a retired root turn.',
+              },
+              timer,
+            )
+            return
+          }
+          const finalCheck = this.tryClaimForHttp(
+            toolName,
+            httpFingerprint,
+            canonicalPt,
+            toolName !== 'read_collaboration_source',
+            checkRootProof,
+          )
+          finish(finalCheck, timer)
+        },
+        Math.max(0, timeoutMs),
+      )
+      const onSignal = (): void => {
+        if (this.closed || this.revoked || !isCurrent()) {
+          finish(
+            { kind: 'reject', error: 'This Pact tool capability belongs to a retired root turn.' },
+            timer,
+          )
+          return
+        }
+        const check = this.tryClaimForHttp(
+          toolName,
+          httpFingerprint,
+          canonicalPt,
+          false,
+          checkRootProof,
+        )
+        if (check.kind === 'claimed' || check.kind === 'reject') {
+          finish(check, timer)
+        }
+      }
+      this.activeCallWaiters.add(onSignal)
+    })
+
+    if (waitOutcome.kind === 'claimed') {
+      return { ok: true, ownerKey: waitOutcome.ownerKey }
+    }
+    if (waitOutcome.kind === 'reject') {
+      return { ok: false, error: waitOutcome.error }
+    }
+    if (this.closed || this.revoked || !isCurrent()) {
+      return { ok: false, error: 'This Pact tool capability belongs to a retired root turn.' }
+    }
+
+    // Re-check terminal token dispositions & capacity BEFORE missing positive root proof.
+    if (this.tokenCapacityExhausted || this.correlatorCapacityExhausted) {
+      return {
+        ok: false,
+        error: 'Antigravity MCP replay protection token capacity reached for this turn.',
+      }
+    }
+    const ledger = this.tokenLedger.get(canonicalPt)
+    if (ledger?.kind === 'non_mcp') {
+      return {
+        ok: false,
+        error: 'Antigravity MCP progressToken belongs to a non-Pact ACP tool call.',
+      }
+    }
+    if (ledger?.kind !== 'in_flight_http') {
+      return {
+        ok: false,
+        error: 'Duplicate or already consumed Antigravity MCP progressToken.',
+      }
+    }
+
+    const finalRootProof = checkRootProof()
+    if (finalRootProof !== 'ok') {
+      return {
+        ok: false,
+        error:
+          finalRootProof === 'wait'
+            ? 'Antigravity MCP progressToken does not match an ACP-authenticated root trajectory or step boundary.'
+            : finalRootProof.error,
+      }
+    }
+
+    // Only ACP-pinned non-source tools with no blocking pre-terminal ACP call may stage provisionally
+    // as `token:<canonicalPt>`, and they atomically migrate to `call:<id>` if a late `in_progress` arrives.
+    if (
+      this.trajectoryIdSource === 'acp' &&
+      toolName !== 'read_collaboration_source' &&
+      !this.tokenlessCorrelationCompromised &&
+      !this.hasBlockingPreTerminalCall(toolName)
+    ) {
+      const tokenOwnerKey = `token:${canonicalPt}`
+      const releasedInFlight = this.inFlightHttpFingerprints.get(canonicalPt) ?? 0
+      const deltaMetadata =
+        -releasedInFlight +
+        Buffer.byteLength(canonicalPt, 'utf8') +
+        httpFingerprint.approxBytes +
+        32 +
+        Buffer.byteLength(tokenOwnerKey, 'utf8') +
+        16
+      const current = this.computeCorrelationHeldBytes()
+      if (!this.tryAdmitBytes(current.metadataBytes + deltaMetadata, current.planBufferBytes)) {
+        return {
+          ok: false,
+          error: 'Antigravity MCP correlation memory budget exceeded for this turn.',
+        }
+      }
+      this.inFlightHttpFingerprints.delete(canonicalPt)
+      this.tokenLedger.set(canonicalPt, { kind: 'claimed', ownerKey: tokenOwnerKey })
+      this.provisionalTokenOwners.set(canonicalPt, { toolName, httpFingerprint })
+      return { ok: true, ownerKey: tokenOwnerKey }
+    }
+
+    return {
+      ok: false,
+      error: 'Antigravity MCP call does not match an active ACP-authenticated root tool call.',
+    }
+  }
+
+  revalidateLiveClaim(
+    canonicalToken: string,
+    toolName: string,
+    httpFingerprint: CompactArgsFingerprint,
+    isCurrent: () => boolean,
+  ): { ok: true; ownerKey: string } | { ok: false; error: string } {
+    if (this.closed || this.revoked || !isCurrent()) {
+      return { ok: false, error: 'This Pact tool capability belongs to a retired root turn.' }
+    }
+    if (this.correlatorCapacityExhausted || this.tokenCapacityExhausted) {
+      return {
+        ok: false,
+        error: 'Antigravity MCP replay protection capacity reached for this turn.',
+      }
+    }
+    const ledger = this.tokenLedger.get(canonicalToken)
+    if (ledger?.kind !== 'claimed') {
+      return {
+        ok: false,
+        error: 'Antigravity MCP claim was revoked or superseded before execution.',
+      }
+    }
+    const ownerKey = ledger.ownerKey
+    if (ownerKey.startsWith('call:')) {
+      const tcId = ownerKey.slice('call:'.length)
+      if (this.retiredCallIdDigests.has(hashCallIdDigest(tcId))) {
+        return {
+          ok: false,
+          error: 'Antigravity MCP claim was revoked before execution.',
+        }
+      }
+      const entry = this.activeAcpToolCalls.get(tcId)
+      if (
+        !entry ||
+        entry.lifecycle !== 'open' ||
+        entry.toolName !== toolName ||
+        entry.correlatedProgressToken !== canonicalToken ||
+        !this.matchesCallRootEvidence(entry, canonicalToken) ||
+        (entry.explicitProgressToken !== undefined &&
+          entry.explicitProgressToken !== canonicalToken) ||
+        (entry.explicitProgressToken === undefined && this.tokenlessCorrelationCompromised) ||
+        entry.claimedHttpArgsFingerprint?.fullDigest !== httpFingerprint.fullDigest ||
+        (entry.argsFingerprint !== undefined &&
+          compareArgsFingerprints(entry.argsFingerprint, httpFingerprint) === 'mismatch')
+      ) {
+        return {
+          ok: false,
+          error: 'Antigravity MCP claim is no longer valid for this active tool call.',
+        }
+      }
+      return { ok: true, ownerKey }
+    }
+    if (ownerKey === `token:${canonicalToken}`) {
+      const prov = this.provisionalTokenOwners.get(canonicalToken)
+      if (
+        !prov ||
+        prov.toolName !== toolName ||
+        prov.httpFingerprint.fullDigest !== httpFingerprint.fullDigest ||
+        this.trajectoryIdSource !== 'acp' ||
+        this.tokenlessCorrelationCompromised ||
+        toolName === 'read_collaboration_source'
+      ) {
+        return {
+          ok: false,
+          error: 'Antigravity MCP provisional claim is no longer valid.',
+        }
+      }
+      return { ok: true, ownerKey }
+    }
+    return {
+      ok: false,
+      error: 'Antigravity MCP claim owner is invalid.',
+    }
+  }
+
+  consumeRejectedClaim(canonicalToken: string): void {
+    const ledger = this.tokenLedger.get(canonicalToken)
+    if (ledger?.kind !== 'claimed') return
+    const ownerKey = ledger.ownerKey
+    if (this.stagedOutcomes.has(ownerKey)) return
+    this.tokenLedger.set(canonicalToken, { kind: 'consumed' })
+    if (ownerKey === `token:${canonicalToken}`) {
+      this.provisionalTokenOwners.delete(canonicalToken)
+    } else if (ownerKey.startsWith('call:')) {
+      const tcId = ownerKey.slice('call:'.length)
+      const call = this.activeAcpToolCalls.get(tcId)
+      if (call?.correlatedProgressToken === canonicalToken) {
+        this.retireCallId(tcId)
+      }
+    }
+    this.syncReservationAfterShrink()
+    this.wakeAllWaiters()
+  }
+
+  stageOutcome(
+    auth: { progressToken: string; httpFingerprint: CompactArgsFingerprint },
+    toolName: string,
+    kind: StagedMcpOutcomeKind,
+    isCurrent: () => boolean,
+    planChunk?: { offset: number; bytes: Buffer; hasNonWhitespace: boolean; complete: boolean },
+  ): { ok: true; ownerKey: string } | { ok: false; error: string } {
+    const live = this.revalidateLiveClaim(
+      auth.progressToken,
+      toolName,
+      auth.httpFingerprint,
+      isCurrent,
+    )
+    if (!live.ok) {
+      return live
+    }
+    const ownerKey = live.ownerKey
+    if (
+      this.stagedOutcomes.size >= 64 ||
+      this.stagedOutcomes.has(ownerKey) ||
+      (planChunk && this.pendingPlanChunks.length >= 64)
+    ) {
+      return { ok: false, error: 'Too many pending Pact MCP outcomes in this turn.' }
+    }
+    if (kind.type === 'title' && this.isTitleSlotTaken) {
+      return { ok: false, error: 'A session title was already submitted in this turn.' }
+    }
+    if (kind.type === 'peer' && this.isPeerSlotTaken) {
+      return { ok: false, error: 'This answer already has a peer request.' }
+    }
+    if (kind.type === 'publish_plan_chunk' && this.isOpenPlanFinalizedOrPendingFinal) {
+      return { ok: false, error: 'A published Plan has already been finalized in this root turn.' }
+    }
+
+    const payloadBytes = estimateStagedOutcomePayloadBytes(kind)
+    const stagedMetaBytes =
+      Buffer.byteLength(ownerKey, 'utf8') +
+      Buffer.byteLength(auth.progressToken, 'utf8') +
+      auth.httpFingerprint.approxBytes +
+      payloadBytes +
+      32
+    const chunkMetaBytes = planChunk ? Buffer.byteLength(ownerKey, 'utf8') + 48 : 0
+    const chunkBufBytes = planChunk ? planChunk.bytes.byteLength : 0
+    const current = this.computeCorrelationHeldBytes()
+    const nextPlanBufferBytes = current.planBufferBytes + chunkBufBytes
+    const nextConversionWorkspaceBytes = planChunk?.complete
+      ? computePlanConversionWorkspaceBytes(nextPlanBufferBytes)
+      : this.planConversionWorkspaceBytes
+    if (
+      !this.tryAdmitBytes(
+        current.metadataBytes + stagedMetaBytes + chunkMetaBytes,
+        nextPlanBufferBytes,
+        nextConversionWorkspaceBytes + this.pendingTransferredPlanBytes,
+      )
+    ) {
+      return {
+        ok: false,
+        error: 'Antigravity MCP correlation memory budget exceeded for this turn.',
+      }
+    }
+
+    const record: StagedMcpOutcomeRecord = {
+      ownerKey,
+      progressToken: auth.progressToken,
+      httpFingerprint: auth.httpFingerprint,
+      kind,
+      payloadBytes,
+    }
+    this.stagedOutcomes.set(ownerKey, record)
+    if (planChunk) {
+      if (planChunk.complete) {
+        this.planConversionWorkspaceBytes = nextConversionWorkspaceBytes
+        this.acknowledgedFinalOpenPlan = true
+      }
+      this.pendingPlanChunks.push({
+        ownerKey,
+        offset: planChunk.offset,
+        bytes: planChunk.bytes,
+        hasNonWhitespace: planChunk.hasNonWhitespace,
+        complete: planChunk.complete,
+        confirmed: false,
+        invalidated: false,
+      })
+    }
+    if (kind.type === 'title') {
+      this.pendingTitleOwner = ownerKey
+    } else if (kind.type === 'peer') {
+      this.pendingPeerOwner = ownerKey
+    }
+    return { ok: true, ownerKey }
+  }
+
+  assembleCandidateOpenPlanMarkdown(finalOwnerKey: string): string | undefined {
+    // Require EVERY preceding contributing chunk to be ACP-confirmed before accepting a durable
+    // final intent so unconfirmed prefix bytes can never be promoted during cold recovery.
+    const activePending = this.pendingPlanChunks.filter((chunk) => !chunk.invalidated)
+    const finalChunk = activePending.find(
+      (chunk) => chunk.ownerKey === finalOwnerKey && chunk.complete,
+    )
+    if (!finalChunk) return undefined
+    if (
+      activePending.some((chunk) => chunk !== finalChunk && !chunk.confirmed) ||
+      finalChunk.offset !== this.confirmedPlanBytes
+    ) {
+      return undefined
+    }
+    const orderedParts: Buffer[] = [...this.confirmedPlanChunks, finalChunk.bytes]
+    const totalBytes = this.confirmedPlanBytes + finalChunk.bytes.byteLength
+    if (totalBytes <= 0 || totalBytes > COLLABORATION_PUBLISHED_PLAN_MAX_BYTES) {
+      return undefined
+    }
+    const markdown = Buffer.concat(orderedParts, totalBytes).toString('utf8')
+    return markdown.trim().length > 0 ? markdown : undefined
+  }
+
+  rollbackFailedFinalOpenPlanIntent(ownerKey: string, canonicalToken: string): void {
+    this.cancelStagedOwner(ownerKey)
+    if (
+      !this.openPlanFinalized &&
+      !this.pendingPlanChunks.some((chunk) => !chunk.invalidated && chunk.complete)
+    ) {
+      this.acknowledgedFinalOpenPlan = false
+    }
+    this.consumeRejectedClaim(canonicalToken)
+  }
+
+  private resolvePromotableOwnerKey(info: {
+    toolCallId: string
+    toolName: string
+    progressToken?: unknown
+    invalidProgressToken?: boolean | undefined
+    trajectoryId?: string | undefined
+    stepIdx?: number | undefined
+    rootEvidenceContradicted?: boolean | undefined
+    receivedAfterPromptReply?: boolean | undefined
+  }): string | undefined {
+    if (this.revoked || this.closed || info.receivedAfterPromptReply) return undefined
+    if (
+      info.toolCallId.length === 0 ||
+      Buffer.byteLength(info.toolCallId, 'utf8') > AGY_MCP_MAX_TOOL_CALL_ID_BYTES
+    ) {
+      return undefined
+    }
+    if (this.retiredCallIdDigests.has(hashCallIdDigest(info.toolCallId))) {
+      return undefined
+    }
+    if (this.correlatorCapacityExhausted || this.tokenCapacityExhausted) {
+      this.retireCallId(info.toolCallId)
+      return undefined
+    }
+    if (info.invalidProgressToken || info.rootEvidenceContradicted) {
+      this.retireCallId(info.toolCallId)
+      return undefined
+    }
+    let canonicalPt: string | undefined
+    let parsedPt: CanonicalProgressToken | undefined
+    if (info.progressToken !== undefined) {
+      parsedPt = canonicalizeProgressToken(info.progressToken)
+      if (!parsedPt || parsedPt.structured?.hasLeadingZeros) {
+        this.retireCallId(info.toolCallId)
+        return undefined
+      }
+      canonicalPt = parsedPt.canonical
+    }
+    if (!this.validatesAgainstRootEvidence(info.trajectoryId, info.stepIdx, parsedPt)) {
+      this.retireCallId(info.toolCallId)
+      return undefined
+    }
+    const entry = this.activeAcpToolCalls.get(info.toolCallId)
+    // S1-#2: Require the current terminal transition to have been admitted into activeAcpToolCalls,
+    // never already promoted, and strictly bound to the admitted toolName.
+    if (
+      !entry ||
+      entry.lifecycle !== 'completed' ||
+      entry.promoted === true ||
+      entry.toolName !== info.toolName
+    ) {
+      return undefined
+    }
+    if (entry.correlatedProgressToken !== undefined) {
+      const callOwnerKey = `call:${info.toolCallId}`
+      const ledger = this.tokenLedger.get(entry.correlatedProgressToken)
+      if (ledger?.kind !== 'claimed' || ledger.ownerKey !== callOwnerKey) {
+        return undefined
+      }
+      if (
+        (entry.explicitProgressToken === undefined || entry.claimedViaTokenless) &&
+        this.tokenlessCorrelationCompromised
+      ) {
+        this.retireCallId(info.toolCallId)
+        return undefined
+      }
+      if (
+        !this.matchesCallRootEvidence(entry, entry.correlatedProgressToken) ||
+        (entry.explicitProgressToken !== undefined &&
+          entry.explicitProgressToken !== entry.correlatedProgressToken) ||
+        (canonicalPt !== undefined && canonicalPt !== entry.correlatedProgressToken)
+      ) {
+        this.retireCallId(info.toolCallId)
+        return undefined
+      }
+      return callOwnerKey
+    }
+    if (
+      !entry.sawPreTerminal &&
+      canonicalPt !== undefined &&
+      entry.explicitProgressToken === canonicalPt &&
+      this.trajectoryIdSource === 'acp' &&
+      !this.tokenlessCorrelationCompromised &&
+      this.matchesCallRootEvidence(entry, canonicalPt)
+    ) {
+      const tokenOwnerKey = `token:${canonicalPt}`
+      const ledger = this.tokenLedger.get(canonicalPt)
+      const prov = this.provisionalTokenOwners.get(canonicalPt)
+      if (
+        ledger?.kind === 'claimed' &&
+        ledger.ownerKey === tokenOwnerKey &&
+        prov !== undefined &&
+        prov.toolName === entry.toolName
+      ) {
+        return tokenOwnerKey
+      }
+    }
+    return undefined
+  }
+
+  promoteCompletedAcpToolCall(info: {
+    toolCallId: string
+    toolName: string
+    progressToken?: unknown
+    invalidProgressToken?: boolean | undefined
+    args?: Record<string, unknown> | undefined
+    argsFingerprint?: CompactArgsFingerprint | undefined
+    trajectoryId?: string | undefined
+    stepIdx?: number | undefined
+    rootEvidenceContradicted?: boolean | undefined
+    receivedAfterPromptReply?: boolean | undefined
+  }): PromotedMcpOutcome | undefined {
+    const ownerKey = this.resolvePromotableOwnerKey({
+      toolCallId: info.toolCallId,
+      toolName: info.toolName,
+      progressToken: info.progressToken,
+      invalidProgressToken: info.invalidProgressToken,
+      trajectoryId: info.trajectoryId,
+      stepIdx: info.stepIdx,
+      rootEvidenceContradicted: info.rootEvidenceContradicted,
+      receivedAfterPromptReply: info.receivedAfterPromptReply,
+    })
+    if (!ownerKey) return undefined
+    const entry = this.activeAcpToolCalls.get(info.toolCallId)
+    if (entry) {
+      entry.promoted = true
+    }
+    const staged = this.stagedOutcomes.get(ownerKey)
+    this.stagedOutcomes.delete(ownerKey)
+    if (!staged) {
+      this.markClaimedTokenConsumedForOwner(ownerKey)
+      this.syncReservationAfterShrink()
+      return undefined
+    }
+
+    if (info.argsFingerprint !== undefined || info.args !== undefined) {
+      const incomingFp =
+        info.argsFingerprint ??
+        (info.args !== undefined ? buildCompactArgsFingerprint(info.args, true) : undefined)
+      if (
+        !incomingFp ||
+        compareArgsFingerprints(incomingFp, staged.httpFingerprint) === 'mismatch'
+      ) {
+        this.cancelStagedOwner(ownerKey)
+        return undefined
+      }
+    }
+
+    this.markClaimedTokenConsumedForOwner(ownerKey, staged.progressToken)
+    const kind = staged.kind
+    let promoted: PromotedMcpOutcome | undefined
+    if (kind.type === 'title') {
+      if (this.pendingTitleOwner === ownerKey) this.pendingTitleOwner = undefined
+      if (!this.titleConfirmed && info.toolName === 'publish_session_title') {
+        this.titleConfirmed = true
+        promoted = kind
+      }
+    } else if (kind.type === 'peer') {
+      if (this.pendingPeerOwner === ownerKey) this.pendingPeerOwner = undefined
+      if (!this.peerConfirmed && info.toolName === 'request_peer_assistance') {
+        this.peerConfirmed = true
+        promoted = kind
+      }
+    } else if (kind.type === 'review') {
+      promoted = info.toolName === 'submit_review' ? kind : undefined
+    } else if (kind.type === 'input_result') {
+      promoted = info.toolName === 'submit_input_result' ? kind : undefined
+    } else if (kind.type === 'retain_plan') {
+      promoted = info.toolName === 'retain_current_plan' ? kind : undefined
+    } else if (kind.type === 'publish_plan_chunk') {
+      if (info.toolName === 'publish_plan') {
+        const chunk = this.pendingPlanChunks.find((c) => c.ownerKey === ownerKey && !c.invalidated)
+        if (chunk && chunk.offset === kind.offset) {
+          if (chunk.complete) {
+            const idBytes = Buffer.byteLength(info.toolCallId, 'utf8')
+            const current = this.computeCorrelationHeldBytes()
+            if (!this.tryAdmitBytes(current.metadataBytes + idBytes, current.planBufferBytes)) {
+              this.cancelStagedOwner(ownerKey)
+              this.openPlanFinalized = true
+              this.syncReservationAfterShrink()
+              return {
+                type: 'publish_plan_failed',
+                reason:
+                  'Antigravity open plan metadata budget exceeded while confirming final chunk.',
+              }
+            }
+            chunk.confirmedToolCallId = info.toolCallId
+          }
+          chunk.confirmed = true
+          promoted = this.flushConfirmedPlanChunks()
+        }
+      }
+    }
+    this.syncReservationAfterShrink()
+    return promoted
+  }
+
+  private flushConfirmedPlanChunks(): PromotedMcpOutcome | undefined {
+    if (this.openPlanFinalized) return undefined
+    while (this.pendingPlanChunks.length > 0) {
+      const head = this.pendingPlanChunks[0]!
+      if (head.invalidated || !head.confirmed || head.offset !== this.confirmedPlanBytes) {
+        break
+      }
+      this.pendingPlanChunks.shift()
+      this.confirmedPlanChunks.push(head.bytes)
+      this.confirmedPlanBytes += head.bytes.byteLength
+      if (head.hasNonWhitespace) {
+        this.confirmedPlanHasNonWhitespace = true
+      }
+      if (head.complete) {
+        const finalToolCallId = head.confirmedToolCallId
+        if (!this.confirmedPlanHasNonWhitespace || !finalToolCallId) {
+          this.confirmedPlanChunks.length = 0
+          this.confirmedPlanBytes = 0
+          this.confirmedPlanHasNonWhitespace = false
+          this.planConversionWorkspaceBytes = 0
+          this.openPlanFinalized = true
+          this.syncReservationAfterShrink()
+          return {
+            type: 'publish_plan_failed',
+            reason: 'Antigravity open plan finalization lacked non-empty confirmed content.',
+          }
+        }
+        const workspaceBytes = computePlanConversionWorkspaceBytes(this.confirmedPlanBytes)
+        if (workspaceBytes > this.planConversionWorkspaceBytes) {
+          const current = this.computeCorrelationHeldBytes()
+          if (
+            !this.tryAdmitBytes(
+              current.metadataBytes,
+              current.planBufferBytes,
+              workspaceBytes + this.pendingTransferredPlanBytes,
+            )
+          ) {
+            this.confirmedPlanChunks.length = 0
+            this.confirmedPlanBytes = 0
+            this.confirmedPlanHasNonWhitespace = false
+            this.planConversionWorkspaceBytes = 0
+            this.openPlanFinalized = true
+            this.syncReservationAfterShrink()
+            return {
+              type: 'publish_plan_failed',
+              reason: 'Antigravity open plan conversion exceeded shared working-memory budget.',
+            }
+          }
+          this.planConversionWorkspaceBytes = workspaceBytes
+        }
+        const markdown = Buffer.concat(this.confirmedPlanChunks, this.confirmedPlanBytes).toString(
+          'utf8',
+        )
+        this.confirmedPlanChunks.length = 0
+        this.confirmedPlanBytes = 0
+        this.confirmedPlanHasNonWhitespace = false
+        this.planConversionWorkspaceBytes = 0
+        if (!markdown.trim()) {
+          this.openPlanFinalized = true
+          this.syncReservationAfterShrink()
+          return {
+            type: 'publish_plan_failed',
+            reason: 'Antigravity open plan decoded to empty Markdown.',
+          }
+        }
+        this.pendingTransferredPlanBytes = computeRetainedPlanTextBytes(markdown)
+        this.syncReservationAfterShrink()
+        this.openPlanFinalized = true
+        return { type: 'publish_plan', markdown, finalToolCallId }
+      }
+    }
+    return undefined
+  }
+
+  failAcpToolCall(info: { toolCallId: string; toolName: string; progressToken?: unknown }): void {
+    this.retireCallId(info.toolCallId)
+    const parsedPt =
+      info.progressToken !== undefined ? canonicalizeProgressToken(info.progressToken) : undefined
+    const canonicalPt = parsedPt?.canonical
+    if (canonicalPt !== undefined) {
+      const tokenOwnerKey = `token:${canonicalPt}`
+      const ledger = this.tokenLedger.get(canonicalPt)
+      if (ledger?.kind === 'claimed' && ledger.ownerKey === tokenOwnerKey) {
+        this.cancelStagedOwner(tokenOwnerKey)
+      }
+    }
+    this.syncReservationAfterShrink()
+    this.wakeAllWaiters()
+  }
+
+  revokeRun(): void {
+    this.revoked = true
+    this.pendingTitleOwner = undefined
+    this.pendingPeerOwner = undefined
+    this.provisionalTokenOwners.clear()
+    this.stagedOutcomes.clear()
+    this.pendingPlanChunks.length = 0
+    this.confirmedPlanHasNonWhitespace = false
+    this.planConversionWorkspaceBytes = 0
+    this.pendingTransferredPlanBytes = 0
+    this.syncReservationAfterShrink()
+    this.wakeAllWaiters()
+  }
+
+  close(): void {
+    this.closed = true
+    this.revoked = true
+    this.wakeAllWaiters()
+    this.activeCallWaiters.clear()
+    this.activeAcpToolCalls.clear()
+    this.retiredCallIdDigests.clear()
+    this.tokenLedger.clear()
+    this.inFlightHttpFingerprints.clear()
+    this.provisionalTokenOwners.clear()
+    this.stagedOutcomes.clear()
+    this.pendingTitleOwner = undefined
+    this.pendingPeerOwner = undefined
+    this.pendingPlanChunks.length = 0
+    this.confirmedPlanChunks.length = 0
+    this.confirmedPlanBytes = 0
+    this.confirmedPlanHasNonWhitespace = false
+    this.planConversionWorkspaceBytes = 0
+    this.pendingTransferredPlanBytes = 0
+    this.syncReservationAfterShrink()
+  }
 }
 
 interface AgyMcpServerConfig {
   runId: string
   getNativeSessionId: () => string | undefined
   getExecutorId: () => string
+  getExecutionId?: () => string | undefined
   getRootStepIdx: () => number | undefined
+  hasZeroTurnStepBoundary: () => boolean
+  tryLoadHostTrajectoryId?: () => Promise<
+    { readonly trajectoryId: string; readonly stepCount: number } | undefined
+  >
   bindingGeneration: number
   isRootCurrent: () => boolean
   isSourceCurrent: () => boolean
@@ -1011,34 +4564,41 @@ interface AgyMcpServerConfig {
   sourceReader: AgentCollaborationSourceReader | undefined
   legacySourceReader: ((input: unknown) => CollaborationSourceReadResult) | undefined
   isPlanRetentionCurrent: () => boolean
-  onStagedOutcome: (outcome: StagedMcpCallOutcome) => void
+  recordOpenPlanFinalIntent?: ((intent: AgentOpenPlanFinalIntent) => boolean | void) | undefined
+  reserveCorrelationBytes?: (nextBytes: number) => boolean
 }
 
 /**
  * Per-Run loopback Streamable HTTP MCP server enforcing Antigravity's four-tuple root verification:
  * 1. `_meta['antigravity.google/root_conversation_id'] === activeRoot.nativeSessionId` AND
  *    `_meta['antigravity.google/conversation_id'] === activeRoot.nativeSessionId`
- * 2. Valid `_meta.progressToken` correlated with bound root `tool_call` tokens or structured root trajectory steps
+ * 2. Valid monotonic one-shot `_meta.progressToken` strictly owned 1-to-1 by one root trajectory/step & call
  * 3. Active `(executorId, bindingGeneration, runId)` after root prompt start and before root settlement
- * 4. Exact `progressToken` or `toolCallId` root `tool_call` completion in `session/update` before promoting state.
+ * 4. Exact owner-keyed `tool_call` completion in `session/update` with matching args before promoting state.
  */
 class AgyRunMcpServer {
-  readonly serverName = `pact_peer_${randomUUID().replaceAll('-', '')}`
+  readonly serverName: string
   private readonly token = randomUUID().replaceAll('-', '')
   private http: HttpServer | undefined
+  private readonly activeSockets = new Set<NetSocket>()
+  private httpClosed = false
   private activeRequests = 0
   private activeSourceReads = 0
-  private peerRecorded = false
-  private titleStaged = false
-  private readonly openPlanChunks: Buffer[] = []
-  private openPlanBytes = 0
-  private openPlanCompleted: string | undefined
-  private readonly boundToolCallTokens = new Set<string>()
-  private pinnedTrajectoryId: string | undefined
+  private readonly correlator: McpCallCorrelator
+  readonly sourceCapability: AgentCollaborationSourceCapability
   readonly allowedToolNames = new Set<string>()
 
   constructor(private readonly config: AgyMcpServerConfig) {
-    if (config.sourceReader || config.legacySourceReader) {
+    this.serverName = buildAgyPactMcpServerName(config.runId)
+    this.correlator = new McpCallCorrelator(
+      config.reserveCorrelationBytes,
+      () => config.getRootStepIdx() ?? (config.hasZeroTurnStepBoundary() ? 0 : undefined),
+    )
+    this.sourceCapability = resolveAgentCollaborationSourceCapability({
+      readCollaborationSourcePart: config.legacySourceReader,
+      collaborationSourceReader: config.sourceReader,
+    })
+    if (this.sourceCapability.tier !== 'none') {
       this.allowedToolNames.add('read_collaboration_source')
     }
     if (config.requestSessionTitle) {
@@ -1056,7 +4616,10 @@ class AgyRunMcpServer {
     if (collaborationPlanRetentionAllowed(config.workflow, config.authorization)) {
       this.allowedToolNames.add('retain_current_plan')
     }
-    if (collaborationOpenPlanPublishAllowed(config.workflow, config.authorization)) {
+    if (
+      collaborationOpenPlanPublishAllowed(config.workflow, config.authorization) &&
+      typeof config.recordOpenPlanFinalIntent === 'function'
+    ) {
       this.allowedToolNames.add('publish_plan')
     }
   }
@@ -1065,24 +4628,231 @@ class AgyRunMcpServer {
     return this.allowedToolNames.size > 0
   }
 
-  pinRootTrajectoryId(trajectoryId: string): void {
-    if (!trajectoryId || trajectoryId.length > 256) return
-    if (this.pinnedTrajectoryId === undefined) {
-      this.pinnedTrajectoryId = trajectoryId
-    }
+  get hasAcknowledgedFinalOpenPlan(): boolean {
+    return this.correlator.hasAcknowledgedFinalOpenPlan
   }
 
-  bindToolCallToken(token: string): void {
-    if (!token || token.length > 512) return
-    if (this.boundToolCallTokens.size >= 256 && !this.boundToolCallTokens.has(token)) {
-      const oldest = this.boundToolCallTokens.values().next().value
-      if (oldest !== undefined) this.boundToolCallTokens.delete(oldest)
+  get pinnedTrajectory(): string | undefined {
+    return this.correlator.pinnedTrajectory
+  }
+
+  get minStepIdx(): number | undefined {
+    return (
+      this.config.getRootStepIdx() ??
+      this.correlator.minHostStepIdx ??
+      (this.config.hasZeroTurnStepBoundary() ? 0 : undefined)
+    )
+  }
+
+  isRootActive(): boolean {
+    return !this.correlator.isClosed && !this.correlator.isRevoked && this.config.isRootCurrent()
+  }
+
+  disallowLazyStorageDbPin(): void {
+    this.correlator.disallowLazyStorageDbPin()
+  }
+
+  beginWakeBatch(): void {
+    this.correlator.beginWakeBatch()
+  }
+
+  endWakeBatch(): void {
+    this.correlator.endWakeBatch()
+  }
+
+  notifyRootProofUpdated(): void {
+    this.correlator.notifyRootProofUpdated()
+  }
+
+  clearPendingTransferredPlanBytes(): void {
+    this.correlator.clearPendingTransferredPlanBytes()
+  }
+
+  revokeRun(): void {
+    this.correlator.revokeRun()
+  }
+
+  observeNonMcpProgressToken(token: unknown): void {
+    this.correlator.observeNonMcpProgressToken(token)
+  }
+
+  pinHostTrajectoryId(trajectoryId: string, stepCount?: number): void {
+    this.correlator.pinHostTrajectoryId(trajectoryId, stepCount)
+  }
+
+  pinRootTrajectoryId(trajectoryId: string): void {
+    this.correlator.pinRootTrajectoryId(trajectoryId)
+  }
+
+  lookupVerifiedCallToolName(toolCallId: string): string | undefined {
+    const tool = this.correlator.lookupVerifiedCallToolName(toolCallId)
+    return tool !== undefined ? `mcp_${this.serverName}_${tool}` : undefined
+  }
+
+  observeNonPactCall(toolCallId: string | undefined, allCanonicalTokens: readonly string[]): void {
+    this.correlator.observeNonPactCall(toolCallId, allCanonicalTokens)
+  }
+
+  revokeDisputedTokens(
+    toolCallId: string | undefined,
+    allCanonicalTokens: readonly string[],
+  ): void {
+    this.correlator.revokeDisputedTokens(toolCallId, allCanonicalTokens)
+  }
+
+  revokeAcpToolCall(toolCallId?: string, rawProgressToken?: unknown): void {
+    this.correlator.revokeAcpToolCall(toolCallId, rawProgressToken)
+  }
+
+  revokeIfKnownMcpCall(toolCallId: string, rawProgressToken?: unknown): void {
+    this.correlator.revokeIfKnownMcpCall(toolCallId, rawProgressToken)
+  }
+
+  observeAcpToolCall(entry: {
+    toolCallId: string
+    rawToolName: string
+    status: string
+    invalidStatus?: boolean | undefined
+    args?: Record<string, unknown> | undefined
+    argsFingerprint?: CompactArgsFingerprint | undefined
+    invalidArgs?: boolean | undefined
+    progressToken?: unknown
+    disputedTokens?: readonly string[] | undefined
+    invalidProgressToken?: boolean | undefined
+    trajectoryId?: string | undefined
+    stepIdx?: number | undefined
+    rootEvidenceContradicted?: boolean | undefined
+  }): AcpToolCallAdmissionResult {
+    const authorized = this.isAuthorizedMcpToolCallName(entry.rawToolName)
+    if (!authorized) {
+      const tokens: string[] = [...(entry.disputedTokens ?? [])]
+      if (entry.progressToken !== undefined) {
+        const parsed = canonicalizeProgressToken(entry.progressToken)
+        if (parsed && !tokens.includes(parsed.canonical)) {
+          tokens.push(parsed.canonical)
+        }
+      }
+      this.correlator.observeNonPactCall(entry.toolCallId, tokens)
+      return 'already_retired'
     }
-    this.boundToolCallTokens.add(token)
-    const structured = AGY_PROGRESS_TOKEN_PATTERN.exec(token)
-    if (structured?.[1]) {
-      this.pinRootTrajectoryId(structured[1])
+    return this.correlator.observeAcpToolCall({
+      toolCallId: entry.toolCallId,
+      toolName: authorized.tool,
+      status: entry.status,
+      ...(entry.invalidStatus !== undefined ? { invalidStatus: entry.invalidStatus } : {}),
+      ...(entry.args !== undefined ? { args: entry.args } : {}),
+      ...(entry.argsFingerprint !== undefined ? { argsFingerprint: entry.argsFingerprint } : {}),
+      ...(entry.invalidArgs !== undefined ? { invalidArgs: entry.invalidArgs } : {}),
+      ...(entry.progressToken !== undefined ? { progressToken: entry.progressToken } : {}),
+      ...(entry.disputedTokens !== undefined ? { disputedTokens: entry.disputedTokens } : {}),
+      ...(entry.invalidProgressToken !== undefined
+        ? { invalidProgressToken: entry.invalidProgressToken }
+        : {}),
+      ...(entry.trajectoryId !== undefined ? { trajectoryId: entry.trajectoryId } : {}),
+      ...(entry.stepIdx !== undefined ? { stepIdx: entry.stepIdx } : {}),
+      ...(entry.rootEvidenceContradicted !== undefined
+        ? { rootEvidenceContradicted: entry.rootEvidenceContradicted }
+        : {}),
+    })
+  }
+
+  promoteCompletedAcpToolCall(info: {
+    toolCallId: string
+    rawToolName: string
+    progressToken?: unknown
+    invalidProgressToken?: boolean | undefined
+    args?: Record<string, unknown> | undefined
+    argsFingerprint?: CompactArgsFingerprint | undefined
+    trajectoryId?: string | undefined
+    stepIdx?: number | undefined
+    rootEvidenceContradicted?: boolean | undefined
+    receivedAfterPromptReply?: boolean | undefined
+  }): PromotedMcpOutcome | undefined {
+    const authorized = this.isAuthorizedMcpToolCallName(info.rawToolName)
+    if (!authorized) return undefined
+    return this.correlator.promoteCompletedAcpToolCall({
+      toolCallId: info.toolCallId,
+      toolName: authorized.tool,
+      ...(info.progressToken !== undefined ? { progressToken: info.progressToken } : {}),
+      ...(info.invalidProgressToken !== undefined
+        ? { invalidProgressToken: info.invalidProgressToken }
+        : {}),
+      ...(info.args !== undefined ? { args: info.args } : {}),
+      ...(info.argsFingerprint !== undefined ? { argsFingerprint: info.argsFingerprint } : {}),
+      ...(info.trajectoryId !== undefined ? { trajectoryId: info.trajectoryId } : {}),
+      ...(info.stepIdx !== undefined ? { stepIdx: info.stepIdx } : {}),
+      ...(info.rootEvidenceContradicted !== undefined
+        ? { rootEvidenceContradicted: info.rootEvidenceContradicted }
+        : {}),
+      ...(info.receivedAfterPromptReply !== undefined
+        ? { receivedAfterPromptReply: info.receivedAfterPromptReply }
+        : {}),
+    })
+  }
+
+  failAcpToolCall(info: {
+    toolCallId: string
+    rawToolName: string
+    progressToken?: unknown
+  }): void {
+    const authorized = this.isAuthorizedMcpToolCallName(info.rawToolName)
+    if (!authorized) return
+    this.correlator.failAcpToolCall({
+      toolCallId: info.toolCallId,
+      toolName: authorized.tool,
+      ...(info.progressToken !== undefined ? { progressToken: info.progressToken } : {}),
+    })
+  }
+
+  private peerTargetEnum(): ReadonlyArray<Exclude<RuntimeAgentId, 'agy'>> {
+    return this.config.peerTargetAgentId ? [this.config.peerTargetAgentId] : ['claude', 'codex']
+  }
+
+  formatToolUsageInstructions(): string {
+    const contracts: string[] = []
+    const prefix = `mcp_${this.serverName}_`
+    if (this.allowedToolNames.has('read_collaboration_source')) {
+      const legacyForm =
+        '{ runId: uuid, grant: uuid, source: "document"|"batch"|"inputs"|"handoff_sources"|"cutoff", offset: integer, document?: object, batchId?: uuid, cutoffId?: uuid, part?: "catalog"|"message"|"comments"|"comment", messageId?: uuid, commentId?: uuid }'
+      const sourceRefForm = '{ sourceReference: string, offset: integer }'
+      const nativeRootForm =
+        '{ context: "native-root-v1", source: "document"|"batch"|"root_batch"|"root_document"|"inputs"|"handoff_sources"|"cutoff", offset: integer, part?: "body"|"user_information"|"clarification_answer"|"comment"|"catalog"|"message"|"comments", ordinal?: integer, document?: object, batchId?: uuid, cutoffId?: uuid, messageId?: uuid, commentId?: uuid }'
+      const supportedForms: string[] = []
+      if (this.sourceCapability.sourceReference) supportedForms.push(sourceRefForm)
+      if (this.sourceCapability.nativeRoot) supportedForms.push(nativeRootForm)
+      if (this.sourceCapability.legacy) supportedForms.push(legacyForm)
+      contracts.push(`${prefix}read_collaboration_source(${supportedForms.join(' | ')})`)
     }
+    if (this.allowedToolNames.has('publish_session_title')) {
+      contracts.push(`${prefix}publish_session_title({ title: string(1..120) })`)
+    }
+    if (this.allowedToolNames.has('request_peer_assistance')) {
+      const targetUnion = this.peerTargetEnum()
+        .map((target) => JSON.stringify(target))
+        .join('|')
+      contracts.push(
+        `${prefix}request_peer_assistance({ target: ${targetUnion}, kind: "supplement"|"fact_check"|"challenge"|"review", reason? })`,
+      )
+    }
+    if (this.allowedToolNames.has('submit_review')) {
+      contracts.push(
+        `${prefix}submit_review({ verdict: "accepted"|"changes_requested"|"needs_user"|"incomplete", questions?: [{ prompt: string, selection: "single"|"multiple", options?: [{ label: string, description?: string }] }] })`,
+      )
+    }
+    if (this.allowedToolNames.has('submit_input_result')) {
+      contracts.push(
+        `${prefix}submit_input_result({ outcome: "processed"|"needs_user"|"explanation_only", questions?: [{ prompt: string, selection: "single"|"multiple", options?: [{ label: string, description?: string }] }] })`,
+      )
+    }
+    if (this.allowedToolNames.has('retain_current_plan')) {
+      contracts.push(`${prefix}retain_current_plan({})`)
+    }
+    if (this.allowedToolNames.has('publish_plan')) {
+      contracts.push(
+        `${prefix}publish_plan({ text: string, offset?: integer, complete?: boolean })`,
+      )
+    }
+    return `Registered Pact MCP tools on "${this.serverName}": ${contracts.join('; ')}. Call these MCP tools directly using the contracts above; never call read_file on <appDataDir>/mcp paths or run shell commands to inspect MCP directories.`
   }
 
   isAuthorizedMcpToolCallName(rawToolName: string): { tool: string } | undefined {
@@ -1103,6 +4873,22 @@ class AgyRunMcpServer {
   async start(): Promise<{ type: 'http'; name: string; url: string; headers: never[] }> {
     const server = createServer((req, res) => {
       this.handleHttp(req, res)
+    })
+    server.headersTimeout = AGY_MCP_HEADERS_TIMEOUT_MS
+    server.requestTimeout = AGY_MCP_REQUEST_TIMEOUT_MS
+    server.keepAliveTimeout = 2_000
+    server.on('connection', (socket) => {
+      if (this.httpClosed || this.activeSockets.size >= AGY_MCP_MAX_CONCURRENT_SOCKETS) {
+        socket.destroy()
+        return
+      }
+      this.activeSockets.add(socket)
+      socket.setTimeout(AGY_MCP_REQUEST_TIMEOUT_MS, () => {
+        socket.destroy()
+      })
+      socket.once('close', () => {
+        this.activeSockets.delete(socket)
+      })
     })
     this.http = server
     await new Promise<void>((resolveListen, rejectListen) => {
@@ -1129,12 +4915,39 @@ class AgyRunMcpServer {
     }
   }
 
-  async close(): Promise<void> {
+  async close(deadlineMs = AGY_MCP_CLOSE_TIMEOUT_MS): Promise<void> {
+    this.httpClosed = true
+    this.correlator.close()
     const server = this.http
     this.http = undefined
     if (!server) return
+    server.closeIdleConnections?.()
+    for (const socket of this.activeSockets) {
+      socket.destroy()
+    }
+    this.activeSockets.clear()
+    server.closeAllConnections?.()
     await new Promise<void>((resolveClose) => {
-      server.close(() => resolveClose())
+      let done = false
+      const finish = (): void => {
+        if (done) return
+        done = true
+        clearTimeout(timer)
+        resolveClose()
+      }
+      const timer = setTimeout(
+        () => {
+          for (const socket of this.activeSockets) {
+            socket.destroy()
+          }
+          this.activeSockets.clear()
+          server.closeAllConnections?.()
+          finish()
+        },
+        Math.max(50, deadlineMs),
+      )
+      timer.unref?.()
+      server.close(() => finish())
     })
   }
 
@@ -1178,66 +4991,74 @@ class AgyRunMcpServer {
     })
     request.on('end', () => {
       processing = true
-      let rpc: McpJsonRpcRequest
-      try {
-        const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'))
-        if (
-          !isPlainObject(parsed) ||
-          parsed.jsonrpc !== '2.0' ||
-          typeof parsed.method !== 'string'
-        ) {
-          throw new Error('Invalid MCP request.')
-        }
-        const rawId = parsed.id
-        let validId: string | number | undefined
-        if ('id' in parsed) {
-          if (typeof rawId !== 'string' && typeof rawId !== 'number') {
-            throw new Error('Invalid MCP request ID.')
+      void (async () => {
+        let rpc: McpJsonRpcRequest
+        try {
+          const decodedBody = new TextDecoder('utf-8', { fatal: true }).decode(
+            Buffer.concat(chunks),
+          )
+          const parsed: unknown = JSON.parse(decodedBody)
+          if (
+            !isPlainObject(parsed) ||
+            parsed.jsonrpc !== '2.0' ||
+            typeof parsed.method !== 'string'
+          ) {
+            throw new Error('Invalid MCP request.')
           }
-          validId = rawId
+          const rawId = parsed.id
+          let validId: string | number | undefined
+          if ('id' in parsed) {
+            if (typeof rawId !== 'string' && typeof rawId !== 'number') {
+              throw new Error('Invalid MCP request ID.')
+            }
+            validId = rawId
+          }
+          rpc = {
+            jsonrpc: '2.0',
+            method: parsed.method,
+            ...(validId !== undefined ? { id: validId } : {}),
+            ...('params' in parsed ? { params: parsed.params } : {}),
+          }
+        } catch {
+          this.replyJson(response, {
+            jsonrpc: '2.0',
+            id: null,
+            error: { code: -32_700, message: 'Invalid MCP request.' },
+          })
+          settle()
+          return
         }
-        rpc = {
-          jsonrpc: '2.0',
-          method: parsed.method,
-          ...(validId !== undefined ? { id: validId } : {}),
-          ...('params' in parsed ? { params: parsed.params } : {}),
+        if (rpc.id === undefined) {
+          if (!response.destroyed && !response.writableEnded) {
+            response.writeHead(202).end()
+          }
+          settle()
+          return
         }
-      } catch {
-        this.replyJson(response, {
-          jsonrpc: '2.0',
-          id: null,
-          error: { code: -32_700, message: 'Invalid MCP request.' },
-        })
-        settle()
-        return
-      }
-      if (rpc.id === undefined) {
-        response.writeHead(202).end()
-        settle()
-        return
-      }
-      try {
-        const result = this.dispatchRpc(rpc)
-        this.replyJson(response, { jsonrpc: '2.0', id: rpc.id, result })
-      } catch (error) {
-        this.replyJson(response, {
-          jsonrpc: '2.0',
-          id: rpc.id,
-          error: {
-            code: -32_602,
-            message: safeNativePermissionText(
-              error instanceof Error ? error.message : 'MCP tool invocation failed.',
-              512,
-            ),
-          },
-        })
-      } finally {
-        settle()
-      }
+        try {
+          const result = await this.dispatchRpc(rpc)
+          this.replyJson(response, { jsonrpc: '2.0', id: rpc.id, result })
+        } catch (error) {
+          this.replyJson(response, {
+            jsonrpc: '2.0',
+            id: rpc.id,
+            error: {
+              code: -32_602,
+              message: safeNativePermissionText(
+                error instanceof Error ? error.message : 'MCP tool invocation failed.',
+                512,
+              ),
+            },
+          })
+        } finally {
+          settle()
+        }
+      })()
     })
   }
 
   private replyJson(response: ServerResponse, body: object): void {
+    if (response.destroyed || response.writableEnded) return
     const payload = Buffer.from(JSON.stringify(body), 'utf8')
     response
       .writeHead(200, {
@@ -1247,12 +5068,13 @@ class AgyRunMcpServer {
       .end(payload)
   }
 
-  private dispatchRpc(rpc: McpJsonRpcRequest): object {
+  private async dispatchRpc(rpc: McpJsonRpcRequest): Promise<object> {
     if (rpc.method === 'initialize') {
       return {
         protocolVersion: '2025-03-26',
         capabilities: { tools: {} },
         serverInfo: { name: this.serverName, version: '1.0.0' },
+        instructions: this.formatToolUsageInstructions(),
       }
     }
     if (rpc.method === 'ping') {
@@ -1267,13 +5089,55 @@ class AgyRunMcpServer {
     throw new Error(`Unsupported MCP method: ${rpc.method}`)
   }
 
+  private buildSourceToolInputSchema(): object {
+    const cap = this.sourceCapability
+    if (cap.nativeRoot && cap.sourceReference && cap.legacy) {
+      return codexCollaborationSourceWireReadSchema.toJSONSchema()
+    }
+    if (!cap.nativeRoot && cap.sourceReference && cap.legacy) {
+      return collaborationSourceWireReadSchema.toJSONSchema()
+    }
+    const sourceRefOnlySchema: Record<string, unknown> = {
+      type: 'object',
+      properties: {
+        sourceReference: { type: 'string', minLength: 1, maxLength: 2048 },
+        offset: { type: 'integer', minimum: 0 },
+      },
+      required: ['sourceReference', 'offset'],
+      additionalProperties: false,
+    }
+    if (cap.sourceReference && !cap.nativeRoot && !cap.legacy) {
+      return sourceRefOnlySchema
+    }
+    if (cap.nativeRoot && !cap.sourceReference && !cap.legacy) {
+      return collaborationSourceNativeReadSchema.toJSONSchema()
+    }
+    if (cap.legacy && !cap.sourceReference && !cap.nativeRoot) {
+      return collaborationSourceAnyReadSchema.toJSONSchema()
+    }
+    const variants: object[] = []
+    if (cap.sourceReference) variants.push(sourceRefOnlySchema)
+    if (cap.nativeRoot) {
+      const { $schema: _ignoredNativeSchema, ...nativeVariant } =
+        collaborationSourceNativeReadSchema.toJSONSchema() as Record<string, unknown>
+      variants.push(nativeVariant)
+    }
+    if (cap.legacy) {
+      const { $schema: _ignoredLegacySchema, ...legacyVariant } =
+        collaborationSourceAnyReadSchema.toJSONSchema() as Record<string, unknown>
+      variants.push(legacyVariant)
+    }
+    return { anyOf: variants }
+  }
+
   private describeTools(): object[] {
     const tools: object[] = []
     if (this.allowedToolNames.has('read_collaboration_source')) {
+      const inputSchema = this.buildSourceToolInputSchema()
       tools.push({
         name: 'read_collaboration_source',
-        description: collaborationSourceToolDescription,
-        inputSchema: { type: 'object', additionalProperties: true },
+        description: buildCollaborationSourceToolDescription(this.sourceCapability),
+        inputSchema,
       })
     }
     if (this.allowedToolNames.has('publish_session_title')) {
@@ -1290,9 +5154,7 @@ class AgyRunMcpServer {
       })
     }
     if (this.allowedToolNames.has('request_peer_assistance')) {
-      const targetEnum = this.config.peerTargetAgentId
-        ? [this.config.peerTargetAgentId]
-        : ['claude', 'codex']
+      const targetEnum = [...this.peerTargetEnum()]
       tools.push({
         name: 'request_peer_assistance',
         description: PEER_ASSISTANCE_TOOL_DESCRIPTION,
@@ -1315,19 +5177,8 @@ class AgyRunMcpServer {
       tools.push({
         name: 'submit_review',
         description:
-          'Submit this root independent review conclusion after its complete natural-language report.',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            verdict: {
-              type: 'string',
-              enum: ['accepted', 'changes_requested', 'needs_user', 'incomplete'],
-            },
-            questions: { type: 'array' },
-          },
-          required: ['verdict'],
-          additionalProperties: false,
-        },
+          'Submit the current independent review conclusion after writing its natural-language report. needs_user requires 1 to 3 explicit questions with selection ("single"|"multiple") and optional options ([{ label, description? }]); other verdicts must omit questions. Only the current root reviewer can submit; this never starts another turn or permits project edits.',
+        inputSchema: collaborationReviewInputSchema.toJSONSchema(),
       })
     }
     if (this.allowedToolNames.has('submit_input_result')) {
@@ -1365,18 +5216,30 @@ class AgyRunMcpServer {
     return tools
   }
 
-  private verifyFourTupleRoot(
+  private async verifyFourTupleRoot(
     toolName: string,
+    rawArgs: unknown,
     meta: unknown,
-  ): { ok: true; nativeSessionId: string; progressToken: string } | { ok: false; error: string } {
+  ): Promise<
+    | {
+        ok: true
+        nativeSessionId: string
+        progressToken: string
+        ownerKey: string
+        httpFingerprint: CompactArgsFingerprint
+      }
+    | { ok: false; error: string }
+  > {
     const expectedSessionId = this.config.getNativeSessionId()
     const executorId = this.config.getExecutorId()
-    const current =
+    const isCurrent = (): boolean =>
       toolName === 'read_collaboration_source'
         ? this.config.isSourceCurrent()
         : this.config.isRootCurrent()
     if (
-      !current ||
+      this.correlator.isClosed ||
+      this.correlator.isRevoked ||
+      !isCurrent() ||
       !expectedSessionId ||
       !executorId ||
       this.config.bindingGeneration <= 0 ||
@@ -1388,9 +5251,18 @@ class AgyRunMcpServer {
       return { ok: false, error: 'Missing Antigravity MCP _meta root authentication.' }
     }
     const rootConvId = asString(meta['antigravity.google/root_conversation_id'])
+    const rawLegacyRootConvId = Object.hasOwn(meta, 'root_conversation_id')
+      ? meta.root_conversation_id
+      : undefined
     const agyConvId = asString(meta['antigravity.google/conversation_id'])
-    const legacyConvId = asString(meta.conversation_id)
-    if (!rootConvId || rootConvId !== expectedSessionId) {
+    const rawLegacyConvId = Object.hasOwn(meta, 'conversation_id')
+      ? meta.conversation_id
+      : undefined
+    if (
+      !rootConvId ||
+      rootConvId !== expectedSessionId ||
+      (rawLegacyRootConvId !== undefined && rawLegacyRootConvId !== expectedSessionId)
+    ) {
       return {
         ok: false,
         error: 'The MCP call root_conversation_id does not match the active Antigravity session.',
@@ -1399,58 +5271,110 @@ class AgyRunMcpServer {
     if (
       !agyConvId ||
       agyConvId !== expectedSessionId ||
-      (legacyConvId !== undefined && legacyConvId !== expectedSessionId)
+      (rawLegacyConvId !== undefined && rawLegacyConvId !== expectedSessionId)
     ) {
       return {
         ok: false,
         error: 'Delegated subagent conversations cannot invoke root-scoped Pact tools.',
       }
     }
-    const rawProgressToken = meta.progressToken
-    const normalizedToken =
-      typeof rawProgressToken === 'string' &&
-      rawProgressToken.length > 0 &&
-      rawProgressToken.length <= 512
-        ? rawProgressToken
-        : typeof rawProgressToken === 'number' && Number.isSafeInteger(rawProgressToken)
-          ? String(rawProgressToken)
-          : undefined
-    if (!normalizedToken) {
+    const parsedPt = parseRootProgressToken(meta.progressToken)
+    if (!parsedPt) {
       return {
         ok: false,
-        error: 'Missing or invalid Antigravity MCP progressToken.',
+        error:
+          'Missing or invalid structured <trajectoryId>:<stepIdx> Antigravity MCP progressToken.',
       }
     }
-    if (!this.boundToolCallTokens.has(normalizedToken)) {
-      const structured = AGY_PROGRESS_TOKEN_PATTERN.exec(normalizedToken)
-      if (!structured) {
-        return {
-          ok: false,
-          error:
-            'Antigravity MCP progressToken must match an active root tool call or structured <trajectoryId>:<stepIdx> token.',
-        }
-      }
-      const trajectoryId = structured[1]!
-      const stepIdx = Number(structured[2]!)
-      const minStepIdx = this.config.getRootStepIdx() ?? 0
-      if (!Number.isSafeInteger(stepIdx) || stepIdx < minStepIdx) {
-        return {
-          ok: false,
-          error: 'Antigravity MCP progressToken precedes the active root Turn step boundary.',
-        }
-      }
-      if (this.pinnedTrajectoryId === undefined || trajectoryId !== this.pinnedTrajectoryId) {
-        return {
-          ok: false,
-          error:
-            'Antigravity MCP progressToken does not match an ACP-authenticated root trajectory.',
-        }
+    const canonicalPt = parsedPt.canonical
+    const { trajectoryId, stepIdx } = parsedPt.structured
+
+    const httpFingerprint = buildCompactArgsFingerprint(
+      isPlainObject(rawArgs) ? rawArgs : {},
+      false,
+    )
+    if (!httpFingerprint) {
+      return {
+        ok: false,
+        error: 'Antigravity MCP arguments exceed structured correlation limits.',
       }
     }
-    return { ok: true, nativeSessionId: expectedSessionId, progressToken: normalizedToken }
+
+    const inFlightAdmission = this.correlator.beginInFlightToken(canonicalPt, httpFingerprint)
+    if (!inFlightAdmission.ok) {
+      return inFlightAdmission
+    }
+    try {
+      const deadlineAt = Date.now() + AGY_MCP_CORRELATION_WAIT_MS
+      const hasProvenBoundary =
+        this.config.getRootStepIdx() !== undefined ||
+        this.correlator.minHostStepIdx !== undefined ||
+        this.config.hasZeroTurnStepBoundary()
+      if (
+        this.correlator.pinnedTrajectory === undefined &&
+        hasProvenBoundary &&
+        this.correlator.canLazyPinStorageDb
+      ) {
+        const hostIdentity = await this.config.tryLoadHostTrajectoryId?.()
+        if (this.correlator.isClosed || this.correlator.isRevoked || !isCurrent()) {
+          return { ok: false, error: 'This Pact tool capability belongs to a retired root turn.' }
+        }
+        if (hostIdentity) {
+          this.correlator.pinHostTrajectoryId(hostIdentity.trajectoryId, undefined)
+        }
+      }
+
+      const checkRootProof = (): RootProofCheckResult => {
+        const minStepIdx =
+          this.config.getRootStepIdx() ??
+          this.correlator.minHostStepIdx ??
+          (this.config.hasZeroTurnStepBoundary() ? 0 : undefined)
+        if (minStepIdx !== undefined && (!Number.isSafeInteger(stepIdx) || stepIdx < minStepIdx)) {
+          return {
+            kind: 'reject',
+            error: 'Antigravity MCP progressToken precedes the active root Turn step boundary.',
+          }
+        }
+        if (
+          this.correlator.pinnedTrajectory !== undefined &&
+          trajectoryId !== this.correlator.pinnedTrajectory
+        ) {
+          return {
+            kind: 'reject',
+            error:
+              'Antigravity MCP progressToken does not match an ACP-authenticated root trajectory.',
+          }
+        }
+        if (minStepIdx === undefined || this.correlator.pinnedTrajectory === undefined) {
+          return 'wait'
+        }
+        return 'ok'
+      }
+
+      const claimed = await this.correlator.claimOrWaitForHttp(
+        toolName,
+        httpFingerprint,
+        canonicalPt,
+        isCurrent,
+        checkRootProof,
+        Math.max(0, deadlineAt - Date.now()),
+      )
+      if (!claimed.ok) {
+        return claimed
+      }
+      return {
+        ok: true,
+        nativeSessionId: expectedSessionId,
+        progressToken: canonicalPt,
+        ownerKey: claimed.ownerKey,
+        httpFingerprint,
+      }
+    } finally {
+      this.correlator.releaseInFlightToken(canonicalPt)
+    }
   }
 
-  private callTool(params: unknown): object {
+  private async callTool(params: unknown): Promise<object> {
     if (!isPlainObject(params) || typeof params.name !== 'string') {
       return this.toolError('Invalid MCP tool call parameters.')
     }
@@ -1458,24 +5382,55 @@ class AgyRunMcpServer {
     if (!this.allowedToolNames.has(toolName)) {
       return this.toolError(`Tool ${toolName} is not authorized for this turn.`)
     }
-    const auth = this.verifyFourTupleRoot(toolName, Reflect.get(params, '_meta'))
+    const rawArgs = params.arguments ?? {}
+    const auth = await this.verifyFourTupleRoot(toolName, rawArgs, Reflect.get(params, '_meta'))
     if (!auth.ok) {
       return this.toolError(auth.error)
     }
-    const rawArgs = params.arguments ?? {}
+    const rejectClaimedTool = (message: string): object => {
+      this.correlator.consumeRejectedClaim(auth.progressToken)
+      return this.toolError(message)
+    }
+    const isCurrent = (): boolean =>
+      toolName === 'read_collaboration_source'
+        ? this.config.isSourceCurrent()
+        : this.config.isRootCurrent()
+    const liveClaim = this.correlator.revalidateLiveClaim(
+      auth.progressToken,
+      toolName,
+      auth.httpFingerprint,
+      isCurrent,
+    )
+    if (!liveClaim.ok) {
+      return rejectClaimedTool(liveClaim.error)
+    }
 
     if (toolName === 'read_collaboration_source') {
       if (!this.config.sourceGrant) {
-        return this.toolError('No source capability is bound to this root.')
+        return rejectClaimedTool('No source capability is bound to this root.')
       }
       if (this.activeSourceReads >= 2) {
-        return this.toolError('Concurrent source reads exceeded the per-root limit.')
+        return rejectClaimedTool('Concurrent source reads exceeded the per-root limit.')
       }
       this.activeSourceReads += 1
       try {
         const nativeReq = collaborationSourceNativeReadSchema.safeParse(rawArgs)
+        if (nativeReq.success && !this.sourceCapability.nativeRoot) {
+          return rejectClaimedTool(
+            'Native-root source reads are not supported by this source reader.',
+          )
+        }
+        const hasSourceRefArg = isPlainObject(rawArgs) && 'sourceReference' in rawArgs
+        if (!nativeReq.success && hasSourceRefArg && !this.sourceCapability.sourceReference) {
+          return rejectClaimedTool(
+            'Source-reference reads are not supported by this source reader.',
+          )
+        }
+        if (!nativeReq.success && !hasSourceRefArg && !this.sourceCapability.legacy) {
+          return rejectClaimedTool('Legacy source reads are not supported by this source reader.')
+        }
         const page =
-          nativeReq.success && this.config.sourceReader
+          nativeReq.success && this.sourceCapability.nativeRoot && this.config.sourceReader
             ? readNativeFrozenSourceTool(
                 this.config.sourceGrant,
                 rawArgs,
@@ -1485,12 +5440,20 @@ class AgyRunMcpServer {
             : readFrozenSourceTool(
                 this.config.sourceGrant,
                 rawArgs,
-                this.config.sourceReader,
-                this.config.legacySourceReader,
+                hasSourceRefArg
+                  ? this.sourceCapability.sourceReference
+                    ? this.config.sourceReader
+                    : undefined
+                  : this.sourceCapability.legacy
+                    ? this.config.sourceReader
+                    : undefined,
+                !hasSourceRefArg && this.sourceCapability.legacy
+                  ? this.config.legacySourceReader
+                  : undefined,
               )
         const serialized = JSON.stringify(page)
         if (Buffer.byteLength(serialized, 'utf8') > COLLABORATION_PAGE_BYTES * 2) {
-          return this.toolError('Source page exceeded its bounded transport size.')
+          return rejectClaimedTool('Source page exceeded its bounded transport size.')
         }
         return { content: [{ type: 'text', text: serialized }] }
       } catch (error) {
@@ -1498,55 +5461,63 @@ class AgyRunMcpServer {
           error instanceof NativeSourceReadFailure || error instanceof Error
             ? error.message
             : 'Source read failed.'
-        return this.toolError(safeNativePermissionText(message, 512))
+        return rejectClaimedTool(safeNativePermissionText(message, 512))
       } finally {
         this.activeSourceReads = Math.max(0, this.activeSourceReads - 1)
       }
     }
 
     if (toolName === 'publish_session_title') {
-      if (this.titleStaged) {
-        return this.toolError('A session title was already submitted in this turn.')
+      if (this.correlator.isTitleSlotTaken) {
+        return rejectClaimedTool('A session title was already submitted in this turn.')
       }
       const parsed = sessionTitleInputSchema.safeParse(rawArgs)
       if (!parsed.success) {
-        return this.toolError('Invalid Session title.')
+        return rejectClaimedTool('Invalid Session title.')
       }
-      this.titleStaged = true
-      this.config.onStagedOutcome({
-        progressToken: auth.progressToken,
-        kind: { type: 'title', title: parsed.data.title },
-      })
+      const staged = this.correlator.stageOutcome(
+        auth,
+        toolName,
+        { type: 'title', title: parsed.data.title },
+        isCurrent,
+      )
+      if (!staged.ok) {
+        return rejectClaimedTool(staged.error)
+      }
       return {
         content: [{ type: 'text', text: 'Title validated. Continue your substantive answer.' }],
       }
     }
 
     if (toolName === 'request_peer_assistance') {
-      if (this.peerRecorded) {
-        return this.toolError('This answer already has a peer request.')
+      if (this.correlator.isPeerSlotTaken) {
+        return rejectClaimedTool('This answer already has a peer request.')
       }
       const parsed = peerRequestToolInputSchema.safeParse(rawArgs)
       if (!parsed.success) {
-        return this.toolError('Peer request arguments are invalid.')
+        return rejectClaimedTool('Peer request arguments are invalid.')
       }
       const target = parsed.data.target
       if (target === 'agy') {
-        return this.toolError('An Agent can only request the other Pact Agent.')
+        return rejectClaimedTool('An Agent can only request the other Pact Agent.')
       }
       if (this.config.peerTargetAgentId && target !== this.config.peerTargetAgentId) {
-        return this.toolError('An Agent can only request the active peer Agent in this session.')
+        return rejectClaimedTool('An Agent can only request the active peer Agent in this session.')
       }
-      this.peerRecorded = true
-      this.config.onStagedOutcome({
-        progressToken: auth.progressToken,
-        kind: {
+      const staged = this.correlator.stageOutcome(
+        auth,
+        toolName,
+        {
           type: 'peer',
           targetAgentId: target,
           proposalKind: parsed.data.kind,
           ...(parsed.data.reason ? { reason: parsed.data.reason } : {}),
         },
-      })
+        isCurrent,
+      )
+      if (!staged.ok) {
+        return rejectClaimedTool(staged.error)
+      }
       return { content: [{ type: 'text', text: PEER_ASSISTANCE_RECORDED_RESULT }] }
     }
 
@@ -1561,16 +5532,21 @@ class AgyRunMcpServer {
         !['plan_review', 'code_review'].includes(stage) ||
         actor !== collaborationActor(task, stage)
       ) {
-        return this.toolError('This turn is not authorized to submit a review verdict.')
+        return rejectClaimedTool('This turn is not authorized to submit a review verdict.')
       }
       const parsed = collaborationReviewInputSchema.safeParse(rawArgs)
       if (!parsed.success) {
-        return this.toolError('Invalid review verdict payload.')
+        return rejectClaimedTool('Invalid review verdict payload.')
       }
-      this.config.onStagedOutcome({
-        progressToken: auth.progressToken,
-        kind: { type: 'review', observation: parsed.data },
-      })
+      const staged = this.correlator.stageOutcome(
+        auth,
+        toolName,
+        { type: 'review', observation: parsed.data },
+        isCurrent,
+      )
+      if (!staged.ok) {
+        return rejectClaimedTool(staged.error)
+      }
       return {
         content: [
           {
@@ -1590,12 +5566,17 @@ class AgyRunMcpServer {
         !parsed.success ||
         !collaborationInputOutcomeAllowed(task, authorization, parsed.data.outcome)
       ) {
-        return this.toolError('This root is not authorized to submit that input result.')
+        return rejectClaimedTool('This root is not authorized to submit that input result.')
       }
-      this.config.onStagedOutcome({
-        progressToken: auth.progressToken,
-        kind: { type: 'input_result', observation: parsed.data },
-      })
+      const staged = this.correlator.stageOutcome(
+        auth,
+        toolName,
+        { type: 'input_result', observation: parsed.data },
+        isCurrent,
+      )
+      if (!staged.ok) {
+        return rejectClaimedTool(staged.error)
+      }
       return { content: [{ type: 'text', text: collaborationInputResultReceiptText }] }
     }
 
@@ -1604,50 +5585,112 @@ class AgyRunMcpServer {
         !this.config.isPlanRetentionCurrent() ||
         !collaborationPlanRetentionInputSchema.safeParse(rawArgs).success
       ) {
-        return this.toolError(
+        return rejectClaimedTool(
           'Plan retention is unavailable because the plan was modified or retention arguments were invalid.',
         )
       }
-      this.config.onStagedOutcome({
-        progressToken: auth.progressToken,
-        kind: { type: 'retain_plan' },
-      })
+      const staged = this.correlator.stageOutcome(
+        auth,
+        toolName,
+        { type: 'retain_plan' },
+        isCurrent,
+      )
+      if (!staged.ok) {
+        return rejectClaimedTool(staged.error)
+      }
       return { content: [{ type: 'text', text: collaborationPlanRetentionReceiptText }] }
     }
 
     if (toolName === 'publish_plan') {
-      if (this.openPlanCompleted !== undefined) {
-        return this.toolError('A published Plan has already been finalized in this root turn.')
+      if (this.correlator.isOpenPlanFinalizedOrPendingFinal) {
+        return rejectClaimedTool('A published Plan has already been finalized in this root turn.')
       }
       const parsed = collaborationPublishPlanInputSchema.safeParse(rawArgs)
       if (!parsed.success) {
-        return this.toolError('Invalid publish_plan payload.')
+        return rejectClaimedTool('Invalid publish_plan payload.')
       }
       const chunkBytes = Buffer.from(parsed.data.text, 'utf8')
       if (chunkBytes.byteLength > COLLABORATION_PLAN_CHUNK_BYTES) {
-        return this.toolError('Plan chunk exceeds 48 KiB UTF-8 limit.')
+        return rejectClaimedTool('Plan chunk exceeds 48 KiB UTF-8 limit.')
       }
-      const expectedOffset = this.openPlanBytes
+      const expectedOffset =
+        this.correlator.confirmedPlanByteCount + this.correlator.pendingPlanBufferBytes()
       const offset = parsed.data.offset ?? 0
       if (offset !== expectedOffset) {
-        return this.toolError(`Expected byte offset ${expectedOffset}, received ${offset}.`)
+        return rejectClaimedTool(`Expected byte offset ${expectedOffset}, received ${offset}.`)
       }
-      if (this.openPlanBytes + chunkBytes.byteLength > COLLABORATION_PUBLISHED_PLAN_MAX_BYTES) {
-        return this.toolError('Published Plan exceeds maximum byte capacity.')
+      const nextTotalBytes = expectedOffset + chunkBytes.byteLength
+      if (nextTotalBytes > COLLABORATION_PUBLISHED_PLAN_MAX_BYTES) {
+        return rejectClaimedTool('Published Plan exceeds maximum byte capacity.')
       }
-      this.openPlanChunks.push(chunkBytes)
-      this.openPlanBytes += chunkBytes.byteLength
       const complete = parsed.data.complete ?? parsed.data.offset === undefined
+      if (!complete && chunkBytes.byteLength === 0) {
+        return rejectClaimedTool('Non-final Plan chunk cannot be empty.')
+      }
+      if (this.correlator.pendingPlanChunkCount >= 64) {
+        return rejectClaimedTool('Too many pending Plan chunks in this turn.')
+      }
+      const chunkHasNonWhitespace = /\S/u.test(parsed.data.text)
+      if (complete && !this.correlator.hasNonWhitespacePlanContent(chunkHasNonWhitespace)) {
+        return rejectClaimedTool('Published Plan Markdown cannot be empty.')
+      }
+      const staged = this.correlator.stageOutcome(
+        auth,
+        toolName,
+        {
+          type: 'publish_plan_chunk',
+          offset,
+          byteLength: chunkBytes.byteLength,
+          complete,
+        },
+        isCurrent,
+        { offset, bytes: chunkBytes, hasNonWhitespace: chunkHasNonWhitespace, complete },
+      )
+      if (!staged.ok) {
+        return rejectClaimedTool(staged.error)
+      }
       if (complete) {
-        const markdown = Buffer.concat(this.openPlanChunks, this.openPlanBytes).toString('utf8')
-        if (!markdown.trim()) {
-          return this.toolError('Published Plan Markdown cannot be empty.')
+        const candidateMarkdown = this.correlator.assembleCandidateOpenPlanMarkdown(staged.ownerKey)
+        if (!candidateMarkdown) {
+          this.correlator.rollbackFailedFinalOpenPlanIntent(staged.ownerKey, auth.progressToken)
+          return this.toolError(
+            'All preceding Plan chunks must complete before finalizing publish_plan.',
+          )
         }
-        this.openPlanCompleted = markdown
-        this.config.onStagedOutcome({
-          progressToken: auth.progressToken,
-          kind: { type: 'publish_plan', markdown },
-        })
+        if (typeof this.config.recordOpenPlanFinalIntent !== 'function') {
+          this.correlator.rollbackFailedFinalOpenPlanIntent(staged.ownerKey, auth.progressToken)
+          return this.toolError(
+            'Open-mode plan publication requires a configured durable intent persistence callback.',
+          )
+        }
+        const executionId = this.config.getExecutionId?.()
+        const boundedCallKey = encodeBoundedOpenPlanCallKey(staged.ownerKey)
+        const boundedProgressToken = encodeBoundedOpenPlanProgressToken(auth.progressToken)
+        const nativePlanId = staged.ownerKey.startsWith('call:')
+          ? buildBoundedNativePlanId(auth.nativeSessionId, staged.ownerKey.slice('call:'.length))
+          : undefined
+        try {
+          const persisted = this.config.recordOpenPlanFinalIntent({
+            ...(executionId ? { executionId } : {}),
+            callKey: boundedCallKey,
+            progressToken: boundedProgressToken,
+            ...(nativePlanId ? { nativePlanId } : {}),
+            candidateMarkdown,
+          })
+          if (persisted !== true) {
+            throw new Error('Open-mode plan publish intent persistence was rejected.')
+          }
+        } catch (error) {
+          this.correlator.rollbackFailedFinalOpenPlanIntent(staged.ownerKey, auth.progressToken)
+          return this.toolError(
+            safeNativePermissionText(
+              error instanceof Error
+                ? error.message
+                : 'Failed to persist open-mode plan publish intent.',
+              512,
+            ),
+          )
+        }
       }
       return {
         content: [
@@ -1655,13 +5698,13 @@ class AgyRunMcpServer {
             type: 'text',
             text: complete
               ? 'Updated Plan staged. Pact will publish it once this root turn completes.'
-              : `Accepted Plan chunk (${this.openPlanBytes} bytes).`,
+              : `Accepted Plan chunk (${nextTotalBytes} bytes).`,
           },
         ],
       }
     }
 
-    return this.toolError('Unsupported Pact MCP tool.')
+    return rejectClaimedTool('Unsupported Pact MCP tool.')
   }
 
   private toolError(message: string): object {
@@ -1669,6 +5712,65 @@ class AgyRunMcpServer {
       content: [{ type: 'text', text: message }],
       isError: true,
     }
+  }
+}
+
+function delayAbortable(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) {
+    return Promise.reject(
+      signal.reason instanceof Error ? signal.reason : new Error('Operation was cancelled.'),
+    )
+  }
+  return new Promise<void>((resolveWait, rejectWait) => {
+    const onAbort = (): void => {
+      clearTimeout(timer)
+      rejectWait(
+        signal.reason instanceof Error ? signal.reason : new Error('Operation was cancelled.'),
+      )
+    }
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort)
+      resolveWait()
+    }, ms)
+    timer.unref?.()
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
+function classifyIdentityWorkerError(
+  error: unknown,
+): Extract<AgyTrajectoryIdentityClientResult, { status: 'timeout' | 'worker_error' }> {
+  const rawMessage = error instanceof Error ? error.message : String(error)
+  const reason = safeNativePermissionText(rawMessage.trim(), 512) || undefined
+  const isTimeout =
+    (error instanceof Error && error.name === 'TimeoutError') ||
+    /\b(?:timeout|timed out|deadline|already active)\b/iu.test(rawMessage)
+  return {
+    status: isTimeout ? 'timeout' : 'worker_error',
+    ...(reason !== undefined ? { reason } : {}),
+  }
+}
+
+function identityStatusPriority(
+  status: Exclude<AgyTrajectoryIdentityClientResult['status'], 'ok'>,
+): number {
+  switch (status) {
+    case 'invalid':
+      return 6
+    case 'budget_exceeded':
+      return 5
+    case 'worker_error':
+      return 4
+    case 'timeout':
+      return 3
+    case 'transient_churn':
+      return 2
+    case 'missing':
+      return 1
+    case 'no_storage_root':
+      return 0
+    default:
+      return 0
   }
 }
 
@@ -1680,6 +5782,7 @@ export class AgyAgentAdapter implements AgentAdapter {
   private readonly pool: AgyAcpConnectionPool
   private readonly ownsPool: boolean
   private readonly unsubscribePoolPhysicalOps: () => void
+  private readonly unsubscribeStoragePhysicalOps: (() => void) | undefined
   private readonly nativeChecks: NativeCheckOperation
   private readonly evidenceCacheWork = new NativeWorkingMemory().reserve(0)
   private readonly nativeEvidence = new Map<string, NativeProbeResult>()
@@ -1696,9 +5799,31 @@ export class AgyAgentAdapter implements AgentAdapter {
     }
   >()
   private readonly activeRuns = new Map<string, ActiveAgyRun>()
+  private readonly ownedRunHandles = new Set<{
+    readonly runId: string
+    readonly cancel: () => void
+    readonly closeZeroInputSession: (deadlineAt?: number) => Promise<void>
+    readonly forceCleanup: () => Promise<void>
+    readonly finalized: Promise<void>
+  }>()
+  private readonly skillProbeOwner = new AgySkillProbeOwner()
+  private ownedForkFiles: NativeForkFiles | undefined
+  private readonly activeOwnedForkFiles = new Set<NativeForkFiles>()
+  private disposalPromise: Promise<void> | undefined
   private skillCatalogListener: (() => void) | undefined
   private nextTurnEpoch = 1
   private disposed = false
+
+  private getOwnedForkFiles(): NativeForkFiles {
+    if (this.disposed) {
+      throw new AgentExecutionError('agent_process_crash', 'Antigravity is shutting down.', false)
+    }
+    if (!this.ownedForkFiles) {
+      this.ownedForkFiles = new NativeForkFiles(this.options.ipcTraffic)
+      this.activeOwnedForkFiles.add(this.ownedForkFiles)
+    }
+    return this.ownedForkFiles
+  }
 
   constructor(private readonly options: AgyAgentAdapterOptions = {}) {
     this.executablePath = options.executablePath ?? 'agy'
@@ -1707,7 +5832,12 @@ export class AgyAgentAdapter implements AgentAdapter {
       : options.relativeAppDataDir
         ? resolvePath(join(homedir(), '.gemini', options.relativeAppDataDir))
         : resolveAgyAppDataDir(process.env)
-    const fallbackDir = resolvePath(join(homedir(), '.gemini', 'antigravity'))
+    const explicitGeminiDir = process.env['ANTIGRAVITY_GEMINI_DIR']?.trim()
+    const geminiBaseDir =
+      explicitGeminiDir && isAbsolute(explicitGeminiDir)
+        ? resolvePath(explicitGeminiDir)
+        : join(homedir(), '.gemini')
+    const fallbackDir = resolvePath(join(geminiBaseDir, 'antigravity'))
     this.appDataDirs =
       options.appDataDir || options.relativeAppDataDir || this.primaryAppDataDir === fallbackDir
         ? [this.primaryAppDataDir]
@@ -1733,6 +5863,11 @@ export class AgyAgentAdapter implements AgentAdapter {
         this.nativeChecks.observeRequest(signal, physicalCompletion)
       },
     )
+    this.unsubscribeStoragePhysicalOps = options.subscribeStoragePhysicalOperations?.(
+      (signal, physicalCompletion) => {
+        this.nativeChecks.observeRequest(signal, physicalCompletion)
+      },
+    )
   }
 
   get executorId(): string {
@@ -1747,6 +5882,14 @@ export class AgyAgentAdapter implements AgentAdapter {
     return this.pool.poolSnapshot()
   }
 
+  get unconfirmedClosedSessionCount(): number {
+    return this.pool.unconfirmedClosedSessionCount
+  }
+
+  hasUnconfirmedClosedSession(sessionId: string): boolean {
+    return this.pool.hasUnconfirmedClosedSession(sessionId)
+  }
+
   retireFullAccess(options: { sessionId?: string; cwd?: string } = {}): Promise<void> {
     return this.pool.retireFullAccess(options)
   }
@@ -1756,7 +5899,10 @@ export class AgyAgentAdapter implements AgentAdapter {
   }
 
   async discoverSkills(cwd: string, signal: AbortSignal): Promise<SkillBinding[]> {
-    return discoverAgySkills(cwd, this.executablePath, signal, this.options.skillDiscoveryOptions)
+    return discoverAgySkills(cwd, this.executablePath, signal, {
+      ...this.options.skillDiscoveryOptions,
+      probeOwner: this.options.skillDiscoveryOptions?.probeOwner ?? this.skillProbeOwner,
+    })
   }
 
   preflightPrompt(input: AgentRunInput): void {
@@ -1936,11 +6082,13 @@ export class AgyAgentAdapter implements AgentAdapter {
       !readOnlyStage && effectivePermissionMode === 'full' ? 'full' : 'standard'
 
     let brainPlanTouched = false
-    let unresolvedBrainPlanWrite = false
+    const activeBrainPlanOpCallIds = new Set<string>()
+    const hasUnresolvedBrainPlanWrite = (): boolean => activeBrainPlanOpCallIds.size > 0
     let latestBrainPlanCandidate: { nativeId: string; text: string } | undefined
+    let brainPlanReadbackRequired = false
     let brainPlanCaptureFailed = false
+    let unresolvedPreBindOutput = false
 
-    const stagedMcpOutcomes = new Map<string, StagedMcpCallOutcome['kind']>()
     let sourceRetired = false
     const retireSourceReader = (): void => {
       if (sourceRetired) return
@@ -1949,21 +6097,232 @@ export class AgyAgentAdapter implements AgentAdapter {
     }
 
     let resolvedSessionId: string | undefined = input.nativeSessionId
+    let createdFreshSession = false
     let activeExecutorId = this.pool.executorId
     let rootFirstByteWritten = false
     let promptEnteredTransport = false
     let rootConfirmedNotSent = false
+    const isConfirmedZeroBytesSent = (): boolean =>
+      (!promptEnteredTransport && !rootFirstByteWritten) || rootConfirmedNotSent
     let promptReplyReceived = false
     let userCancelRequested = false
     let rootTerminal = false
     let rootReleasing = false
     let foregroundReleased = false
 
+    let lease: AgyPoolLease | undefined
+    let sessionStream: AgyOrderedSessionStream | undefined
+    let promptMemoryReservation: NativeMemoryReservation | undefined
+    let toolStateMemoryReservation: NativeMemoryReservation | undefined
+    let foregroundDedupMemoryReservation: NativeMemoryReservation | undefined
+    let mcpCorrelationMemoryReservation: NativeMemoryReservation | undefined
+    let publishedPlanMemoryReservation: NativeMemoryReservation | undefined
+    let pendingEventsMemoryReservation: NativeMemoryReservation | undefined
+    let stagedPreBindMemoryReservation: NativeMemoryReservation | undefined
+    let foreignExecIdsMemoryReservation: NativeMemoryReservation | undefined
+    let postCutoffBgMemoryReservation: NativeMemoryReservation | undefined
+    let serverRequestOwner: AgyServerRequestOwnerHandle | undefined
+    let unsubscribeBackground: (() => void) | undefined
+    let activeRun: ActiveAgyRun | undefined
+    let cancelGraceTimer: ReturnType<typeof setTimeout> | undefined
+    let promptSettled = false
+    const promptRpcAbort = new AbortController()
+    const runDisposeAbort = new AbortController()
+    const runSignal = AbortSignal.any([signal, runDisposeAbort.signal])
+    const observation = new AbortController()
+    const runFinalizer = Promise.withResolvers<void>()
+    let stopStreamPump: (() => void) | undefined
+    let handoffOrderedStreamToBackground: (() => void) | undefined
+
+    const loadHostTrajectoryIdentity = async (
+      loadSignal: AbortSignal,
+    ): Promise<AgyTrajectoryIdentityClientResult> => {
+      if (!resolvedSessionId) return { status: 'missing' }
+      let bestNonOk: Exclude<AgyTrajectoryIdentityClientResult, { status: 'ok' }> | undefined
+      for (const appDataDir of this.appDataDirs) {
+        if (this.disposed || observation.signal.aborted) {
+          throw new AgentExecutionError(
+            'agent_process_crash',
+            'Antigravity is shutting down.',
+            false,
+          )
+        }
+        loadSignal.throwIfAborted()
+        let identity: AgyTrajectoryIdentityClientResult | undefined
+        for (let busyAttempt = 0; busyAttempt < 4; busyAttempt += 1) {
+          if (this.disposed || observation.signal.aborted) {
+            throw new AgentExecutionError(
+              'agent_process_crash',
+              'Antigravity is shutting down.',
+              false,
+            )
+          }
+          try {
+            if (this.options.storageClient?.readTrajectoryIdentity) {
+              // oxlint-disable-next-line no-await-in-loop -- Bounded short retry when shared fork worker is momentarily busy.
+              identity = await this.options.storageClient.readTrajectoryIdentity(
+                {
+                  appDataDir,
+                  cwd: lease?.canonicalCwd ?? input.cwd,
+                  nativeSessionId: resolvedSessionId,
+                },
+                loadSignal,
+              )
+            } else {
+              // oxlint-disable-next-line no-await-in-loop -- Bounded short retry when standalone adapter fork worker is momentarily busy.
+              const workerRes = await this.getOwnedForkFiles().readAgyTrajectoryIdentity(
+                {
+                  cwd: lease?.canonicalCwd ?? input.cwd,
+                  storageRoot: appDataDir,
+                  nativeSessionId: resolvedSessionId,
+                },
+                loadSignal,
+              )
+              identity =
+                workerRes.status === 'ok'
+                  ? {
+                      status: 'ok',
+                      trajectoryId: workerRes.trajectoryId,
+                      stepCount: workerRes.stepCount,
+                    }
+                  : {
+                      status: workerRes.status,
+                      ...(workerRes.reason !== undefined ? { reason: workerRes.reason } : {}),
+                    }
+            }
+            break
+          } catch (error) {
+            if (signal.aborted) throw error
+            if (this.disposed || observation.signal.aborted) {
+              throw new AgentExecutionError(
+                'agent_process_crash',
+                'Antigravity is shutting down.',
+                false,
+              )
+            }
+            if (loadSignal.aborted) {
+              return {
+                status: 'timeout',
+                reason: 'Antigravity trajectory identity inspection exceeded its deadline.',
+              }
+            }
+            if (
+              busyAttempt < 3 &&
+              error instanceof Error &&
+              error.message.includes('already active')
+            ) {
+              // oxlint-disable-next-line no-await-in-loop -- Bounded 15ms retry for active storage worker.
+              await delayAbortable(15, loadSignal)
+              continue
+            }
+            identity = classifyIdentityWorkerError(error)
+            break
+          }
+        }
+        const resolvedIdentity: AgyTrajectoryIdentityClientResult = identity ?? {
+          status: 'timeout',
+          reason: 'Antigravity trajectory identity worker remained busy.',
+        }
+        if (resolvedIdentity.status === 'ok') return resolvedIdentity
+        if (
+          resolvedIdentity.status === 'invalid' ||
+          resolvedIdentity.status === 'budget_exceeded'
+        ) {
+          return resolvedIdentity
+        }
+        if (
+          !bestNonOk ||
+          identityStatusPriority(resolvedIdentity.status) > identityStatusPriority(bestNonOk.status)
+        ) {
+          bestNonOk = resolvedIdentity
+        }
+      }
+      return bestNonOk ?? { status: 'no_storage_root' }
+    }
+
+    const loadHostTrajectoryIdentityBeforePrompt = async (
+      loadSignal: AbortSignal,
+    ): Promise<AgyTrajectoryIdentityClientResult> => {
+      const backoffMs = [25, 50, 100, 200]
+      let latest: AgyTrajectoryIdentityClientResult = { status: 'no_storage_root' }
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        if (signal.aborted) signal.throwIfAborted()
+        if (this.disposed || observation.signal.aborted) {
+          throw new AgentExecutionError(
+            'agent_process_crash',
+            'Antigravity is shutting down.',
+            false,
+          )
+        }
+        if (loadSignal.aborted) {
+          return {
+            status: 'timeout',
+            reason: 'Antigravity trajectory identity inspection exceeded its pre-prompt deadline.',
+          }
+        }
+        try {
+          // oxlint-disable-next-line no-await-in-loop -- Bounded backoff retry strictly for transient WAL churn before prompt.
+          latest = await loadHostTrajectoryIdentity(loadSignal)
+        } catch (error) {
+          if (signal.aborted) throw error
+          if (this.disposed || observation.signal.aborted) {
+            throw new AgentExecutionError(
+              'agent_process_crash',
+              'Antigravity is shutting down.',
+              false,
+            )
+          }
+          if (loadSignal.aborted) {
+            return {
+              status: 'timeout',
+              reason:
+                'Antigravity trajectory identity inspection exceeded its pre-prompt deadline.',
+            }
+          }
+          return classifyIdentityWorkerError(error)
+        }
+        if (latest.status !== 'transient_churn') return latest
+        if (attempt < backoffMs.length) {
+          try {
+            // oxlint-disable-next-line no-await-in-loop -- Bounded backoff delay before retrying transient WAL churn.
+            await delayAbortable(backoffMs[attempt]!, loadSignal)
+          } catch (error) {
+            if (signal.aborted) throw error
+            if (this.disposed || observation.signal.aborted) {
+              throw new AgentExecutionError(
+                'agent_process_crash',
+                'Antigravity is shutting down.',
+                false,
+              )
+            }
+            return loadSignal.aborted
+              ? {
+                  status: 'timeout',
+                  reason:
+                    'Antigravity trajectory identity inspection exceeded its pre-prompt deadline.',
+                }
+              : latest
+          }
+        }
+      }
+      return latest
+    }
+
     const mcpServer = new AgyRunMcpServer({
       runId: input.runId,
       getNativeSessionId: () => resolvedSessionId,
       getExecutorId: () => activeExecutorId,
+      getExecutionId: () => activeRun?.providerExecutionId,
       getRootStepIdx: () => activeRun?.rootStepIdx,
+      hasZeroTurnStepBoundary: () => createdFreshSession,
+      tryLoadHostTrajectoryId: async () => {
+        const res = await loadHostTrajectoryIdentity(
+          AbortSignal.any([observation.signal, AbortSignal.timeout(500)]),
+        ).catch(() => ({ status: 'transient_churn' as const }))
+        return res.status === 'ok'
+          ? { trajectoryId: res.trajectoryId, stepCount: res.stepCount }
+          : undefined
+      },
       bindingGeneration: input.bindingGeneration ?? 1,
       isRootCurrent: () =>
         !this.disposed &&
@@ -1988,25 +6347,26 @@ export class AgyAgentAdapter implements AgentAdapter {
       sourceGrant: input.promptEnvelope.sourceGrant,
       sourceReader: input.collaborationSourceReader,
       legacySourceReader: input.readCollaborationSourcePart,
-      isPlanRetentionCurrent: () => !brainPlanTouched && !unresolvedBrainPlanWrite,
-      onStagedOutcome: ({ progressToken, kind }) => {
-        if (stagedMcpOutcomes.size < 64) {
-          stagedMcpOutcomes.set(progressToken, kind)
+      isPlanRetentionCurrent: () => !brainPlanTouched && !hasUnresolvedBrainPlanWrite(),
+      recordOpenPlanFinalIntent: input.recordOpenPlanFinalIntent,
+      reserveCorrelationBytes: (nextBytes) => {
+        if (!mcpCorrelationMemoryReservation) return true
+        try {
+          mcpCorrelationMemoryReservation.resize(nextBytes)
+          return true
+        } catch {
+          return false
         }
       },
     })
 
-    let lease: AgyPoolLease | undefined
-    let sessionStream: AgySessionNotificationStream | undefined
-    let promptMemoryReservation: NativeMemoryReservation | undefined
-    let toolStateMemoryReservation: NativeMemoryReservation | undefined
-    let serverRequestOwner: AgyServerRequestOwnerHandle | undefined
-    let unsubscribeBackground: (() => void) | undefined
-    let activeRun: ActiveAgyRun | undefined
-    let cancelGraceTimer: ReturnType<typeof setTimeout> | undefined
-    const promptRpcAbort = new AbortController()
-    const observation = new AbortController()
     const interactionControllers = new Set<AbortController>()
+    const abortOutstandingInteractions = (): void => {
+      for (const ctrl of interactionControllers) {
+        ctrl.abort()
+      }
+      interactionControllers.clear()
+    }
     const recordings = new Set<Promise<void>>()
     let recordingTail = Promise.resolve()
     let unknownEffectsReported = false
@@ -2028,6 +6388,203 @@ export class AgyAgentAdapter implements AgentAdapter {
       }
     }
 
+    let zeroInputClosePromise: Promise<void> | undefined
+    const closeZeroInputSessionOnce = (deadlineAt?: number): Promise<void> => {
+      if (zeroInputClosePromise) return zeroInputClosePromise
+      if (
+        !createdFreshSession ||
+        !resolvedSessionId ||
+        !isConfirmedZeroBytesSent() ||
+        !lease?.connection.isOpen
+      ) {
+        return Promise.resolve()
+      }
+      const timeoutMs = deadlineAt !== undefined ? Math.min(1_500, deadlineAt - Date.now()) : 1_500
+      if (timeoutMs <= 0) {
+        return Promise.resolve()
+      }
+      const targetSessionId = resolvedSessionId
+      const targetLease = lease
+      zeroInputClosePromise = (async () => {
+        const closeRes = await targetLease.closeSession(targetSessionId, { timeoutMs })
+        if (closeRes.confirmed) {
+          this.sessionModes.delete(targetSessionId)
+        } else {
+          const closeDiag = classifyAgyCloseFailureDiagnostic(closeRes.reason)
+          recordDiagnostic({
+            operation: 'native_check',
+            phase: 'failed',
+            level: 'warn',
+            scope: 'run',
+            sessionId: input.sessionId,
+            runId: input.runId,
+            agentId: 'agy',
+            executorId: activeExecutorId,
+            nativeMethod: 'session/close',
+            failureSource: closeDiag.failureSource,
+            code: closeDiag.code,
+          })
+        }
+      })()
+      return zeroInputClosePromise
+    }
+
+    let emergencyCleanedUp = false
+    let finalizationPromise: Promise<void> | undefined
+    const finalizeRun = (options: { emergency: boolean }): Promise<void> => {
+      if (options.emergency) {
+        emergencyCleanedUp = true
+      }
+      if (finalizationPromise) {
+        return finalizationPromise
+      }
+      finalizationPromise = (async () => {
+        if (cancelGraceTimer !== undefined) {
+          clearTimeout(cancelGraceTimer)
+          cancelGraceTimer = undefined
+        }
+        promptRpcAbort.abort()
+        stopStreamPump?.()
+        foregroundReleased = true
+        if (options.emergency || emergencyCleanedUp) {
+          rootTerminal = true
+        }
+        if (activeRun) {
+          activeRun.foregroundReleased = true
+          if (options.emergency || emergencyCleanedUp) {
+            activeRun.rootTerminal = true
+          }
+          this.notifyRootExecutionWaiters(activeRun)
+        }
+        if (
+          (options.emergency || emergencyCleanedUp) &&
+          !unknownEffectsReported &&
+          !isConfirmedZeroBytesSent()
+        ) {
+          reportUnknown(
+            'Antigravity adapter disposed before native Turn cleanup could be confirmed.',
+          )
+        }
+        this.invalidateNonTerminalEvidence(input.runId, resolvedSessionId)
+        // Root Turn has ended: unconditionally revoke and close MCP server synchronously before releasing its reservation.
+        mcpServer.revokeRun()
+        await mcpServer.close().catch(() => undefined)
+        mcpCorrelationMemoryReservation?.release()
+        mcpCorrelationMemoryReservation = undefined
+        publishedPlanMemoryReservation?.release()
+        publishedPlanMemoryReservation = undefined
+        promptMemoryReservation?.release()
+        promptMemoryReservation = undefined
+        toolStateMemoryReservation?.release()
+        toolStateMemoryReservation = undefined
+        pendingEventsMemoryReservation?.release()
+        pendingEventsMemoryReservation = undefined
+        stagedPreBindMemoryReservation?.release()
+        stagedPreBindMemoryReservation = undefined
+        foreignExecIdsMemoryReservation?.release()
+        foreignExecIdsMemoryReservation = undefined
+        for (const ctrl of interactionControllers) ctrl.abort()
+        interactionControllers.clear()
+        if (!options.emergency && !emergencyCleanedUp) {
+          await closeZeroInputSessionOnce().catch(() => undefined)
+        }
+        serverRequestOwner?.dispose()
+        serverRequestOwner = undefined
+        if (
+          !options.emergency &&
+          !emergencyCleanedUp &&
+          !this.disposed &&
+          activeRun &&
+          activeRun.activeBackgroundTasks.size > 0
+        ) {
+          handoffOrderedStreamToBackground?.()
+          sessionStream?.close()
+          sessionStream = undefined
+          // Keep background listener & lease until active background tasks settle or pool disposes.
+          const retainedRun = activeRun
+          const retainedLease = lease
+          lease = undefined
+          let retainedCleaned = false
+          const cleanupRetained = (): void => {
+            if (retainedCleaned) return
+            retainedCleaned = true
+            unsubscribeBackground?.()
+            unsubscribeBackground = undefined
+            foregroundDedupMemoryReservation?.release()
+            foregroundDedupMemoryReservation = undefined
+            postCutoffBgMemoryReservation?.release()
+            postCutoffBgMemoryReservation = undefined
+            retireSourceReader()
+            this.activeRuns.delete(input.runId)
+            retainedLease?.release()
+          }
+          if (retainedRun.observation.signal.aborted || this.disposed || emergencyCleanedUp) {
+            cleanupRetained()
+          } else {
+            retainedRun.observation.signal.addEventListener('abort', cleanupRetained, {
+              once: true,
+            })
+          }
+        } else {
+          sessionStream?.close()
+          sessionStream = undefined
+          unsubscribeBackground?.()
+          unsubscribeBackground = undefined
+          foregroundDedupMemoryReservation?.release()
+          foregroundDedupMemoryReservation = undefined
+          postCutoffBgMemoryReservation?.release()
+          postCutoffBgMemoryReservation = undefined
+          retireSourceReader()
+          observation.abort()
+          if (activeRun) this.activeRuns.delete(input.runId)
+          lease?.release()
+          lease = undefined
+        }
+        this.ownedRunHandles.delete(runHandle)
+        runFinalizer.resolve()
+      })()
+      return finalizationPromise
+    }
+
+    const runHandle = {
+      runId: input.runId,
+      cancel: (): void => {
+        runDisposeAbort.abort(
+          new AgentExecutionError(
+            'agent_process_crash',
+            'Antigravity adapter is shutting down.',
+            false,
+          ),
+        )
+        observation.abort()
+        if (activeRun) {
+          this.notifyRootExecutionWaiters(activeRun)
+        }
+        for (const ctrl of interactionControllers) ctrl.abort()
+        if (cancelGraceTimer !== undefined) {
+          clearTimeout(cancelGraceTimer)
+          cancelGraceTimer = undefined
+        }
+        if (
+          rootFirstByteWritten &&
+          !promptSettled &&
+          !rootTerminal &&
+          resolvedSessionId &&
+          lease?.connection.isOpen
+        ) {
+          void lease.connection
+            .notify('session/cancel', { sessionId: resolvedSessionId }, {})
+            .catch(() => undefined)
+        }
+        promptRpcAbort.abort()
+      },
+      closeZeroInputSession: (deadlineAt?: number): Promise<void> =>
+        closeZeroInputSessionOnce(deadlineAt),
+      forceCleanup: (): Promise<void> => finalizeRun({ emergency: true }),
+      finalized: runFinalizer.promise,
+    }
+    this.ownedRunHandles.add(runHandle)
+
     try {
       // Re-verify explicit /skill selections before acquiring or dispatching to native process.
       if (input.promptEnvelope.skillInvocation) {
@@ -2035,7 +6592,7 @@ export class AgyAgentAdapter implements AgentAdapter {
           (b) => b.agentId === 'agy',
         )
         if (hasAgySkill) {
-          const catalog = await this.discoverSkills(input.cwd, signal)
+          const catalog = await this.discoverSkills(input.cwd, runSignal)
           bindAgySkillSelections(input.promptEnvelope.skillInvocation.bindings, catalog)
         }
       }
@@ -2048,23 +6605,67 @@ export class AgyAgentAdapter implements AgentAdapter {
         permissionMode: effectivePermissionMode,
         readOnly: readOnlyStage,
         sessionId: input.sessionId,
-        signal,
+        signal: runSignal,
       })
       const connection = lease.connection
       activeExecutorId = connection.executorId
       input.recordExecutor?.(activeExecutorId)
 
-      await lease.ensureInitialized(signal)
+      await lease.ensureInitialized(runSignal)
 
-      // Event queue fed by server-request interactions (approval / question) and session updates.
-      // Registered BEFORE `session/new` / `session/load` on the shared `AgyAcpConnection` owner registry
-      // so init-phase forms/elicitation reach the exact owner without cross-session interference.
-      const pendingEvents: NormalizedAgentEvent[] = []
+      // Event queue fed by ordered server-request interactions (approval / question) and session updates.
+      pendingEventsMemoryReservation = connection.reserveWorkingMemory(0)
+      const pendingEvents: Array<{ readonly event: NormalizedAgentEvent; readonly bytes: number }> =
+        []
+      let pendingEventsBytes = 0
       let wakeEventLoop: (() => void) | undefined
+      let wakePumpForBackpressure: (() => void) | undefined
       const notifyEventLoop = (): void => {
         const wake = wakeEventLoop
         wakeEventLoop = undefined
         wake?.()
+      }
+      const notifyPumpForBackpressure = (): void => {
+        const wake = wakePumpForBackpressure
+        wakePumpForBackpressure = undefined
+        wake?.()
+      }
+      const isPendingEventsAtSoftCap = (): boolean =>
+        pendingEvents.length >= AGY_MAX_PENDING_EVENTS ||
+        pendingEventsBytes >= AGY_MAX_PENDING_EVENT_BYTES
+      const pushPendingEvent = (ev: NormalizedAgentEvent): void => {
+        const evBytes = estimateNormalizedEventBytes(ev)
+        const nextBytes = pendingEventsBytes + evBytes
+        if (
+          pendingEvents.length >= AGY_MAX_PENDING_EVENTS * 2 ||
+          nextBytes > AGY_MAX_PENDING_EVENT_BYTES * 2
+        ) {
+          throw new AgentExecutionError(
+            'response_too_large',
+            'Antigravity pending event queue exceeded working-memory budget.',
+            false,
+          )
+        }
+        pendingEventsMemoryReservation?.resize(nextBytes)
+        pendingEventsBytes = nextBytes
+        pendingEvents.push({ event: ev, bytes: evBytes })
+        notifyEventLoop()
+      }
+      const shiftPendingEvent = (): NormalizedAgentEvent | undefined => {
+        const entry = pendingEvents.shift()
+        if (!entry) return undefined
+        pendingEventsBytes = Math.max(0, pendingEventsBytes - entry.bytes)
+        pendingEventsMemoryReservation?.resize(pendingEventsBytes)
+        if (!isPendingEventsAtSoftCap()) {
+          notifyPumpForBackpressure()
+        }
+        return entry.event
+      }
+      const clearPendingEvents = (): void => {
+        pendingEvents.length = 0
+        pendingEventsBytes = 0
+        pendingEventsMemoryReservation?.resize(0)
+        notifyPumpForBackpressure()
       }
 
       const permissionWait = new NativePermissionWait()
@@ -2085,119 +6686,275 @@ export class AgyAgentAdapter implements AgentAdapter {
       })
       observation.signal.addEventListener('abort', releaseWaitObserver, { once: true })
 
+      let replayingHistory = false
+      let promptCutoffSeq: number | undefined
+
+      const isUnscopedDuringForeignTurn = (validated: ValidatedAgyFrame): boolean =>
+        Boolean(
+          activeRun &&
+          activeRun.providerExecutionId === undefined &&
+          activeRun.foreignTurnActiveUntilRootBound &&
+          validated.executionId === undefined,
+        )
+
+      const isServerRequestIdentityContradicted = (validated: ValidatedAgyFrame): boolean =>
+        validated.hasForeignOrInvalidSessionMeta ||
+        validated.executionIdInvalid ||
+        validated.rootEvidenceContradicted ||
+        isUnscopedDuringForeignTurn(validated) ||
+        (validated.executionId !== undefined &&
+          activeRun?.providerExecutionId !== undefined &&
+          validated.executionId !== activeRun.providerExecutionId) ||
+        (validated.executionId !== undefined &&
+          Boolean(activeRun?.knownForeignExecutionIds.has(validated.executionId)))
+
+      const handleOrderedServerRequest = (
+        req: Extract<AgyIngress, { kind: 'server_request' }>,
+      ): boolean => {
+        const { method, rpcId, message } = req
+        if (method !== 'session/request_permission' && method !== 'elicitation/create') {
+          void connection
+            .respondError(rpcId, 'Unsupported Antigravity ACP server request.', -32_601)
+            .catch(() => undefined)
+          return false
+        }
+        const rawParams = Reflect.get(message, 'params')
+        const paramsObjectValid = isPlainObject(rawParams)
+        const params = paramsObjectValid ? rawParams : {}
+
+        if (
+          activeRun?.promptReplyReceived ||
+          (promptCutoffSeq !== undefined && req.seq > promptCutoffSeq)
+        ) {
+          if (method === 'session/request_permission') {
+            const rejectOnce = findRejectOnceOptionId(params.options)
+            void connection
+              .respond(
+                rpcId,
+                rejectOnce
+                  ? { outcome: { outcome: 'selected', optionId: rejectOnce } }
+                  : { outcome: { outcome: 'cancelled' } },
+              )
+              .catch(() => undefined)
+          } else {
+            void connection.respond(rpcId, { action: 'cancel' }).catch(() => undefined)
+          }
+          return true
+        }
+
+        // Validate session, execution, trajectory/step, tokens, and operation-specific payload
+        // BEFORE recording acceptance, showing an interaction, or granting permission!
+        const validated = validateAgyFrame(
+          req,
+          resolvedSessionId,
+          mcpServer.pinnedTrajectory,
+          mcpServer.minStepIdx,
+        )
+        const unscopedForeign = isUnscopedDuringForeignTurn(validated)
+        const identityContradicted = isServerRequestIdentityContradicted(validated)
+        const permRequestInvalid =
+          method === 'session/request_permission' &&
+          (!paramsObjectValid ||
+            identityContradicted ||
+            validated.tokens.hasInvalidToken ||
+            validated.tokens.hasConflictingTokens ||
+            validated.toolCallIdInvalid ||
+            validated.argsEvidence.kind === 'invalid_or_conflict' ||
+            (validated.statusPresent &&
+              (validated.statusInvalid ||
+                validated.status === 'completed' ||
+                validated.status === 'failed' ||
+                validated.status === 'cancelled')))
+        const elicitRequestInvalid =
+          method === 'elicitation/create' &&
+          (!paramsObjectValid ||
+            identityContradicted ||
+            validated.tokens.hasInvalidToken ||
+            validated.tokens.hasConflictingTokens)
+
+        let preBuiltPermissionCard: ReturnType<typeof buildAgyPermissionCard> | undefined
+        let permissionCardValid = false
+        if (method === 'session/request_permission' && !permRequestInvalid) {
+          try {
+            preBuiltPermissionCard = buildAgyPermissionCard(params, lease!.canonicalCwd)
+            permissionCardValid = true
+          } catch {
+            permissionCardValid = false
+          }
+        }
+
+        let preParsedElicitationRequest: NativeUserInputRequest | undefined
+        let elicitationPayloadValid = false
+        let elicitationParseErrorMessage: string | undefined
+        if (method === 'elicitation/create' && !elicitRequestInvalid) {
+          try {
+            preParsedElicitationRequest = agyElicitationRequest(params)
+            elicitationPayloadValid = true
+          } catch (error) {
+            elicitationPayloadValid = false
+            elicitationParseErrorMessage =
+              error instanceof Error ? error.message : 'Unsupported Antigravity elicitation schema.'
+          }
+        }
+
+        const requestValidForAcceptance =
+          method === 'session/request_permission'
+            ? !permRequestInvalid && permissionCardValid
+            : !elicitRequestInvalid && elicitationPayloadValid
+
+        // Only count as model Turn acceptance AFTER the root prompt has dispatched AND BOTH
+        // attributable frame identity and operation-specific payload validation succeed!
+        if (
+          requestValidForAcceptance &&
+          activeRun &&
+          rootFirstByteWritten &&
+          !activeRun.turnAccepted &&
+          !activeRun.promptReplyReceived &&
+          !rootTerminal &&
+          !replayingHistory
+        ) {
+          activeRun.turnAccepted = true
+          input.recordDispatch?.('accepted', activeRun.nativeSessionId, activeExecutorId)
+          this.recordEvidence(
+            input,
+            activeRun.nativeSessionId,
+            activeExecutorId,
+            {
+              kind: 'running',
+              source: 'live_runtime',
+            },
+            activeRun.nativeTurnId,
+          )
+          pushPendingEvent({ agentId: 'agy', type: 'turn.started', turnId: input.runId })
+        }
+
+        if (method === 'session/request_permission') {
+          this.handlePermissionRequest({
+            connection,
+            validated,
+            rpcId,
+            params,
+            paramsObjectValid,
+            unscopedDuringForeignTurn: unscopedForeign,
+            preBuiltCard: preBuiltPermissionCard,
+            cwd: lease!.canonicalCwd,
+            input,
+            activeRun,
+            getSessionId: () => resolvedSessionId,
+            mcpServer,
+            readOnlyStage,
+            permissionMode: effectivePermissionMode,
+            permissionWait,
+            getActiveCount: () => activePermissionRequests,
+            adjustActiveCount: (delta) => {
+              activePermissionRequests += delta
+            },
+            interactionControllers,
+            pushEvent: pushPendingEvent,
+            signal,
+          }).catch(() => undefined)
+          return true
+        }
+
+        if (!elicitRequestInvalid && !elicitationPayloadValid) {
+          void connection
+            .respondError(
+              rpcId,
+              elicitationParseErrorMessage ?? 'Unsupported Antigravity elicitation schema.',
+              -32_602,
+            )
+            .catch(() => undefined)
+          return true
+        }
+
+        this.handleElicitationRequest({
+          connection,
+          validated,
+          rpcId,
+          params,
+          paramsObjectValid,
+          unscopedDuringForeignTurn: unscopedForeign,
+          preParsedRequest: preParsedElicitationRequest,
+          input,
+          activeRun,
+          askOnlyStage,
+          readOnlyNonInteractive:
+            readOnlyStage &&
+            !planModeStage &&
+            (authorization?.stage ?? workflow?.stage) !== 'reply',
+          permissionWait,
+          interactionControllers,
+          pushEvent: pushPendingEvent,
+          signal,
+        }).catch(() => undefined)
+        return true
+      }
+
+      // Register this Run in the connection's server-request owner registry for its full lifetime so
+      // concurrent sessions sharing one connection properly reject ambiguous unscoped requests (-32601),
+      // while session-scoped requests are routed in strict stdout order via `openSessionStream({ ordered: true })`.
       serverRequestOwner = connection.registerServerRequestOwner({
         ownerId: `run:${input.runId}`,
         knownSessionId: resolvedSessionId,
-        handler: (message) => {
+        handler: (message, seq?: number) => {
           const method = asString(Reflect.get(message, 'method'))
           const rpcId = Reflect.get(message, 'id')
           if (
             (typeof rpcId !== 'string' && typeof rpcId !== 'number') ||
             !method ||
-            (method !== 'session/request_permission' && method !== 'elicitation/create')
+            (method !== 'session/request_permission' && method !== 'elicitation/create') ||
+            !isPlainObject(message)
           ) {
             return false
           }
-          const rawParams = Reflect.get(message, 'params')
-          const params = isPlainObject(rawParams) ? rawParams : {}
-
-          // Only count as model Turn acceptance AFTER the root prompt has actually dispatched!
-          if (activeRun && rootFirstByteWritten && !activeRun.turnAccepted && !rootTerminal) {
-            activeRun.turnAccepted = true
-            input.recordDispatch?.('accepted', activeRun.nativeSessionId, activeExecutorId)
-            this.recordEvidence(
-              input,
-              activeRun.nativeSessionId,
-              activeExecutorId,
-              {
-                kind: 'running',
-                source: 'live_runtime',
-              },
-              activeRun.nativeTurnId,
-            )
-            pendingEvents.push({ agentId: 'agy', type: 'turn.started', turnId: input.runId })
-            notifyEventLoop()
-          }
-
-          if (method === 'session/request_permission') {
-            void this.handlePermissionRequest({
-              connection,
-              rpcId,
-              params,
-              cwd: lease!.canonicalCwd,
-              input,
-              activeRun,
-              getSessionId: () => resolvedSessionId,
-              mcpServer,
-              readOnlyStage,
-              permissionMode: effectivePermissionMode,
-              permissionWait,
-              getActiveCount: () => activePermissionRequests,
-              adjustActiveCount: (delta) => {
-                activePermissionRequests += delta
-              },
-              interactionControllers,
-              pushEvent: (ev) => {
-                pendingEvents.push(ev)
-                notifyEventLoop()
-              },
-              signal,
-            })
-            return true
-          }
-
-          void this.handleElicitationRequest({
-            connection,
+          const effectiveSeq = seq ?? (promptCutoffSeq !== undefined ? promptCutoffSeq + 1 : 0)
+          return handleOrderedServerRequest({
+            kind: 'server_request',
+            seq: effectiveSeq,
             rpcId,
-            params,
-            input,
-            activeRun,
-            askOnlyStage,
-            readOnlyNonInteractive:
-              readOnlyStage &&
-              !planModeStage &&
-              (authorization?.stage ?? workflow?.stage) !== 'reply',
-            permissionWait,
-            interactionControllers,
-            pushEvent: (ev) => {
-              pendingEvents.push(ev)
-              notifyEventLoop()
-            },
-            signal,
+            method,
+            message,
           })
-          return true
         },
       })
 
-      // Establish or load the ACP session, concurrently draining replay notifications and yielding
-      // any init-phase interaction events so neither transport queues nor elicitation waits block.
-      let replayingHistory = false
       let descriptor: AcpSessionDescriptor
       if (input.nativeSessionId) {
         resolvedSessionId = input.nativeSessionId
         replayingHistory = true
-        sessionStream = connection.openSessionStream(input.nativeSessionId)
+        sessionStream = connection.openSessionStream(input.nativeSessionId, { ordered: true })
         let replayConfigOptions: AcpConfigOptionEntry[] | undefined
-        const loadReq = connection.request(
+        const loadOp = connection.requestOwned(
           'session/load',
           {
             sessionId: input.nativeSessionId,
             cwd: lease.canonicalCwd,
             mcpServers: mcpDescriptor ? [mcpDescriptor] : [],
           },
-          { timeoutMs: AGY_CONTROL_RPC_TIMEOUT_MS, signal },
+          {
+            timeoutMs: AGY_SESSION_LIFECYCLE_RPC_TIMEOUT_MS,
+            signal: runSignal,
+            replyTo: sessionStream,
+          },
         )
         const loadResp = yield* this.awaitControlRpcWithConcurrentDrain({
-          requestPromise: loadReq,
+          requestPromise: loadOp.result,
+          requestId: loadOp.requestId,
           stream: sessionStream,
-          pendingEvents,
+          shiftPendingEvent,
           setWakeup: (fn) => {
             wakeEventLoop = fn
           },
           onNotification: (replayed) => {
             this.observeSessionTitleFromNotification(replayed, input.nativeSessionId!, input)
-            const notifiedOptions = this.extractConfigOptionsFromNotification(replayed)
+            const notifiedOptions = this.extractConfigOptionsFromNotification(
+              replayed,
+              input.nativeSessionId,
+            )
             if (notifiedOptions) replayConfigOptions = notifiedOptions
+          },
+          onServerRequest: (req) => {
+            handleOrderedServerRequest(req)
           },
         })
         const loadError = Reflect.get(loadResp, 'error')
@@ -2223,12 +6980,12 @@ export class AgyAgentAdapter implements AgentAdapter {
             cwd: lease.canonicalCwd,
             mcpServers: mcpDescriptor ? [mcpDescriptor] : [],
           },
-          { timeoutMs: AGY_CONTROL_RPC_TIMEOUT_MS, signal },
+          { timeoutMs: AGY_SESSION_LIFECYCLE_RPC_TIMEOUT_MS, signal: runSignal },
         )
         const newResp = yield* this.awaitControlRpcWithConcurrentDrain({
           requestPromise: newReq,
           stream: undefined,
-          pendingEvents,
+          shiftPendingEvent,
           setWakeup: (fn) => {
             wakeEventLoop = fn
           },
@@ -2247,14 +7004,23 @@ export class AgyAgentAdapter implements AgentAdapter {
         }
         descriptor = parseAcpSessionDescriptor(newResult)
         resolvedSessionId = descriptor.sessionId
+        createdFreshSession = true
         serverRequestOwner.updateSessionId(resolvedSessionId)
-        sessionStream = connection.openSessionStream(resolvedSessionId)
-        // Drain any initial metadata updates (`available_commands_update` / `config_option_update`).
+        sessionStream = connection.openSessionStream(resolvedSessionId, { ordered: true })
+        // Drain any initial metadata updates or early server requests (`available_commands_update` / `config_option_update`).
         while (true) {
-          const initialNote = sessionStream.shift()
-          if (!initialNote) break
-          this.observeSessionTitleFromNotification(initialNote, resolvedSessionId, input)
-          const notifiedOptions = this.extractConfigOptionsFromNotification(initialNote)
+          const initialItem = sessionStream.shift()
+          if (!initialItem) break
+          if (initialItem.kind === 'server_request') {
+            handleOrderedServerRequest(initialItem)
+            continue
+          }
+          if (initialItem.kind !== 'notification') continue
+          this.observeSessionTitleFromNotification(initialItem.message, resolvedSessionId, input)
+          const notifiedOptions = this.extractConfigOptionsFromNotification(
+            initialItem.message,
+            resolvedSessionId,
+          )
           if (notifiedOptions) descriptor.configOptions = notifiedOptions
         }
       }
@@ -2272,7 +7038,7 @@ export class AgyAgentAdapter implements AgentAdapter {
         sessionState,
         readOnlyStage,
         permissionMode: effectivePermissionMode,
-        signal,
+        signal: runSignal,
       })
 
       // Confirm applied model & thought_level via `session/set_config_option` (keeping speed: 'native').
@@ -2284,13 +7050,18 @@ export class AgyAgentAdapter implements AgentAdapter {
         onMetadataNotification: (note) => {
           this.observeSessionTitleFromNotification(note, resolvedSessionId!, input)
         },
+        onServerRequest: (req) => {
+          handleOrderedServerRequest(req)
+        },
         requestedModel: input.model,
         requestedEffort: input.effort,
-        signal,
+        signal: runSignal,
       })
 
-      while (pendingEvents.length > 0) {
-        yield pendingEvents.shift()!
+      let earlyEvent = shiftPendingEvent()
+      while (earlyEvent !== undefined) {
+        yield earlyEvent
+        earlyEvent = shiftPendingEvent()
       }
 
       const appliedSettings = this.buildEffectiveExecutionSettings(
@@ -2326,14 +7097,22 @@ export class AgyAgentAdapter implements AgentAdapter {
       // Prepare prompt content with Cutoff serialization & verified ACP images.
       const images: AgentPromptImage[] = []
       const currentEnvelope = input.currentPromptEnvelope?.() ?? input.promptEnvelope
-      const sourceForm: AgentSourceReadForm = input.collaborationSourceReader
+      const sourceForm: AgentSourceReadForm | undefined = mcpServer.sourceCapability.sourceReference
         ? 'sourceReference'
-        : 'legacy'
-      const navigate = input.collaborationSourceReader
-        ? (target: Parameters<AgentCollaborationSourceReader['navigation']>[0]) =>
-            input.collaborationSourceReader!.navigation(target, sourceForm)
-        : undefined
-      const navigateCutoff = cutoffSourceNavigator(input.collaborationSourceReader, sourceForm)
+        : mcpServer.sourceCapability.nativeRoot
+          ? 'nativeRoot'
+          : mcpServer.sourceCapability.legacy
+            ? 'legacy'
+            : undefined
+      const navigate =
+        input.collaborationSourceReader && sourceForm !== undefined
+          ? (target: Parameters<AgentCollaborationSourceReader['navigation']>[0]) =>
+              input.collaborationSourceReader!.navigation(target, sourceForm)
+          : undefined
+      const navigateCutoff =
+        sourceForm !== undefined
+          ? cutoffSourceNavigator(input.collaborationSourceReader, sourceForm)
+          : undefined
 
       for (const group of agentPromptImageGroups(currentEnvelope)) {
         images.push(...group.images)
@@ -2342,13 +7121,32 @@ export class AgyAgentAdapter implements AgentAdapter {
         64 * 1024 + nativeImagePreparationBytes(images),
       )
       toolStateMemoryReservation = connection.reserveWorkingMemory(0)
-      const promptBlocks = await agyPromptInput(currentEnvelope, signal, navigate, navigateCutoff, {
-        pactRunId: input.runId,
-      })
+      foregroundDedupMemoryReservation = connection.reserveWorkingMemory(0)
+      mcpCorrelationMemoryReservation = connection.reserveWorkingMemory(0)
+      publishedPlanMemoryReservation = connection.reserveWorkingMemory(0)
+      stagedPreBindMemoryReservation = connection.reserveWorkingMemory(0)
+      foreignExecIdsMemoryReservation = connection.reserveWorkingMemory(0)
+      postCutoffBgMemoryReservation = connection.reserveWorkingMemory(0)
+      const promptBlocks = await agyPromptInput(
+        currentEnvelope,
+        runSignal,
+        navigate,
+        navigateCutoff,
+        {
+          pactRunId: input.runId,
+        },
+      )
+      const expectedFullPromptText = promptBlocks
+        .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
+        .map((block) => block.text)
+        .join('\n')
+        .trim()
 
       const systemAppendParts: string[] = []
       if (workflow) {
-        systemAppendParts.push(collaborationInstructions(workflow, authorization))
+        systemAppendParts.push(
+          collaborationInstructions(workflow, authorization, mcpServer.sourceCapability),
+        )
         if (planModeStage) {
           systemAppendParts.push(AGY_PLAN_SUBMISSION_INSTRUCTIONS)
         }
@@ -2357,8 +7155,11 @@ export class AgyAgentAdapter implements AgentAdapter {
           systemAppendParts.push(PEER_ASSISTANCE_INSTRUCTIONS)
         }
         if (mcpServer.allowedToolNames.has('read_collaboration_source')) {
-          systemAppendParts.push(frozenSourceInstructions)
+          systemAppendParts.push(buildSourceInstructions(mcpServer.sourceCapability))
         }
+      }
+      if (mcpServer.hasTools) {
+        systemAppendParts.push(mcpServer.formatToolUsageInstructions())
       }
       const systemAppend = systemAppendParts.filter(Boolean).join('\n\n')
 
@@ -2425,6 +7226,66 @@ export class AgyAgentAdapter implements AgentAdapter {
       }
       this.activeRuns.set(input.runId, activeRun)
 
+      if (mcpServer.hasTools) {
+        const hostTrajectory = await loadHostTrajectoryIdentityBeforePrompt(
+          AbortSignal.any([runSignal, observation.signal, AbortSignal.timeout(2_500)]),
+        )
+        if (hostTrajectory.status === 'ok') {
+          mcpServer.pinHostTrajectoryId(hostTrajectory.trajectoryId, hostTrajectory.stepCount)
+          if (activeRun.rootStepIdx === undefined) {
+            activeRun.rootStepIdx = hostTrajectory.stepCount
+          }
+        } else if (hostTrajectory.status === 'invalid') {
+          recordHostBeforeRootStart()
+          throw new AgentExecutionError(
+            input.nativeSessionId ? 'context_resume_failed' : 'protocol_error',
+            hostTrajectory.reason ??
+              'Antigravity trajectory storage metadata is invalid or corrupted.',
+            false,
+          )
+        } else if (
+          hostTrajectory.status === 'budget_exceeded' ||
+          hostTrajectory.status === 'worker_error'
+        ) {
+          recordHostBeforeRootStart()
+          throw new AgentExecutionError(
+            'runtime_incompatible',
+            hostTrajectory.reason ??
+              (hostTrajectory.status === 'budget_exceeded'
+                ? 'Antigravity trajectory storage exceeded the bounded identity read budget.'
+                : 'Antigravity trajectory identity worker failed before prompt dispatch.'),
+            false,
+          )
+        } else if (
+          hostTrajectory.status === 'transient_churn' ||
+          hostTrajectory.status === 'timeout'
+        ) {
+          recordHostBeforeRootStart()
+          throw new AgentExecutionError(
+            'transient_transport',
+            hostTrajectory.reason ??
+              (hostTrajectory.status === 'timeout'
+                ? 'Antigravity trajectory identity inspection timed out before prompt dispatch.'
+                : 'Antigravity trajectory storage remained unstable before prompt dispatch.'),
+            true,
+          )
+        } else if (hostTrajectory.status === 'missing') {
+          if (activeRun.rootStepIdx === undefined) {
+            recordHostBeforeRootStart()
+            throw new AgentExecutionError(
+              input.nativeSessionId ? 'context_resume_failed' : 'protocol_error',
+              hostTrajectory.reason ??
+                (input.nativeSessionId
+                  ? 'Antigravity trajectory database for the resumed session is missing before prompt dispatch.'
+                  : 'Antigravity trajectory database for the new session is missing before prompt dispatch.'),
+              false,
+            )
+          }
+        } else if (hostTrajectory.status === 'no_storage_root') {
+          mcpServer.disallowLazyStorageDbPin()
+        }
+      }
+
       yield {
         agentId: 'agy',
         type: 'session.started',
@@ -2455,46 +7316,124 @@ export class AgyAgentAdapter implements AgentAdapter {
         state: 'pending',
       })
 
-      // Post-turn background listener for attributable, deduplicable out-of-turn completion updates.
+      // Post-turn background listener & dedup state for attributable out-of-turn completion updates.
       const seenForegroundMessageIds = new Set<string>()
-      const reportedBackgroundMessageIds = new Set<string>()
-      let observedBackgroundTask = false
-
-      unsubscribeBackground = connection.subscribeBackground((message) => {
-        if (
-          !rootTerminal ||
-          replayingHistory ||
-          asString(Reflect.get(message, 'method')) !== 'session/update'
-        ) {
-          return false
+      let seenForegroundMessageIdBytes = 0
+      let foregroundDedupIncomplete = false
+      let omittedForegroundIdLacksTrustedStep = false
+      let maxForegroundStepIdx: number | undefined
+      const recordSeenForegroundMessageId = (
+        msgIdentity: string,
+        trustedStepIdx?: number,
+      ): void => {
+        if (!isEligibleAgyBackgroundReportId(msgIdentity)) {
+          return
         }
-        const params = Reflect.get(message, 'params')
-        if (!isPlainObject(params)) return false
-        const sid = asString(params.sessionId ?? params.session_id)
-        if (sid !== resolvedSessionId) return false
-        // If a newer foreground Run has taken over this nativeSessionId, yield to that Run.
-        for (const other of this.activeRuns.values()) {
-          if (
-            other !== activeRun &&
-            other.nativeSessionId === resolvedSessionId &&
-            !other.rootTerminal
-          ) {
-            return false
+        if (seenForegroundMessageIds.has(msgIdentity)) return
+        const markOmitted = (): void => {
+          foregroundDedupIncomplete = true
+          if (trustedStepIdx === undefined) {
+            omittedForegroundIdLacksTrustedStep = true
           }
         }
-        const update = params.update
-        if (!isPlainObject(update)) return true
-        void this.handlePostTurnBackgroundUpdate({
-          update,
-          input,
-          activeRun: activeRun!,
-          observedBackgroundTask,
-          canSettleEffects: () => !unknownEffectsReported,
-          seenForegroundMessageIds,
-          reportedBackgroundMessageIds,
-        })
-        return true
-      })
+        if (seenForegroundMessageIds.size >= AGY_MAX_FOREGROUND_DEDUP_ID_COUNT) {
+          markOmitted()
+          return
+        }
+        const entryBytes = msgIdentity.length * 2 + 32
+        if (seenForegroundMessageIdBytes + entryBytes > AGY_MAX_FOREGROUND_DEDUP_BYTES) {
+          markOmitted()
+          return
+        }
+        if (foregroundDedupMemoryReservation) {
+          try {
+            foregroundDedupMemoryReservation.resize(seenForegroundMessageIdBytes + entryBytes)
+          } catch {
+            markOmitted()
+            return
+          }
+        }
+        seenForegroundMessageIds.add(msgIdentity)
+        seenForegroundMessageIdBytes += entryBytes
+      }
+      const recordForegroundStepIdx = (stepIdx: number): void => {
+        if (maxForegroundStepIdx === undefined || stepIdx > maxForegroundStepIdx) {
+          maxForegroundStepIdx = stepIdx
+        }
+      }
+      const reportedBackgroundMessageIds = new Set<string>()
+      let observedBackgroundTask = false
+      let postCutoffBackgroundTail = Promise.resolve()
+      let postCutoffBgQueuedCount = 0
+      let postCutoffBgQueuedBytes = 0
+
+      const enqueuePostCutoffBackgroundUpdate = (
+        params: Record<string, unknown>,
+        update: Record<string, unknown>,
+        preValidatedOwnership?: ValidatedBackgroundOwnership,
+      ): void => {
+        if (!activeRun) return
+        const ownership =
+          preValidatedOwnership ??
+          validateBackgroundUpdateForRun(
+            params,
+            update,
+            activeRun,
+            mcpServer.pinnedTrajectory,
+            mcpServer.minStepIdx,
+          )
+        if (!ownership.valid) return
+        const record = buildCompactPostCutoffBackgroundRecord(update, ownership)
+        if (!record) return
+        const recordBytes = estimateCompactBackgroundRecordBytes(record)
+        const nextBytes = postCutoffBgQueuedBytes + recordBytes
+        if (
+          postCutoffBgQueuedCount >= AGY_MAX_POST_CUTOFF_BG_PENDING ||
+          nextBytes > AGY_MAX_POST_CUTOFF_BG_BYTES
+        ) {
+          activeRun.backgroundUnconfirmed = true
+          reportUnknown(
+            'Antigravity post-cutoff background update queue exceeded working-memory budget; coverage is incomplete.',
+          )
+          return
+        }
+        try {
+          postCutoffBgMemoryReservation?.resize(nextBytes)
+        } catch {
+          activeRun.backgroundUnconfirmed = true
+          reportUnknown(
+            'Antigravity post-cutoff background update queue exceeded shared working-memory budget; coverage is incomplete.',
+          )
+          return
+        }
+        postCutoffBgQueuedCount += 1
+        postCutoffBgQueuedBytes = nextBytes
+        postCutoffBackgroundTail = postCutoffBackgroundTail
+          .then(() =>
+            this.handlePostTurnBackgroundUpdate({
+              record,
+              input,
+              activeRun: activeRun!,
+              observedBackgroundTask,
+              canSettleEffects: () => !unknownEffectsReported,
+              isRootTerminal: () => rootTerminal,
+              seenForegroundMessageIds,
+              isForegroundDedupIncomplete: () => foregroundDedupIncomplete,
+              hasOmittedForegroundIdWithoutStep: () => omittedForegroundIdLacksTrustedStep,
+              getMaxForegroundStepIdx: () => maxForegroundStepIdx,
+              getPinnedTrajectory: () => mcpServer.pinnedTrajectory,
+              getMinStepIdx: () => mcpServer.minStepIdx,
+              reportedBackgroundMessageIds,
+              reportUnknown,
+            }),
+          )
+          .catch(() => undefined)
+          .finally(() => {
+            postCutoffBgQueuedCount = Math.max(0, postCutoffBgQueuedCount - 1)
+            postCutoffBgQueuedBytes = Math.max(0, postCutoffBgQueuedBytes - recordBytes)
+            postCutoffBgMemoryReservation?.resize(postCutoffBgQueuedBytes)
+          })
+      }
 
       // Abort handler: distinguishes pre-write abort (`not_sent`) from post-write `session/cancel`
       // with a bounded settlement window for a real native `{ stopReason: 'cancelled' }` reply.
@@ -2528,7 +7467,7 @@ export class AgyAgentAdapter implements AgentAdapter {
         onCallerAbort()
       }
 
-      // Dispatch `session/prompt`.
+      // Dispatch `session/prompt` with ordered reply delivery (`replyTo: sessionStream`).
       let rootWithheldByGuard = false
       const promptParams: Record<string, unknown> = {
         sessionId: resolvedSessionId,
@@ -2542,6 +7481,7 @@ export class AgyAgentAdapter implements AgentAdapter {
       const promptOp = connection.requestOwned('session/prompt', promptParams, {
         timeoutMs: undefined,
         signal: promptRpcAbort.signal,
+        replyTo: sessionStream,
         canDispatch: () => {
           if (this.disposed || signal.aborted || userCancelRequested) return false
           if (input.recovery?.canDispatch && !input.recovery.canDispatch()) {
@@ -2558,43 +7498,58 @@ export class AgyAgentAdapter implements AgentAdapter {
         },
       })
 
-      let promptSettled = false
       let promptResponse: object | undefined
+      let parsedPromptTerminalReply: ParsedAgyPromptTerminalReply | undefined
+      let promptRpcResolvedResponse: object | undefined
       let promptError: Error | undefined
+      let pumpError: Error | undefined
+      let streamEnded = false
+      const pumpAbort = new AbortController()
+      stopStreamPump = (): void => {
+        pumpAbort.abort()
+      }
+
+      const settlePromptFromResponse = (res: object): void => {
+        promptResponse = res
+        parsedPromptTerminalReply = parseAgyPromptTerminalReply(res, resolvedSessionId)
+        promptSettled = true
+        promptReplyReceived = true
+        abortOutstandingInteractions()
+        if (activeRun) {
+          activeRun.promptReplyReceived = true
+          if (
+            parsedPromptTerminalReply.ok &&
+            parsedPromptTerminalReply.executionId &&
+            !activeRun.providerExecutionId &&
+            !activeRun.knownForeignExecutionIds.has(parsedPromptTerminalReply.executionId)
+          ) {
+            this.bindRootExecutionId(activeRun, input, parsedPromptTerminalReply.executionId)
+          }
+          this.notifyRootExecutionWaiters(activeRun)
+        }
+        if (cancelGraceTimer !== undefined) {
+          clearTimeout(cancelGraceTimer)
+          cancelGraceTimer = undefined
+        }
+        notifyEventLoop()
+      }
+
       void promptOp.result.then(
         (res) => {
-          promptResponse = res
-          promptSettled = true
-          promptReplyReceived = true
-          if (activeRun) {
-            activeRun.promptReplyReceived = true
-            const resErr = Reflect.get(res, 'error')
-            const resObj = Reflect.get(res, 'result')
-            if (!resErr && isPlainObject(resObj)) {
-              const sr = asString(resObj.stopReason)?.trim()
-              const execId = asString(resObj.executionId ?? resObj.execution_id)
-              if (
-                sr &&
-                VALID_ACP_STOP_REASONS.has(sr) &&
-                execId &&
-                !activeRun.providerExecutionId
-              ) {
-                this.bindRootExecutionId(activeRun, input, execId)
-              }
-            }
-            this.notifyRootExecutionWaiters(activeRun)
+          promptRpcResolvedResponse = res
+          // Normal path waits for the ordered `{ kind: 'reply', seq }` ingress frame on `sessionStream`
+          // so all notifications with `seq < cutoffSeq` are guaranteed pre-cutoff.
+          // If the stream already ended before delivering the reply frame, settle immediately.
+          if (streamEnded && !promptSettled) {
+            settlePromptFromResponse(res)
           }
-          if (cancelGraceTimer !== undefined) {
-            clearTimeout(cancelGraceTimer)
-            cancelGraceTimer = undefined
-          }
-          notifyEventLoop()
           return undefined
         },
         (err: unknown) => {
-          promptError = err instanceof Error ? err : new Error(String(err))
+          promptError ??= err instanceof Error ? err : new Error(String(err))
           promptSettled = true
           promptReplyReceived = true
+          abortOutstandingInteractions()
           if (activeRun) {
             activeRun.promptReplyReceived = true
             this.notifyRootExecutionWaiters(activeRun)
@@ -2603,6 +7558,7 @@ export class AgyAgentAdapter implements AgentAdapter {
             clearTimeout(cancelGraceTimer)
             cancelGraceTimer = undefined
           }
+          pumpAbort.abort()
           notifyEventLoop()
           return undefined
         },
@@ -2634,6 +7590,8 @@ export class AgyAgentAdapter implements AgentAdapter {
       let inputResult: CollaborationInputObservation | undefined
       let planRetained = false
       let publishedOpenPlan: { nativeId: string; text: string } | undefined
+      let openPlanPublishFailed = false
+      let openPlanUnavailableRecorded = false
       let sessionTitleEmitted = false
 
       const observeFiles = (evidence: Parameters<typeof recordNativeChanges>[1]): void => {
@@ -2654,14 +7612,14 @@ export class AgyAgentAdapter implements AgentAdapter {
         void task.finally(() => recordings.delete(task))
       }
 
-      type StreamNextOutcome = { kind: 'note' } | { kind: 'error'; error: Error }
-      let pendingNextNote: Promise<StreamNextOutcome> | undefined
-      const waiterNotes: object[] = []
-      let waiterError: Error | undefined
-
-      const projectNote = (notification: object): Generator<NormalizedAgentEvent> =>
-        this.projectSessionNotification({
-          notification,
+      const projectValidatedFrame = (
+        validated: ValidatedAgyFrame,
+      ): Generator<NormalizedAgentEvent> => {
+        const receivedAfterPromptReply =
+          promptCutoffSeq !== undefined && validated.seq > promptCutoffSeq
+        return this.projectSessionNotification({
+          validated,
+          receivedAfterPromptReply,
           input,
           activeRun: activeRun!,
           cwd: lease!.canonicalCwd,
@@ -2687,20 +7645,39 @@ export class AgyAgentAdapter implements AgentAdapter {
           onBrainPlanTouched: () => {
             brainPlanTouched = true
           },
-          setUnresolvedBrainPlanWrite: (v) => {
-            unresolvedBrainPlanWrite = v
+          onBrainPlanOpStarted: (callId) => {
+            // Invalidate any prior Plan candidate as soon as a subsequent Plan mutation begins so
+            // deferred readback or the newer body is always obtained before publication.
+            latestBrainPlanCandidate = undefined
+            if (activeBrainPlanOpCallIds.size > 0) {
+              // Overlapping Phase-1 Plan ops MUST verify final disk body via storage readback.
+              brainPlanReadbackRequired = true
+            }
+            activeBrainPlanOpCallIds.add(callId)
           },
-          onBrainPlanCaptured: (candidate) => {
-            latestBrainPlanCandidate = candidate
-            brainPlanCaptureFailed = false
-            input.recordWorkflowPlan?.(candidate)
+          onBrainPlanDeferredReadback: (callId) => {
+            activeBrainPlanOpCallIds.delete(callId)
+            latestBrainPlanCandidate = undefined
+            brainPlanReadbackRequired = true
           },
-          onBrainPlanCaptureFailed: () => {
+          onBrainPlanCaptured: (callId, candidate) => {
+            activeBrainPlanOpCallIds.delete(callId)
+            if (activeBrainPlanOpCallIds.size === 0 && !brainPlanReadbackRequired) {
+              latestBrainPlanCandidate = candidate
+              brainPlanCaptureFailed = false
+              input.recordWorkflowPlan?.(candidate)
+            } else {
+              // Another concurrent Plan op was in flight or readback was already latched; defer to verified storage readback.
+              brainPlanReadbackRequired = true
+              latestBrainPlanCandidate = undefined
+            }
+          },
+          onBrainPlanCaptureFailed: (callId) => {
+            if (callId !== undefined) activeBrainPlanOpCallIds.delete(callId)
             brainPlanCaptureFailed = true
             latestBrainPlanCandidate = undefined
             input.recordWorkflowPlanUnavailable?.()
           },
-          stagedMcpOutcomes,
           onReviewAccepted: (obs) => {
             reviewResult = mergeWorkflowReview(reviewResult, obs)
             input.recordWorkflowReview?.(reviewResult)
@@ -2710,19 +7687,44 @@ export class AgyAgentAdapter implements AgentAdapter {
             input.recordWorkflowInputResult?.(inputResult)
           },
           onPlanRetainedAccepted: () => {
-            if (!brainPlanTouched && !unresolvedBrainPlanWrite) {
+            if (!brainPlanTouched && !hasUnresolvedBrainPlanWrite()) {
               planRetained = true
             }
           },
           onOpenPlanPublished: (plan) => {
-            publishedOpenPlan = plan
-            input.recordWorkflowPlan?.(plan)
+            try {
+              publishedPlanMemoryReservation?.resize(
+                computeRetainedPlanTextBytes(plan.text) + plan.nativeId.length * 2,
+              )
+              publishedOpenPlan = plan
+              openPlanPublishFailed = false
+              openPlanUnavailableRecorded = false
+              input.recordWorkflowPlan?.(plan)
+            } catch {
+              openPlanPublishFailed = true
+              publishedOpenPlan = undefined
+              if (!openPlanUnavailableRecorded) {
+                openPlanUnavailableRecorded = true
+                input.recordWorkflowPlanUnavailable?.()
+              }
+            } finally {
+              mcpServer.clearPendingTransferredPlanBytes()
+            }
+          },
+          onOpenPlanPublishFailed: () => {
+            openPlanPublishFailed = true
+            publishedOpenPlan = undefined
+            if (!openPlanUnavailableRecorded) {
+              openPlanUnavailableRecorded = true
+              input.recordWorkflowPlanUnavailable?.()
+            }
           },
           getSessionTitleEmitted: () => sessionTitleEmitted,
           markSessionTitleEmitted: () => {
             sessionTitleEmitted = true
           },
-          seenForegroundMessageIds,
+          recordSeenForegroundMessageId,
+          recordForegroundStepIdx,
           onObservedBackgroundTask: () => {
             observedBackgroundTask = true
           },
@@ -2730,38 +7732,96 @@ export class AgyAgentAdapter implements AgentAdapter {
           observeFiles,
           signal,
         })
+      }
+
+      let stagedPreBindBytes = 0
+      let foreignExecIdsBytes = 0
+      const addKnownForeignExecutionId = (execId: string): void => {
+        if (activeRun!.knownForeignExecutionIds.has(execId)) return
+        const entryBytes = Buffer.byteLength(execId, 'utf8') + 32
+        const nextBytes = foreignExecIdsBytes + entryBytes
+        if (
+          activeRun!.knownForeignExecutionIds.size >= AGY_MAX_FOREIGN_EXECUTION_IDS ||
+          nextBytes > AGY_MAX_FOREIGN_EXECUTION_ID_BYTES
+        ) {
+          throw new AgentExecutionError(
+            'response_too_large',
+            'Antigravity foreign execution tracking exceeded working-memory budget.',
+            false,
+          )
+        }
+        foreignExecIdsMemoryReservation?.resize(nextBytes)
+        foreignExecIdsBytes = nextBytes
+        activeRun!.knownForeignExecutionIds.add(execId)
+      }
+      const clearStagedPreBindNotifications = (): void => {
+        activeRun!.stagedPreBindNotifications.length = 0
+        stagedPreBindBytes = 0
+        stagedPreBindMemoryReservation?.resize(0)
+      }
 
       function* drainStagedPreBindNotes(): Generator<NormalizedAgentEvent> {
         const boundExecId = activeRun!.providerExecutionId
         if (!boundExecId || activeRun!.stagedPreBindNotifications.length === 0) return
         const queued = activeRun!.stagedPreBindNotifications.splice(0)
+        stagedPreBindBytes = 0
+        stagedPreBindMemoryReservation?.resize(0)
         for (const staged of queued) {
-          const params = Reflect.get(staged, 'params')
-          const update = isPlainObject(params) ? params.update : undefined
-          const stagedExecId = isPlainObject(update)
-            ? asString(update.executionId ?? update.execution_id)
-            : undefined
-          if (stagedExecId !== undefined && stagedExecId !== boundExecId) {
+          // Retain arrival-time attribution: execution-less frames observed while a foreign turn
+          // was active, or frames carrying a different execution_id, never replay into this root.
+          if (staged.frame.executionId !== boundExecId) {
             continue
           }
-          yield* projectNote(staged)
+          if (staged.arrivedDuringForeignTurn && staged.frame.executionId === undefined) {
+            continue
+          }
+          const rechecked = recheckValidatedFrameAgainstRootBoundary(
+            staged.frame,
+            mcpServer.pinnedTrajectory,
+            mcpServer.minStepIdx,
+          )
+          yield* projectValidatedFrame(rechecked)
         }
       }
 
-      const admitAndProjectNote = function* (
+      const admitAndProjectValidatedFrame = function* (
         self: AgyAgentAdapter,
-        notification: object,
+        validated: ValidatedAgyFrame,
       ): Generator<NormalizedAgentEvent> {
         if (activeRun!.providerExecutionId && activeRun!.stagedPreBindNotifications.length > 0) {
           yield* drainStagedPreBindNotes()
         }
-        const method = asString(Reflect.get(notification, 'method'))
-        if (method !== 'session/update') return
-        const params = Reflect.get(notification, 'params')
-        const update = isPlainObject(params) ? params.update : undefined
-        if (!isPlainObject(update)) return
-        const sessionUpdate = asString(update.sessionUpdate)
-        if (!sessionUpdate) return
+        if (validated.method !== 'session/update') {
+          return
+        }
+        const update = validated.payload
+        const sessionUpdate = validated.sessionUpdate
+        if (!update || !sessionUpdate) return
+
+        const updateExecId = validated.executionId
+        // Run contradiction guard BEFORE any execution binding, foreign-ID insertion,
+        // staged-frame drain, or projection! Retain ONLY negative MCP revocation for disputed frames.
+        const frameRootContradictsPinned =
+          validated.hasForeignOrInvalidSessionMeta ||
+          validated.executionIdInvalid ||
+          validated.rootEvidenceContradicted ||
+          (updateExecId !== undefined &&
+            activeRun!.providerExecutionId !== undefined &&
+            updateExecId !== activeRun!.providerExecutionId) ||
+          (updateExecId !== undefined && activeRun!.knownForeignExecutionIds.has(updateExecId))
+        if (frameRootContradictsPinned || !validated.isAttributableToCurrentSession) {
+          if (
+            validated.sessionAttribution !== 'pure_foreign' &&
+            (sessionUpdate === 'tool_call' || sessionUpdate === 'tool_call_update')
+          ) {
+            const disputedTokens = validated.tokens.allCanonicalTokens
+            const tcId = validated.toolCallIdInvalid ? undefined : validated.toolCallId
+            if (tcId !== undefined || disputedTokens.length > 0) {
+              mcpServer.revokeDisputedTokens(tcId, disputedTokens)
+            }
+          }
+          return
+        }
 
         const updateMeta = Reflect.get(update, '_meta')
         const steerId =
@@ -2769,19 +7829,13 @@ export class AgyAgentAdapter implements AgentAdapter {
             ? (asString(update.pactSteerInputId) ??
               (isPlainObject(updateMeta) ? asString(updateMeta.pactSteerInputId) : undefined))
             : undefined
-        const updateExecId = asString(update.executionId ?? update.execution_id)
-
-        // Drop updates carrying a known foreign execution_id immediately.
-        if (updateExecId && activeRun!.knownForeignExecutionIds.has(updateExecId)) {
-          return
-        }
 
         // Once root `providerExecutionId` is bound, strictly drop any update carrying a different `execution_id`!
         if (activeRun!.providerExecutionId !== undefined) {
           if (updateExecId !== undefined && updateExecId !== activeRun!.providerExecutionId) {
             return
           }
-          yield* projectNote(notification)
+          yield* projectValidatedFrame(validated)
           return
         }
 
@@ -2793,36 +7847,47 @@ export class AgyAgentAdapter implements AgentAdapter {
             sessionUpdate === 'usage_update') &&
           updateExecId === undefined
         ) {
-          yield* projectNote(notification)
+          yield* projectValidatedFrame(validated)
           return
         }
 
         // Before root `providerExecutionId` is bound:
         if (sessionUpdate === 'user_message_chunk') {
           if (steerId) {
-            yield* projectNote(notification)
+            yield* projectValidatedFrame(validated)
             return
           }
           const chunkIdentity = extractUserChunkPactIdentity(update)
+          const normalizedChunkText = chunkIdentity.text?.trim()
           const expectedPromptContent = currentEnvelope.message.content.trim()
+          // Bind root execution strictly from exact host run receipt (`pactRunId === input.runId`)
+          // or exact normalized full prompt proof — never substring `.includes(...)`!
+          const hasExactHostRunReceipt = chunkIdentity.pactRunId === input.runId
+          const hasExactFullPromptProof =
+            chunkIdentity.pactRunId === undefined &&
+            normalizedChunkText !== undefined &&
+            expectedFullPromptText.length > 0 &&
+            normalizedChunkText === expectedFullPromptText
+          const hasExactPlainPromptProof =
+            updateExecId === undefined &&
+            chunkIdentity.pactRunId === undefined &&
+            normalizedChunkText !== undefined &&
+            expectedPromptContent.length > 0 &&
+            normalizedChunkText === expectedPromptContent
           const matchesRootPrompt =
-            chunkIdentity.pactRunId === input.runId ||
-            (chunkIdentity.pactRunId === undefined &&
-              expectedPromptContent.length > 0 &&
-              chunkIdentity.text !== undefined &&
-              chunkIdentity.text.includes(expectedPromptContent))
+            hasExactHostRunReceipt || hasExactFullPromptProof || hasExactPlainPromptProof
           if (matchesRootPrompt) {
             activeRun!.foreignTurnActiveUntilRootBound = false
-            if (updateExecId) {
+            if (updateExecId && (hasExactHostRunReceipt || hasExactFullPromptProof)) {
               self.bindRootExecutionId(activeRun!, input, updateExecId)
               yield* drainStagedPreBindNotes()
             }
-            yield* projectNote(notification)
+            yield* projectValidatedFrame(validated)
             return
           }
           // Foreign user_message_chunk on the session!
           if (updateExecId) {
-            activeRun!.knownForeignExecutionIds.add(updateExecId)
+            addKnownForeignExecutionId(updateExecId)
           }
           activeRun!.foreignTurnActiveUntilRootBound = true
           return
@@ -2839,103 +7904,307 @@ export class AgyAgentAdapter implements AgentAdapter {
         if (canBindFromInitialUpdate) {
           self.bindRootExecutionId(activeRun!, input, updateExecId)
           yield* drainStagedPreBindNotes()
-          yield* projectNote(notification)
+          yield* projectValidatedFrame(validated)
           return
         }
 
-        if (updateExecId !== undefined || activeRun!.foreignTurnActiveUntilRootBound) {
-          if (activeRun!.stagedPreBindNotifications.length >= 256) {
+        // Execution-less frames arriving while a foreign turn is active belong to the foreign turn
+        // and must NEVER be replayed into our subsequently bound root.
+        if (activeRun!.foreignTurnActiveUntilRootBound && updateExecId === undefined) {
+          return
+        }
+
+        if (updateExecId !== undefined) {
+          const frameBytes = estimateJsonPayloadBytes(
+            validated.message,
+            AGY_MAX_STAGED_PRE_BIND_BYTES,
+          )
+          const nextStagedBytes = stagedPreBindBytes + frameBytes
+          if (
+            activeRun!.stagedPreBindNotifications.length >= AGY_MAX_STAGED_PRE_BIND_FRAMES ||
+            nextStagedBytes > AGY_MAX_STAGED_PRE_BIND_BYTES
+          ) {
             throw new AgentExecutionError(
-              'protocol_error',
-              'Antigravity emitted too many unattributed updates before binding root execution_id.',
+              'response_too_large',
+              'Antigravity pre-bind staged updates exceeded working-memory budget.',
               false,
             )
           }
-          activeRun!.stagedPreBindNotifications.push(notification)
+          stagedPreBindMemoryReservation?.resize(nextStagedBytes)
+          stagedPreBindBytes = nextStagedBytes
+          activeRun!.stagedPreBindNotifications.push({
+            frame: validated,
+            bytes: frameBytes,
+            arrivedDuringForeignTurn: activeRun!.foreignTurnActiveUntilRootBound,
+          })
           return
         }
 
-        yield* projectNote(notification)
+        yield* projectValidatedFrame(validated)
       }
+
+      const routePostCutoffIngress = (item: AgyIngress): void => {
+        if (item.kind === 'server_request') {
+          handleOrderedServerRequest(item)
+          return
+        }
+        if (item.kind !== 'notification') return
+        if (asString(Reflect.get(item.message, 'method')) !== 'session/update') return
+        const params = Reflect.get(item.message, 'params')
+        if (!isPlainObject(params)) return
+        const sid = asString(params.sessionId ?? params.session_id)
+        if (sid !== resolvedSessionId || !isPlainObject(params.update)) return
+        enqueuePostCutoffBackgroundUpdate(params, params.update)
+      }
+
+      const dispatchOrderedIngress = (item: AgyIngress): void => {
+        if (item.kind === 'end') {
+          streamEnded = true
+          if (promptCutoffSeq === undefined) {
+            if (promptRpcResolvedResponse && !promptSettled) {
+              settlePromptFromResponse(promptRpcResolvedResponse)
+            } else if (!promptError) {
+              if (!activeRun!.turnAccepted && connection.isOpen) {
+                void connection
+                  .notify('session/cancel', { sessionId: resolvedSessionId! }, {})
+                  .catch(() => undefined)
+              }
+              promptError ??= new AgentExecutionError(
+                item.cause === 'deadline' ? 'transient_transport' : 'agent_process_crash',
+                item.detail ?? 'Antigravity session stream ended before prompt settlement.',
+                item.cause === 'deadline',
+              )
+              promptSettled = true
+              promptReplyReceived = true
+              abortOutstandingInteractions()
+              if (activeRun) {
+                activeRun.promptReplyReceived = true
+                this.notifyRootExecutionWaiters(activeRun)
+              }
+              promptRpcAbort.abort()
+              notifyEventLoop()
+            }
+          }
+          return
+        }
+
+        if (item.kind === 'reply') {
+          if (item.requestId === promptOp.requestId && promptCutoffSeq === undefined) {
+            promptCutoffSeq = item.seq
+            settlePromptFromResponse(item.message)
+          }
+          return
+        }
+
+        // Strict stdout-order post-cutoff routing: even while foreground is still yielding or
+        // awaiting `waitForRootOutput()` / `recordingTail`, post-cutoff updates flow immediately
+        // into the serialized background observer without blocking or contaminating foreground state.
+        if (promptCutoffSeq !== undefined) {
+          routePostCutoffIngress(item)
+          return
+        }
+
+        // Pre-cutoff ordered frame (`item.seq < promptCutoffSeq`).
+        mcpServer.beginWakeBatch()
+        try {
+          if (item.kind === 'server_request') {
+            handleOrderedServerRequest(item)
+            return
+          }
+          const validated = validateAgyFrame(
+            item,
+            resolvedSessionId,
+            mcpServer.pinnedTrajectory,
+            mcpServer.minStepIdx,
+          )
+          for (const ev of admitAndProjectValidatedFrame(this, validated)) {
+            pushPendingEvent(ev)
+          }
+        } finally {
+          mcpServer.endWakeBatch()
+        }
+      }
+
+      // Zero-gap handoff from `orderedStream` to `subscribeBackground` when retaining background tasks:
+      // 1. Arm `subscribeBackground` FIRST (so no subsequent stdout frame can slip through).
+      // 2. Synchronously drain all buffered post-cutoff frames from `sessionStream.shift()`.
+      // 3. Close `sessionStream`.
+      handoffOrderedStreamToBackground = (): void => {
+        if (!activeRun || unsubscribeBackground) return
+        const trackedRun = activeRun
+        const trackedSessionId = resolvedSessionId!
+        unsubscribeBackground = connection.subscribeBackground((message) => {
+          if (asString(Reflect.get(message, 'method')) !== 'session/update') {
+            return false
+          }
+          const params = Reflect.get(message, 'params')
+          if (!isPlainObject(params)) return false
+          const sid = asString(params.sessionId ?? params.session_id)
+          if (sid !== trackedSessionId) return false
+          const update = params.update
+          if (!isPlainObject(update)) return false
+
+          // Explicitly different execution, session, trajectory, step lower bound, or progressToken
+          // ALWAYS vetoes alias matches!
+          const ownership = validateBackgroundUpdateForRun(
+            params,
+            update,
+            trackedRun,
+            mcpServer.pinnedTrajectory,
+            mcpServer.minStepIdx,
+          )
+          if (!ownership.valid) {
+            return false
+          }
+
+          let hasNewerActiveRun = false
+          for (const other of this.activeRuns.values()) {
+            if (
+              other !== trackedRun &&
+              other.nativeSessionId === trackedSessionId &&
+              !other.rootTerminal
+            ) {
+              hasNewerActiveRun = true
+              break
+            }
+          }
+          if (hasNewerActiveRun) {
+            // Even after a newer foreground Run starts on the same nativeSessionId, allow the older
+            // retained Run to consume updates ONLY when validated owner matches AND aliases/execution match.
+            const rawOutput = isPlainObject(update.rawOutput) ? update.rawOutput : undefined
+            const taskId =
+              asString(update.taskId ?? update.backgroundTaskId) ??
+              (rawOutput ? asString(rawOutput.taskId ?? rawOutput.backgroundTaskId) : undefined)
+            const toolCallId = asString(update.toolCallId ?? update.id)
+            const execId = ownership.executionId
+            const explicitlyOwnedByOldRun =
+              (taskId !== undefined &&
+                (trackedRun.backgroundTaskAliases.has(taskId) ||
+                  trackedRun.activeBackgroundTasks.has(taskId))) ||
+              (toolCallId !== undefined &&
+                (trackedRun.backgroundTaskAliases.has(toolCallId) ||
+                  trackedRun.activeBackgroundTasks.has(toolCallId))) ||
+              (execId !== undefined &&
+                trackedRun.providerExecutionId !== undefined &&
+                execId === trackedRun.providerExecutionId)
+            if (!explicitlyOwnedByOldRun) {
+              return false
+            }
+          }
+          enqueuePostCutoffBackgroundUpdate(params, update, ownership)
+          return true
+        })
+
+        if (sessionStream) {
+          while (true) {
+            const buffered = sessionStream.shift()
+            if (!buffered) break
+            if (promptCutoffSeq !== undefined && buffered.seq <= promptCutoffSeq) continue
+            routePostCutoffIngress(buffered)
+          }
+          sessionStream.close()
+          sessionStream = undefined
+        }
+      }
+
+      // Continuous async frame pump over `sessionStream` with bounded backpressure on `pendingEvents`.
+      const isPumpActive = (): boolean =>
+        !pumpAbort.signal.aborted && !streamEnded && sessionStream !== undefined
+      void (async () => {
+        try {
+          while (isPumpActive()) {
+            if (isPendingEventsAtSoftCap() && promptCutoffSeq === undefined) {
+              // oxlint-disable-next-line no-await-in-loop -- Apply backpressure to ordered stream when generator consumer lags.
+              await new Promise<void>((resolveDrain) => {
+                wakePumpForBackpressure = resolveDrain
+                if (!isPumpActive() || !isPendingEventsAtSoftCap()) {
+                  wakePumpForBackpressure = undefined
+                  resolveDrain()
+                }
+              })
+              if (!isPumpActive()) break
+            }
+            let drainedAny = false
+            const canDrainPendingIngress = (): boolean =>
+              !isPendingEventsAtSoftCap() || promptCutoffSeq !== undefined
+            while (isPumpActive() && canDrainPendingIngress()) {
+              const buffered = sessionStream?.shift()
+              if (!buffered) break
+              drainedAny = true
+              dispatchOrderedIngress(buffered)
+            }
+            if (!isPumpActive() || !sessionStream) break
+            if (drainedAny) continue
+            let nextItem: AgyIngress
+            try {
+              // oxlint-disable-next-line no-await-in-loop -- Continuous ordered ingress pump independent of generator yield backpressure.
+              nextItem = await sessionStream.nextIngress(undefined, pumpAbort.signal)
+            } catch (waitErr) {
+              if (pumpAbort.signal.aborted) break
+              const err = waitErr instanceof Error ? waitErr : new Error(String(waitErr))
+              if (promptCutoffSeq === undefined) {
+                if (!activeRun.turnAccepted && connection.isOpen) {
+                  void connection
+                    .notify('session/cancel', { sessionId: resolvedSessionId }, {})
+                    .catch(() => undefined)
+                }
+                promptError ??= err
+                promptSettled = true
+                promptReplyReceived = true
+                abortOutstandingInteractions()
+                if (activeRun) {
+                  activeRun.promptReplyReceived = true
+                  this.notifyRootExecutionWaiters(activeRun)
+                }
+                promptRpcAbort.abort()
+                notifyEventLoop()
+              }
+              break
+            }
+            dispatchOrderedIngress(nextItem)
+          }
+        } catch (err) {
+          pumpError ??= err instanceof Error ? err : new Error(String(err))
+          promptError ??= pumpError
+          promptSettled = true
+          promptReplyReceived = true
+          abortOutstandingInteractions()
+          if (activeRun) {
+            activeRun.promptReplyReceived = true
+            this.notifyRootExecutionWaiters(activeRun)
+          }
+          promptRpcAbort.abort()
+          notifyEventLoop()
+        }
+      })()
 
       try {
         while (true) {
           while (pendingEvents.length > 0) {
-            yield pendingEvents.shift()!
+            const nextEv = shiftPendingEvent()
+            if (nextEv) yield nextEv
           }
           if (activeRun.providerExecutionId && activeRun.stagedPreBindNotifications.length > 0) {
             for (const ev of drainStagedPreBindNotes()) {
               yield ev
             }
           }
-          if (waiterNotes.length > 0) {
-            while (waiterNotes.length > 0) {
-              for (const ev of admitAndProjectNote(this, waiterNotes.shift()!)) {
-                yield ev
-              }
-            }
-            continue
-          }
           if (promptSettled) {
-            // Flush one microtask tick so any notification that resolved `sessionStream.next()`
-            // in the same stdout chunk before `session/prompt` settled pushes into `waiterNotes`.
-            // oxlint-disable-next-line no-await-in-loop -- Single microtask flush on prompt settlement.
-            await Promise.resolve()
-            // Drain any remaining notifications queued before `session/prompt` resolved.
-            while (true) {
-              const trailing = waiterNotes.shift() ?? sessionStream.shift()
-              if (!trailing) break
-              for (const ev of admitAndProjectNote(this, trailing)) {
-                yield ev
-              }
+            while (pendingEvents.length > 0) {
+              const nextEv = shiftPendingEvent()
+              if (nextEv) yield nextEv
             }
             if (activeRun.providerExecutionId && activeRun.stagedPreBindNotifications.length > 0) {
               for (const ev of drainStagedPreBindNotes()) {
                 yield ev
               }
             }
-            while (pendingEvents.length > 0) {
-              yield pendingEvents.shift()!
-            }
             break
           }
-          if (waiterError) {
-            const err = waiterError
-            waiterError = undefined
-            // Silence / acceptance deadline or disconnect expired before prompt reply!
-            if (!activeRun.turnAccepted && connection.isOpen) {
-              void connection
-                .notify('session/cancel', { sessionId: resolvedSessionId }, {})
-                .catch(() => undefined)
-            }
-            promptRpcAbort.abort()
-            promptError ??= err
-            break
-          }
-
-          const acceptTimeoutMs = activeRun.turnAccepted ? undefined : AGY_PROMPT_ACCEPT_TIMEOUT_MS
-          const wakeupPromise = new Promise<'wakeup'>((resolveWake) => {
-            wakeEventLoop = () => resolveWake('wakeup')
+          // oxlint-disable-next-line no-await-in-loop -- Generator yields events as the independent frame pump pushes them.
+          await new Promise<void>((resolveWake) => {
+            wakeEventLoop = resolveWake
           })
-          if (!pendingNextNote) {
-            const created = sessionStream.next(acceptTimeoutMs, promptRpcAbort.signal).then(
-              (note): StreamNextOutcome => {
-                waiterNotes.push(note)
-                if (pendingNextNote === created) pendingNextNote = undefined
-                return { kind: 'note' }
-              },
-              (err: unknown): StreamNextOutcome => {
-                const error = err instanceof Error ? err : new Error(String(err))
-                waiterError ??= error
-                if (pendingNextNote === created) pendingNextNote = undefined
-                return { kind: 'error', error }
-              },
-            )
-            pendingNextNote = created
-          }
-
-          // oxlint-disable-next-line no-await-in-loop -- Turn stream processes ordered notifications one by one.
-          await Promise.race([wakeupPromise, pendingNextNote])
         }
 
         // Fence steer dispatch BEFORE releasing the root Turn, and verify any dispatched steer receipts.
@@ -2947,9 +8216,12 @@ export class AgyAgentAdapter implements AgentAdapter {
           cancelGraceTimer = undefined
         }
 
+        if (pumpError) {
+          promptError = pumpError
+        }
         if (promptError) {
           promptRpcAbort.abort()
-          const physical = await awaitPhysicalCompletionBounded(promptOp.physicalCompletion)
+          const physical = await awaitPhysicalCompletionBounded(promptOp.physicalOutcome)
           if (physical === 'not_sent' && !rootFirstByteWritten) {
             rootConfirmedNotSent = true
             input.recordDispatch?.('rejected', resolvedSessionId, activeExecutorId)
@@ -2977,6 +8249,10 @@ export class AgyAgentAdapter implements AgentAdapter {
                 'Antigravity root prompt was withheld by the recovery dispatch guard before any byte was written.',
               )
             }
+          } else if (physical === 'invalid_reply') {
+            reportUnknown(
+              'Antigravity received an invalid session/prompt response after request bytes were written.',
+            )
           } else {
             reportUnknown(
               userCancelRequested
@@ -2989,34 +8265,26 @@ export class AgyAgentAdapter implements AgentAdapter {
           throw promptError
         }
 
-        const rpcError = promptResponse ? Reflect.get(promptResponse, 'error') : undefined
-        const rpcResult = promptResponse ? Reflect.get(promptResponse, 'result') : undefined
-        if (rpcError || !isPlainObject(rpcResult)) {
-          reportUnknown('Antigravity returned an invalid session/prompt response.')
-          throw new AgentExecutionError(
-            'protocol_error',
-            rpcError
-              ? safeNativePermissionText(JSON.stringify(rpcError), 240)
-              : 'Antigravity returned an invalid session/prompt result.',
-            false,
-          )
+        const parsedTerminal =
+          parsedPromptTerminalReply ??
+          parseAgyPromptTerminalReply(promptResponse, resolvedSessionId)
+        if (!parsedTerminal.ok) {
+          reportUnknown(parsedTerminal.reason)
+          throw new AgentExecutionError('protocol_error', parsedTerminal.message, false)
         }
-
-        const rawStopReason = asString(rpcResult.stopReason)?.trim()
-        if (!rawStopReason || !VALID_ACP_STOP_REASONS.has(rawStopReason)) {
-          reportUnknown('Antigravity returned a session/prompt result without a valid stopReason.')
-          throw new AgentExecutionError(
-            'protocol_error',
-            rawStopReason
-              ? `Antigravity returned an unrecognized session/prompt stopReason "${safeNativePermissionText(rawStopReason, 80)}".`
-              : 'Antigravity returned a session/prompt result without a stopReason.',
-            false,
-          )
-        }
-        const stopReason = rawStopReason
-
-        const respExecId = asString(rpcResult.executionId ?? rpcResult.execution_id)
+        const stopReason = parsedTerminal.stopReason
+        const respExecId = parsedTerminal.executionId
         if (respExecId) {
+          if (activeRun.knownForeignExecutionIds.has(respExecId)) {
+            reportUnknown(
+              'Antigravity root session/prompt execution_id matched a known foreign execution.',
+            )
+            throw new AgentExecutionError(
+              'protocol_error',
+              'Antigravity root session/prompt execution_id matched a known foreign execution.',
+              false,
+            )
+          }
           if (activeRun.providerExecutionId && activeRun.providerExecutionId !== respExecId) {
             reportUnknown(
               'Antigravity root session/prompt execution_id conflicted with streamed updates.',
@@ -3036,7 +8304,30 @@ export class AgyAgentAdapter implements AgentAdapter {
             yield ev
           }
         }
-        activeRun.stagedPreBindNotifications.length = 0
+        if (!activeRun.providerExecutionId && activeRun.stagedPreBindNotifications.length > 0) {
+          const hasSubstantiveUnresolved = activeRun.stagedPreBindNotifications.some((staged) => {
+            const execId = staged.frame.executionId
+            if (execId !== undefined && activeRun!.knownForeignExecutionIds.has(execId)) {
+              return false
+            }
+            if (staged.arrivedDuringForeignTurn) return false
+            const kind = staged.frame.sessionUpdate
+            return (
+              kind === 'agent_message_chunk' ||
+              kind === 'agent_thought_chunk' ||
+              kind === 'tool_call' ||
+              kind === 'tool_call_update' ||
+              kind === 'background_task_completed'
+            )
+          })
+          if (hasSubstantiveUnresolved) {
+            unresolvedPreBindOutput = true
+            reportUnknown(
+              'Antigravity terminal reply completed without binding execution_id for staged updates; output completeness cannot be confirmed.',
+            )
+          }
+        }
+        clearStagedPreBindNotifications()
 
         if (!activeRun.turnAccepted) {
           activeRun.turnAccepted = true
@@ -3072,34 +8363,69 @@ export class AgyAgentAdapter implements AgentAdapter {
         }
         reasoningItems.clear()
 
-        // If an incomplete brain plan write never settled, read or mark unavailable.
-        if (planModeStage && latestBrainPlanCandidate === undefined && !brainPlanCaptureFailed) {
-          const fallbackArtifactPath = join(
-            this.primaryAppDataDir,
-            'brain',
-            resolvedSessionId,
-            'implementation_plan.md',
-          )
-          if (brainPlanTouched && !unresolvedBrainPlanWrite) {
-            const diskText = await readBoundedMarkdownArtifact(
-              fallbackArtifactPath,
-              postReplyCheckSignal,
-            ).catch(() => undefined)
-            if (diskText?.trim()) {
+        // If a brain plan write was touched and did not capture inline (or readback was latched due to
+        // overlapping ops / deferred edit readback), inspect through the isolated storage client
+        // (NEVER direct Utility `fs.open`!) for the SAME execution.
+        if (
+          planModeStage &&
+          (latestBrainPlanCandidate === undefined || brainPlanReadbackRequired) &&
+          !brainPlanCaptureFailed
+        ) {
+          if (brainPlanTouched && !hasUnresolvedBrainPlanWrite()) {
+            const inspected = this.options.storageClient?.inspectRun
+              ? await this.options.storageClient
+                  .inspectRun(
+                    {
+                      appDataDir: this.primaryAppDataDir,
+                      cwd: lease.canonicalCwd,
+                      nativeSessionId: resolvedSessionId,
+                      nativeTurnId: activeRun.providerExecutionId ?? activeRun.nativeTurnId,
+                      includePlan: true,
+                    },
+                    postReplyCheckSignal,
+                  )
+                  .catch(() => undefined)
+              : await this.getOwnedForkFiles()
+                  .inspectAgyRun(
+                    {
+                      cwd: lease.canonicalCwd,
+                      storageRoot: this.primaryAppDataDir,
+                      nativeSessionId: resolvedSessionId,
+                      nativeTurnId: activeRun.providerExecutionId ?? activeRun.nativeTurnId,
+                      includePlan: true,
+                    },
+                    postReplyCheckSignal,
+                  )
+                  .catch(() => undefined)
+            const terminal = inspected?.exists ? inspected.terminalState : undefined
+            const matchesExecution =
+              terminal !== undefined &&
+              !terminal.planUnavailable &&
+              (activeRun.providerExecutionId === undefined ||
+                terminal.executionId === activeRun.providerExecutionId)
+            if (matchesExecution && terminal.plan?.text.trim()) {
               latestBrainPlanCandidate = {
-                nativeId: `${resolvedSessionId}:implementation_plan`,
-                text: diskText,
+                nativeId:
+                  terminal.plan.nativeId ||
+                  buildBoundedNativePlanId(resolvedSessionId, 'implementation_plan'),
+                text: terminal.plan.text,
               }
+              brainPlanReadbackRequired = false
               input.recordWorkflowPlan?.(latestBrainPlanCandidate)
+            } else {
+              brainPlanCaptureFailed = true
+              latestBrainPlanCandidate = undefined
+              input.recordWorkflowPlanUnavailable?.()
             }
           }
         }
 
         await recordingTail
         await input.waitForRootOutput?.()
+        await postCutoffBackgroundTail
 
         const finalSnapshot = answer.finalize()
-        if (finalSnapshot !== undefined) {
+        if (finalSnapshot !== undefined && !unresolvedPreBindOutput) {
           yield {
             agentId: 'agy',
             type: 'text.completed',
@@ -3118,30 +8444,61 @@ export class AgyAgentAdapter implements AgentAdapter {
               ? 'completed'
               : 'failed'
 
-        // Promote collaboration artifacts ONLY after normal root completion & settlement (`B6`).
-        if (outcome === 'completed' && !unknownEffectsReported) {
+        // Record negative plan unavailability OUTSIDE `!unknownEffectsReported` so recovery is never
+        // suppressed when an open-mode final `publish_plan` was acknowledged without confirmed ACP promotion
+        // or when a Phase-1 brain plan write failed.
+        if (outcome === 'completed') {
           if (planModeStage) {
-            if (unresolvedBrainPlanWrite || brainPlanCaptureFailed) {
+            if (
+              hasUnresolvedBrainPlanWrite() ||
+              brainPlanCaptureFailed ||
+              brainPlanReadbackRequired
+            ) {
               input.recordWorkflowPlanUnavailable?.()
-            } else if (latestBrainPlanCandidate) {
-              yield {
-                agentId: 'agy',
-                type: 'collaboration.plan',
-                turnId: input.runId,
-                nativeId: latestBrainPlanCandidate.nativeId,
-                text: latestBrainPlanCandidate.text,
-              }
-            } else if (planRetained && authorization?.planReference) {
-              const planDoc = authorization.planReference.document
-              input.recordWorkflowPlanRetained?.({
-                nativeId: `${resolvedSessionId}:retained`,
-                sha256: planDoc.sha256,
-                bytes: planDoc.bytes,
-                chars: planDoc.chars,
-                confirmation: 'native_root_settled_v1',
-              })
             }
-          } else if (publishedOpenPlan) {
+          } else if (
+            openPlanPublishFailed ||
+            (mcpServer.hasAcknowledgedFinalOpenPlan && !publishedOpenPlan)
+          ) {
+            if (!openPlanUnavailableRecorded) {
+              openPlanUnavailableRecorded = true
+              input.recordWorkflowPlanUnavailable?.()
+            }
+          }
+        }
+
+        // Promote collaboration artifacts ONLY after normal root completion & settlement (`B6`).
+        if (outcome === 'completed' && !unknownEffectsReported && !unresolvedPreBindOutput) {
+          if (planModeStage) {
+            if (
+              !hasUnresolvedBrainPlanWrite() &&
+              !brainPlanCaptureFailed &&
+              !brainPlanReadbackRequired
+            ) {
+              if (latestBrainPlanCandidate) {
+                yield {
+                  agentId: 'agy',
+                  type: 'collaboration.plan',
+                  turnId: input.runId,
+                  nativeId: latestBrainPlanCandidate.nativeId,
+                  text: latestBrainPlanCandidate.text,
+                }
+              } else if (planRetained && authorization?.planReference) {
+                const planDoc = authorization.planReference.document
+                input.recordWorkflowPlanRetained?.({
+                  nativeId: buildBoundedNativePlanId(resolvedSessionId, 'retained'),
+                  sha256: planDoc.sha256,
+                  bytes: planDoc.bytes,
+                  chars: planDoc.chars,
+                  confirmation: 'native_root_settled_v1',
+                })
+              }
+            }
+          } else if (
+            !openPlanPublishFailed &&
+            !(mcpServer.hasAcknowledgedFinalOpenPlan && !publishedOpenPlan) &&
+            publishedOpenPlan
+          ) {
             yield {
               agentId: 'agy',
               type: 'collaboration.plan',
@@ -3164,51 +8521,79 @@ export class AgyAgentAdapter implements AgentAdapter {
         rootTerminal = true
         activeRun.rootTerminal = true
 
-        this.recordEvidence(
-          input,
-          resolvedSessionId,
-          activeExecutorId,
-          {
-            kind: 'ended',
-            source: 'live_terminal',
-            outcome,
-            ...(answer.text
-              ? {
-                  output: {
-                    outputId: answer.outputId,
-                    text: answer.text,
-                    completeness: outcome === 'completed' ? 'complete' : 'partial',
-                    ...(outcome === 'completed' && latestBrainPlanCandidate
-                      ? { plan: latestBrainPlanCandidate }
-                      : {}),
-                    ...(outcome === 'completed' && reviewResult
-                      ? { reviewVerdict: reviewResult.verdict, reviewResult }
-                      : {}),
-                    ...(outcome === 'completed' && inputResult
-                      ? { inputOutcome: inputResult.outcome, inputResult }
-                      : {}),
-                  },
-                }
-              : {}),
-          },
-          activeRun.nativeTurnId,
-        )
-
-        if (
-          !unknownEffectsReported &&
-          !activeRun.backgroundUnconfirmed &&
-          activeRun.activeBackgroundTasks.size === 0
-        ) {
-          nativeFileChangesSettled(input, 'settled', 'native_work_drained')
+        const settledPlan = latestBrainPlanCandidate ?? publishedOpenPlan
+        const outputCompleteness: 'complete' | 'partial' =
+          outcome === 'completed' && !unresolvedPreBindOutput ? 'complete' : 'partial'
+        const terminalEvidence: Parameters<AgyAgentAdapter['recordEvidence']>[3] = {
+          kind: 'ended',
+          source: 'live_terminal',
+          outcome,
+          ...(answer.text || (outcome === 'completed' && !unresolvedPreBindOutput && settledPlan)
+            ? {
+                output: {
+                  outputId: answer.outputId,
+                  text: answer.text,
+                  completeness: outputCompleteness,
+                  ...(outcome === 'completed' && !unresolvedPreBindOutput && settledPlan
+                    ? { plan: settledPlan }
+                    : {}),
+                  ...(outcome === 'completed' && !unresolvedPreBindOutput && reviewResult
+                    ? { reviewVerdict: reviewResult.verdict, reviewResult }
+                    : {}),
+                  ...(outcome === 'completed' && !unresolvedPreBindOutput && inputResult
+                    ? { inputOutcome: inputResult.outcome, inputResult }
+                    : {}),
+                },
+              }
+            : {}),
         }
 
-        yield {
-          agentId: 'agy',
-          type: 'turn.completed',
-          turnId: input.runId,
-          outcome,
+        if (unresolvedPreBindOutput && outcome === 'completed') {
+          // When unresolved substantive pre-bind frames remain after emitting a visible prefix,
+          // emit `turn.completed { outcome: 'failed' }` (without `text.completed`) so SQLite marks
+          // the truncated prefix `incomplete`, then record the independently verified native
+          // outcome with `completeness: 'partial'` so `nativeOutcome` stays preserved.
+          yield {
+            agentId: 'agy',
+            type: 'turn.completed',
+            turnId: input.runId,
+            outcome: 'failed',
+          }
+          this.recordEvidence(
+            input,
+            resolvedSessionId,
+            activeExecutorId,
+            terminalEvidence,
+            activeRun.nativeTurnId,
+          )
+        } else {
+          this.recordEvidence(
+            input,
+            resolvedSessionId,
+            activeExecutorId,
+            terminalEvidence,
+            activeRun.nativeTurnId,
+          )
+
+          if (
+            !unknownEffectsReported &&
+            !unresolvedPreBindOutput &&
+            !activeRun.backgroundUnconfirmed &&
+            activeRun.activeBackgroundTasks.size === 0
+          ) {
+            nativeFileChangesSettled(input, 'settled', 'native_work_drained')
+          }
+
+          yield {
+            agentId: 'agy',
+            type: 'turn.completed',
+            turnId: input.runId,
+            outcome,
+          }
         }
       } finally {
+        clearPendingEvents()
+        clearStagedPreBindNotifications()
         answer.dispose()
       }
     } catch (error) {
@@ -3222,10 +8607,10 @@ export class AgyAgentAdapter implements AgentAdapter {
         cancelGraceTimer = undefined
       }
       promptRpcAbort.abort()
+      stopStreamPump?.()
       this.invalidateNonTerminalEvidence(input.runId, resolvedSessionId)
       await recordingTail.catch(() => undefined)
-      const confirmedZeroBytesSent =
-        (!promptEnteredTransport && !rootFirstByteWritten) || rootConfirmedNotSent
+      const confirmedZeroBytesSent = isConfirmedZeroBytesSent()
       if (!unknownEffectsReported) {
         if (confirmedZeroBytesSent) {
           if (activeRun) {
@@ -3240,43 +8625,7 @@ export class AgyAgentAdapter implements AgentAdapter {
       }
       throw error
     } finally {
-      if (cancelGraceTimer !== undefined) {
-        clearTimeout(cancelGraceTimer)
-        cancelGraceTimer = undefined
-      }
-      promptRpcAbort.abort()
-      foregroundReleased = true
-      if (activeRun) {
-        activeRun.foregroundReleased = true
-        this.notifyRootExecutionWaiters(activeRun)
-      }
-      this.invalidateNonTerminalEvidence(input.runId, resolvedSessionId)
-      promptMemoryReservation?.release()
-      toolStateMemoryReservation?.release()
-      for (const ctrl of interactionControllers) ctrl.abort()
-      interactionControllers.clear()
-      serverRequestOwner?.dispose()
-      sessionStream?.close()
-      if (!activeRun || activeRun.activeBackgroundTasks.size === 0) {
-        unsubscribeBackground?.()
-        retireSourceReader()
-        observation.abort()
-        if (activeRun) this.activeRuns.delete(input.runId)
-        await mcpServer.close().catch(() => undefined)
-        lease?.release()
-      } else {
-        // Keep background listener & lease until active background tasks settle or pool disposes.
-        const retainedRun = activeRun
-        const retainedLease = lease
-        const cleanupRetained = (): void => {
-          unsubscribeBackground?.()
-          retireSourceReader()
-          this.activeRuns.delete(input.runId)
-          void mcpServer.close().catch(() => undefined)
-          retainedLease?.release()
-        }
-        retainedRun.observation.signal.addEventListener('abort', cleanupRetained, { once: true })
-      }
+      await finalizeRun({ emergency: false })
     }
   }
 
@@ -3387,7 +8736,7 @@ export class AgyAgentAdapter implements AgentAdapter {
       }
 
       if (rpcFailure) {
-        const physical = await awaitPhysicalCompletionBounded(op.physicalCompletion)
+        const physical = await awaitPhysicalCompletionBounded(op.physicalOutcome)
         if (physical === 'not_sent' && !entry.dispatched) {
           entry.settled = true
           activeRun.steeredInputs.delete(steerInput.inputId)
@@ -3566,7 +8915,8 @@ export class AgyAgentAdapter implements AgentAdapter {
       if (
         cached &&
         cached.kind === 'ended' &&
-        (!input.executorId || cached.identity.executorId === input.executorId)
+        (!input.executorId || cached.identity.executorId === input.executorId) &&
+        !(input.inspectMissingPlan && !cached.output?.plan)
       ) {
         return {
           ...cached,
@@ -3810,6 +9160,7 @@ export class AgyAgentAdapter implements AgentAdapter {
     })
     const executorId = lease.connection.executorId
     let candidateSessionId = input.nativeSessionId
+    let creationPossiblyDelivered = Boolean(candidateSessionId)
     let controlOwner: ReturnType<typeof this.registerControlOperationServerRequests> | undefined
     try {
       await lease.ensureInitialized(signal)
@@ -3825,13 +9176,19 @@ export class AgyAgentAdapter implements AgentAdapter {
       })
       if (!candidateSessionId) {
         await input.onNativeCreationDispatched?.(executorId)
-        candidateSessionId = await this.allocateZeroTurnSessionShell(
-          lease.connection,
-          lease.canonicalCwd,
-          signal,
-          (allocatedId) => controlOwner?.updateSessionId(allocatedId),
-        )
-        await input.onNativeSessionCreated?.(candidateSessionId)
+        candidateSessionId = await this.allocateZeroTurnSessionShell(lease, signal, {
+          onCreationDispatched: () => {
+            creationPossiblyDelivered = true
+          },
+          onCreationRejectedByServer: () => {
+            creationPossiblyDelivered = false
+          },
+          onSessionAllocated: async (allocatedId) => {
+            candidateSessionId = allocatedId
+            controlOwner?.updateSessionId(allocatedId)
+            await input.onNativeSessionCreated?.(allocatedId)
+          },
+        })
       }
 
       const resolveImage = input.resolveImage
@@ -3863,16 +9220,13 @@ export class AgyAgentAdapter implements AgentAdapter {
       )
 
       // Cold `session/load` + `session/close` verification (0 model invocations!).
-      await this.verifyZeroTurnSessionLoad(
-        lease.connection,
-        lease.canonicalCwd,
-        candidateSessionId,
-        signal,
-        {
-          expectReplaySteps: written.stepCount > 0,
-          forbidToolUpdates: true,
+      await this.verifyZeroTurnSessionLoad(lease, candidateSessionId, signal, {
+        expectReplaySteps: written.stepCount > 0,
+        forbidToolUpdates: true,
+        onServerRequest: (req) => {
+          controlOwner?.handleServerRequest(req.message)
         },
-      )
+      })
       controlOwner.dispose()
       await lease.disposeIfIdle()
 
@@ -3953,7 +9307,7 @@ export class AgyAgentAdapter implements AgentAdapter {
       input.reportNativeWork?.({
         executorId,
         ...(candidateSessionId ? { nativeSessionId: candidateSessionId } : {}),
-        state: candidateSessionId ? 'unknown' : 'settled',
+        state: candidateSessionId || creationPossiblyDelivered ? 'unknown' : 'settled',
       })
       throw error
     } finally {
@@ -4019,6 +9373,7 @@ export class AgyAgentAdapter implements AgentAdapter {
     })
     const executorId = lease.connection.executorId
     let candidateSessionId = input.nativeSessionId
+    let creationPossiblyDelivered = Boolean(candidateSessionId)
     let controlOwner: ReturnType<typeof this.registerControlOperationServerRequests> | undefined
     try {
       await lease.ensureInitialized(signal)
@@ -4034,13 +9389,19 @@ export class AgyAgentAdapter implements AgentAdapter {
       })
       await input.onDispatched(executorId)
       if (!candidateSessionId) {
-        candidateSessionId = await this.allocateZeroTurnSessionShell(
-          lease.connection,
-          lease.canonicalCwd,
-          signal,
-          (allocatedId) => controlOwner?.updateSessionId(allocatedId),
-        )
-        await input.onCandidate(candidateSessionId)
+        candidateSessionId = await this.allocateZeroTurnSessionShell(lease, signal, {
+          onCreationDispatched: () => {
+            creationPossiblyDelivered = true
+          },
+          onCreationRejectedByServer: () => {
+            creationPossiblyDelivered = false
+          },
+          onSessionAllocated: async (allocatedId) => {
+            candidateSessionId = allocatedId
+            controlOwner?.updateSessionId(allocatedId)
+            await input.onCandidate(allocatedId)
+          },
+        })
       }
       const witness = await this.options.storageClient.writeFork(
         {
@@ -4058,16 +9419,13 @@ export class AgyAgentAdapter implements AgentAdapter {
       await input.onCandidate(candidateSessionId, witness)
 
       // Cold `session/load` + `session/close` verification with zero model input.
-      await this.verifyZeroTurnSessionLoad(
-        lease.connection,
-        lease.canonicalCwd,
-        candidateSessionId,
-        signal,
-        {
-          expectReplaySteps: (witness.candidatePrefixRecords ?? input.source.prefixRecords) > 0,
-          forbidToolUpdates: false,
+      await this.verifyZeroTurnSessionLoad(lease, candidateSessionId, signal, {
+        expectReplaySteps: (witness.candidatePrefixRecords ?? input.source.prefixRecords) > 0,
+        forbidToolUpdates: false,
+        onServerRequest: (req) => {
+          controlOwner?.handleServerRequest(req.message)
         },
-      )
+      })
       controlOwner.dispose()
       await lease.disposeIfIdle()
 
@@ -4084,7 +9442,7 @@ export class AgyAgentAdapter implements AgentAdapter {
     } catch (error) {
       input.reportNativeWork({
         executorId,
-        state: candidateSessionId ? 'unknown' : 'settled',
+        state: candidateSessionId || creationPossiblyDelivered ? 'unknown' : 'settled',
       })
       throw error
     } finally {
@@ -4128,17 +9486,13 @@ export class AgyAgentAdapter implements AgentAdapter {
         signal,
       })
       await input.onDispatched(executorId)
-      await this.verifyZeroTurnSessionLoad(
-        lease.connection,
-        lease.canonicalCwd,
-        input.nativeSessionId,
-        signal,
-        {
-          expectReplaySteps:
-            (input.witness.candidatePrefixRecords ?? input.source.prefixRecords) > 0,
-          forbidToolUpdates: false,
+      await this.verifyZeroTurnSessionLoad(lease, input.nativeSessionId, signal, {
+        expectReplaySteps: (input.witness.candidatePrefixRecords ?? input.source.prefixRecords) > 0,
+        forbidToolUpdates: false,
+        onServerRequest: (req) => {
+          controlOwner?.handleServerRequest(req.message)
         },
-      )
+      })
       controlOwner.dispose()
       await lease.disposeIfIdle()
 
@@ -4161,49 +9515,176 @@ export class AgyAgentAdapter implements AgentAdapter {
     }
   }
 
+  async closeZeroInputSessions(deadlineAt?: number): Promise<void> {
+    const ownedRuns = [...this.ownedRunHandles]
+    if (ownedRuns.length === 0) return
+    await Promise.allSettled(ownedRuns.map((handle) => handle.closeZeroInputSession(deadlineAt)))
+  }
+
   async dispose(shutdown?: AgentShutdownSettlement): Promise<void> {
     if (this.ownsPool && shutdown?.flushDeadlineAt !== undefined) {
       this.pool.capShutdownDeadline(shutdown.flushDeadlineAt)
     }
-    if (shutdown?.foregroundSettlement) {
-      const remaining = Math.max(0, shutdown.flushDeadlineAt - Date.now())
-      await Promise.race([
-        shutdown.foregroundSettlement,
-        new Promise<void>((r) => setTimeout(r, remaining)),
-      ]).catch(() => undefined)
+    if (this.disposalPromise) {
+      return this.disposalPromise
     }
-    this.disposed = true
-    this.unsubscribePoolPhysicalOps()
-    this.nativeChecks.cancel()
-    for (const run of this.activeRuns.values()) {
-      this.notifyRootExecutionWaiters(run)
-      run.observation.abort()
-    }
-    this.activeRuns.clear()
-    this.sessionModes.clear()
-    this.nativeRebuildReceipts.clear()
-    this.nativeEvidence.clear()
-    this.evidenceCacheWork.release()
-    await Promise.all([
-      this.nativeChecks.join().catch(() => undefined),
-      ...(this.ownsPool ? [this.pool.dispose(shutdown?.flushDeadlineAt)] : []),
-    ])
+    const runDisposal = (async () => {
+      if (shutdown?.foregroundSettlement) {
+        const remaining = Math.max(0, shutdown.flushDeadlineAt - Date.now())
+        await Promise.race([
+          shutdown.foregroundSettlement,
+          new Promise<void>((r) => setTimeout(r, remaining)),
+        ]).catch(() => undefined)
+      }
+      this.disposed = true
+      this.unsubscribePoolPhysicalOps()
+      this.unsubscribeStoragePhysicalOps?.()
+      this.nativeChecks.cancel()
+      const ownedRuns = [...this.ownedRunHandles]
+      for (const handle of ownedRuns) {
+        handle.cancel()
+      }
+      // Give any confirmed zero-byte fresh sessions their single bounded `session/close` chance
+      // BEFORE tearing down the ACP connection pool or releasing their leases.
+      if (ownedRuns.length > 0) {
+        await Promise.allSettled(
+          ownedRuns.map((handle) => handle.closeZeroInputSession(shutdown?.flushDeadlineAt)),
+        )
+      }
+      for (const run of this.activeRuns.values()) {
+        this.notifyRootExecutionWaiters(run)
+        run.observation.abort()
+      }
+      this.activeRuns.clear()
+      this.sessionModes.clear()
+      this.nativeRebuildReceipts.clear()
+      this.nativeEvidence.clear()
+      this.evidenceCacheWork.release()
+      const joinOwnedRuns = async (): Promise<void> => {
+        if (ownedRuns.length === 0) return
+        const waitMs =
+          shutdown?.flushDeadlineAt !== undefined
+            ? Math.max(0, shutdown.flushDeadlineAt - Date.now())
+            : AGY_PHYSICAL_SETTLEMENT_GRACE_MS
+        let settledInTime = false
+        let timer: ReturnType<typeof setTimeout> | undefined
+        try {
+          await Promise.race([
+            Promise.allSettled(ownedRuns.map((handle) => handle.finalized)).then(() => {
+              settledInTime = true
+              return undefined
+            }),
+            new Promise<void>((resolve) => {
+              timer = setTimeout(resolve, waitMs)
+              timer.unref?.()
+            }),
+          ])
+        } finally {
+          if (timer !== undefined) clearTimeout(timer)
+        }
+        if (!settledInTime) {
+          const lingering = ownedRuns.filter((handle) => this.ownedRunHandles.has(handle))
+          await Promise.allSettled(lingering.map((handle) => handle.forceCleanup()))
+          if (lingering.length > 0 && shutdown?.flushDeadlineAt !== undefined) {
+            throw new AgentExecutionError(
+              'agent_process_crash',
+              'Antigravity adapter disposal timed out waiting for active Run finalization.',
+              false,
+            )
+          }
+        }
+      }
+      const ownedForksToDispose = [...this.activeOwnedForkFiles]
+      this.ownedForkFiles = undefined
+      const results = await Promise.allSettled([
+        joinOwnedRuns(),
+        this.nativeChecks.join().catch(() => undefined),
+        this.skillProbeOwner.dispose(shutdown?.flushDeadlineAt),
+        ...ownedForksToDispose.map(async (forkFiles) => {
+          await forkFiles.dispose(shutdown?.flushDeadlineAt)
+          this.activeOwnedForkFiles.delete(forkFiles)
+        }),
+        ...(this.ownsPool ? [this.pool.dispose(shutdown?.flushDeadlineAt)] : []),
+      ])
+      const firstFailure = results.find(
+        (result): result is PromiseRejectedResult => result.status === 'rejected',
+      )
+      if (firstFailure) {
+        throw firstFailure.reason
+      }
+    })()
+    const trackedDisposal = runDisposal.catch((error: unknown) => {
+      if (this.disposalPromise === trackedDisposal) {
+        this.disposalPromise = undefined
+      }
+      throw error
+    })
+    this.disposalPromise = trackedDisposal
+    return trackedDisposal
   }
 
   private async allocateZeroTurnSessionShell(
-    connection: AgyAcpConnection,
-    canonicalCwd: string,
+    lease: AgyPoolLease,
     signal: AbortSignal,
-    onSessionAllocated?: (sessionId: string) => void,
+    options: {
+      onSessionAllocated?: (sessionId: string) => void | Promise<void>
+      onCreationDispatched?: () => void
+      onCreationRejectedByServer?: () => void
+    } = {},
   ): Promise<string> {
-    const newResp = await connection.request(
+    let creationDispatched = false
+    const newOp = lease.connection.requestOwned(
       'session/new',
-      { cwd: canonicalCwd, mcpServers: [] },
-      { timeoutMs: AGY_CONTROL_RPC_TIMEOUT_MS, signal },
+      { cwd: lease.canonicalCwd, mcpServers: [] },
+      {
+        timeoutMs: AGY_SESSION_LIFECYCLE_RPC_TIMEOUT_MS,
+        signal,
+        canDispatch: () => !signal.aborted && !this.disposed,
+        onDispatch: () => {
+          creationDispatched = true
+          options.onCreationDispatched?.()
+        },
+      },
     )
-    const newError = Reflect.get(newResp, 'error')
-    const newResult = Reflect.get(newResp, 'result')
-    if (newError || !isPlainObject(newResult)) {
+    let newResp: object
+    try {
+      newResp = await newOp.result
+    } catch (error) {
+      if (!creationDispatched) {
+        const physical = await Promise.race([
+          newOp.physicalOutcome,
+          new Promise<'still_pending'>((r) => setTimeout(() => r('still_pending'), 0)),
+        ])
+        if (physical !== 'not_sent') {
+          options.onCreationDispatched?.()
+        }
+      }
+      throw error
+    }
+    const hasResultField = Object.hasOwn(newResp, 'result')
+    const hasErrorField = Object.hasOwn(newResp, 'error')
+    const newError = hasErrorField ? Reflect.get(newResp, 'error') : undefined
+    const newResult = hasResultField ? Reflect.get(newResp, 'result') : undefined
+    if (hasErrorField) {
+      const isValidatedRejection =
+        !hasResultField &&
+        isPlainObject(newError) &&
+        typeof newError.code === 'number' &&
+        Number.isSafeInteger(newError.code) &&
+        typeof newError.message === 'string'
+      if (isValidatedRejection) {
+        options.onCreationRejectedByServer?.()
+      } else {
+        options.onCreationDispatched?.()
+      }
+      throw new AgentExecutionError(
+        'protocol_error',
+        'Antigravity failed to allocate a zero-Turn session shell.',
+        false,
+      )
+    }
+    if (!isPlainObject(newResult)) {
+      options.onCreationDispatched?.()
       throw new AgentExecutionError(
         'protocol_error',
         'Antigravity failed to allocate a zero-Turn session shell.',
@@ -4211,18 +9692,49 @@ export class AgyAgentAdapter implements AgentAdapter {
       )
     }
     const descriptor = parseAcpSessionDescriptor(newResult)
-    onSessionAllocated?.(descriptor.sessionId)
-    const closeResp = await connection.request(
-      'session/close',
-      { sessionId: descriptor.sessionId },
-      { timeoutMs: AGY_CONTROL_RPC_TIMEOUT_MS, signal },
-    )
-    if (Reflect.get(closeResp, 'error')) {
-      throw new AgentExecutionError(
-        'protocol_error',
-        'Antigravity failed to close the zero-Turn session shell cleanly.',
-        false,
-      )
+    let callbackFailed = false
+    let callbackError: unknown
+    try {
+      await options.onSessionAllocated?.(descriptor.sessionId)
+    } catch (err) {
+      callbackFailed = true
+      callbackError = err
+    }
+    const callerAborted = signal.aborted
+    const cleanupOnly = callbackFailed || callerAborted
+    const closeRes = await lease.closeSession(descriptor.sessionId, {
+      timeoutMs: cleanupOnly
+        ? Math.min(AGY_CONTROL_RPC_TIMEOUT_MS, 1_500)
+        : AGY_CONTROL_RPC_TIMEOUT_MS,
+    })
+    if (closeRes.confirmed) {
+      this.sessionModes.delete(descriptor.sessionId)
+    } else {
+      const closeDiag = classifyAgyCloseFailureDiagnostic(closeRes.reason)
+      recordDiagnostic({
+        operation: 'native_check',
+        phase: 'failed',
+        level: 'warn',
+        scope: 'process',
+        agentId: 'agy',
+        executorId: lease.connection.executorId,
+        nativeMethod: 'session/close',
+        failureSource: closeDiag.failureSource,
+        code: closeDiag.code,
+      })
+      if (!cleanupOnly) {
+        throw new AgentExecutionError(
+          'protocol_error',
+          'Antigravity failed to close the zero-Turn session shell cleanly.',
+          false,
+        )
+      }
+    }
+    if (callbackFailed) {
+      throw callbackError
+    }
+    if (callerAborted) {
+      signal.throwIfAborted()
     }
     return descriptor.sessionId
   }
@@ -4238,6 +9750,7 @@ export class AgyAgentAdapter implements AgentAdapter {
     signal: AbortSignal
   }): {
     updateSessionId: (sessionId: string | undefined) => void
+    handleServerRequest: (message: object) => boolean
     dispose: () => void
   } {
     const {
@@ -4259,163 +9772,217 @@ export class AgyAgentAdapter implements AgentAdapter {
     const isFenceCurrent = (): boolean =>
       !this.disposed && !ownerDisposed && !signal.aborted && connection.isOpen
 
-    const ownerHandle = connection.registerServerRequestOwner({
-      ownerId,
-      knownSessionId: currentSessionId,
-      handler: (message) => {
-        const method = asString(Reflect.get(message, 'method'))
-        const rpcId = Reflect.get(message, 'id')
-        if (
-          (typeof rpcId !== 'string' && typeof rpcId !== 'number') ||
-          !method ||
-          (method !== 'session/request_permission' && method !== 'elicitation/create')
-        ) {
-          return false
-        }
-        const rawParams = Reflect.get(message, 'params')
-        const reqParams = isPlainObject(rawParams) ? rawParams : {}
+    const handleServerRequest = (message: object, seq = 0): boolean => {
+      const method = asString(Reflect.get(message, 'method'))
+      const rpcId = Reflect.get(message, 'id')
+      if (
+        (typeof rpcId !== 'string' && typeof rpcId !== 'number') ||
+        !method ||
+        (method !== 'session/request_permission' && method !== 'elicitation/create') ||
+        !isPlainObject(message)
+      ) {
+        return false
+      }
+      const rawParams = Reflect.get(message, 'params')
+      const paramsObjectValid = isPlainObject(rawParams)
+      const reqParams = paramsObjectValid ? rawParams : {}
 
-        if (method === 'session/request_permission') {
-          void (async () => {
-            if (permissionMode === 'full') {
-              const rejectOnce = findRejectOnceOptionId(reqParams.options)
-              await connection
-                .respond(
-                  rpcId,
-                  rejectOnce
-                    ? { outcome: { outcome: 'selected', optionId: rejectOnce } }
-                    : { outcome: { outcome: 'cancelled' } },
-                )
-                .catch(() => undefined)
-              return
-            }
-            if (!requestPermission || activePermissionRequests >= NATIVE_PERMISSION_REQUESTS) {
-              const rejectOnce = findRejectOnceOptionId(reqParams.options)
-              await connection
-                .respond(
-                  rpcId,
-                  rejectOnce
-                    ? { outcome: { outcome: 'selected', optionId: rejectOnce } }
-                    : { outcome: { outcome: 'cancelled' } },
-                )
-                .catch(() => undefined)
-              return
-            }
-            let card: ReturnType<typeof buildAgyPermissionCard>
-            try {
-              card = buildAgyPermissionCard(reqParams, cwd)
-            } catch {
-              const rejectOnce = findRejectOnceOptionId(reqParams.options)
-              await connection
-                .respond(
-                  rpcId,
-                  rejectOnce
-                    ? { outcome: { outcome: 'selected', optionId: rejectOnce } }
-                    : { outcome: { outcome: 'cancelled' } },
-                )
-                .catch(() => undefined)
-              return
-            }
-            activePermissionRequests += 1
-            const endConnectionWait = connection.beginPermissionWait()
-            const endLocalWait = permissionWait.begin()
-            const interactionAbort = new AbortController()
-            interactionControllers.add(interactionAbort)
-            try {
-              const combinedSignal = AbortSignal.any([signal, interactionAbort.signal])
-              const permWork = requestPermission(card.request, combinedSignal)
-              void permWork.catch(() => undefined)
-              const decisionId = await NativePermissionWait.decision(permWork, combinedSignal)
-              if (!isFenceCurrent()) {
-                if (connection.isOpen) {
-                  await connection
-                    .respond(rpcId, { outcome: { outcome: 'cancelled' } })
-                    .catch(() => undefined)
-                }
-                return
-              }
-              const mappedResponse = card.responses.get(decisionId) ?? {
-                outcome: { outcome: 'cancelled' },
-              }
-              await connection.respond(rpcId, mappedResponse)
-              if (decisionId === 'agy-cancel' && currentSessionId) {
-                await connection
-                  .notify('session/cancel', { sessionId: currentSessionId }, {})
-                  .catch(() => undefined)
-              }
-            } catch {
-              if (connection.isOpen) {
-                await connection
-                  .respond(rpcId, { outcome: { outcome: 'cancelled' } })
-                  .catch(() => undefined)
-              }
-            } finally {
-              interactionControllers.delete(interactionAbort)
-              endLocalWait()
-              endConnectionWait()
-              activePermissionRequests = Math.max(0, activePermissionRequests - 1)
-            }
-          })()
-          return true
-        }
+      // Validate control-operation requests with the same frame identity validator against the
+      // expected control session identity before reaching approval or elicitation callbacks!
+      const validated = validateAgyFrame(
+        {
+          kind: 'server_request',
+          seq,
+          method,
+          rpcId,
+          message,
+        },
+        currentSessionId,
+        undefined,
+        undefined,
+      )
+      const controlIdentityInvalid =
+        !paramsObjectValid ||
+        !validated.isAttributableToCurrentSession ||
+        validated.hasForeignOrInvalidSessionMeta ||
+        validated.executionIdInvalid ||
+        validated.rootEvidenceContradicted ||
+        validated.tokens.hasInvalidToken ||
+        validated.tokens.hasConflictingTokens
 
+      if (method === 'session/request_permission') {
+        const permFrameInvalid =
+          controlIdentityInvalid ||
+          validated.toolCallIdInvalid ||
+          validated.argsEvidence.kind === 'invalid_or_conflict' ||
+          (validated.statusPresent &&
+            (validated.statusInvalid ||
+              validated.status === 'completed' ||
+              validated.status === 'failed' ||
+              validated.status === 'cancelled'))
         void (async () => {
-          if (!requestUserInput) {
-            await connection.respond(rpcId, { action: 'decline' }).catch(() => undefined)
-            return
-          }
-          let uiRequest: NativeUserInputRequest
-          try {
-            uiRequest = agyElicitationRequest(reqParams)
-          } catch (error) {
+          if (permFrameInvalid || permissionMode === 'full') {
+            const rejectOnce = findRejectOnceOptionId(reqParams.options)
             await connection
-              .respondError(
+              .respond(
                 rpcId,
-                error instanceof Error
-                  ? error.message
-                  : 'Unsupported Antigravity elicitation schema.',
-                -32_602,
+                rejectOnce
+                  ? { outcome: { outcome: 'selected', optionId: rejectOnce } }
+                  : { outcome: { outcome: 'cancelled' } },
               )
               .catch(() => undefined)
             return
           }
+          if (!requestPermission || activePermissionRequests >= NATIVE_PERMISSION_REQUESTS) {
+            const rejectOnce = findRejectOnceOptionId(reqParams.options)
+            await connection
+              .respond(
+                rpcId,
+                rejectOnce
+                  ? { outcome: { outcome: 'selected', optionId: rejectOnce } }
+                  : { outcome: { outcome: 'cancelled' } },
+              )
+              .catch(() => undefined)
+            return
+          }
+          let card: ReturnType<typeof buildAgyPermissionCard>
+          try {
+            card = buildAgyPermissionCard(reqParams, cwd)
+          } catch {
+            const rejectOnce = findRejectOnceOptionId(reqParams.options)
+            await connection
+              .respond(
+                rpcId,
+                rejectOnce
+                  ? { outcome: { outcome: 'selected', optionId: rejectOnce } }
+                  : { outcome: { outcome: 'cancelled' } },
+              )
+              .catch(() => undefined)
+            return
+          }
+          activePermissionRequests += 1
           const endConnectionWait = connection.beginPermissionWait()
           const endLocalWait = permissionWait.begin()
           const interactionAbort = new AbortController()
           interactionControllers.add(interactionAbort)
           try {
-            const combinedSignal = AbortSignal.any([signal, interactionAbort.signal])
-            const userWork = requestUserInput(uiRequest, combinedSignal)
-            void userWork.catch(() => undefined)
-            const decision = await NativePermissionWait.decision(userWork, combinedSignal)
             if (!isFenceCurrent()) {
               if (connection.isOpen) {
-                await connection.respond(rpcId, { action: 'cancel' }).catch(() => undefined)
+                await connection
+                  .respond(rpcId, { outcome: { outcome: 'cancelled' } })
+                  .catch(() => undefined)
               }
               return
             }
-            if (decision.action === 'accept') {
-              await connection.respond(
-                rpcId,
-                uiRequest.kind === 'url'
-                  ? { action: 'accept' }
-                  : { action: 'accept', content: decision.values ?? {} },
-              )
-            } else {
-              await connection.respond(rpcId, { action: decision.action })
+            const combinedSignal = AbortSignal.any([signal, interactionAbort.signal])
+            const permWork = requestPermission(card.request, combinedSignal)
+            void permWork.catch(() => undefined)
+            const decisionId = await NativePermissionWait.decision(permWork, combinedSignal)
+            if (!isFenceCurrent()) {
+              if (connection.isOpen) {
+                await connection
+                  .respond(rpcId, { outcome: { outcome: 'cancelled' } })
+                  .catch(() => undefined)
+              }
+              return
+            }
+            const mappedResponse = card.responses.get(decisionId) ?? {
+              outcome: { outcome: 'cancelled' },
+            }
+            await connection.respond(rpcId, mappedResponse)
+            if (decisionId === 'agy-cancel' && currentSessionId) {
+              await connection
+                .notify('session/cancel', { sessionId: currentSessionId }, {})
+                .catch(() => undefined)
             }
           } catch {
             if (connection.isOpen) {
-              await connection.respond(rpcId, { action: 'cancel' }).catch(() => undefined)
+              await connection
+                .respond(rpcId, { outcome: { outcome: 'cancelled' } })
+                .catch(() => undefined)
             }
           } finally {
             interactionControllers.delete(interactionAbort)
             endLocalWait()
             endConnectionWait()
+            activePermissionRequests = Math.max(0, activePermissionRequests - 1)
           }
         })()
         return true
-      },
+      }
+
+      void (async () => {
+        if (controlIdentityInvalid) {
+          await connection.respond(rpcId, { action: 'cancel' }).catch(() => undefined)
+          return
+        }
+        if (!requestUserInput) {
+          await connection.respond(rpcId, { action: 'decline' }).catch(() => undefined)
+          return
+        }
+        let uiRequest: NativeUserInputRequest
+        try {
+          uiRequest = agyElicitationRequest(reqParams)
+        } catch (error) {
+          await connection
+            .respondError(
+              rpcId,
+              error instanceof Error
+                ? error.message
+                : 'Unsupported Antigravity elicitation schema.',
+              -32_602,
+            )
+            .catch(() => undefined)
+          return
+        }
+        const endConnectionWait = connection.beginPermissionWait()
+        const endLocalWait = permissionWait.begin()
+        const interactionAbort = new AbortController()
+        interactionControllers.add(interactionAbort)
+        try {
+          if (!isFenceCurrent()) {
+            if (connection.isOpen) {
+              await connection.respond(rpcId, { action: 'cancel' }).catch(() => undefined)
+            }
+            return
+          }
+          const combinedSignal = AbortSignal.any([signal, interactionAbort.signal])
+          const userWork = requestUserInput(uiRequest, combinedSignal)
+          void userWork.catch(() => undefined)
+          const decision = await NativePermissionWait.decision(userWork, combinedSignal)
+          if (!isFenceCurrent()) {
+            if (connection.isOpen) {
+              await connection.respond(rpcId, { action: 'cancel' }).catch(() => undefined)
+            }
+            return
+          }
+          if (decision.action === 'accept') {
+            await connection.respond(
+              rpcId,
+              uiRequest.kind === 'url'
+                ? { action: 'accept' }
+                : { action: 'accept', content: decision.values ?? {} },
+            )
+          } else {
+            await connection.respond(rpcId, { action: decision.action })
+          }
+        } catch {
+          if (connection.isOpen) {
+            await connection.respond(rpcId, { action: 'cancel' }).catch(() => undefined)
+          }
+        } finally {
+          interactionControllers.delete(interactionAbort)
+          endLocalWait()
+          endConnectionWait()
+        }
+      })()
+      return true
+    }
+
+    const ownerHandle = connection.registerServerRequestOwner({
+      ownerId,
+      knownSessionId: currentSessionId,
+      handler: handleServerRequest,
     })
 
     return {
@@ -4423,6 +9990,7 @@ export class AgyAgentAdapter implements AgentAdapter {
         currentSessionId = sessionId
         ownerHandle.updateSessionId(sessionId)
       },
+      handleServerRequest,
       dispose: () => {
         if (ownerDisposed) return
         ownerDisposed = true
@@ -4489,21 +10057,33 @@ export class AgyAgentAdapter implements AgentAdapter {
   }
 
   private async verifyZeroTurnSessionLoad(
-    connection: AgyAcpConnection,
-    canonicalCwd: string,
+    lease: AgyPoolLease,
     sessionId: string,
     signal: AbortSignal,
-    options: { expectReplaySteps?: boolean; forbidToolUpdates?: boolean } = {},
+    options: {
+      expectReplaySteps?: boolean
+      forbidToolUpdates?: boolean
+      onServerRequest?: (req: Extract<AgyIngress, { kind: 'server_request' }>) => void
+    } = {},
   ): Promise<void> {
-    const stream = connection.openSessionStream(sessionId)
+    const connection = lease.connection
+    const canonicalCwd = lease.canonicalCwd
+    const stream = connection.openSessionStream(sessionId, { ordered: true })
+    let sawObservedReplay = false
     let sawUserChunk = false
     let sawAgentChunk = false
     let sawForbiddenExecutionUpdate = false
 
     const observeReplayItem = (item: object): void => {
+      const method = asString(Reflect.get(item, 'method'))
+      if (method !== 'session/update') return
       const params = Reflect.get(item, 'params')
-      const update = isPlainObject(params) ? params.update : undefined
+      if (!isPlainObject(params)) return
+      const sid = asString(params.sessionId ?? params.session_id)
+      if (sid !== undefined && sid !== sessionId) return
+      const update = params.update
       if (!isPlainObject(update)) return
+      sawObservedReplay = true
       const kind = asString(update.sessionUpdate)
       if (kind === 'user_message_chunk') {
         const content = isPlainObject(update.content) ? asString(update.content.text) : undefined
@@ -4524,22 +10104,71 @@ export class AgyAgentAdapter implements AgentAdapter {
       }
     }
 
+    let sessionLoaded = false
+    let loadPossiblyDispatched = false
+    let loadRejectedByServer = false
+    let sessionClosed = false
+
+    const recordCloseFailureDiagnostic = (reason: AgySessionCloseFailureReason) => {
+      const closeDiag = classifyAgyCloseFailureDiagnostic(reason)
+      recordDiagnostic({
+        operation: 'native_check',
+        phase: 'failed',
+        level: 'warn',
+        scope: 'process',
+        agentId: 'agy',
+        executorId: lease.connection.executorId,
+        nativeMethod: 'session/close',
+        failureSource: closeDiag.failureSource,
+        code: closeDiag.code,
+      })
+    }
+
+    let loadOp: ReturnType<AgyAcpConnection['requestOwned']> | undefined
     try {
-      const loadReq = connection.request(
+      loadOp = connection.requestOwned(
         'session/load',
         { sessionId, cwd: canonicalCwd, mcpServers: [] },
-        { timeoutMs: AGY_CONTROL_RPC_TIMEOUT_MS, signal },
+        {
+          timeoutMs: AGY_SESSION_LIFECYCLE_RPC_TIMEOUT_MS,
+          signal,
+          replyTo: stream,
+          canDispatch: () => !signal.aborted && !this.disposed,
+          onDispatch: () => {
+            loadPossiblyDispatched = true
+          },
+        },
       )
-      const loadResp = await this.runWithConcurrentReplayDrain(loadReq, stream, observeReplayItem)
-      const loadError = Reflect.get(loadResp, 'error')
-      const loadResult = Reflect.get(loadResp, 'result')
-      if (loadError || !isPlainObject(loadResult)) {
+      const loadResp = await this.runWithConcurrentReplayDrain(
+        loadOp.result,
+        stream,
+        observeReplayItem,
+        undefined,
+        loadOp.requestId,
+        options.onServerRequest,
+      )
+      const hasLoadResult = Object.hasOwn(loadResp, 'result')
+      const hasLoadError = Object.hasOwn(loadResp, 'error')
+      const loadError = hasLoadError ? Reflect.get(loadResp, 'error') : undefined
+      const loadResult = hasLoadResult ? Reflect.get(loadResp, 'result') : undefined
+      if (hasLoadError || !isPlainObject(loadResult)) {
+        if (
+          hasLoadError &&
+          !hasLoadResult &&
+          isPlainObject(loadError) &&
+          typeof loadError.code === 'number' &&
+          Number.isSafeInteger(loadError.code) &&
+          typeof loadError.message === 'string'
+        ) {
+          loadRejectedByServer = true
+        }
         throw new AgentExecutionError(
           'context_resume_failed',
           'Antigravity cold session/load verification failed.',
           false,
         )
       }
+      sessionLoaded = true
       if (sawForbiddenExecutionUpdate) {
         throw new AgentExecutionError(
           'context_resume_failed',
@@ -4554,81 +10183,199 @@ export class AgyAgentAdapter implements AgentAdapter {
           false,
         )
       }
-      const closeResp = await connection.request(
-        'session/close',
-        { sessionId },
-        { timeoutMs: AGY_CONTROL_RPC_TIMEOUT_MS, signal },
-      )
-      if (Reflect.get(closeResp, 'error')) {
-        throw new AgentExecutionError(
-          'protocol_error',
-          'Antigravity failed to close verified cold session.',
-          false,
-        )
+      const callerAborted = signal.aborted
+      sessionClosed = true
+      const closeRes = await lease.closeSession(sessionId, {
+        timeoutMs: callerAborted
+          ? Math.min(AGY_CONTROL_RPC_TIMEOUT_MS, 1_500)
+          : AGY_CONTROL_RPC_TIMEOUT_MS,
+      })
+      if (closeRes.confirmed) {
+        this.sessionModes.delete(sessionId)
+      } else {
+        recordCloseFailureDiagnostic(closeRes.reason)
+        if (!callerAborted) {
+          throw new AgentExecutionError(
+            'protocol_error',
+            'Antigravity failed to close verified cold session.',
+            false,
+          )
+        }
+      }
+      if (callerAborted) {
+        signal.throwIfAborted()
       }
     } finally {
-      stream.close()
+      try {
+        if (!loadPossiblyDispatched && loadOp && !loadRejectedByServer && !sawObservedReplay) {
+          const physical = await Promise.race([
+            loadOp.physicalOutcome,
+            new Promise<'still_pending'>((r) => setTimeout(() => r('still_pending'), 0)),
+          ])
+          if (physical !== 'not_sent') {
+            loadPossiblyDispatched = true
+          }
+        }
+        const mayBeLoaded =
+          sessionLoaded || sawObservedReplay || (loadPossiblyDispatched && !loadRejectedByServer)
+        if (mayBeLoaded && !sessionClosed) {
+          sessionClosed = true
+          const cleanupClose = await lease.closeSession(sessionId, {
+            timeoutMs: Math.min(AGY_CONTROL_RPC_TIMEOUT_MS, 1_500),
+          })
+          if (cleanupClose.confirmed) {
+            this.sessionModes.delete(sessionId)
+          } else {
+            recordCloseFailureDiagnostic(cleanupClose.reason)
+          }
+        }
+      } catch {
+        // Preserve the original replay verification or cancellation error.
+      } finally {
+        stream.close()
+      }
     }
   }
 
-  private async runWithConcurrentReplayDrain<TResult>(
-    requestPromise: Promise<TResult>,
-    stream: AgySessionNotificationStream,
+  private async runWithConcurrentReplayDrain(
+    requestPromise: Promise<object>,
+    stream: AgyOrderedSessionStream,
     onNotification: (notification: object) => void,
-  ): Promise<TResult> {
+    onReply?: (value: object) => void,
+    requestId?: number,
+    onServerRequest?: (req: Extract<AgyIngress, { kind: 'server_request' }>) => void,
+  ): Promise<object> {
     const drainAbort = new AbortController()
     const drainState: {
       settled: boolean
-      outcome: { ok: true; value: TResult } | { ok: false; error: unknown } | undefined
+      outcome: { ok: true; value: object } | { ok: false; error: unknown } | undefined
+      replyObserved: boolean
+      streamEnded: boolean
+      observerFailed: boolean
+      observerError: unknown
     } = {
       settled: false,
       outcome: undefined,
+      replyObserved: false,
+      streamEnded: false,
+      observerFailed: false,
+      observerError: undefined,
     }
 
-    const tracked = requestPromise.then(
-      (value) => {
-        drainState.settled = true
-        drainState.outcome = { ok: true, value }
-        drainAbort.abort()
-        return undefined
-      },
-      (error: unknown) => {
-        drainState.settled = true
-        drainState.outcome = { ok: false, error }
-        drainAbort.abort()
-        return undefined
-      },
-    )
+    const recordObserverFailure = (error: unknown): void => {
+      if (!drainState.observerFailed) {
+        drainState.observerFailed = true
+        drainState.observerError = error
+      }
+      drainState.settled = true
+      drainAbort.abort()
+    }
+
+    const handleIngressItem = (item: AgyIngress): boolean => {
+      if (drainState.observerFailed) return false
+      if (item.kind === 'notification') {
+        try {
+          onNotification(item.message)
+        } catch (error) {
+          recordObserverFailure(error)
+          throw error
+        }
+        return true
+      }
+      if (item.kind === 'server_request') {
+        try {
+          onServerRequest?.(item)
+        } catch (error) {
+          recordObserverFailure(error)
+          throw error
+        }
+        return true
+      }
+      if (item.kind === 'reply') {
+        if (requestId === undefined || item.requestId === requestId) {
+          drainState.replyObserved = true
+          try {
+            onReply?.(item.message)
+          } catch (error) {
+            recordObserverFailure(error)
+            throw error
+          }
+          return false
+        }
+        return true
+      }
+      drainState.streamEnded = true
+      return false
+    }
 
     const drainBuffered = (): void => {
-      while (true) {
+      while (!drainState.observerFailed && !drainState.replyObserved && !drainState.streamEnded) {
         const item = stream.shift()
         if (!item) break
-        onNotification(item)
+        if (!handleIngressItem(item)) break
       }
     }
 
+    const tracked = (async () => {
+      try {
+        const value = await requestPromise
+        try {
+          drainBuffered()
+          if (!drainState.replyObserved && !drainState.observerFailed) {
+            drainState.replyObserved = true
+            onReply?.(value)
+          }
+        } catch (error) {
+          recordObserverFailure(error)
+        } finally {
+          drainState.settled = true
+          drainState.outcome = { ok: true, value }
+          drainAbort.abort()
+        }
+      } catch (error) {
+        try {
+          drainBuffered()
+        } catch (obsError) {
+          recordObserverFailure(obsError)
+        } finally {
+          drainState.settled = true
+          drainState.outcome = { ok: false, error }
+          drainAbort.abort()
+        }
+      }
+    })()
+
     try {
-      while (!drainState.settled) {
+      while (!drainState.settled && !drainState.observerFailed && !drainState.streamEnded) {
         drainBuffered()
-        if (drainState.settled) break
-        // oxlint-disable-next-line no-await-in-loop -- Continuous O(1) drain while `session/load` streams replay.
-        const nextNote = await stream
-          .next(undefined, drainAbort.signal)
-          .then((note) => ({ hasNote: true as const, note }))
-          .catch(() => ({ hasNote: false as const }))
-        if (nextNote.hasNote) {
-          onNotification(nextNote.note)
+        if (drainState.settled || drainState.observerFailed || drainState.streamEnded) break
+        let nextItem: AgyIngress | undefined
+        try {
+          // oxlint-disable-next-line no-await-in-loop -- Continuous O(1) ordered drain while RPC is in flight.
+          nextItem = await stream.nextIngress(undefined, drainAbort.signal)
+        } catch (waitError) {
+          if (drainAbort.signal.aborted) {
+            break
+          }
+          throw waitError
+        }
+        if (nextItem !== undefined) {
+          handleIngressItem(nextItem)
         }
         drainBuffered()
       }
-      await tracked
-      await Promise.resolve()
-      drainBuffered()
+      if (!drainState.observerFailed) {
+        await tracked
+        await Promise.resolve()
+        drainBuffered()
+      }
     } finally {
       drainAbort.abort()
     }
 
+    if (drainState.observerFailed) {
+      throw drainState.observerError
+    }
     if (!drainState.outcome) {
       throw new AgentExecutionError('protocol_error', 'Session load ended unexpectedly.', false)
     }
@@ -4640,19 +10387,37 @@ export class AgyAgentAdapter implements AgentAdapter {
 
   private async *awaitControlRpcWithConcurrentDrain<TResult>(params: {
     requestPromise: Promise<TResult>
-    stream: AgySessionNotificationStream | undefined
-    pendingEvents: NormalizedAgentEvent[]
+    requestId?: number | undefined
+    stream: AgyOrderedSessionStream | undefined
+    shiftPendingEvent: () => NormalizedAgentEvent | undefined
     setWakeup: (fn: (() => void) | undefined) => void
     onNotification: (notification: object) => void
+    onServerRequest?: ((req: Extract<AgyIngress, { kind: 'server_request' }>) => void) | undefined
   }): AsyncGenerator<NormalizedAgentEvent, TResult, void> {
-    const { requestPromise, stream, pendingEvents, setWakeup, onNotification } = params
+    const {
+      requestPromise,
+      requestId,
+      stream,
+      shiftPendingEvent,
+      setWakeup,
+      onNotification,
+      onServerRequest,
+    } = params
     const drainAbort = new AbortController()
     const drainState: {
       settled: boolean
       outcome: { ok: true; value: TResult } | { ok: false; error: unknown } | undefined
+      replyObserved: boolean
+      streamEnded: boolean
+      observerFailed: boolean
+      observerError: unknown
     } = {
       settled: false,
       outcome: undefined,
+      replyObserved: false,
+      streamEnded: false,
+      observerFailed: false,
+      observerError: undefined,
     }
     let wakeLocal: (() => void) | undefined
 
@@ -4660,6 +10425,47 @@ export class AgyAgentAdapter implements AgentAdapter {
       const fn = wakeLocal
       wakeLocal = undefined
       fn?.()
+    }
+
+    const recordObserverFailure = (error: unknown): void => {
+      if (!drainState.observerFailed) {
+        drainState.observerFailed = true
+        drainState.observerError = error
+      }
+      drainState.settled = true
+      drainAbort.abort()
+      triggerWake()
+    }
+
+    const handleIngressItem = (item: AgyIngress): boolean => {
+      if (drainState.observerFailed) return false
+      if (item.kind === 'notification') {
+        try {
+          onNotification(item.message)
+        } catch (error) {
+          recordObserverFailure(error)
+          throw error
+        }
+        return true
+      }
+      if (item.kind === 'server_request') {
+        try {
+          onServerRequest?.(item)
+        } catch (error) {
+          recordObserverFailure(error)
+          throw error
+        }
+        return true
+      }
+      if (item.kind === 'reply') {
+        if (requestId === undefined || item.requestId === requestId) {
+          drainState.replyObserved = true
+          return false
+        }
+        return true
+      }
+      drainState.streamEnded = true
+      return false
     }
 
     const tracked = requestPromise.then(
@@ -4681,21 +10487,23 @@ export class AgyAgentAdapter implements AgentAdapter {
 
     const drainBuffered = (): void => {
       if (!stream) return
-      while (true) {
+      while (!drainState.observerFailed && !drainState.replyObserved && !drainState.streamEnded) {
         const item = stream.shift()
         if (!item) break
-        onNotification(item)
+        if (!handleIngressItem(item)) break
       }
     }
 
     let pendingStreamNext: Promise<void> | undefined
     try {
-      while (!drainState.settled) {
+      while (!drainState.settled && !drainState.observerFailed && !drainState.streamEnded) {
         drainBuffered()
-        while (pendingEvents.length > 0) {
-          yield pendingEvents.shift()!
+        let nextEvent = shiftPendingEvent()
+        while (nextEvent !== undefined) {
+          yield nextEvent
+          nextEvent = shiftPendingEvent()
         }
-        if (drainState.settled) break
+        if (drainState.settled || drainState.observerFailed || drainState.streamEnded) break
 
         const wakePromise = new Promise<void>((resolveWake) => {
           wakeLocal = resolveWake
@@ -4707,33 +10515,49 @@ export class AgyAgentAdapter implements AgentAdapter {
 
         if (stream && !pendingStreamNext) {
           const created = stream
-            .next(undefined, drainAbort.signal)
-            .then((note) => {
-              onNotification(note)
-              if (pendingStreamNext === created) pendingStreamNext = undefined
-              return undefined
-            })
-            .catch(() => {
-              if (pendingStreamNext === created) pendingStreamNext = undefined
+            .nextIngress(undefined, drainAbort.signal)
+            .then(
+              (item) => {
+                if (pendingStreamNext === created) pendingStreamNext = undefined
+                handleIngressItem(item)
+                return undefined
+              },
+              (waitError: unknown) => {
+                if (pendingStreamNext === created) pendingStreamNext = undefined
+                if (!drainAbort.signal.aborted) {
+                  recordObserverFailure(waitError)
+                }
+                return undefined
+              },
+            )
+            .catch((obsError: unknown) => {
+              recordObserverFailure(obsError)
             })
           pendingStreamNext = created
         }
 
-        // oxlint-disable-next-line no-await-in-loop -- Concurrent init-event yield and replay drain.
+        // oxlint-disable-next-line no-await-in-loop -- Concurrent init-event yield and ordered replay drain.
         await Promise.race(pendingStreamNext ? [wakePromise, pendingStreamNext] : [wakePromise])
       }
 
-      await tracked
-      await Promise.resolve()
-      drainBuffered()
-      while (pendingEvents.length > 0) {
-        yield pendingEvents.shift()!
+      if (!drainState.observerFailed) {
+        await tracked
+        await Promise.resolve()
+        drainBuffered()
+        let nextEvent = shiftPendingEvent()
+        while (nextEvent !== undefined) {
+          yield nextEvent
+          nextEvent = shiftPendingEvent()
+        }
       }
     } finally {
       setWakeup(undefined)
       drainAbort.abort()
     }
 
+    if (drainState.observerFailed) {
+      throw drainState.observerError
+    }
     if (!drainState.outcome) {
       throw new AgentExecutionError('protocol_error', 'Control RPC ended unexpectedly.', false)
     }
@@ -4861,8 +10685,9 @@ export class AgyAgentAdapter implements AgentAdapter {
     connection: AgyAcpConnection
     sessionId: string
     descriptor: AcpSessionDescriptor
-    sessionStream: AgySessionNotificationStream | undefined
+    sessionStream: AgyOrderedSessionStream | undefined
     onMetadataNotification: (notification: object) => void
+    onServerRequest?: ((req: Extract<AgyIngress, { kind: 'server_request' }>) => void) | undefined
     requestedModel: string | null
     requestedEffort: string | null
     signal: AbortSignal
@@ -4873,6 +10698,7 @@ export class AgyAgentAdapter implements AgentAdapter {
       descriptor,
       sessionStream,
       onMetadataNotification,
+      onServerRequest,
       requestedModel,
       requestedEffort,
       signal,
@@ -4880,16 +10706,23 @@ export class AgyAgentAdapter implements AgentAdapter {
     let configOptions = descriptor.configOptions
     let currentModelId = descriptor.currentModelId
 
-    const drainNotifiedConfigOptions = async (): Promise<AcpConfigOptionEntry[] | undefined> => {
+    const drainNotifiedConfigOptions = async (
+      accept?: (options: AcpConfigOptionEntry[]) => boolean,
+    ): Promise<AcpConfigOptionEntry[] | undefined> => {
       if (!sessionStream) return undefined
       await Promise.resolve()
       let latest: AcpConfigOptionEntry[] | undefined
       while (true) {
-        const note = sessionStream.shift()
-        if (!note) break
-        onMetadataNotification(note)
-        const parsed = this.extractConfigOptionsFromNotification(note)
-        if (parsed) latest = parsed
+        const item = sessionStream.shift()
+        if (!item) break
+        if (item.kind === 'server_request') {
+          onServerRequest?.(item)
+          continue
+        }
+        if (item.kind !== 'notification') continue
+        onMetadataNotification(item.message)
+        const parsed = this.extractConfigOptionsFromNotification(item.message, sessionId)
+        if (parsed && (!accept || accept(parsed))) latest = parsed
       }
       return latest
     }
@@ -4897,10 +10730,44 @@ export class AgyAgentAdapter implements AgentAdapter {
     const findOption = (id: string): AcpConfigOptionEntry | undefined =>
       configOptions.find((entry) => entry.id === id)
 
+    const initialModelOption = findOption('model')
+    const declaredModelFamilies = initialModelOption?.options?.map((opt) => opt.value)
+    const concreteModelMatches = (actualModelId: string): boolean => {
+      if (requestedModel === null) return true
+      return actualModelId === requestedModel
+    }
+    const isFamilyPrefixOf = (family: string, concrete: string): boolean =>
+      declaredModelFamilies !== undefined &&
+      declaredModelFamilies.length > 0 &&
+      declaredModelFamilies.includes(family) &&
+      concrete.startsWith(`${family}-`)
+    const configFamilyMatchesRequested = (actualValue: string): boolean => {
+      if (requestedModel === null) return true
+      if (actualValue === requestedModel) return true
+      return isFamilyPrefixOf(actualValue, requestedModel)
+    }
+    const priorModelId = descriptor.currentModelId ?? initialModelOption?.currentValue
+    const didSwitchModel = requestedModel !== null && priorModelId !== requestedModel
+    const isAmbiguousSharedFamilyUpdate = (notifiedModel: string): boolean =>
+      didSwitchModel &&
+      requestedModel !== null &&
+      priorModelId !== undefined &&
+      notifiedModel !== requestedModel &&
+      isFamilyPrefixOf(notifiedModel, requestedModel) &&
+      isFamilyPrefixOf(notifiedModel, priorModelId)
+    const modelAttribution = {
+      didSwitchModel,
+      requestedModel,
+      priorModelId,
+      declaredModelFamilies,
+      configFamilyMatchesRequested,
+      isAmbiguousSharedFamilyUpdate,
+    }
+
     let derivedEffortFromModelVariant: string | undefined
 
     if (requestedModel !== null) {
-      const modelOption = findOption('model')
+      const modelOption = initialModelOption
       const matchesConfigFamily =
         modelOption?.options?.some((opt) => opt.value === requestedModel) ?? false
 
@@ -4938,27 +10805,110 @@ export class AgyAgentAdapter implements AgentAdapter {
             value: targetFamily,
             sessionStream,
             onMetadataNotification,
+            onServerRequest,
+            modelAttribution,
             signal,
           })
         }
         currentModelId = requestedModel
       } else if (descriptor.availableModels?.includes(requestedModel)) {
-        if (descriptor.currentModelId !== requestedModel) {
+        const classifySetModelOptions = (
+          options: AcpConfigOptionEntry[],
+        ): 'match' | 'stale_prior' | 'unattributed_during_switch' | 'conflict' => {
+          const notifiedModel = options.find((opt) => opt.id === 'model')?.currentValue
+          if (notifiedModel === undefined) {
+            if (didSwitchModel) {
+              return 'unattributed_during_switch'
+            }
+            return 'match'
+          }
+          if (isAmbiguousSharedFamilyUpdate(notifiedModel)) {
+            return 'unattributed_during_switch'
+          }
+          if (configFamilyMatchesRequested(notifiedModel)) {
+            return 'match'
+          }
+          if (
+            priorModelId !== undefined &&
+            (notifiedModel === priorModelId || isFamilyPrefixOf(notifiedModel, priorModelId))
+          ) {
+            return 'stale_prior'
+          }
+          return 'conflict'
+        }
+        if (
+          didSwitchModel ||
+          (modelOption?.currentValue !== undefined &&
+            !configFamilyMatchesRequested(modelOption.currentValue))
+        ) {
           // Invalidate stale `configOptions` from the prior model immediately on model change.
           configOptions = []
         }
-        const setModelReq = connection.request(
+        await drainNotifiedConfigOptions()
+        const setModelOp = connection.requestOwned(
           'session/set_model',
           { sessionId, modelId: requestedModel },
-          { timeoutMs: AGY_CONTROL_RPC_TIMEOUT_MS, signal },
+          {
+            timeoutMs: AGY_CONTROL_RPC_TIMEOUT_MS,
+            signal,
+            ...(sessionStream ? { replyTo: sessionStream } : {}),
+          },
         )
-        let notifiedDuringSetModel: AcpConfigOptionEntry[] | undefined
+        const setModelReq = setModelOp.result
+        const setModelTrack: {
+          matched: AcpConfigOptionEntry[] | undefined
+          conflictModel: string | undefined
+          replyError: AgentExecutionError | undefined
+          replyHadOptions: boolean
+        } = {
+          matched: undefined,
+          conflictModel: undefined,
+          replyError: undefined,
+          replyHadOptions: false,
+        }
+        const recordSetModelOptions = (parsed: AcpConfigOptionEntry[]): void => {
+          const verdict = classifySetModelOptions(parsed)
+          if (verdict === 'match') {
+            setModelTrack.matched = parsed
+            setModelTrack.conflictModel = undefined
+          } else if (verdict === 'conflict') {
+            setModelTrack.matched = undefined
+            setModelTrack.conflictModel =
+              parsed.find((opt) => opt.id === 'model')?.currentValue ?? 'unknown'
+          }
+        }
+        const observeSetModelReply = (resp: object): void => {
+          const rErr = Reflect.get(resp, 'error')
+          const rRes = Reflect.get(resp, 'result')
+          if (rErr || !isPlainObject(rRes)) return
+          if (!Array.isArray(Reflect.get(rRes, 'configOptions'))) return
+          const parsedReply = parseConfigOptions(Reflect.get(rRes, 'configOptions'))
+          setModelTrack.replyHadOptions = true
+          const replyOptModel = parsedReply.find((opt) => opt.id === 'model')?.currentValue
+          if (replyOptModel !== undefined && !configFamilyMatchesRequested(replyOptModel)) {
+            setModelTrack.replyError = new AgentExecutionError(
+              'runtime_incompatible',
+              `Antigravity silently substituted model="${replyOptModel}" for requested "${requestedModel}".`,
+              false,
+            )
+            return
+          }
+          setModelTrack.matched = parsedReply
+          setModelTrack.conflictModel = undefined
+        }
         const setModelResp = sessionStream
-          ? await this.runWithConcurrentReplayDrain(setModelReq, sessionStream, (note) => {
-              onMetadataNotification(note)
-              const parsed = this.extractConfigOptionsFromNotification(note)
-              if (parsed) notifiedDuringSetModel = parsed
-            })
+          ? await this.runWithConcurrentReplayDrain(
+              setModelReq,
+              sessionStream,
+              (note) => {
+                onMetadataNotification(note)
+                const parsed = this.extractConfigOptionsFromNotification(note, sessionId)
+                if (parsed) recordSetModelOptions(parsed)
+              },
+              observeSetModelReply,
+              setModelOp.requestId,
+              onServerRequest,
+            )
           : await setModelReq
         const err = Reflect.get(setModelResp, 'error')
         const res = Reflect.get(setModelResp, 'result')
@@ -4969,21 +10919,81 @@ export class AgyAgentAdapter implements AgentAdapter {
             false,
           )
         }
-        const replyHasOptions = Array.isArray(Reflect.get(res, 'configOptions'))
-        const replyOptions = replyHasOptions
-          ? parseConfigOptions(Reflect.get(res, 'configOptions'))
-          : undefined
-        const trailingNotified = await drainNotifiedConfigOptions()
-        let mergedUpdated = trailingNotified ?? notifiedDuringSetModel ?? replyOptions
-        if (mergedUpdated === undefined && sessionStream) {
-          mergedUpdated = await this.awaitPostReplyConfigOptionUpdate(
-            sessionStream,
-            onMetadataNotification,
-            signal,
+        if (!sessionStream) {
+          observeSetModelReply(setModelResp)
+        }
+        const replyReportedModel = asString(
+          Reflect.get(res, 'modelId') ?? Reflect.get(res, 'currentModelId'),
+        )
+        if (replyReportedModel !== undefined && !concreteModelMatches(replyReportedModel)) {
+          throw new AgentExecutionError(
+            'runtime_incompatible',
+            `Antigravity silently substituted model="${replyReportedModel}" for requested "${requestedModel}".`,
+            false,
           )
         }
-        if (mergedUpdated !== undefined) {
-          configOptions = mergedUpdated
+        if (setModelTrack.replyError) {
+          throw setModelTrack.replyError
+        }
+        const throwIfSetModelConflict = (): void => {
+          if (setModelTrack.conflictModel !== undefined) {
+            throw new AgentExecutionError(
+              'runtime_incompatible',
+              `Antigravity silently substituted model="${setModelTrack.conflictModel}" for requested "${requestedModel}".`,
+              false,
+            )
+          }
+        }
+        throwIfSetModelConflict()
+        if (sessionStream) {
+          await Promise.resolve()
+          while (true) {
+            const item = sessionStream.shift()
+            if (!item) break
+            if (item.kind === 'server_request') {
+              onServerRequest?.(item)
+              continue
+            }
+            if (item.kind !== 'notification') continue
+            onMetadataNotification(item.message)
+            const parsed = this.extractConfigOptionsFromNotification(item.message, sessionId)
+            if (parsed) recordSetModelOptions(parsed)
+          }
+        }
+        throwIfSetModelConflict()
+        if (setModelTrack.replyHadOptions) {
+          configOptions = setModelTrack.matched ?? []
+        } else {
+          let confirmedUpdated = setModelTrack.matched
+          if (confirmedUpdated === undefined && sessionStream) {
+            const awaited = await this.awaitPostReplyConfigOptionUpdate(
+              sessionStream,
+              onMetadataNotification,
+              signal,
+              AGY_CONFIG_OPTION_POST_REPLY_WINDOW_MS,
+              (opts) => {
+                const verdict = classifySetModelOptions(opts)
+                return verdict === 'match' || verdict === 'conflict'
+              },
+              onServerRequest,
+              sessionId,
+            )
+            if (awaited !== undefined) {
+              if (classifySetModelOptions(awaited) === 'conflict') {
+                const actualModel =
+                  awaited.find((opt) => opt.id === 'model')?.currentValue ?? 'unknown'
+                throw new AgentExecutionError(
+                  'runtime_incompatible',
+                  `Antigravity silently substituted model="${actualModel}" for requested "${requestedModel}".`,
+                  false,
+                )
+              }
+              confirmedUpdated = awaited
+            }
+          }
+          if (confirmedUpdated !== undefined) {
+            configOptions = confirmedUpdated
+          }
         }
         currentModelId = requestedModel
       } else if (!modelOption && !descriptor.availableModels) {
@@ -4995,6 +11005,8 @@ export class AgyAgentAdapter implements AgentAdapter {
           value: requestedModel,
           sessionStream,
           onMetadataNotification,
+          onServerRequest,
+          modelAttribution,
           signal,
         })
         currentModelId = requestedModel
@@ -5007,7 +11019,39 @@ export class AgyAgentAdapter implements AgentAdapter {
       }
     }
 
-    const trailingBeforeEffort = await drainNotifiedConfigOptions()
+    const trailingBeforeEffort = await drainNotifiedConfigOptions((options) => {
+      const notifiedModel = options.find((opt) => opt.id === 'model')?.currentValue
+      if (notifiedModel === undefined) {
+        if (didSwitchModel) return false
+        return !(
+          requestedModel !== null &&
+          initialModelOption !== undefined &&
+          configOptions.length === 0
+        )
+      }
+      if (requestedModel !== null) {
+        if (isAmbiguousSharedFamilyUpdate(notifiedModel)) return false
+        if (configFamilyMatchesRequested(notifiedModel)) return true
+        const currentFamily = findOption('model')?.currentValue
+        if (
+          priorModelId !== undefined &&
+          (notifiedModel === priorModelId ||
+            (declaredModelFamilies !== undefined &&
+              declaredModelFamilies.length > 0 &&
+              declaredModelFamilies.includes(notifiedModel) &&
+              priorModelId.startsWith(`${notifiedModel}-`))) &&
+          currentFamily !== priorModelId
+        ) {
+          return false
+        }
+        throw new AgentExecutionError(
+          'runtime_incompatible',
+          `Antigravity silently substituted model="${notifiedModel}" for requested "${requestedModel}".`,
+          false,
+        )
+      }
+      return true
+    })
     if (trailingBeforeEffort !== undefined) {
       configOptions = trailingBeforeEffort
     }
@@ -5040,6 +11084,8 @@ export class AgyAgentAdapter implements AgentAdapter {
           value: effectiveRequestedEffort,
           sessionStream,
           onMetadataNotification,
+          onServerRequest,
+          modelAttribution,
           signal,
         })
       }
@@ -5054,6 +11100,17 @@ export class AgyAgentAdapter implements AgentAdapter {
     }
 
     const finalModelOption = findOption('model')
+    if (
+      requestedModel !== null &&
+      finalModelOption?.currentValue !== undefined &&
+      !configFamilyMatchesRequested(finalModelOption.currentValue)
+    ) {
+      throw new AgentExecutionError(
+        'runtime_incompatible',
+        `Antigravity silently substituted model="${finalModelOption.currentValue}" for requested "${requestedModel}".`,
+        false,
+      )
+    }
     const finalThoughtOption = findOption('thought_level')
     const modelKnown =
       requestedModel !== null ||
@@ -5061,8 +11118,8 @@ export class AgyAgentAdapter implements AgentAdapter {
       currentModelId !== undefined
     const effortKnown =
       effectiveRequestedEffort !== null ||
-      finalThoughtOption?.currentValue !== undefined ||
-      (configOptions.length > 0 && !finalThoughtOption)
+      (configOptions.length > 0 &&
+        (finalThoughtOption?.currentValue !== undefined || !finalThoughtOption))
     const resolvedModel =
       requestedModel ?? finalModelOption?.currentValue ?? currentModelId ?? 'agy-default'
     const resolvedEffort =
@@ -5074,10 +11131,13 @@ export class AgyAgentAdapter implements AgentAdapter {
   }
 
   private async awaitPostReplyConfigOptionUpdate(
-    sessionStream: AgySessionNotificationStream,
+    sessionStream: AgyOrderedSessionStream,
     onMetadataNotification: (notification: object) => void,
     signal: AbortSignal,
     windowMs = AGY_CONFIG_OPTION_POST_REPLY_WINDOW_MS,
+    matches?: (options: AcpConfigOptionEntry[]) => boolean,
+    onServerRequest?: (req: Extract<AgyIngress, { kind: 'server_request' }>) => void,
+    sessionId?: string,
   ): Promise<AcpConfigOptionEntry[] | undefined> {
     const deadlineAt = Date.now() + windowMs
     let latest: AcpConfigOptionEntry[] | undefined
@@ -5085,22 +11145,40 @@ export class AgyAgentAdapter implements AgentAdapter {
       while (true) {
         const buffered = sessionStream.shift()
         if (!buffered) break
-        onMetadataNotification(buffered)
-        const parsed = this.extractConfigOptionsFromNotification(buffered)
-        if (parsed) latest = parsed
+        if (buffered.kind === 'server_request') {
+          onServerRequest?.(buffered)
+          continue
+        }
+        if (buffered.kind === 'end') return matches ? undefined : latest
+        if (buffered.kind !== 'notification') continue
+        onMetadataNotification(buffered.message)
+        const parsed = this.extractConfigOptionsFromNotification(buffered.message, sessionId)
+        if (parsed) {
+          latest = parsed
+          if (!matches || matches(parsed)) return parsed
+        }
       }
-      if (latest !== undefined) return latest
+      if (latest !== undefined && !matches) return latest
       const remainingMs = deadlineAt - Date.now()
-      if (remainingMs <= 0) return undefined
+      if (remainingMs <= 0) return matches ? undefined : latest
       // oxlint-disable-next-line no-await-in-loop -- Bounded short wait for post-reply `config_option_update`.
-      const nextNote = await sessionStream.next(remainingMs, signal).catch(() => undefined)
-      if (!nextNote) {
+      const nextItem = await sessionStream.nextIngress(remainingMs, signal).catch(() => undefined)
+      if (!nextItem) {
         signal.throwIfAborted()
-        return undefined
+        return matches ? undefined : latest
       }
-      onMetadataNotification(nextNote)
-      const parsed = this.extractConfigOptionsFromNotification(nextNote)
-      if (parsed) latest = parsed
+      if (nextItem.kind === 'server_request') {
+        onServerRequest?.(nextItem)
+        continue
+      }
+      if (nextItem.kind === 'end') return matches ? undefined : latest
+      if (nextItem.kind !== 'notification') continue
+      onMetadataNotification(nextItem.message)
+      const parsed = this.extractConfigOptionsFromNotification(nextItem.message, sessionId)
+      if (parsed) {
+        latest = parsed
+        if (!matches || matches(parsed)) return parsed
+      }
     }
   }
 
@@ -5109,8 +11187,17 @@ export class AgyAgentAdapter implements AgentAdapter {
     sessionId: string
     configId: 'model' | 'thought_level'
     value: string
-    sessionStream: AgySessionNotificationStream | undefined
+    sessionStream: AgyOrderedSessionStream | undefined
     onMetadataNotification: (notification: object) => void
+    onServerRequest?: ((req: Extract<AgyIngress, { kind: 'server_request' }>) => void) | undefined
+    modelAttribution?: {
+      didSwitchModel: boolean
+      requestedModel: string | null
+      priorModelId: string | undefined
+      declaredModelFamilies: readonly string[] | undefined
+      configFamilyMatchesRequested: (actualValue: string) => boolean
+      isAmbiguousSharedFamilyUpdate: (notifiedModel: string) => boolean
+    }
     signal: AbortSignal
   }): Promise<AcpConfigOptionEntry[]> {
     const {
@@ -5120,20 +11207,126 @@ export class AgyAgentAdapter implements AgentAdapter {
       value,
       sessionStream,
       onMetadataNotification,
+      onServerRequest,
+      modelAttribution,
       signal,
     } = params
-    const requestPromise = connection.request(
+    if (sessionStream) {
+      while (true) {
+        const buffered = sessionStream.shift()
+        if (!buffered) break
+        if (buffered.kind === 'server_request') {
+          onServerRequest?.(buffered)
+          continue
+        }
+        if (buffered.kind !== 'notification') continue
+        onMetadataNotification(buffered.message)
+      }
+    }
+    const isStalePriorModel = (notifiedModel: string): boolean => {
+      if (!modelAttribution?.priorModelId) return false
+      return (
+        notifiedModel === modelAttribution.priorModelId ||
+        (modelAttribution.declaredModelFamilies !== undefined &&
+          modelAttribution.declaredModelFamilies.length > 0 &&
+          modelAttribution.declaredModelFamilies.includes(notifiedModel) &&
+          modelAttribution.priorModelId.startsWith(`${notifiedModel}-`))
+      )
+    }
+    const classifyAsyncOptions = (
+      options: AcpConfigOptionEntry[],
+    ): 'match' | 'other_attributed' | 'ignore' | 'conflict' => {
+      if (modelAttribution) {
+        const notifiedModel = options.find((opt) => opt.id === 'model')?.currentValue
+        if (notifiedModel === undefined) {
+          if (modelAttribution.didSwitchModel || configId === 'model') {
+            return 'ignore'
+          }
+        } else if (modelAttribution.isAmbiguousSharedFamilyUpdate(notifiedModel)) {
+          // Same-family variant switch: family-only async notifications cannot confirm either
+          // `model` OR model-dependent `thought_level`!
+          return 'ignore'
+        } else if (
+          modelAttribution.requestedModel !== null &&
+          !modelAttribution.configFamilyMatchesRequested(notifiedModel)
+        ) {
+          return isStalePriorModel(notifiedModel) ? 'ignore' : 'conflict'
+        }
+      }
+      return options.find((opt) => opt.id === configId)?.currentValue === value
+        ? 'match'
+        : 'other_attributed'
+    }
+    const setOptionOp = connection.requestOwned(
       'session/set_config_option',
       { sessionId, configId, value },
-      { timeoutMs: AGY_CONTROL_RPC_TIMEOUT_MS, signal },
+      {
+        timeoutMs: AGY_CONTROL_RPC_TIMEOUT_MS,
+        signal,
+        ...(sessionStream ? { replyTo: sessionStream } : {}),
+      },
     )
-    let notifiedOptions: AcpConfigOptionEntry[] | undefined
+    const requestPromise = setOptionOp.result
+    let latestAttributedOptions: AcpConfigOptionEntry[] | undefined
+    let latestAttributedMatched = false
+    let conflictModelDuringSet: string | undefined
+    let replyError: AgentExecutionError | undefined
+    let replyHadOptions = false
+    const observeAsyncConfigOptions = (parsed: AcpConfigOptionEntry[]): void => {
+      const verdict = classifyAsyncOptions(parsed)
+      if (verdict === 'conflict') {
+        conflictModelDuringSet = parsed.find((opt) => opt.id === 'model')?.currentValue ?? 'unknown'
+        latestAttributedOptions = undefined
+        latestAttributedMatched = false
+      } else if (verdict === 'match') {
+        conflictModelDuringSet = undefined
+        latestAttributedOptions = parsed
+        latestAttributedMatched = true
+      } else if (verdict === 'other_attributed') {
+        conflictModelDuringSet = undefined
+        latestAttributedOptions = parsed
+        latestAttributedMatched = false
+      }
+    }
+    const observeReplyOptions = (resp: object): void => {
+      const rErr = Reflect.get(resp, 'error')
+      const rRes = Reflect.get(resp, 'result')
+      if (rErr || !isPlainObject(rRes)) return
+      if (!Array.isArray(Reflect.get(rRes, 'configOptions'))) return
+      const parsedReply = parseConfigOptions(Reflect.get(rRes, 'configOptions'))
+      replyHadOptions = true
+      if (modelAttribution && modelAttribution.requestedModel !== null) {
+        const replyModel = parsedReply.find((opt) => opt.id === 'model')?.currentValue
+        if (
+          replyModel !== undefined &&
+          !modelAttribution.configFamilyMatchesRequested(replyModel)
+        ) {
+          replyError = new AgentExecutionError(
+            'runtime_incompatible',
+            `Antigravity silently substituted model="${replyModel}" for requested "${modelAttribution.requestedModel}".`,
+            false,
+          )
+          return
+        }
+      }
+      conflictModelDuringSet = undefined
+      latestAttributedOptions = parsedReply
+      latestAttributedMatched =
+        parsedReply.find((opt) => opt.id === configId)?.currentValue === value
+    }
     const response = sessionStream
-      ? await this.runWithConcurrentReplayDrain(requestPromise, sessionStream, (note) => {
-          onMetadataNotification(note)
-          const parsed = this.extractConfigOptionsFromNotification(note)
-          if (parsed) notifiedOptions = parsed
-        })
+      ? await this.runWithConcurrentReplayDrain(
+          requestPromise,
+          sessionStream,
+          (note) => {
+            onMetadataNotification(note)
+            const parsed = this.extractConfigOptionsFromNotification(note, sessionId)
+            if (parsed) observeAsyncConfigOptions(parsed)
+          },
+          observeReplyOptions,
+          setOptionOp.requestId,
+          onServerRequest,
+        )
       : await requestPromise
     const error = Reflect.get(response, 'error')
     const result = Reflect.get(response, 'result')
@@ -5144,19 +11337,96 @@ export class AgyAgentAdapter implements AgentAdapter {
         false,
       )
     }
-    const replyHasOptions = Array.isArray(Reflect.get(result, 'configOptions'))
-    const replyOptions = replyHasOptions
-      ? parseConfigOptions(Reflect.get(result, 'configOptions'))
-      : undefined
-    let postReplyOptions: AcpConfigOptionEntry[] | undefined
-    if (notifiedOptions === undefined && replyOptions === undefined && sessionStream) {
-      postReplyOptions = await this.awaitPostReplyConfigOptionUpdate(
-        sessionStream,
-        onMetadataNotification,
-        signal,
+    if (!sessionStream) {
+      observeReplyOptions(response)
+    }
+    if (replyError) {
+      throw replyError
+    }
+    if (conflictModelDuringSet !== undefined && modelAttribution?.requestedModel !== null) {
+      throw new AgentExecutionError(
+        'runtime_incompatible',
+        `Antigravity silently substituted model="${conflictModelDuringSet}" for requested "${modelAttribution?.requestedModel ?? 'unknown'}".`,
+        false,
       )
     }
-    const updated = postReplyOptions ?? notifiedOptions ?? replyOptions ?? []
+    if (sessionStream) {
+      await Promise.resolve()
+      while (true) {
+        const buffered = sessionStream.shift()
+        if (!buffered) break
+        if (buffered.kind === 'server_request') {
+          onServerRequest?.(buffered)
+          continue
+        }
+        if (buffered.kind !== 'notification') continue
+        onMetadataNotification(buffered.message)
+        const parsed = this.extractConfigOptionsFromNotification(buffered.message, sessionId)
+        if (parsed) observeAsyncConfigOptions(parsed)
+      }
+    }
+    if (conflictModelDuringSet !== undefined && modelAttribution?.requestedModel !== null) {
+      throw new AgentExecutionError(
+        'runtime_incompatible',
+        `Antigravity silently substituted model="${conflictModelDuringSet}" for requested "${modelAttribution?.requestedModel ?? 'unknown'}".`,
+        false,
+      )
+    }
+    let updated: AcpConfigOptionEntry[]
+    if (replyHadOptions) {
+      updated = latestAttributedOptions ?? []
+    } else {
+      if (!latestAttributedMatched && sessionStream) {
+        const deadlineAt = Date.now() + AGY_CONFIG_OPTION_POST_REPLY_WINDOW_MS
+        while (true) {
+          let sawEnd = false
+          while (true) {
+            const buffered = sessionStream.shift()
+            if (!buffered) break
+            if (buffered.kind === 'server_request') {
+              onServerRequest?.(buffered)
+              continue
+            }
+            if (buffered.kind === 'end') {
+              sawEnd = true
+              break
+            }
+            if (buffered.kind !== 'notification') continue
+            onMetadataNotification(buffered.message)
+            const parsed = this.extractConfigOptionsFromNotification(buffered.message, sessionId)
+            if (parsed) observeAsyncConfigOptions(parsed)
+          }
+          if (sawEnd || conflictModelDuringSet !== undefined || latestAttributedMatched) break
+          const remainingMs = deadlineAt - Date.now()
+          if (remainingMs <= 0) break
+          // oxlint-disable-next-line no-await-in-loop -- Bounded short wait for post-reply `config_option_update`.
+          const nextItem = await sessionStream
+            .nextIngress(remainingMs, signal)
+            .catch(() => undefined)
+          if (!nextItem) {
+            signal.throwIfAborted()
+            break
+          }
+          if (nextItem.kind === 'server_request') {
+            onServerRequest?.(nextItem)
+            continue
+          }
+          if (nextItem.kind === 'end') break
+          if (nextItem.kind !== 'notification') continue
+          onMetadataNotification(nextItem.message)
+          const parsed = this.extractConfigOptionsFromNotification(nextItem.message, sessionId)
+          if (parsed) observeAsyncConfigOptions(parsed)
+        }
+      }
+      if (conflictModelDuringSet !== undefined && modelAttribution?.requestedModel !== null) {
+        throw new AgentExecutionError(
+          'runtime_incompatible',
+          `Antigravity silently substituted model="${conflictModelDuringSet}" for requested "${modelAttribution?.requestedModel ?? 'unknown'}".`,
+          false,
+        )
+      }
+      updated = latestAttributedOptions ?? []
+    }
     const confirmed = updated.find((opt) => opt.id === configId)
     if (confirmed && confirmed.currentValue !== undefined && confirmed.currentValue !== value) {
       throw new AgentExecutionError(
@@ -5210,8 +11480,12 @@ export class AgyAgentAdapter implements AgentAdapter {
 
   private async handlePermissionRequest(context: {
     connection: AgyAcpConnection
+    validated: ValidatedAgyFrame
     rpcId: string | number
     params: Record<string, unknown>
+    paramsObjectValid: boolean
+    unscopedDuringForeignTurn: boolean
+    preBuiltCard: ReturnType<typeof buildAgyPermissionCard> | undefined
     cwd: string
     input: AgentRunInput
     activeRun: ActiveAgyRun | undefined
@@ -5228,8 +11502,12 @@ export class AgyAgentAdapter implements AgentAdapter {
   }): Promise<void> {
     const {
       connection,
+      validated,
       rpcId,
       params,
+      paramsObjectValid,
+      unscopedDuringForeignTurn,
+      preBuiltCard,
       cwd,
       input,
       activeRun,
@@ -5245,84 +11523,149 @@ export class AgyAgentAdapter implements AgentAdapter {
       signal,
     } = context
 
-    // 1. Full access (`requirements.md:519`): explicitly deny ANY residual `session/request_permission`
-    // BEFORE any Pact MCP tool-name auto-allow and without surfacing a user approval card!
-    if (!readOnlyStage && permissionMode === 'full') {
+    const mayRevokeCurrentSessionMcp = validated.sessionAttribution !== 'pure_foreign'
+    const hasForeignOrInvalidMeta = validated.hasForeignOrInvalidSessionMeta
+    const executionContradicted =
+      validated.executionIdInvalid ||
+      unscopedDuringForeignTurn ||
+      (validated.executionId !== undefined &&
+        activeRun?.providerExecutionId !== undefined &&
+        validated.executionId !== activeRun.providerExecutionId) ||
+      (validated.executionId !== undefined &&
+        Boolean(activeRun?.knownForeignExecutionIds.has(validated.executionId)))
+    const validTcId = validated.toolCallIdInvalid ? undefined : validated.toolCallId
+    const inheritedName =
+      validated.explicitToolName === undefined &&
+      !validated.explicitToolNameInvalid &&
+      validTcId !== undefined
+        ? mcpServer.lookupVerifiedCallToolName(validTcId)
+        : undefined
+    const exactToolName = validated.explicitToolName ?? inheritedName ?? ''
+    const isAuthorizedPactTool =
+      !validated.explicitToolNameInvalid &&
+      Boolean(mcpServer.isAuthorizedMcpToolCallName(exactToolName))
+    const disputedTokens = validated.tokens.allCanonicalTokens
+    const resolvedPt = validated.tokens.resolvedToken
+    const hasTerminalOrInvalidPermStatus =
+      validated.statusPresent &&
+      (validated.statusInvalid ||
+        validated.status === 'completed' ||
+        validated.status === 'failed' ||
+        validated.status === 'cancelled')
+    const hasInvalidOrContradictedPermFrame =
+      !paramsObjectValid ||
+      hasForeignOrInvalidMeta ||
+      executionContradicted ||
+      validated.rootEvidenceContradicted ||
+      validated.tokens.hasInvalidToken ||
+      validated.tokens.hasConflictingTokens ||
+      validated.toolCallIdInvalid ||
+      hasTerminalOrInvalidPermStatus ||
+      validated.argsEvidence.kind === 'invalid_or_conflict'
+
+    const recordNegativeNonPactDecision = (): void => {
+      if (!mayRevokeCurrentSessionMcp) return
+      mcpServer.observeNonPactCall(validTcId, disputedTokens)
+    }
+
+    const denyPermission = async (): Promise<void> => {
       const rejectOnce = findRejectOnceOptionId(params.options)
       const payload = rejectOnce
         ? { outcome: { outcome: 'selected', optionId: rejectOnce } }
         : { outcome: { outcome: 'cancelled' } }
       await connection.respond(rpcId, payload).catch(() => undefined)
+    }
+
+    // 1. Full access (`requirements.md:519`): explicitly deny ANY residual `session/request_permission`
+    // BEFORE any Pact MCP tool-name auto-allow and without surfacing a user approval card!
+    // Record refusal of both call ID and all supplied progressTokens BEFORE sending the negative reply.
+    if (!readOnlyStage && permissionMode === 'full') {
+      if (mayRevokeCurrentSessionMcp) {
+        if (isAuthorizedPactTool) {
+          mcpServer.revokeDisputedTokens(validTcId, disputedTokens)
+        } else {
+          recordNegativeNonPactDecision()
+        }
+      }
+      await denyPermission()
       return
     }
 
-    const toolCall = isPlainObject(params.toolCall) ? params.toolCall : {}
-    const toolName = asString(toolCall.name) ?? ''
-    const expectedSessionId = activeRun?.nativeSessionId ?? getSessionId()
-    const rawPermMeta = Reflect.get(params, '_meta')
-    const rawToolMeta = Reflect.get(toolCall, '_meta')
-    const permConvId = isPlainObject(rawPermMeta)
-      ? asString(rawPermMeta['antigravity.google/conversation_id'] ?? rawPermMeta.conversation_id)
-      : undefined
-    const permRootConvId = isPlainObject(rawPermMeta)
-      ? asString(rawPermMeta['antigravity.google/root_conversation_id'])
-      : undefined
-    const toolConvId = isPlainObject(rawToolMeta)
-      ? asString(rawToolMeta['antigravity.google/conversation_id'] ?? rawToolMeta.conversation_id)
-      : undefined
-    const hasForeignMeta =
-      expectedSessionId !== undefined &&
-      ((permConvId !== undefined && permConvId !== expectedSessionId) ||
-        (permRootConvId !== undefined && permRootConvId !== expectedSessionId) ||
-        (toolConvId !== undefined && toolConvId !== expectedSessionId))
-
-    // 2. Auto-allow ONLY verified current-root Pact MCP tools matching this Run's active allowed list.
-    if (
-      activeRun &&
-      !activeRun.rootTerminal &&
-      !signal.aborted &&
-      !hasForeignMeta &&
-      mcpServer.isAuthorizedMcpToolCallName(toolName)
-    ) {
-      const rawPt =
-        toolCall.progressToken ??
-        (isPlainObject(rawToolMeta) ? rawToolMeta.progressToken : undefined) ??
-        (isPlainObject(rawPermMeta) ? rawPermMeta.progressToken : undefined)
-      if (typeof rawPt === 'string' && rawPt.length > 0) {
-        mcpServer.bindToolCallToken(rawPt)
-      } else if (typeof rawPt === 'number' && Number.isSafeInteger(rawPt)) {
-        mcpServer.bindToolCallToken(String(rawPt))
-      }
-      const tcId = asString(toolCall.toolCallId ?? toolCall.id)
-      if (tcId) mcpServer.bindToolCallToken(tcId)
-
-      const allowOnce = findAllowOnceOptionId(params.options)
-      if (allowOnce) {
-        await connection
-          .respond(rpcId, { outcome: { outcome: 'selected', optionId: allowOnce } })
-          .catch(() => undefined)
-        return
-      }
+    // 2. Record non-Pact call ID & token ownership before replying (independent of activeRun or prior admission).
+    if (!isAuthorizedPactTool) {
+      recordNegativeNonPactDecision()
     }
 
-    // 3. Read-Only Ironclad Wall (`B4`): deterministically reject ALL workspace file/command/other
+    // Reject contradictory, malformed, foreign-execution, terminal-status, or invalid-token
+    // permission requests for BOTH Pact and non-Pact tools BEFORE auto-approval or approval cards!
+    if (hasInvalidOrContradictedPermFrame) {
+      if (mayRevokeCurrentSessionMcp && isAuthorizedPactTool) {
+        mcpServer.revokeDisputedTokens(validTcId, disputedTokens)
+      }
+      await denyPermission()
+      return
+    }
+
+    // Auto-allow ONLY verified current-root Pact MCP tools matching this Run's active allowed list.
+    if (
+      activeRun &&
+      !activeRun.promptReplyReceived &&
+      mcpServer.isRootActive() &&
+      !signal.aborted &&
+      !hasInvalidOrContradictedPermFrame &&
+      isAuthorizedPactTool
+    ) {
+      const allowOnce = findAllowOnceOptionId(params.options)
+      if (!allowOnce || validTcId === undefined) {
+        mcpServer.revokeDisputedTokens(validTcId, disputedTokens)
+        await denyPermission()
+        return
+      }
+      const admission = mcpServer.observeAcpToolCall({
+        toolCallId: validTcId,
+        rawToolName: exactToolName,
+        status: validated.status ?? 'pending',
+        ...(validated.argsEvidence.kind === 'present'
+          ? {
+              args: validated.argsEvidence.args,
+              argsFingerprint: validated.argsEvidence.fingerprint,
+            }
+          : {}),
+        ...(resolvedPt !== undefined ? { progressToken: resolvedPt.canonical } : {}),
+        ...(disputedTokens.length > 0 ? { disputedTokens } : {}),
+        ...(validated.trajectoryId !== undefined ? { trajectoryId: validated.trajectoryId } : {}),
+        ...(validated.stepIdx !== undefined ? { stepIdx: validated.stepIdx } : {}),
+      })
+      if (admission !== 'admitted') {
+        mcpServer.revokeDisputedTokens(validTcId, disputedTokens)
+        await denyPermission()
+        return
+      }
+      // Pin root trajectory/step ONLY after full frame validation AND correlator admission succeeded!
+      if (validated.trajectoryId !== undefined) {
+        mcpServer.pinRootTrajectoryId(validated.trajectoryId)
+      } else if (resolvedPt?.structured && !resolvedPt.structured.hasLeadingZeros) {
+        mcpServer.pinRootTrajectoryId(resolvedPt.structured.trajectoryId)
+      }
+      await connection
+        .respond(rpcId, { outcome: { outcome: 'selected', optionId: allowOnce } })
+        .catch(() => undefined)
+      return
+    }
+    if (mayRevokeCurrentSessionMcp && isAuthorizedPactTool) {
+      mcpServer.revokeDisputedTokens(validTcId, disputedTokens)
+    }
+
+    // 3. Read-Only Ironclad Wall (`B4`): deterministically reject ALL workspace/read_file/command/other
     // permission requests using `reject_once` / `deny` (NEVER `options[0]`!).
     if (readOnlyStage) {
-      const rejectOnce = findRejectOnceOptionId(params.options)
-      const payload = rejectOnce
-        ? { outcome: { outcome: 'selected', optionId: rejectOnce } }
-        : { outcome: { outcome: 'cancelled' } }
-      await connection.respond(rpcId, payload).catch(() => undefined)
+      await denyPermission()
       return
     }
 
     // 4. Interactive user approval (`native`, `ask`, or `auto` classifier escalation).
     if (!input.requestPermission || getActiveCount() >= NATIVE_PERMISSION_REQUESTS) {
-      const rejectOnce = findRejectOnceOptionId(params.options)
-      const payload = rejectOnce
-        ? { outcome: { outcome: 'selected', optionId: rejectOnce } }
-        : { outcome: { outcome: 'cancelled' } }
-      await connection.respond(rpcId, payload).catch(() => undefined)
+      await denyPermission()
       return
     }
 
@@ -5334,25 +11677,23 @@ export class AgyAgentAdapter implements AgentAdapter {
       !signal.aborted &&
       connection.isOpen &&
       (activeRun
-        ? !activeRun.rootTerminal &&
+        ? !activeRun.promptReplyReceived &&
+          !activeRun.rootTerminal &&
           activeRun.turnEpoch === fenceEpoch &&
           activeRun.executorId === fenceExecutor &&
-          activeRun.bindingGeneration === fenceGen
+          activeRun.bindingGeneration === fenceGen &&
+          !(
+            validated.executionId !== undefined &&
+            activeRun.providerExecutionId !== undefined &&
+            activeRun.providerExecutionId !== validated.executionId
+          )
         : true)
 
     let card: ReturnType<typeof buildAgyPermissionCard>
     try {
-      card = buildAgyPermissionCard(params, cwd)
+      card = preBuiltCard ?? buildAgyPermissionCard(params, cwd)
     } catch {
-      const rejectOnce = findRejectOnceOptionId(params.options)
-      await connection
-        .respond(
-          rpcId,
-          rejectOnce
-            ? { outcome: { outcome: 'selected', optionId: rejectOnce } }
-            : { outcome: { outcome: 'cancelled' } },
-        )
-        .catch(() => undefined)
+      await denyPermission()
       return
     }
 
@@ -5362,15 +11703,22 @@ export class AgyAgentAdapter implements AgentAdapter {
     const interactionAbort = new AbortController()
     interactionControllers.add(interactionAbort)
 
-    pushEvent({
-      agentId: 'agy',
-      type: 'interaction.requested',
-      turnId: input.runId,
-      requestId: String(rpcId),
-      category: 'approval',
-    })
-
     try {
+      if (!isFenceCurrent()) {
+        if (connection.isOpen) {
+          await connection
+            .respond(rpcId, { outcome: { outcome: 'cancelled' } })
+            .catch(() => undefined)
+        }
+        return
+      }
+      pushEvent({
+        agentId: 'agy',
+        type: 'interaction.requested',
+        turnId: input.runId,
+        requestId: String(rpcId),
+        category: 'approval',
+      })
       const combinedSignal = AbortSignal.any([signal, interactionAbort.signal])
       const permWork = input.requestPermission(card.request, combinedSignal)
       void permWork.catch(() => undefined)
@@ -5411,8 +11759,12 @@ export class AgyAgentAdapter implements AgentAdapter {
 
   private async handleElicitationRequest(context: {
     connection: AgyAcpConnection
+    validated: ValidatedAgyFrame
     rpcId: string | number
     params: Record<string, unknown>
+    paramsObjectValid: boolean
+    unscopedDuringForeignTurn: boolean
+    preParsedRequest: NativeUserInputRequest | undefined
     input: AgentRunInput
     activeRun: ActiveAgyRun | undefined
     askOnlyStage: boolean
@@ -5424,8 +11776,12 @@ export class AgyAgentAdapter implements AgentAdapter {
   }): Promise<void> {
     const {
       connection,
+      validated,
       rpcId,
       params,
+      paramsObjectValid,
+      unscopedDuringForeignTurn,
+      preParsedRequest,
       input,
       activeRun,
       askOnlyStage,
@@ -5436,6 +11792,27 @@ export class AgyAgentAdapter implements AgentAdapter {
       signal,
     } = context
 
+    // Reject foreign, malformed, or root-contradicting elicitation requests before prompting the user.
+    const executionContradicted =
+      validated.executionIdInvalid ||
+      unscopedDuringForeignTurn ||
+      (validated.executionId !== undefined &&
+        activeRun !== undefined &&
+        (activeRun.knownForeignExecutionIds.has(validated.executionId) ||
+          (activeRun.providerExecutionId !== undefined &&
+            activeRun.providerExecutionId !== validated.executionId)))
+    if (
+      !paramsObjectValid ||
+      executionContradicted ||
+      validated.hasForeignOrInvalidSessionMeta ||
+      validated.rootEvidenceContradicted ||
+      validated.tokens.hasInvalidToken ||
+      validated.tokens.hasConflictingTokens
+    ) {
+      await connection.respond(rpcId, { action: 'cancel' }).catch(() => undefined)
+      return
+    }
+
     if (!input.requestUserInput || askOnlyStage || readOnlyNonInteractive) {
       await connection.respond(rpcId, { action: 'decline' }).catch(() => undefined)
       return
@@ -5443,7 +11820,7 @@ export class AgyAgentAdapter implements AgentAdapter {
 
     let uiRequest: NativeUserInputRequest
     try {
-      uiRequest = agyElicitationRequest(params)
+      uiRequest = preParsedRequest ?? agyElicitationRequest(params)
     } catch (error) {
       await connection
         .respondError(
@@ -5463,10 +11840,16 @@ export class AgyAgentAdapter implements AgentAdapter {
       !signal.aborted &&
       connection.isOpen &&
       (activeRun
-        ? !activeRun.rootTerminal &&
+        ? !activeRun.promptReplyReceived &&
+          !activeRun.rootTerminal &&
           activeRun.turnEpoch === fenceEpoch &&
           activeRun.executorId === fenceExecutor &&
-          activeRun.bindingGeneration === fenceGen
+          activeRun.bindingGeneration === fenceGen &&
+          !(
+            validated.executionId !== undefined &&
+            activeRun.providerExecutionId !== undefined &&
+            activeRun.providerExecutionId !== validated.executionId
+          )
         : true)
 
     const endConnectionWait = connection.beginPermissionWait()
@@ -5474,15 +11857,20 @@ export class AgyAgentAdapter implements AgentAdapter {
     const interactionAbort = new AbortController()
     interactionControllers.add(interactionAbort)
 
-    pushEvent({
-      agentId: 'agy',
-      type: 'interaction.requested',
-      turnId: input.runId,
-      requestId: String(rpcId),
-      category: 'question',
-    })
-
     try {
+      if (!isFenceCurrent()) {
+        if (connection.isOpen) {
+          await connection.respond(rpcId, { action: 'cancel' }).catch(() => undefined)
+        }
+        return
+      }
+      pushEvent({
+        agentId: 'agy',
+        type: 'interaction.requested',
+        turnId: input.runId,
+        requestId: String(rpcId),
+        category: 'question',
+      })
       const combinedSignal = AbortSignal.any([signal, interactionAbort.signal])
       const userWork = input.requestUserInput(uiRequest, combinedSignal)
       void userWork.catch(() => undefined)
@@ -5516,7 +11904,8 @@ export class AgyAgentAdapter implements AgentAdapter {
   }
 
   private *projectSessionNotification(context: {
-    notification: object
+    validated: ValidatedAgyFrame
+    receivedAfterPromptReply: boolean
     input: AgentRunInput
     activeRun: ActiveAgyRun
     cwd: string
@@ -5534,575 +11923,817 @@ export class AgyAgentAdapter implements AgentAdapter {
     bumpThoughtIndex: () => void
     planModeStage: boolean
     onBrainPlanTouched: () => void
-    setUnresolvedBrainPlanWrite: (unresolved: boolean) => void
-    onBrainPlanCaptured: (plan: { nativeId: string; text: string }) => void
-    onBrainPlanCaptureFailed: () => void
-    stagedMcpOutcomes: Map<string, StagedMcpCallOutcome['kind']>
+    onBrainPlanOpStarted: (callId: string) => void
+    onBrainPlanDeferredReadback: (callId: string) => void
+    onBrainPlanCaptured: (callId: string, plan: { nativeId: string; text: string }) => void
+    onBrainPlanCaptureFailed: (callId?: string) => void
     onReviewAccepted: (obs: CollaborationReviewObservation) => void
     onInputResultAccepted: (obs: CollaborationInputObservation) => void
     onPlanRetainedAccepted: () => void
     onOpenPlanPublished: (plan: { nativeId: string; text: string }) => void
+    onOpenPlanPublishFailed: () => void
     getSessionTitleEmitted: () => boolean
     markSessionTitleEmitted: () => void
-    seenForegroundMessageIds: Set<string>
+    recordSeenForegroundMessageId: (msgIdentity: string, trustedStepIdx?: number) => void
+    recordForegroundStepIdx: (stepIdx: number) => void
     onObservedBackgroundTask: () => void
     reportUnknown: (reason: string) => void
     observeFiles: (evidence: Parameters<typeof recordNativeChanges>[1]) => void
     signal: AbortSignal
   }): Generator<NormalizedAgentEvent> {
-    const { notification, input, activeRun } = context
-    const method = asString(Reflect.get(notification, 'method'))
-    if (method !== 'session/update') return
-    const params = Reflect.get(notification, 'params')
-    if (!isPlainObject(params)) return
-    const update = params.update
-    if (!isPlainObject(update)) return
+    const emitted: NormalizedAgentEvent[] = []
+    const processFrame = (): void => {
+      const { validated, input, activeRun } = context
+      if (validated.method !== 'session/update') return
+      if (validated.sessionAttribution === 'pure_foreign') return
+      const update = validated.payload
+      if (!update) return
+      const sessionUpdate = validated.sessionUpdate
+      if (!sessionUpdate) return
 
-    const sessionUpdate = asString(update.sessionUpdate)
-    if (!sessionUpdate) return
+      const updateMeta = Reflect.get(update, '_meta')
+      const steerId =
+        sessionUpdate === 'user_message_chunk'
+          ? (asString(update.pactSteerInputId) ??
+            (isPlainObject(updateMeta) ? asString(updateMeta.pactSteerInputId) : undefined))
+          : undefined
 
-    const updateMeta = Reflect.get(update, '_meta')
-    const steerId =
-      sessionUpdate === 'user_message_chunk'
-        ? (asString(update.pactSteerInputId) ??
-          (isPlainObject(updateMeta) ? asString(updateMeta.pactSteerInputId) : undefined))
-        : undefined
+      const updateExecId = validated.executionId
+      const updateStepIdx = update.stepIdx ?? update.step_idx
+      const frameRootContradictsPinned =
+        !validated.isAttributableToCurrentSession ||
+        validated.hasForeignOrInvalidSessionMeta ||
+        validated.executionIdInvalid ||
+        validated.rootEvidenceContradicted ||
+        (updateExecId !== undefined &&
+          activeRun.providerExecutionId !== undefined &&
+          updateExecId !== activeRun.providerExecutionId) ||
+        (updateExecId !== undefined && activeRun.knownForeignExecutionIds.has(updateExecId))
+      const frameCanPinRoot =
+        !steerId &&
+        !context.receivedAfterPromptReply &&
+        !frameRootContradictsPinned &&
+        !validated.tokens.hasInvalidToken &&
+        !validated.tokens.hasConflictingTokens
 
-    const updateExecId = asString(update.executionId ?? update.execution_id)
-    const updateStepIdx = update.stepIdx ?? update.step_idx
-    const updateTrajectoryId =
-      asString(update.trajectoryId ?? update.trajectory_id) ??
-      (isPlainObject(updateMeta)
-        ? asString(updateMeta.trajectoryId ?? updateMeta.trajectory_id)
-        : undefined)
-
-    // Bind `rootStepIdx` and trusted root trajectory ID ONLY from verified non-steer root updates!
-    if (!steerId) {
-      if (
-        typeof updateStepIdx === 'number' &&
-        Number.isSafeInteger(updateStepIdx) &&
-        activeRun.rootStepIdx === undefined
-      ) {
-        activeRun.rootStepIdx = updateStepIdx
+      // Allow contradictory frames to revoke disputed MCP evidence ONLY; never project text,
+      // record steer consumption, update session metadata/activity, or settle work!
+      if (frameRootContradictsPinned) {
+        if (sessionUpdate === 'tool_call' || sessionUpdate === 'tool_call_update') {
+          const disputedTokens = validated.tokens.allCanonicalTokens
+          const tcId = validated.toolCallIdInvalid ? undefined : validated.toolCallId
+          if (tcId !== undefined || disputedTokens.length > 0) {
+            context.mcpServer.revokeDisputedTokens(tcId, disputedTokens)
+          }
+        }
+        return
       }
-      if (updateTrajectoryId) {
-        context.mcpServer.pinRootTrajectoryId(updateTrajectoryId)
-      }
-    }
 
-    const msgIdentity = asString(update.messageId ?? update.stepId ?? update.toolCallId)
-    if (msgIdentity && context.seenForegroundMessageIds.size < 4096) {
-      context.seenForegroundMessageIds.add(msgIdentity)
-    }
+      const trustedStepIdx =
+        frameCanPinRoot && validated.stepIdx !== undefined ? validated.stepIdx : undefined
 
-    if (sessionUpdate === 'session_info_update') {
-      const title = asString(update.title)?.trim()
-      if (title && title.length <= 120) {
-        input.observeNativeTitle?.(activeRun.nativeSessionId, title)
-        if (
-          !context.getSessionTitleEmitted() &&
-          sessionTitleInputSchema.safeParse({ title }).success
+      // Bind `rootStepIdx` and trusted root trajectory ID ONLY after full intra-frame validation passes!
+      if (frameCanPinRoot) {
+        if (validated.stepIdx !== undefined) {
+          context.recordForegroundStepIdx(validated.stepIdx)
+          if (activeRun.rootStepIdx === undefined) {
+            activeRun.rootStepIdx = validated.stepIdx
+            context.mcpServer.notifyRootProofUpdated()
+          }
+        }
+        if (validated.trajectoryId !== undefined) {
+          context.mcpServer.pinRootTrajectoryId(validated.trajectoryId)
+        } else if (
+          validated.tokens.resolvedToken?.structured &&
+          !validated.tokens.resolvedToken.structured.hasLeadingZeros
         ) {
-          context.markSessionTitleEmitted()
-          yield { agentId: 'agy', type: 'session.title.updated', title }
+          context.mcpServer.pinRootTrajectoryId(
+            validated.tokens.resolvedToken.structured.trajectoryId,
+          )
         }
       }
-      return
-    }
 
-    if (sessionUpdate === 'available_commands_update') {
-      this.skillCatalogListener?.()
-      return
-    }
-
-    if (sessionUpdate === 'current_mode_update') {
-      const nextMode = asString(update.currentModeId ?? update.modeId)
-      if (nextMode) {
-        const modeState = this.sessionModes.get(activeRun.nativeSessionId)
-        if (modeState) modeState.currentModeId = nextMode
+      const msgIdentity = asString(update.messageId ?? update.stepId ?? update.toolCallId)
+      if (msgIdentity) {
+        context.recordSeenForegroundMessageId(msgIdentity, trustedStepIdx)
       }
-      return
-    }
 
-    if (sessionUpdate === 'user_message_chunk') {
-      // Correlate in-Turn steer consumption receipt if echoed on the live stream!
-      if (
-        steerId &&
-        typeof updateStepIdx === 'number' &&
-        Number.isSafeInteger(updateStepIdx) &&
-        updateStepIdx >= 0 &&
-        updateExecId
-      ) {
-        const steerEntry = activeRun.steeredInputs.get(steerId)
-        if (steerEntry && !steerEntry.consumed) {
-          steerEntry.candidateStepIdx = updateStepIdx
-          steerEntry.candidateExecutionId = updateExecId
-          if (activeRun.providerExecutionId) {
-            if (this.tryPromoteStagedSteerCandidate(activeRun, steerId, steerEntry)) {
-              input.recordInputConsumption?.(steerId, {
-                nativeSessionId: activeRun.nativeSessionId,
-                nativeTurnId: activeRun.nativeTurnId,
-                executorId: activeRun.executorId,
-              })
+      if (sessionUpdate === 'session_info_update') {
+        const title = asString(update.title)?.trim()
+        if (title && title.length <= 120) {
+          input.observeNativeTitle?.(activeRun.nativeSessionId, title)
+          if (
+            !context.getSessionTitleEmitted() &&
+            sessionTitleInputSchema.safeParse({ title }).success
+          ) {
+            context.markSessionTitleEmitted()
+            emitted.push({ agentId: 'agy', type: 'session.title.updated', title })
+          }
+        }
+        return
+      }
+
+      if (sessionUpdate === 'available_commands_update') {
+        this.skillCatalogListener?.()
+        return
+      }
+
+      if (sessionUpdate === 'current_mode_update') {
+        const nextMode = asString(update.currentModeId ?? update.modeId)
+        if (nextMode) {
+          const modeState = this.sessionModes.get(activeRun.nativeSessionId)
+          if (modeState) modeState.currentModeId = nextMode
+        }
+        return
+      }
+
+      if (sessionUpdate === 'user_message_chunk') {
+        // Correlate in-Turn steer consumption receipt if echoed on the live stream!
+        if (
+          steerId &&
+          typeof updateStepIdx === 'number' &&
+          Number.isSafeInteger(updateStepIdx) &&
+          updateStepIdx >= 0 &&
+          updateExecId
+        ) {
+          const steerEntry = activeRun.steeredInputs.get(steerId)
+          if (steerEntry && !steerEntry.consumed) {
+            steerEntry.candidateStepIdx = updateStepIdx
+            steerEntry.candidateExecutionId = updateExecId
+            if (activeRun.providerExecutionId) {
+              if (this.tryPromoteStagedSteerCandidate(activeRun, steerId, steerEntry)) {
+                input.recordInputConsumption?.(steerId, {
+                  nativeSessionId: activeRun.nativeSessionId,
+                  nativeTurnId: activeRun.nativeTurnId,
+                  executorId: activeRun.executorId,
+                })
+              }
             }
           }
         }
+        return
       }
-      return
-    }
 
-    if (sessionUpdate === 'background_task_completed') {
-      const completedTaskId = asString(update.taskId ?? update.backgroundTaskId)
-      const completedToolCallId = asString(update.toolCallId ?? update.id)
-      this.settleBackgroundTaskByAlias(activeRun, input, [completedTaskId, completedToolCallId])
-      return
-    }
+      if (sessionUpdate === 'background_task_completed') {
+        const completedTaskId = asString(update.taskId ?? update.backgroundTaskId)
+        const completedToolCallId = asString(update.toolCallId ?? update.id)
+        this.settleBackgroundTaskByAlias(activeRun, input, [completedTaskId, completedToolCallId])
+        return
+      }
 
-    if (sessionUpdate === 'usage_update' || sessionUpdate === 'config_option_update') {
-      return
-    }
+      if (sessionUpdate === 'usage_update' || sessionUpdate === 'config_option_update') {
+        return
+      }
 
-    // First substantive model/tool activity confirms Turn acceptance.
-    if (!activeRun.turnAccepted) {
-      activeRun.turnAccepted = true
-      input.recordDispatch?.('accepted', activeRun.nativeSessionId, activeRun.executorId)
-      this.recordEvidence(
-        input,
-        activeRun.nativeSessionId,
-        activeRun.executorId,
-        {
-          kind: 'running',
-          source: 'live_runtime',
-        },
-        activeRun.nativeTurnId,
-      )
-      yield { agentId: 'agy', type: 'turn.started', turnId: input.runId }
-    }
-
-    if (sessionUpdate === 'agent_thought_chunk') {
-      const content = isPlainObject(update.content) ? update.content : undefined
-      const delta = content && content.type === 'text' ? asString(content.text) : undefined
-      if (!delta) return
-      const key = String(context.getThoughtIndex())
-      const prev = context.reasoningItems.get(key) ?? ''
-      const addedBytes = Buffer.byteLength(delta, 'utf8')
-      if (
-        (!context.reasoningItems.has(key) &&
-          context.reasoningItems.size >= AGY_MAX_REASONING_ITEMS) ||
-        context.getReasoningBytes() + addedBytes > AGY_MAX_REASONING_BYTES
-      ) {
-        throw new AgentExecutionError(
-          'response_too_large',
-          'Antigravity reasoning summary exceeded the 2 MiB / 64-item budget.',
-          false,
+      // First substantive model/tool activity confirms Turn acceptance.
+      if (!activeRun.turnAccepted) {
+        activeRun.turnAccepted = true
+        input.recordDispatch?.('accepted', activeRun.nativeSessionId, activeRun.executorId)
+        this.recordEvidence(
+          input,
+          activeRun.nativeSessionId,
+          activeRun.executorId,
+          {
+            kind: 'running',
+            source: 'live_runtime',
+          },
+          activeRun.nativeTurnId,
         )
+        emitted.push({ agentId: 'agy', type: 'turn.started', turnId: input.runId })
       }
-      context.setReasoningBytes(context.getReasoningBytes() + addedBytes)
-      context.reasoningItems.set(key, prev + delta)
-      const activityId = `${input.runId}:thought:${key}`
-      yield {
-        agentId: 'agy',
-        type: 'reasoning.summary.delta',
-        turnId: input.runId,
-        activityId,
-        text: delta,
-      }
-      return
-    }
 
-    if (sessionUpdate === 'agent_message_chunk') {
-      const content = isPlainObject(update.content) ? update.content : undefined
-      const text = content && content.type === 'text' ? asString(content.text) : undefined
-      if (!text) return
-      const itemId = `msg:${context.getMessageIndex()}`
-      const delta = context.answer.append(itemId, text)
-      if (delta) {
-        yield {
+      if (sessionUpdate === 'agent_thought_chunk') {
+        const content = isPlainObject(update.content) ? update.content : undefined
+        const delta = content && content.type === 'text' ? asString(content.text) : undefined
+        if (!delta) return
+        const key = String(context.getThoughtIndex())
+        const prev = context.reasoningItems.get(key) ?? ''
+        const addedBytes = Buffer.byteLength(delta, 'utf8')
+        if (
+          (!context.reasoningItems.has(key) &&
+            context.reasoningItems.size >= AGY_MAX_REASONING_ITEMS) ||
+          context.getReasoningBytes() + addedBytes > AGY_MAX_REASONING_BYTES
+        ) {
+          throw new AgentExecutionError(
+            'response_too_large',
+            'Antigravity reasoning summary exceeded the 2 MiB / 64-item budget.',
+            false,
+          )
+        }
+        context.setReasoningBytes(context.getReasoningBytes() + addedBytes)
+        context.reasoningItems.set(key, prev + delta)
+        const activityId = `${input.runId}:thought:${key}`
+        emitted.push({
           agentId: 'agy',
-          type: 'text.delta',
+          type: 'reasoning.summary.delta',
           turnId: input.runId,
-          outputId: context.answer.outputId,
+          activityId,
           text: delta,
-        }
+        })
+        return
       }
-      return
-    }
 
-    if (sessionUpdate === 'tool_call' || sessionUpdate === 'tool_call_update') {
-      // Bump message & thought item indices across tool boundaries so multi-segment answers separate cleanly.
-      if (sessionUpdate === 'tool_call') {
-        const currentMsgKey = `msg:${context.getMessageIndex()}`
-        if (context.answer.text.length > 0 && currentMsgKey) {
-          context.bumpMessageIndex()
-        }
-        const currentThoughtKey = String(context.getThoughtIndex())
-        const priorThought = context.reasoningItems.get(currentThoughtKey)
-        if (priorThought) {
-          yield {
+      if (sessionUpdate === 'agent_message_chunk') {
+        if (context.receivedAfterPromptReply) return
+        const content = isPlainObject(update.content) ? update.content : undefined
+        const text = content && content.type === 'text' ? asString(content.text) : undefined
+        if (!text) return
+        const itemId = `msg:${context.getMessageIndex()}`
+        const delta = context.answer.append(itemId, text)
+        if (delta) {
+          emitted.push({
             agentId: 'agy',
-            type: 'reasoning.summary.completed',
+            type: 'text.delta',
             turnId: input.runId,
-            activityId: `${input.runId}:thought:${currentThoughtKey}`,
-            text: priorThought,
-          }
-          context.reasoningItems.delete(currentThoughtKey)
-          context.bumpThoughtIndex()
+            outputId: context.answer.outputId,
+            text: delta,
+          })
         }
+        return
       }
 
-      const toolCallId = asString(update.toolCallId ?? update.id)
-      if (!toolCallId || toolCallId.length > 1024) return
-      let state = context.tools.get(toolCallId)
-      if (!state) {
-        if (context.tools.size >= AGY_MAX_TOOL_STATES) {
-          // Evict oldest completed tool state to stay within <= 64 active items.
-          for (const [k, existing] of context.tools) {
-            if (existing.completedEmitted) {
-              context.resizeToolStateBytes(existing, 0)
-              context.tools.delete(k)
-              break
+      if (sessionUpdate === 'tool_call' || sessionUpdate === 'tool_call_update') {
+        // Bump message & thought item indices across tool boundaries so multi-segment answers separate cleanly.
+        if (sessionUpdate === 'tool_call') {
+          const currentMsgKey = `msg:${context.getMessageIndex()}`
+          if (context.answer.text.length > 0 && currentMsgKey) {
+            context.bumpMessageIndex()
+          }
+          const currentThoughtKey = String(context.getThoughtIndex())
+          const priorThought = context.reasoningItems.get(currentThoughtKey)
+          if (priorThought) {
+            emitted.push({
+              agentId: 'agy',
+              type: 'reasoning.summary.completed',
+              turnId: input.runId,
+              activityId: `${input.runId}:thought:${currentThoughtKey}`,
+              text: priorThought,
+            })
+            context.reasoningItems.delete(currentThoughtKey)
+            context.bumpThoughtIndex()
+          }
+        }
+
+        const disputedTokens = validated.tokens.allCanonicalTokens
+        const resolvedPt = validated.tokens.resolvedToken
+        const toolCallId = validated.toolCallIdInvalid ? undefined : validated.toolCallId
+        if (!toolCallId) {
+          if (disputedTokens.length > 0) {
+            const rawToolName = validated.explicitToolName ?? ''
+            if (
+              validated.explicitToolNameInvalid ||
+              !context.mcpServer.isAuthorizedMcpToolCallName(rawToolName)
+            ) {
+              context.mcpServer.observeNonPactCall(undefined, disputedTokens)
+            } else {
+              context.mcpServer.revokeDisputedTokens(undefined, disputedTokens)
+            }
+          }
+          return
+        }
+        const hasExplicitStatus = validated.statusPresent
+        const normalizedIncomingStatus = validated.status
+        const incomingStatusInvalid = validated.statusInvalid
+
+        let state = context.tools.get(toolCallId)
+        if (!state) {
+          if (context.tools.size >= AGY_MAX_TOOL_STATES) {
+            // Evict oldest completed tool state to stay within <= 64 active items.
+            for (const [k, existing] of context.tools) {
+              if (existing.completedEmitted) {
+                context.resizeToolStateBytes(existing, 0)
+                context.tools.delete(k)
+                break
+              }
+            }
+          }
+          if (context.tools.size >= AGY_MAX_TOOL_STATES) {
+            throw new AgentExecutionError(
+              'response_too_large',
+              'Antigravity exceeded the 64-item concurrent tool call budget.',
+              false,
+            )
+          }
+          const inheritedExplicitName =
+            validated.explicitToolName === undefined && !validated.explicitToolNameInvalid
+              ? context.mcpServer.lookupVerifiedCallToolName(toolCallId)
+              : undefined
+          const initialExplicitName = validated.explicitToolName ?? inheritedExplicitName
+          state = {
+            toolCallId,
+            // Display name may fall back to `update.kind`; authorization STRICTLY uses `explicitToolName`!
+            name: initialExplicitName ?? asString(update.kind)?.slice(0, 120) ?? 'tool',
+            ...(initialExplicitName !== undefined ? { explicitToolName: initialExplicitName } : {}),
+            ...(validated.explicitToolNameInvalid ? { toolIdentityConflicted: true } : {}),
+            title: (asString(update.title) ?? initialExplicitName ?? 'Tool').slice(0, 160),
+            status: normalizedIncomingStatus ?? 'pending',
+            ...(incomingStatusInvalid ? { invalidStatus: true } : {}),
+            reservedBytes: 0,
+            startedEmitted: false,
+            completedEmitted: false,
+          }
+          context.tools.set(toolCallId, state)
+        } else {
+          if (validated.explicitToolNameInvalid) {
+            context.mcpServer.revokeDisputedTokens(
+              state.toolCallId,
+              state.progressToken ? [...disputedTokens, state.progressToken] : disputedTokens,
+            )
+            state.toolIdentityConflicted = true
+          } else if (validated.explicitToolName !== undefined) {
+            const incomingName = validated.explicitToolName
+            if (state.explicitToolName !== undefined && incomingName !== state.explicitToolName) {
+              context.mcpServer.revokeDisputedTokens(
+                state.toolCallId,
+                state.progressToken ? [...disputedTokens, state.progressToken] : disputedTokens,
+              )
+              state.toolIdentityConflicted = true
+            } else if (state.explicitToolName === undefined) {
+              state.explicitToolName = incomingName
+            }
+            state.name = incomingName
+          }
+          if (asString(update.title)) state.title = asString(update.title)!.slice(0, 160)
+          if (hasExplicitStatus) {
+            if (normalizedIncomingStatus !== undefined) {
+              state.status = normalizedIncomingStatus
+            } else {
+              state.invalidStatus = true
             }
           }
         }
-        if (context.tools.size >= AGY_MAX_TOOL_STATES) {
-          throw new AgentExecutionError(
-            'response_too_large',
-            'Antigravity exceeded the 64-item concurrent tool call budget.',
-            false,
-          )
-        }
-        state = {
-          toolCallId,
-          name: (asString(update.name) ?? asString(update.kind) ?? 'tool').slice(0, 120),
-          title: (asString(update.title) ?? asString(update.name) ?? 'Tool').slice(0, 160),
-          status: asString(update.status) ?? 'pending',
-          reservedBytes: 0,
-          startedEmitted: false,
-          completedEmitted: false,
-        }
-        context.tools.set(toolCallId, state)
-      } else {
-        if (asString(update.name)) state.name = asString(update.name)!.slice(0, 120)
-        if (asString(update.title)) state.title = asString(update.title)!.slice(0, 160)
-        if (asString(update.status)) state.status = asString(update.status)!
-      }
 
-      const rawProgressToken =
-        update.progressToken ?? (isPlainObject(updateMeta) ? updateMeta.progressToken : undefined)
-      if (typeof rawProgressToken === 'string' && rawProgressToken.length > 0) {
-        const ptBytes = Buffer.byteLength(rawProgressToken, 'utf8')
-        if (ptBytes > AGY_MAX_TOOL_STATE_BYTES) {
-          throw new AgentExecutionError(
-            'response_too_large',
-            'Antigravity tool progressToken exceeded the 8 MiB working-memory budget.',
-            false,
-          )
+        const verifiedAuthToolName = state.explicitToolName ?? ''
+        const isAuthorizedPactTool =
+          !state.toolIdentityConflicted &&
+          Boolean(context.mcpServer.isAuthorizedMcpToolCallName(verifiedAuthToolName))
+
+        if (validated.tokens.suppliedCount > 0) {
+          if (
+            validated.tokens.hasInvalidToken ||
+            validated.tokens.hasConflictingTokens ||
+            !resolvedPt
+          ) {
+            state.invalidProgressToken = true
+            state.progressToken = undefined
+            if (!isAuthorizedPactTool && verifiedAuthToolName.length > 0) {
+              context.mcpServer.observeNonPactCall(state.toolCallId, disputedTokens)
+            } else {
+              context.mcpServer.revokeDisputedTokens(state.toolCallId, disputedTokens)
+            }
+          } else {
+            if (state.progressToken !== undefined && state.progressToken !== resolvedPt.canonical) {
+              state.invalidProgressToken = true
+              context.mcpServer.revokeDisputedTokens(state.toolCallId, [
+                state.progressToken,
+                resolvedPt.canonical,
+              ])
+              state.progressToken = undefined
+            } else if (!state.invalidProgressToken) {
+              state.progressToken = resolvedPt.canonical
+            }
+            if (!isAuthorizedPactTool && verifiedAuthToolName.length > 0) {
+              context.mcpServer.observeNonPactCall(state.toolCallId, disputedTokens)
+            }
+          }
+        } else if (!isAuthorizedPactTool && verifiedAuthToolName.length > 0) {
+          // Explicit non-Pact call without progressToken MUST still register negative ownership on its call ID!
+          context.mcpServer.observeNonPactCall(state.toolCallId, disputedTokens)
         }
-        state.progressToken = rawProgressToken
-      } else if (typeof rawProgressToken === 'number' && Number.isSafeInteger(rawProgressToken)) {
-        state.progressToken = String(rawProgressToken)
-      }
 
-      if (state.progressToken) {
-        const structuredPt = AGY_PROGRESS_TOKEN_PATTERN.exec(state.progressToken)
-        if (structuredPt?.[1]) {
-          context.mcpServer.pinRootTrajectoryId(structuredPt[1])
-        }
-      }
-
-      if (context.mcpServer.isAuthorizedMcpToolCallName(state.name)) {
-        if (state.progressToken) context.mcpServer.bindToolCallToken(state.progressToken)
-        context.mcpServer.bindToolCallToken(state.toolCallId)
-      }
-
-      if (!state.completedEmitted) {
-        if (isPlainObject(update.args)) state.args = update.args
-        if (isPlainObject(update.rawInput)) state.rawInput = update.rawInput
-        if ('rawOutput' in update) state.rawOutput = update.rawOutput
-        if (Array.isArray(update.content)) state.content = update.content
-        if (Array.isArray(update.locations)) state.locations = update.locations
-        const headerBytes =
+        const computeCompactToolStateBytes = (): number =>
           64 +
           Buffer.byteLength(state.toolCallId, 'utf8') +
           Buffer.byteLength(state.name, 'utf8') +
           Buffer.byteLength(state.title, 'utf8') +
+          Buffer.byteLength(state.status, 'utf8') +
+          (state.detail ? Buffer.byteLength(state.detail, 'utf8') + 16 : 0) +
           (state.progressToken ? Buffer.byteLength(state.progressToken, 'utf8') + 16 : 0)
-        const payloadBytes =
-          headerBytes +
-          estimateJsonPayloadBytes(state.args) +
-          estimateJsonPayloadBytes(state.rawInput) +
-          estimateJsonPayloadBytes(state.rawOutput) +
-          estimateJsonPayloadBytes(state.content) +
-          estimateJsonPayloadBytes(state.locations)
-        context.resizeToolStateBytes(state, payloadBytes)
-      }
 
-      const effectiveArgs = state.args ?? state.rawInput
-      if (effectiveArgs) {
-        const targetPath = asString(effectiveArgs.Path ?? effectiveArgs.path)
-        const command = asString(effectiveArgs.CommandLine ?? effectiveArgs.command)
-        if (targetPath) state.detail = AgentActivityDetail.projectPath(targetPath, context.cwd)
-        else if (command) state.detail = AgentActivityDetail.redact(command)
-      }
+        const computeToolStateBytes = (extraBytes = 0): number =>
+          computeCompactToolStateBytes() +
+          extraBytes +
+          (state.argsBytes ?? 0) +
+          (state.rawInputBytes ?? 0) +
+          (state.mergedArgsBytes ?? 0) +
+          (state.rawOutputBytes ?? 0) +
+          (state.contentBytes ?? 0) +
+          (state.locationsBytes ?? 0)
 
-      // Detect and correlate background task launches (`toolCallId` <-> `rawOutput.taskId`).
-      const spawnedTaskId = isPlainObject(state.rawOutput)
-        ? asString(state.rawOutput.taskId ?? state.rawOutput.backgroundTaskId)
-        : undefined
-      if (
-        (state.name === 'run_command' && effectiveArgs?.IsDaemon === true) ||
-        state.name === 'schedule' ||
-        Boolean(spawnedTaskId) ||
-        activeRun.backgroundTaskAliases.has(state.toolCallId)
-      ) {
-        this.trackBackgroundTaskLaunch(
-          activeRun,
-          input,
-          state.toolCallId,
-          spawnedTaskId,
-          state.status,
-          context.onObservedBackgroundTask,
-          context.reportUnknown,
-        )
-      }
+        const frameArgs = validated.frameArgs
+        const frameRawInput = validated.frameRawInput
+        const frameArgsEvidence = validated.argsEvidence
 
-      // Observe Phase-1 Brain Plan writes (`<appDataDir>/brain/<sessionId>/*.md` with `ArtifactMetadata`).
-      // Strictly verify that any extracted diff path matches the authenticated `effectiveArgs.Path`!
-      if (
-        !state.completedEmitted &&
-        context.planModeStage &&
-        (state.name === 'write_file' || state.name === 'edit_file')
-      ) {
-        const argPath = effectiveArgs
-          ? asString(effectiveArgs.Path ?? effectiveArgs.path)
-          : undefined
-        const diffBlocks = Array.isArray(state.content)
-          ? state.content.filter(
-              (c): c is Record<string, unknown> => isPlainObject(c) && c.type === 'diff',
+        let acpAdmission: AcpToolCallAdmissionResult = 'already_retired'
+        if (!state.completedEmitted) {
+          if (frameArgsEvidence.kind === 'invalid_or_conflict') {
+            state.argsConflicted = true
+          } else if (frameArgsEvidence.kind === 'present') {
+            const merged = mergePlainArgsRecords(state.mergedArgs, frameArgsEvidence.args)
+            if (merged.kind === 'conflict') {
+              state.argsConflicted = true
+            } else {
+              state.mergedArgs = merged.args
+              state.mergedArgsBytes = estimateJsonPayloadBytes(state.mergedArgs)
+            }
+          }
+          if (frameArgs) {
+            state.args = frameArgs
+            state.argsBytes = estimateJsonPayloadBytes(state.args)
+          }
+          if (frameRawInput) {
+            state.rawInput = frameRawInput
+            state.rawInputBytes = estimateJsonPayloadBytes(state.rawInput)
+          }
+          if ('rawOutput' in update) {
+            state.rawOutput = update.rawOutput
+            state.rawOutputBytes = estimateJsonPayloadBytes(state.rawOutput)
+          }
+          if (Array.isArray(update.content)) {
+            state.content = update.content
+            state.contentBytes = estimateJsonPayloadBytes(state.content)
+          }
+          if (Array.isArray(update.locations)) {
+            state.locations = update.locations
+            state.locationsBytes = estimateJsonPayloadBytes(state.locations)
+          }
+          const effectiveArgsForDetail =
+            state.mergedArgs ?? frameArgs ?? frameRawInput ?? state.args ?? state.rawInput
+          if (effectiveArgsForDetail) {
+            const targetPath = asString(effectiveArgsForDetail.Path ?? effectiveArgsForDetail.path)
+            const command = asString(
+              effectiveArgsForDetail.CommandLine ?? effectiveArgsForDetail.command,
             )
-          : []
-        const argIsBrainPlan =
-          argPath !== undefined &&
-          isMarkdownBrainPlanArtifact(
-            argPath,
-            context.cwd,
-            this.appDataDirs,
-            activeRun.nativeSessionId,
+            if (targetPath) state.detail = AgentActivityDetail.projectPath(targetPath, context.cwd)
+            else if (command) state.detail = AgentActivityDetail.redact(command)
+          }
+          context.resizeToolStateBytes(state, computeToolStateBytes())
+          if (state.toolIdentityConflicted) {
+            context.mcpServer.revokeDisputedTokens(
+              state.toolCallId,
+              state.progressToken ? [...disputedTokens, state.progressToken] : disputedTokens,
+            )
+          } else if (!context.receivedAfterPromptReply) {
+            if (verifiedAuthToolName.length > 0) {
+              acpAdmission = context.mcpServer.observeAcpToolCall({
+                toolCallId: state.toolCallId,
+                rawToolName: verifiedAuthToolName,
+                status: state.status,
+                ...(state.invalidStatus || incomingStatusInvalid ? { invalidStatus: true } : {}),
+                ...(frameArgsEvidence.kind === 'present'
+                  ? {
+                      args: frameArgsEvidence.args,
+                      argsFingerprint: frameArgsEvidence.fingerprint,
+                    }
+                  : {}),
+                ...(frameArgsEvidence.kind === 'invalid_or_conflict' || state.argsConflicted
+                  ? { invalidArgs: true }
+                  : {}),
+                ...(resolvedPt !== undefined
+                  ? { progressToken: resolvedPt.canonical }
+                  : state.progressToken !== undefined
+                    ? { progressToken: state.progressToken }
+                    : {}),
+                ...(disputedTokens.length > 0 ? { disputedTokens } : {}),
+                ...(state.invalidProgressToken ||
+                validated.tokens.hasInvalidToken ||
+                validated.tokens.hasConflictingTokens
+                  ? { invalidProgressToken: true }
+                  : {}),
+                ...(validated.trajectoryId !== undefined
+                  ? { trajectoryId: validated.trajectoryId }
+                  : {}),
+                ...(validated.stepIdx !== undefined ? { stepIdx: validated.stepIdx } : {}),
+                ...(frameRootContradictsPinned ? { rootEvidenceContradicted: true } : {}),
+              })
+            } else if (
+              frameRootContradictsPinned ||
+              state.invalidProgressToken ||
+              state.argsConflicted ||
+              incomingStatusInvalid
+            ) {
+              context.mcpServer.revokeDisputedTokens(state.toolCallId, disputedTokens)
+            }
+          }
+        }
+
+        const effectiveArgs = state.mergedArgs ?? state.args ?? state.rawInput
+
+        // Detect and correlate background task launches (`toolCallId` <-> `rawOutput.taskId`).
+        const spawnedTaskId = isPlainObject(state.rawOutput)
+          ? asString(state.rawOutput.taskId ?? state.rawOutput.backgroundTaskId)
+          : undefined
+        if (
+          (state.name === 'run_command' && effectiveArgs?.IsDaemon === true) ||
+          state.name === 'schedule' ||
+          Boolean(spawnedTaskId) ||
+          activeRun.backgroundTaskAliases.has(state.toolCallId)
+        ) {
+          this.trackBackgroundTaskLaunch(
+            activeRun,
+            input,
+            state.toolCallId,
+            spawnedTaskId,
+            state.status,
+            context.onObservedBackgroundTask,
+            context.reportUnknown,
           )
-        const anyDiffIsBrainPlan = diffBlocks.some((d) => {
-          const dp = asString(d.path)
-          return (
-            dp !== undefined &&
+        }
+
+        // Observe Phase-1 Brain Plan writes (`<appDataDir>/brain/<sessionId>/*.md` with `ArtifactMetadata`).
+        // Consumes the SAME single-pass validated frame (pre-cutoff, current-root-attributed, exact
+        // `write_file`/`edit_file`, monotonically merged args, matching diff path, completed terminal).
+        const isExactBrainPlanTool =
+          !state.toolIdentityConflicted &&
+          (state.explicitToolName === 'write_file' || state.explicitToolName === 'edit_file')
+        if (!state.completedEmitted && context.planModeStage && isExactBrainPlanTool) {
+          const argPath = effectiveArgs
+            ? asString(effectiveArgs.Path ?? effectiveArgs.path)
+            : undefined
+          const diffBlocks = Array.isArray(state.content)
+            ? state.content.filter(
+                (c): c is Record<string, unknown> => isPlainObject(c) && c.type === 'diff',
+              )
+            : []
+          const argIsBrainPlan =
+            argPath !== undefined &&
             isMarkdownBrainPlanArtifact(
-              dp,
+              argPath,
               context.cwd,
               this.appDataDirs,
               activeRun.nativeSessionId,
             )
-          )
-        })
+          const anyDiffIsBrainPlan = diffBlocks.some((d) => {
+            const dp = asString(d.path)
+            return (
+              dp !== undefined &&
+              isMarkdownBrainPlanArtifact(
+                dp,
+                context.cwd,
+                this.appDataDirs,
+                activeRun.nativeSessionId,
+              )
+            )
+          })
 
-        if (argIsBrainPlan || anyDiffIsBrainPlan) {
-          context.onBrainPlanTouched()
-          if (state.status !== 'completed' && state.status !== 'failed') {
-            context.setUnresolvedBrainPlanWrite(true)
-          } else if (state.status === 'failed') {
-            context.setUnresolvedBrainPlanWrite(false)
-            context.onBrainPlanCaptureFailed()
-          } else if (state.status === 'completed') {
-            context.setUnresolvedBrainPlanWrite(false)
-            if (!argIsBrainPlan || !argPath || !hasValidArtifactMetadata(effectiveArgs)) {
-              context.onBrainPlanCaptureFailed()
-            } else if (diffBlocks.length > 1) {
-              context.onBrainPlanCaptureFailed()
-            } else {
-              const expectedPlanPath = resolvePath(context.cwd, argPath)
-              let candidateText: string | undefined
-              let pathMismatch = false
-              if (diffBlocks.length === 1) {
-                const diffBlock = diffBlocks[0]!
-                const rawDiffPath = asString(diffBlock.path)
-                if (
-                  !rawDiffPath ||
-                  resolvePath(context.cwd, rawDiffPath) !== expectedPlanPath ||
-                  typeof diffBlock.newText !== 'string'
-                ) {
-                  pathMismatch = true
-                } else {
-                  candidateText = diffBlock.newText
-                }
-              } else if (
-                state.name === 'write_file' &&
-                effectiveArgs?.Append !== true &&
-                typeof effectiveArgs?.Content === 'string'
-              ) {
-                candidateText = effectiveArgs.Content
-              }
+          if (argIsBrainPlan || anyDiffIsBrainPlan) {
+            context.onBrainPlanTouched()
+            const frameInvalidForPlan =
+              context.receivedAfterPromptReply ||
+              frameRootContradictsPinned ||
+              state.argsConflicted === true ||
+              frameArgsEvidence.kind === 'invalid_or_conflict' ||
+              state.invalidStatus === true ||
+              incomingStatusInvalid ||
+              state.invalidProgressToken === true
+            if (frameInvalidForPlan) {
+              context.onBrainPlanCaptureFailed(state.toolCallId)
+            } else if (
+              state.status !== 'completed' &&
+              state.status !== 'failed' &&
+              state.status !== 'cancelled'
+            ) {
+              context.onBrainPlanOpStarted(state.toolCallId)
+            } else if (state.status === 'failed' || state.status === 'cancelled') {
+              context.onBrainPlanCaptureFailed(state.toolCallId)
+            } else if (state.status === 'completed') {
               if (
-                !pathMismatch &&
-                candidateText &&
-                candidateText.trim().length > 0 &&
-                Buffer.byteLength(candidateText, 'utf8') <= COLLABORATION_PUBLISHED_PLAN_MAX_BYTES
+                !argIsBrainPlan ||
+                !argPath ||
+                !effectiveArgs ||
+                !hasValidArtifactMetadata(effectiveArgs)
               ) {
-                context.onBrainPlanCaptured({
-                  nativeId: `${activeRun.nativeSessionId}:${state.toolCallId}`,
-                  text: candidateText,
-                })
+                context.onBrainPlanCaptureFailed(state.toolCallId)
+              } else if (diffBlocks.length > 1) {
+                context.onBrainPlanCaptureFailed(state.toolCallId)
               } else {
-                context.onBrainPlanCaptureFailed()
+                const expectedPlanPath = resolvePath(context.cwd, argPath)
+                let candidateText: string | undefined
+                let pathMismatch = false
+                if (diffBlocks.length === 1) {
+                  const diffBlock = diffBlocks[0]!
+                  const rawDiffPath = asString(diffBlock.path)
+                  if (
+                    !rawDiffPath ||
+                    resolvePath(context.cwd, rawDiffPath) !== expectedPlanPath ||
+                    typeof diffBlock.newText !== 'string'
+                  ) {
+                    pathMismatch = true
+                  } else {
+                    candidateText = diffBlock.newText
+                  }
+                } else if (
+                  state.explicitToolName === 'write_file' &&
+                  effectiveArgs.Append !== true &&
+                  typeof effectiveArgs.Content === 'string'
+                ) {
+                  candidateText = effectiveArgs.Content
+                }
+                if (
+                  !pathMismatch &&
+                  candidateText &&
+                  candidateText.trim().length > 0 &&
+                  Buffer.byteLength(candidateText, 'utf8') <= COLLABORATION_PUBLISHED_PLAN_MAX_BYTES
+                ) {
+                  context.onBrainPlanCaptured(state.toolCallId, {
+                    nativeId: buildBoundedNativePlanId(activeRun.nativeSessionId, state.toolCallId),
+                    text: candidateText,
+                  })
+                } else if (state.explicitToolName === 'edit_file' && diffBlocks.length === 0) {
+                  // `edit_file` without inline full `newText` diff block invalidates any earlier
+                  // candidate so terminal cold `storageClient.inspectRun(..., { includePlan: true })`
+                  // always reads back the updated post-edit body.
+                  context.onBrainPlanDeferredReadback(state.toolCallId)
+                } else {
+                  context.onBrainPlanCaptureFailed(state.toolCallId)
+                }
               }
             }
           }
         }
-      }
 
-      if (!state.startedEmitted) {
-        state.startedEmitted = true
-        yield {
-          agentId: 'agy',
-          type: 'tool.started',
-          turnId: input.runId,
-          toolCallId: state.toolCallId,
-          toolName: state.name,
-          title: state.title,
-          ...(state.detail ? { detail: state.detail } : {}),
+        if (!state.startedEmitted) {
+          state.startedEmitted = true
+          emitted.push({
+            agentId: 'agy',
+            type: 'tool.started',
+            turnId: input.runId,
+            toolCallId: state.toolCallId,
+            toolName: state.name,
+            title: state.title,
+            ...(state.detail ? { detail: state.detail } : {}),
+          })
         }
-      }
 
-      if (!state.completedEmitted && (state.status === 'completed' || state.status === 'failed')) {
-        state.completedEmitted = true
+        const isTerminalToolStatus =
+          state.status === 'completed' || state.status === 'failed' || state.status === 'cancelled'
+        if (!state.completedEmitted && isTerminalToolStatus) {
+          state.completedEmitted = true
 
-        // Promote staged Pact MCP tool outcomes ONLY by exact `progressToken` or matching `toolCallId`!
-        const authorizedMcp = context.mcpServer.isAuthorizedMcpToolCallName(state.name)
-        if (authorizedMcp && state.status === 'completed') {
-          let staged: StagedMcpCallOutcome['kind'] | undefined
-          if (state.progressToken !== undefined) {
-            const candidate = context.stagedMcpOutcomes.get(state.progressToken)
-            if (candidate && this.stagedOutcomeMatchesTool(candidate, authorizedMcp.tool)) {
-              staged = candidate
-              context.stagedMcpOutcomes.delete(state.progressToken)
+          // Promote staged Pact MCP tool outcomes strictly when this terminal transition was admitted.
+          if (
+            !context.receivedAfterPromptReply &&
+            state.status === 'completed' &&
+            !state.invalidStatus &&
+            !incomingStatusInvalid &&
+            !state.invalidProgressToken &&
+            !state.toolIdentityConflicted &&
+            !state.argsConflicted &&
+            frameArgsEvidence.kind !== 'invalid_or_conflict' &&
+            !frameRootContradictsPinned &&
+            verifiedAuthToolName.length > 0 &&
+            acpAdmission === 'admitted'
+          ) {
+            const promoted = context.mcpServer.promoteCompletedAcpToolCall({
+              toolCallId: state.toolCallId,
+              rawToolName: verifiedAuthToolName,
+              ...(resolvedPt !== undefined
+                ? { progressToken: resolvedPt.canonical }
+                : state.progressToken !== undefined
+                  ? { progressToken: state.progressToken }
+                  : {}),
+              ...(state.invalidProgressToken ? { invalidProgressToken: true } : {}),
+              ...(frameArgsEvidence.kind === 'present'
+                ? {
+                    args: frameArgsEvidence.args,
+                    argsFingerprint: frameArgsEvidence.fingerprint,
+                  }
+                : {}),
+              ...(validated.trajectoryId !== undefined
+                ? { trajectoryId: validated.trajectoryId }
+                : {}),
+              ...(validated.stepIdx !== undefined ? { stepIdx: validated.stepIdx } : {}),
+              ...(frameRootContradictsPinned ? { rootEvidenceContradicted: true } : {}),
+              receivedAfterPromptReply: context.receivedAfterPromptReply,
+            })
+            if (promoted) {
+              if (promoted.type === 'title' && !context.getSessionTitleEmitted()) {
+                context.markSessionTitleEmitted()
+                emitted.push({
+                  agentId: 'agy',
+                  type: 'session.title.updated',
+                  title: promoted.title,
+                })
+              } else if (promoted.type === 'peer') {
+                emitted.push({
+                  agentId: 'agy',
+                  type: 'peer.assistance.requested',
+                  turnId: input.runId,
+                  proposalId: randomUUID(),
+                  targetAgentId: promoted.targetAgentId,
+                  kind: promoted.proposalKind,
+                  ...(promoted.reason ? { reason: promoted.reason } : {}),
+                })
+              } else if (promoted.type === 'review') {
+                context.onReviewAccepted(promoted.observation)
+              } else if (promoted.type === 'input_result') {
+                context.onInputResultAccepted(promoted.observation)
+              } else if (promoted.type === 'retain_plan') {
+                context.onPlanRetainedAccepted()
+              } else if (promoted.type === 'publish_plan') {
+                context.onOpenPlanPublished({
+                  nativeId: buildBoundedNativePlanId(
+                    activeRun.nativeSessionId,
+                    promoted.finalToolCallId,
+                  ),
+                  text: promoted.markdown,
+                })
+              } else if (promoted.type === 'publish_plan_failed') {
+                context.onOpenPlanPublishFailed()
+              }
+            }
+          } else if (
+            state.status !== 'completed' ||
+            state.invalidProgressToken ||
+            state.toolIdentityConflicted ||
+            state.argsConflicted
+          ) {
+            context.mcpServer.failAcpToolCall({
+              toolCallId: state.toolCallId,
+              rawToolName: verifiedAuthToolName || state.name,
+              ...(state.progressToken !== undefined ? { progressToken: state.progressToken } : {}),
+            })
+          }
+
+          // File change & round command/tool uncertainty classification (`B9` / Module 6).
+          const mergedItem = {
+            name: state.name,
+            status: state.status,
+            args: state.args,
+            rawInput: state.rawInput,
+            rawOutput: state.rawOutput,
+            content: state.content,
+            locations: state.locations,
+          }
+          if (
+            state.name === 'write_file' ||
+            state.name === 'edit_file' ||
+            state.name === 'delete_file' ||
+            state.name === 'remove_file' ||
+            state.name === 'move_file' ||
+            state.name === 'rename_file'
+          ) {
+            const fileEvidence = context.roundTracker.observeFileTool(mergedItem)
+            fileEvidence.changes = fileEvidence.changes.map((change, index) => ({
+              ...change,
+              operationId: `${state.toolCallId}:${index}`,
+            }))
+            if (fileEvidence.changes.length > 0 || fileEvidence.uncertain) {
+              context.observeFiles(fileEvidence)
             }
           } else {
-            const byToolCallId = context.stagedMcpOutcomes.get(state.toolCallId)
-            if (byToolCallId && this.stagedOutcomeMatchesTool(byToolCallId, authorizedMcp.tool)) {
-              staged = byToolCallId
-              context.stagedMcpOutcomes.delete(state.toolCallId)
+            const nonFile = context.roundTracker.observeNonFileTool(mergedItem)
+            if (nonFile.uncertain && nonFile.reason) {
+              nativeEffectsUncertain(input, nonFile.reason, nonFile.scope)
             }
           }
 
-          if (staged) {
-            if (staged.type === 'title' && !context.getSessionTitleEmitted()) {
-              context.markSessionTitleEmitted()
-              yield {
-                agentId: 'agy',
-                type: 'session.title.updated',
-                title: staged.title,
-              }
-            } else if (staged.type === 'peer') {
-              yield {
-                agentId: 'agy',
-                type: 'peer.assistance.requested',
-                turnId: input.runId,
-                proposalId: randomUUID(),
-                targetAgentId: staged.targetAgentId,
-                kind: staged.proposalKind,
-                ...(staged.reason ? { reason: staged.reason } : {}),
-              }
-            } else if (staged.type === 'review') {
-              context.onReviewAccepted(staged.observation)
-            } else if (staged.type === 'input_result') {
-              context.onInputResultAccepted(staged.observation)
-            } else if (staged.type === 'retain_plan') {
-              context.onPlanRetainedAccepted()
-            } else if (staged.type === 'publish_plan') {
-              context.onOpenPlanPublished({
-                nativeId: `${activeRun.nativeSessionId}:${state.toolCallId}`,
-                text: staged.markdown,
-              })
-            }
-          }
-        }
+          // Immediately release heavy tool payload fields and progressToken on completion while
+          // keeping retained compact dedup metadata accurately charged until eviction!
+          state.args = undefined
+          state.argsBytes = 0
+          state.rawInput = undefined
+          state.rawInputBytes = 0
+          state.mergedArgs = undefined
+          state.mergedArgsBytes = 0
+          state.rawOutput = undefined
+          state.rawOutputBytes = 0
+          state.content = undefined
+          state.contentBytes = 0
+          state.locations = undefined
+          state.locationsBytes = 0
+          state.progressToken = undefined
+          context.resizeToolStateBytes(state, computeCompactToolStateBytes())
 
-        // File change & round command/tool uncertainty classification (`B9` / Module 6).
-        const mergedItem = {
-          name: state.name,
-          status: state.status,
-          args: state.args,
-          rawInput: state.rawInput,
-          rawOutput: state.rawOutput,
-          content: state.content,
-          locations: state.locations,
+          emitted.push({
+            agentId: 'agy',
+            type: 'tool.completed',
+            turnId: input.runId,
+            toolCallId: state.toolCallId,
+            toolName: state.name,
+            title: state.title,
+            ...(state.detail ? { detail: state.detail } : {}),
+            outcome: state.status === 'completed' ? 'completed' : 'failed',
+          })
         }
-        if (
-          state.name === 'write_file' ||
-          state.name === 'edit_file' ||
-          state.name === 'delete_file' ||
-          state.name === 'remove_file' ||
-          state.name === 'move_file' ||
-          state.name === 'rename_file'
-        ) {
-          const fileEvidence = context.roundTracker.observeFileTool(mergedItem)
-          fileEvidence.changes = fileEvidence.changes.map((change, index) => ({
-            ...change,
-            operationId: `${state.toolCallId}:${index}`,
-          }))
-          if (fileEvidence.changes.length > 0 || fileEvidence.uncertain) {
-            context.observeFiles(fileEvidence)
-          }
-        } else {
-          const nonFile = context.roundTracker.observeNonFileTool(mergedItem)
-          if (nonFile.uncertain && nonFile.reason) {
-            nativeEffectsUncertain(input, nonFile.reason, nonFile.scope)
-          }
-        }
-
-        // Immediately release heavy tool payload fields (`args`, `rawInput`, `rawOutput`, `content`, `locations`)
-        // on completion while preserving compact dedup metadata!
-        state.args = undefined
-        state.rawInput = undefined
-        state.rawOutput = undefined
-        state.content = undefined
-        state.locations = undefined
-        context.resizeToolStateBytes(state, 0)
-
-        yield {
-          agentId: 'agy',
-          type: 'tool.completed',
-          turnId: input.runId,
-          toolCallId: state.toolCallId,
-          toolName: state.name,
-          title: state.title,
-          ...(state.detail ? { detail: state.detail } : {}),
-          outcome: state.status === 'completed' ? 'completed' : 'failed',
-        }
+        return
       }
-      return
+
+      emitted.push({
+        agentId: 'agy',
+        type: 'unrecognized',
+        nativeType: sessionUpdate.slice(0, 120),
+        turnId: input.runId,
+      })
     }
 
-    yield {
-      agentId: 'agy',
-      type: 'unrecognized',
-      nativeType: sessionUpdate.slice(0, 120),
-      turnId: input.runId,
+    context.mcpServer.beginWakeBatch()
+    try {
+      processFrame()
+    } finally {
+      context.mcpServer.endWakeBatch()
     }
-  }
-
-  private stagedOutcomeMatchesTool(outcome: StagedMcpCallOutcome['kind'], tool: string): boolean {
-    const expectedType =
-      tool === 'publish_session_title'
-        ? 'title'
-        : tool === 'request_peer_assistance'
-          ? 'peer'
-          : tool === 'submit_review'
-            ? 'review'
-            : tool === 'submit_input_result'
-              ? 'input_result'
-              : tool === 'retain_current_plan'
-                ? 'retain_plan'
-                : tool === 'publish_plan'
-                  ? 'publish_plan'
-                  : undefined
-    return expectedType !== undefined && outcome.type === expectedType
+    yield* emitted
   }
 
   private bindRootExecutionId(
@@ -6368,44 +12999,77 @@ export class AgyAgentAdapter implements AgentAdapter {
   }
 
   private async handlePostTurnBackgroundUpdate(context: {
-    update: Record<string, unknown>
+    record: CompactPostCutoffBackgroundRecord
     input: AgentRunInput
     activeRun: ActiveAgyRun
     observedBackgroundTask: boolean
     canSettleEffects: () => boolean
+    isRootTerminal: () => boolean
     seenForegroundMessageIds: Set<string>
+    isForegroundDedupIncomplete: () => boolean
+    hasOmittedForegroundIdWithoutStep: () => boolean
+    getMaxForegroundStepIdx: () => number | undefined
+    getPinnedTrajectory: () => string | undefined
+    getMinStepIdx: () => number | undefined
     reportedBackgroundMessageIds: Set<string>
+    reportUnknown: (reason: string) => void
   }): Promise<void> {
     const {
-      update,
+      record,
       input,
       activeRun,
       observedBackgroundTask,
       canSettleEffects,
+      isRootTerminal,
       seenForegroundMessageIds,
+      isForegroundDedupIncomplete,
+      hasOmittedForegroundIdWithoutStep,
+      getMaxForegroundStepIdx,
+      getPinnedTrajectory,
+      getMinStepIdx,
       reportedBackgroundMessageIds,
+      reportUnknown,
     } = context
 
-    const sessionUpdate = asString(update.sessionUpdate)
-    const status = asString(update.status)
-    const rawOutput = isPlainObject(update.rawOutput) ? update.rawOutput : undefined
-    const taskId =
-      asString(update.taskId ?? update.backgroundTaskId) ??
-      (rawOutput ? asString(rawOutput.taskId ?? rawOutput.backgroundTaskId) : undefined)
-    const toolCallId = asString(update.toolCallId ?? update.id)
+    // Re-check validated owner evidence against the run's latest execution, pinned trajectory,
+    // and step lower bound BEFORE BOTH report persistence and task settlement!
+    const pinnedTrajectory = getPinnedTrajectory()
+    const minStepIdx = getMinStepIdx()
+    const { ownership } = record
+    if (
+      ownership.executionId !== undefined &&
+      (activeRun.knownForeignExecutionIds.has(ownership.executionId) ||
+        (activeRun.providerExecutionId !== undefined &&
+          ownership.executionId !== activeRun.providerExecutionId))
+    ) {
+      return
+    }
+    if (
+      ownership.trajectoryId !== undefined &&
+      pinnedTrajectory !== undefined &&
+      ownership.trajectoryId !== pinnedTrajectory
+    ) {
+      return
+    }
+    if (
+      ownership.stepIdx !== undefined &&
+      minStepIdx !== undefined &&
+      ownership.stepIdx < minStepIdx
+    ) {
+      return
+    }
+
+    const { sessionUpdate, status, outOfTurn, taskId, toolCallId, explicitMsgId, rawText } = record
 
     try {
       if (observedBackgroundTask && input.recordBackgroundReport) {
         // Never fabricate background reports from cancel ACKs, empty chunks, or foreground messages!
         const isOutOfTurnCompletion =
-          (sessionUpdate === 'agent_message_chunk' && update.outOfTurn === true) ||
+          (sessionUpdate === 'agent_message_chunk' && outOfTurn) ||
           sessionUpdate === 'background_task_completed' ||
-          (sessionUpdate === 'tool_call_update' &&
-            status === 'completed' &&
-            update.outOfTurn === true)
+          (sessionUpdate === 'tool_call_update' && status === 'completed' && outOfTurn)
 
         if (isOutOfTurnCompletion) {
-          const explicitMsgId = asString(update.messageId ?? update.stepId)
           const fallbackId =
             sessionUpdate === 'background_task_completed' ? (taskId ?? toolCallId) : toolCallId
           const nativeMessageId =
@@ -6414,17 +13078,29 @@ export class AgyAgentAdapter implements AgentAdapter {
               ? `bg-task-completed:${fallbackId}`
               : fallbackId)
 
+          const bgStepIdx = ownership.stepIdx
+          const bgSameTrajectory =
+            ownership.trajectoryId === undefined ||
+            pinnedTrajectory === undefined ||
+            ownership.trajectoryId === pinnedTrajectory
+          const maxFgStepIdx = getMaxForegroundStepIdx()
+          // Only when ALL omitted foreground dedup IDs had trusted same-trajectory stepIdx can
+          // `bgStepIdx > maxFgStepIdx` prove novelty!
+          const dedupCanProveNovelty =
+            !isForegroundDedupIncomplete() ||
+            (!hasOmittedForegroundIdWithoutStep() &&
+              bgSameTrajectory &&
+              bgStepIdx !== undefined &&
+              maxFgStepIdx !== undefined &&
+              bgStepIdx > maxFgStepIdx)
+
           if (
-            nativeMessageId &&
-            nativeMessageId.length <= 512 &&
+            isEligibleAgyBackgroundReportId(nativeMessageId) &&
+            dedupCanProveNovelty &&
             !seenForegroundMessageIds.has(nativeMessageId) &&
             !reportedBackgroundMessageIds.has(nativeMessageId)
           ) {
-            const rawText = isPlainObject(update.content)
-              ? asString(update.content.text)
-              : asString(update.text ?? update.summary)
-            if (rawText && /\S/u.test(rawText) && reportedBackgroundMessageIds.size < 64) {
-              reportedBackgroundMessageIds.add(nativeMessageId)
+            if (rawText && /\S/u.test(rawText)) {
               const frameId = deterministicUuid(
                 `agy-bg:${input.runId}:${activeRun.nativeSessionId}:${activeRun.executorId}:${nativeMessageId}`,
               )
@@ -6439,31 +13115,40 @@ export class AgyAgentAdapter implements AgentAdapter {
                 nativeMessageId,
               })
 
-              let reservation: NativeMemoryReservation | undefined
-              try {
-                const byteLength = Buffer.byteLength(rawText, 'utf8')
-                reservation = activeRun.connection.reserveWorkingMemory(
-                  4096 + rawText.length * 10 + byteLength * 2,
+              if (reportedBackgroundMessageIds.size >= 64) {
+                activeRun.backgroundUnconfirmed = true
+                input.recordBackgroundReportUnavailable?.(identity)
+                reportUnknown(
+                  'Antigravity background report tracking reached the 64-report per-run cap; coverage is incomplete.',
                 )
-                await input.recordBackgroundReport({ ...identity, text: rawText })
-              } catch (error) {
-                if (input.recordBackgroundReportUnavailable) {
-                  input.recordBackgroundReportUnavailable(identity)
-                } else {
-                  recordDiagnostic({
-                    operation: 'native_check',
-                    phase: 'failed',
-                    level: 'warn',
-                    scope: 'run',
-                    sessionId: input.sessionId,
-                    runId: input.runId,
-                    agentId: 'agy',
-                    runtimeBoundary: 'archive',
-                    code: classifyAgentError(error).kind,
-                  })
+              } else {
+                reportedBackgroundMessageIds.add(nativeMessageId)
+                let reservation: NativeMemoryReservation | undefined
+                try {
+                  const byteLength = Buffer.byteLength(rawText, 'utf8')
+                  reservation = activeRun.connection.reserveWorkingMemory(
+                    4096 + rawText.length * 10 + byteLength * 2,
+                  )
+                  await input.recordBackgroundReport({ ...identity, text: rawText })
+                } catch (error) {
+                  if (input.recordBackgroundReportUnavailable) {
+                    input.recordBackgroundReportUnavailable(identity)
+                  } else {
+                    recordDiagnostic({
+                      operation: 'native_check',
+                      phase: 'failed',
+                      level: 'warn',
+                      scope: 'run',
+                      sessionId: input.sessionId,
+                      runId: input.runId,
+                      agentId: 'agy',
+                      runtimeBoundary: 'archive',
+                      code: classifyAgentError(error).kind,
+                    })
+                  }
+                } finally {
+                  reservation?.release()
                 }
-              } finally {
-                reservation?.release()
               }
             }
           }
@@ -6477,7 +13162,7 @@ export class AgyAgentAdapter implements AgentAdapter {
           (status === 'completed' || status === 'failed' || status === 'cancelled'))
       if (isTerminalTaskUpdate) {
         const settledAny = this.settleBackgroundTaskByAlias(activeRun, input, [taskId, toolCallId])
-        if (settledAny && activeRun.activeBackgroundTasks.size === 0) {
+        if (settledAny && activeRun.activeBackgroundTasks.size === 0 && isRootTerminal()) {
           if (!activeRun.backgroundUnconfirmed && canSettleEffects()) {
             nativeFileChangesSettled(input, 'settled', 'native_work_drained')
           }
@@ -6489,12 +13174,32 @@ export class AgyAgentAdapter implements AgentAdapter {
 
   private extractConfigOptionsFromNotification(
     notification: object,
+    expectedSessionId?: string,
   ): AcpConfigOptionEntry[] | undefined {
-    if (asString(Reflect.get(notification, 'method')) !== 'session/update') return undefined
-    const params = Reflect.get(notification, 'params')
-    const update = isPlainObject(params) ? params.update : undefined
-    if (!isPlainObject(update) || update.sessionUpdate !== 'config_option_update') return undefined
-    const raw = update.configOptions ?? update.options
+    if (!isPlainObject(notification)) return undefined
+    const method = asString(Reflect.get(notification, 'method'))
+    if (method !== 'session/update') return undefined
+    const validated = validateAgyFrame(
+      {
+        kind: 'notification',
+        seq: 0,
+        message: notification,
+      },
+      expectedSessionId,
+      undefined,
+      undefined,
+    )
+    if (
+      !validated.isAttributableToCurrentSession ||
+      validated.hasForeignOrInvalidSessionMeta ||
+      validated.executionIdInvalid ||
+      validated.rootEvidenceContradicted ||
+      validated.sessionUpdate !== 'config_option_update' ||
+      !validated.payload
+    ) {
+      return undefined
+    }
+    const raw = validated.payload.configOptions ?? validated.payload.options
     if (!Array.isArray(raw)) return undefined
     return parseConfigOptions(raw)
   }
@@ -6504,11 +13209,30 @@ export class AgyAgentAdapter implements AgentAdapter {
     sessionId: string,
     input: Pick<AgentRunInput, 'observeNativeTitle'>,
   ): void {
-    if (asString(Reflect.get(notification, 'method')) !== 'session/update') return
-    const params = Reflect.get(notification, 'params')
-    const update = isPlainObject(params) ? params.update : undefined
-    if (!isPlainObject(update) || update.sessionUpdate !== 'session_info_update') return
-    const title = asString(update.title)?.trim()
+    if (!isPlainObject(notification)) return
+    const method = asString(Reflect.get(notification, 'method'))
+    if (method !== 'session/update') return
+    const validated = validateAgyFrame(
+      {
+        kind: 'notification',
+        seq: 0,
+        message: notification,
+      },
+      sessionId,
+      undefined,
+      undefined,
+    )
+    if (
+      !validated.isAttributableToCurrentSession ||
+      validated.hasForeignOrInvalidSessionMeta ||
+      validated.executionIdInvalid ||
+      validated.rootEvidenceContradicted ||
+      validated.sessionUpdate !== 'session_info_update' ||
+      !validated.payload
+    ) {
+      return
+    }
+    const title = asString(validated.payload.title)?.trim()
     if (title && title.length <= 120) {
       input.observeNativeTitle?.(sessionId, title)
     }

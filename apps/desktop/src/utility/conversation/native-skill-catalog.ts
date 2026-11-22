@@ -2,8 +2,9 @@ import type { ChildProcessWithoutNullStreams } from 'node:child_process'
 
 import { createHash } from 'node:crypto'
 import { realpathSync, statSync } from 'node:fs'
-import { realpath } from 'node:fs/promises'
-import { dirname, isAbsolute, relative, resolve } from 'node:path'
+import { chmod, lstat, mkdtemp, realpath, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 
 import {
   nativeSkillSchema,
@@ -14,11 +15,167 @@ import {
 } from '@pact/contracts'
 
 import { OwnedProcessGroup } from '../owned-process-group'
+import {
+  isAgyProbeSettled,
+  isUnsafeWindowsCmdPath,
+  resolveTrustedWindowsCmdExe,
+} from '../runtime-preparation/agy-acp-probe'
 import { AgentExecutionError } from './agent-execution-error'
 
-export const AGY_SKILL_DISCOVERY_TIMEOUT_MS = 4_000
+export const AGY_SKILL_DISCOVERY_TIMEOUT_MS = 15_000
 export const AGY_SKILL_DISCOVERY_MAX_BYTES = 256 * 1024
-const AGY_SKILL_CLEANUP_MS = 1_000
+const AGY_SKILL_CLEANUP_MS = 4_000
+const MAX_LOG_FILE_PATH_BYTES = 4_096
+const MAX_UNCONFIRMED_SKILL_LOG_DIRS = 4
+
+async function removeDirConfirmed(dir: string): Promise<boolean> {
+  try {
+    await rm(dir, { recursive: true, force: true })
+    try {
+      await lstat(dir)
+      return false
+    } catch (error) {
+      return (
+        typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT'
+      )
+    }
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Owns active and unconfirmed Antigravity `/skills` probe process groups and log directories so
+ * both subsequent discoveries and Utility shutdown can close, confirm, and dispose them cleanly.
+ */
+export class AgySkillProbeOwner {
+  private readonly activeProbes = new Set<OwnedProcessGroup>()
+  private readonly unconfirmedProbes = new Map<OwnedProcessGroup, string>()
+  private readonly inFlightSettlements = new Set<Promise<unknown>>()
+  private disposed = false
+  private disposal: Promise<void> | undefined
+
+  trackActive(group: OwnedProcessGroup): void {
+    if (this.disposed) {
+      throw new AgentExecutionError(
+        'transient_transport',
+        'Antigravity Skill discovery owner is shutting down.',
+        true,
+      )
+    }
+    this.activeProbes.add(group)
+  }
+
+  trackSettlement<T>(promise: Promise<T>): Promise<T> {
+    const tracked = promise.finally(() => {
+      this.inFlightSettlements.delete(tracked)
+    })
+    void tracked.catch(() => undefined)
+    this.inFlightSettlements.add(tracked)
+    return tracked
+  }
+
+  releaseActive(group: OwnedProcessGroup): void {
+    if (!this.unconfirmedProbes.has(group)) {
+      this.activeProbes.delete(group)
+    }
+  }
+
+  recordUnconfirmed(group: OwnedProcessGroup, skillLogDir: string): void {
+    this.activeProbes.add(group)
+    this.unconfirmedProbes.set(group, skillLogDir)
+  }
+
+  async reconcile(): Promise<{ readonly remainingCount: number; readonly hadFailure: boolean }> {
+    const settledEntries: Array<[OwnedProcessGroup, string]> = []
+    for (const [group, dir] of this.unconfirmedProbes.entries()) {
+      if (isAgyProbeSettled(group)) {
+        settledEntries.push([group, dir])
+      }
+    }
+    let hadFailure = false
+    await Promise.all(
+      settledEntries.map(async ([group, dir]) => {
+        const removed = await removeDirConfirmed(dir)
+        if (removed) {
+          if (this.unconfirmedProbes.get(group) === dir) {
+            this.unconfirmedProbes.delete(group)
+          }
+          this.activeProbes.delete(group)
+        } else {
+          hadFailure = true
+        }
+      }),
+    )
+    for (const group of this.activeProbes) {
+      if (!this.unconfirmedProbes.has(group) && isAgyProbeSettled(group)) {
+        this.activeProbes.delete(group)
+      }
+    }
+    return { remainingCount: this.unconfirmedProbes.size, hadFailure }
+  }
+
+  async closeAndReconcile(flushDeadlineAt?: number): Promise<void> {
+    const groupsToClose = new Set<OwnedProcessGroup>([
+      ...this.activeProbes,
+      ...this.unconfirmedProbes.keys(),
+    ])
+    const closeResults = await Promise.allSettled(
+      [...groupsToClose].map((group) => group.close(flushDeadlineAt)),
+    )
+    if (this.inFlightSettlements.size > 0) {
+      const settlements = Promise.allSettled(this.inFlightSettlements).then(() => true)
+      if (flushDeadlineAt === undefined) {
+        await settlements
+      } else {
+        const remainingMs = Math.max(0, flushDeadlineAt - Date.now())
+        let timer: ReturnType<typeof setTimeout> | undefined
+        try {
+          await Promise.race([
+            settlements,
+            new Promise<boolean>((resolveSettlement) => {
+              timer = setTimeout(() => resolveSettlement(false), remainingMs)
+            }),
+          ])
+        } finally {
+          clearTimeout(timer)
+        }
+      }
+    }
+    const { remainingCount, hadFailure } = await this.reconcile()
+    for (const group of this.activeProbes) {
+      if (!this.unconfirmedProbes.has(group) && isAgyProbeSettled(group)) {
+        this.activeProbes.delete(group)
+      }
+    }
+    if (
+      closeResults.some((result) => result.status === 'rejected') ||
+      hadFailure ||
+      remainingCount > 0 ||
+      this.activeProbes.size > 0 ||
+      this.inFlightSettlements.size > 0
+    ) {
+      throw new AgentExecutionError(
+        'transient_transport',
+        'Antigravity Skill discovery probes did not finish cleanup.',
+        true,
+      )
+    }
+  }
+
+  dispose(flushDeadlineAt?: number): Promise<void> {
+    this.disposed = true
+    this.disposal ??= this.closeAndReconcile(flushDeadlineAt)
+    return this.disposal
+  }
+}
+
+const defaultAgySkillProbeOwner = new AgySkillProbeOwner()
+
+/** Closes and reconciles any fallback module-owned `/skills` probes during shutdown. */
+export function disposeDefaultAgySkillProbes(flushDeadlineAt?: number): Promise<void> {
+  return defaultAgySkillProbeOwner.closeAndReconcile(flushDeadlineAt)
+}
 
 interface ParsedAgySkillRecord {
   name: string
@@ -139,10 +296,13 @@ export interface NativeSkillCatalogRecord {
 export type OwnedAgySkillProbeProcess = {
   child: ChildProcessWithoutNullStreams
   close?: (deadlineAt?: number) => Promise<void>
+  readonly isSettled?: () => boolean
+  readonly group?: OwnedProcessGroup
 }
 
 export interface AgySkillDiscoveryOptions {
   env?: NodeJS.ProcessEnv
+  probeOwner?: AgySkillProbeOwner
   spawnProcess?: (
     executablePath: string,
     args: readonly string[],
@@ -242,47 +402,151 @@ export function nativeSkillCatalog(
   )
 }
 
+function isSafeAbsoluteLogPath(logPath: string): boolean {
+  return (
+    isAbsolute(logPath) &&
+    !logPath.includes('\0') &&
+    Buffer.byteLength(logPath, 'utf8') <= MAX_LOG_FILE_PATH_BYTES
+  )
+}
+
+function validateAgySkillProbeArgs(args: readonly string[]): boolean {
+  if (
+    args[0] !== '-p' ||
+    args[1] !== '/skills' ||
+    args[2] !== '--output-format' ||
+    args[3] !== 'json'
+  ) {
+    return false
+  }
+  if (args.length === 4) return true
+  return args.length === 6 && args[4] === '--log-file' && isSafeAbsoluteLogPath(args[5]!)
+}
+
 function spawnDefaultAgySkillProbe(
   executablePath: string,
   args: readonly string[],
   probeCwd: string,
   env: NodeJS.ProcessEnv | undefined,
+  probeOwner: AgySkillProbeOwner,
 ): OwnedAgySkillProbeProcess {
   const isWindowsCommand = process.platform === 'win32' && /\.cmd$/iu.test(executablePath)
-  if (isWindowsCommand && /[&|<>^%!"\r\n]/u.test(executablePath)) {
+  if (
+    isWindowsCommand &&
+    (isUnsafeWindowsCmdPath(executablePath) ||
+      (args.length === 6 && isUnsafeWindowsCmdPath(args[5]!)))
+  ) {
     throw new AgentExecutionError(
       'runtime_incompatible',
-      'Unsafe Antigravity executable path.',
+      'Unsafe Antigravity executable or log path.',
       false,
     )
   }
-  if (args.some((arg) => !/^(?:-[a-z]|--[a-z-]+|\/skills|json)$/u.test(arg))) {
+  if (!validateAgySkillProbeArgs(args)) {
     throw new AgentExecutionError(
       'protocol_error',
       'Unexpected Antigravity Skill probe arguments.',
       false,
     )
   }
+  const target = isWindowsCommand ? resolveTrustedWindowsCmdExe(env) : executablePath
+  if (isWindowsCommand && !target) {
+    throw new AgentExecutionError(
+      'runtime_incompatible',
+      'Trusted Windows command interpreter could not be confirmed.',
+      false,
+    )
+  }
   const group = new OwnedProcessGroup()
-  const target = isWindowsCommand ? (process.env.ComSpec ?? 'cmd.exe') : executablePath
+  probeOwner.trackActive(group)
   const spawnArgs = isWindowsCommand
-    ? ['/d', '/s', '/c', `""${executablePath}" ${args.join(' ')}"`]
+    ? [
+        '/d',
+        '/s',
+        '/c',
+        args.length === 6
+          ? `""${executablePath}" -p /skills --output-format json --log-file "${args[5]}""`
+          : `""${executablePath}" -p /skills --output-format json"`,
+      ]
     : [...args]
-  const child = group.spawn(target, spawnArgs, {
-    cwd: probeCwd,
-    ...(env ? { env } : {}),
-    windowsHide: true,
-    windowsVerbatimArguments: isWindowsCommand,
-  })
+  let child: ChildProcessWithoutNullStreams
+  try {
+    child = group.spawn(target ?? executablePath, spawnArgs, {
+      cwd: probeCwd,
+      ...(env ? { env } : {}),
+      windowsHide: true,
+      windowsVerbatimArguments: isWindowsCommand,
+    })
+  } catch (error) {
+    void group.close().finally(() => {
+      if (isAgyProbeSettled(group)) {
+        probeOwner.releaseActive(group)
+      }
+    })
+    throw error
+  }
   return {
     child,
     close: (deadlineAt) => group.close(deadlineAt),
+    isSettled: () => isAgyProbeSettled(group),
+    group,
   }
+}
+
+async function settleAgySkillProbe(
+  owned: OwnedAgySkillProbeProcess | undefined,
+  skillLogDir: string,
+  probeOwner: AgySkillProbeOwner,
+): Promise<{ readonly closeError?: unknown; readonly cleanupFailed: boolean }> {
+  if (owned?.close) {
+    let closeThrew = false
+    let closeError: unknown
+    try {
+      await owned.close(Date.now() + AGY_SKILL_CLEANUP_MS)
+    } catch (error) {
+      closeThrew = true
+      closeError = error
+    }
+    if (owned.isSettled?.() !== false) {
+      const dirRemoved = await removeDirConfirmed(skillLogDir)
+      if (!dirRemoved && owned.group) {
+        probeOwner.recordUnconfirmed(owned.group, skillLogDir)
+      } else if (dirRemoved && owned.group) {
+        probeOwner.releaseActive(owned.group)
+      }
+      if (closeThrew) {
+        return { closeError, cleanupFailed: false }
+      }
+      return { cleanupFailed: !dirRemoved }
+    }
+    if (owned.group) {
+      probeOwner.recordUnconfirmed(owned.group, skillLogDir)
+    }
+    return {
+      closeError: closeThrew
+        ? closeError
+        : new AgentExecutionError(
+            'transient_transport',
+            'Antigravity Skill discovery cleanup could not be confirmed.',
+            true,
+          ),
+      cleanupFailed: false,
+    }
+  }
+  if (owned && owned.child.exitCode === null && owned.child.signalCode === null) {
+    try {
+      owned.child.kill('SIGKILL')
+    } catch {
+      // Process may have exited concurrently.
+    }
+  }
+  const dirRemoved = await removeDirConfirmed(skillLogDir)
+  return { cleanupFailed: !dirRemoved }
 }
 
 /**
  * Discovers Antigravity Skills via zero-Turn `agy -p /skills --output-format json`
- * inside the canonical target project working directory with a 4s / 256 KiB cap.
+ * inside the canonical target project working directory with a 15s / 256 KiB cap.
  */
 export async function discoverAgySkills(
   cwd: string,
@@ -291,18 +555,50 @@ export async function discoverAgySkills(
   options: AgySkillDiscoveryOptions = {},
 ): Promise<SkillBinding[]> {
   signal.throwIfAborted()
-  const probeArgs = ['-p', '/skills', '--output-format', 'json'] as const
-  const canonicalCwd = options.spawnProcess
-    ? await realpath(cwd).catch(() => canonicalizeWithExistingAncestor(cwd))
-    : await realpath(cwd)
+  const probeOwner = options.probeOwner ?? defaultAgySkillProbeOwner
+  if (!options.spawnProcess) {
+    const { remainingCount } = await probeOwner.reconcile()
+    if (remainingCount >= MAX_UNCONFIRMED_SKILL_LOG_DIRS) {
+      throw new AgentExecutionError(
+        'transient_transport',
+        'Antigravity Skill discovery cleanup is still pending.',
+        true,
+      )
+    }
+  }
+  const skillLogDir = await mkdtemp(join(tmpdir(), 'pact-agy-skills-'))
   let owned: OwnedAgySkillProbeProcess | undefined
+  let hasBodyError = false
+  let bodyError: unknown
+  let bindings!: SkillBinding[]
+
   try {
+    await chmod(skillLogDir, 0o700)
+    signal.throwIfAborted()
+    const skillLogFile = join(skillLogDir, 'skills.log')
+    const probeArgs = [
+      '-p',
+      '/skills',
+      '--output-format',
+      'json',
+      '--log-file',
+      skillLogFile,
+    ] as const
+    const canonicalCwd = options.spawnProcess
+      ? await realpath(cwd).catch(() => canonicalizeWithExistingAncestor(cwd))
+      : await realpath(cwd)
     signal.throwIfAborted()
     if (options.spawnProcess) {
       const supplied = options.spawnProcess(executablePath, probeArgs, canonicalCwd, options.env)
       owned = 'then' in supplied ? await supplied : supplied
     } else {
-      owned = spawnDefaultAgySkillProbe(executablePath, probeArgs, canonicalCwd, options.env)
+      owned = spawnDefaultAgySkillProbe(
+        executablePath,
+        probeArgs,
+        canonicalCwd,
+        options.env,
+        probeOwner,
+      )
     }
     const { child } = owned
     const decoder = new TextDecoder('utf-8', { fatal: true })
@@ -324,7 +620,7 @@ export async function discoverAgySkills(
         fail(
           new AgentExecutionError(
             'transient_transport',
-            'Antigravity Skill discovery exceeded its four-second deadline.',
+            'Antigravity Skill discovery exceeded its 15-second deadline.',
             true,
           ),
         )
@@ -469,18 +765,29 @@ export async function discoverAgySkills(
       if (pluginRef) record.pluginId = pluginRef
       return record
     })
-    return nativeSkillCatalog('agy', canonicalCwd, executablePath, records)
-  } finally {
-    if (owned?.close) {
-      await owned.close(Date.now() + AGY_SKILL_CLEANUP_MS)
-    } else if (owned && owned.child.exitCode === null && owned.child.signalCode === null) {
-      try {
-        owned.child.kill('SIGKILL')
-      } catch {
-        // Process may have exited concurrently.
-      }
-    }
+    bindings = nativeSkillCatalog('agy', canonicalCwd, executablePath, records)
+  } catch (error) {
+    hasBodyError = true
+    bodyError = error
   }
+
+  const settlement = await probeOwner.trackSettlement(
+    settleAgySkillProbe(owned, skillLogDir, probeOwner),
+  )
+  if (settlement.closeError !== undefined) {
+    throw settlement.closeError
+  }
+  if (settlement.cleanupFailed && !hasBodyError && !options.spawnProcess) {
+    throw new AgentExecutionError(
+      'transient_transport',
+      'Antigravity Skill discovery log cleanup could not be confirmed.',
+      true,
+    )
+  }
+  if (hasBodyError) {
+    throw bodyError
+  }
+  return bindings
 }
 
 /** Validates and binds explicit /skill selections targeting Antigravity against its current catalog. */

@@ -517,7 +517,7 @@ export function ProviderUsagePanel({
       <button
         ref={triggerRef}
         type="button"
-        className="relative grid h-9 w-10 shrink-0 place-items-center rounded-control text-secondary transition-colors hover:bg-surface-raised hover:text-primary focus-visible:outline-2 focus-visible:outline-focus data-[active=true]:bg-surface-raised data-[active=true]:text-primary"
+        className="flex min-h-9 w-full items-center gap-group rounded-xl px-group py-2 text-left text-body font-medium text-secondary transition-colors duration-150 hover:bg-row-hover hover:text-primary focus-visible:outline-2 focus-visible:outline-focus data-[active=true]:bg-surface-raised data-[active=true]:text-primary"
         aria-label="Usage"
         aria-haspopup="dialog"
         aria-expanded={mode === 'detailed'}
@@ -538,11 +538,12 @@ export function ProviderUsagePanel({
         }}
         onClick={handleTriggerClick}
       >
-        <Gauge aria-hidden="true" className="size-4" strokeWidth={1.75} />
+        <Gauge aria-hidden="true" className="size-4 shrink-0" strokeWidth={1.75} />
+        <span className="truncate">Usage</span>
         {dotTone ? (
           <span
             aria-hidden="true"
-            className={`absolute top-2 right-2.5 size-1.5 rounded-pill ${dotTone === 'danger' ? 'bg-status-danger' : 'bg-status-warning'}`}
+            className={`ml-auto size-1.5 shrink-0 rounded-pill ${dotTone === 'danger' ? 'bg-status-danger' : 'bg-status-warning'}`}
           />
         ) : null}
       </button>
@@ -569,7 +570,7 @@ export function ProviderUsagePanel({
               }}
             >
               <div
-                className={`max-h-[calc(100vh-2rem)] overflow-y-auto rounded-panel border border-border bg-surface-raised text-primary shadow-popover ${
+                className={`max-h-[calc(100vh-2rem)] overflow-y-auto rounded-panel border border-border bg-menu-surface text-primary shadow-popover ${
                   mode === 'detailed' ? 'space-y-2.5 p-3' : 'space-y-2 p-2.5'
                 }`}
               >

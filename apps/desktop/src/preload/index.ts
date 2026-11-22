@@ -64,6 +64,7 @@ import {
   readSideChatReceiptInputSchema,
   listSideChatsInputSchema,
   listSideChatsPageSchema,
+  runtimePreparationGetInputSchema,
   sideChatSyncMainInputSchema,
   sideChatSyncMainReceiptSchema,
 } from '@pact/contracts'
@@ -364,7 +365,10 @@ const bridge: DesktopBridge = {
       },
     }
   },
-  getRuntimePreparation: () => invoke(IPC_CHANNELS.runtimePreparationGet),
+  getRuntimePreparation: async (input) =>
+    input === undefined
+      ? invoke(IPC_CHANNELS.runtimePreparationGet)
+      : invoke(IPC_CHANNELS.runtimePreparationGet, runtimePreparationGetInputSchema.parse(input)),
   chooseRuntimeExecutable: (agentId) => invoke(IPC_CHANNELS.runtimeExecutableChoose, agentId),
   getSchedulingState: async (input) =>
     rpcResultSchema(schedulingStateSchema).parse(

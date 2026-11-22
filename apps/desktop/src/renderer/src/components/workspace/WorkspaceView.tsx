@@ -1,4 +1,14 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
+import {
+  cloneElement,
+  isValidElement,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from 'react'
 
 import type { SkillSelection } from '@pact/contracts'
 import type {
@@ -19,12 +29,19 @@ import type {
   SchedulingState,
 } from '@pact/contracts'
 
+import type {
+  CreateFileCommentOptions,
+  WorkspaceChangesNavigationGuard,
+  WorkspaceChangesNavigationTarget,
+  WorkspaceProjectFilePanelState,
+} from '../../app/useWorkspacePanels'
 import type { ComposerDocument } from '../conversation/composer-document'
 import type { ConversationViewProjection } from '../conversation/conversation-window'
 import type { ProjectFileTarget } from '../conversation/MessageMarkdown'
 import type { MessageTextSelection } from '../conversation/MessageSelectionSurface'
 import type { SessionForkOpening } from '../conversation/SessionFork'
 import type {
+  CommentDraftSaveOutcome,
   ConversationComposerMention,
   ConversationHistoryControls,
   ConversationFlow,
@@ -34,25 +51,40 @@ import type { NavigationIntent } from './ProjectNavigation'
 import type { SessionWorkspaceFlow } from './useSessionWorkspace'
 
 import { nativeRecoveryTargets } from '../conversation/conversation-window'
-import { ConversationView } from '../conversation/ConversationView'
+import { ConversationView, type ConversationViewProps } from '../conversation/ConversationView'
 import {
   SkillDocumentPanel,
   type SkillDocumentPanelState,
 } from '../conversation/SkillDocumentPanel'
-import { ProjectFilePanel, type ProjectFilePanelState } from '../project-file/ProjectFilePanel'
+import { ProjectFilePanel } from '../project-file/ProjectFilePanel'
 import {
   WorkspaceChangesPanel,
   type WorkspaceChangesPanelState,
 } from '../project-file/WorkspaceChangesPanel'
 import { SessionSettingsPanel } from '../settings/session/SessionSettingsPanel'
+import { ContextInspector, type ContextInspectorTab } from './ContextInspector'
 import { ConversationErrorBoundary } from './ConversationErrorBoundary'
 import { ProjectNavigation } from './ProjectNavigation'
 import { SessionCreationView } from './SessionCreationView'
 import { SessionHeader } from './SessionHeader'
 import { SettingsNavigation, type SettingsPage } from './SettingsNavigation'
-import { SideChatStage } from './SideChatStage'
+import {
+  SideChatsInspectorContext,
+  SideChatsPanel,
+  type SideChatsPanelProps,
+} from './SideChatsPanel'
 import { ProjectEmptyState, ProjectReadyState } from './WorkspaceEmptyStates'
 import { WorkspaceShell } from './WorkspaceShell'
+
+export interface ActiveWorkspaceDiffTarget {
+  sessionId: string
+  changeSetId: string
+  path: string
+}
+
+const ConversationViewWithDiff: React.ComponentType<
+  ConversationViewProps & { activeWorkspaceDiff?: ActiveWorkspaceDiffTarget | undefined }
+> = ConversationView
 
 interface WorkspaceViewProps {
   runtimePreparation?: RuntimePreparation | undefined
@@ -101,22 +133,41 @@ interface WorkspaceViewProps {
   sessionSettingsEditorState?: SessionSettingsEditorState | undefined
   sessionSettingsLoading: boolean
   sessionSettingsOpen: boolean
+  sessionSettingsNavigationToken?: number | undefined
   collaborationTask?: CollaborationTask | null | undefined
   sideChatsOpen?: boolean | undefined
+  sideChatNavigationToken?: number | undefined
+  changesNavigationToken?: number | undefined
+  fileNavigationToken?: number | undefined
+  inspectorNavigationEpoch?: number | undefined
+  overlayCloseToken?: number | undefined
   sideChatActiveCount?: number | undefined
   sideChatAttentionCount?: number | undefined
   sideChatUnreadCount?: number | undefined
   sideChatsPanel?: ReactNode | undefined
+  onInspectorStateChange?:
+    | ((state: { open: boolean; activeTab: ContextInspectorTab }) => void)
+    | undefined
+  onInspectorNavigate?: (() => void) | undefined
+  onRegisterChangesNavigationGuard?:
+    | ((guard: WorkspaceChangesNavigationGuard | undefined) => void)
+    | undefined
+  onConfirmExternalWorkspaceChanges?:
+    | ((target: WorkspaceChangesNavigationTarget) => void)
+    | undefined
+  onFocusChangesTab?: (() => void) | undefined
   onOpenSideChats?: (() => void) | undefined
   onBackToSideChat?: (() => void) | undefined
   onOpenBtwSideChat?: ((draft: ComposerDocument) => Promise<boolean>) | undefined
   onAskInSideChat?: ((selection: MessageTextSelection) => void) | undefined
   onOpenSideChat?: ((sideChatId: string) => void) | undefined
   resolveSideChatTitle?: ((sideChatId: string, fallbackTitle: string) => string) | undefined
-  projectFilePanel?: ProjectFilePanelState | undefined
+  projectFilePanel?: WorkspaceProjectFilePanelState | undefined
+  projectFileSessionId?: string | undefined
   workspaceChangesPanel?: WorkspaceChangesPanelState | undefined
   projectFilePanelExpanded: boolean
   conversation?: ConversationViewProjection | undefined
+  sideChatConversation?: ConversationViewProjection | undefined
   conversationVisible: boolean
   conversationHistory: ConversationHistoryControls
   choosingConversationImages?: boolean | undefined
@@ -167,7 +218,11 @@ interface WorkspaceViewProps {
   conversationComposerSkills: SkillSelection[]
   onConversationComposerSkillsChange: (skills: SkillSelection[]) => void
   onConversationComposerMentionChange: (value: ConversationComposerMention | undefined) => void
-  onCreateFileComment: (anchor: FileCommentAnchor, body: string) => Promise<boolean>
+  onCreateFileComment: (
+    anchor: FileCommentAnchor,
+    body: string,
+    options?: CreateFileCommentOptions,
+  ) => Promise<CommentDraftSaveOutcome>
   messageNavigation?:
     | {
         navigationId?: string
@@ -185,6 +240,9 @@ interface WorkspaceViewProps {
   onAcceptPeerProposal: (proposalId: string) => Promise<boolean>
   onDismissPeerProposal: (proposalId: string) => Promise<boolean>
   onUndoWorkspaceChanges: (changeSetId: string) => Promise<boolean>
+  onUndoWorkspaceFile?: ((changeSetId: string, path: string) => Promise<boolean>) | undefined
+  activeWorkspaceDiff?: ActiveWorkspaceDiffTarget | undefined
+  activeWorkspaceFilePath?: string | undefined
   onRespondNativeInput: (input: import('@pact/contracts').NativeInputRespond) => Promise<boolean>
   nativeInputDrafts: ConversationFlow['nativeInputDrafts']
   onNativeInputDraftChange: ConversationFlow['setNativeInputDraft']
@@ -206,6 +264,21 @@ interface WorkspaceViewProps {
   onRetryProjectFile: () => void
 }
 
+interface InspectorSyncSignals {
+  sessionId: string
+  hasChanges: boolean
+  changesNavigationToken: number | undefined
+  changesFallbackSignal: string
+  hasFile: boolean
+  fileNavigationToken: number | undefined
+  fileFallbackSignal: string
+  sideChats: boolean
+  sideChatNavigationToken: number
+  settings: boolean
+  sessionSettingsNavigationToken: number
+  overlayCloseToken: number
+}
+
 export function WorkspaceView(props: WorkspaceViewProps): React.JSX.Element {
   const selectedSession = props.sessions.find(
     (session) => session.id === props.selectedSessionId && session.status !== 'archived',
@@ -218,6 +291,7 @@ export function WorkspaceView(props: WorkspaceViewProps): React.JSX.Element {
     props.projects.find((project) => project.id === props.selectedProjectId) ??
     selectedProject ??
     props.projects.at(0)
+
   const [planPane, setPlanPane] = useState<{
     sessionId: string
     taskId: string
@@ -225,15 +299,148 @@ export function WorkspaceView(props: WorkspaceViewProps): React.JSX.Element {
     expanded: boolean
   }>()
   const [planHost, setPlanHost] = useState<HTMLDivElement | null>(null)
+  const [requestedTab, setRequestedTab] = useState<ContextInspectorTab>('plan')
+  const [sideChatsMountedSessionId, setSideChatsMountedSessionId] = useState<string | undefined>()
+
   const planRestoreFocusRef = useRef<HTMLButtonElement>(null)
   const sessionSettingsFocusRef = useRef<HTMLButtonElement>(null)
   const sideChatsButtonRef = useRef<HTMLButtonElement>(null)
+  const showCurrentPlanHandlerRef = useRef<(() => void) | undefined>(undefined)
+  const registerShowCurrentPlan = useCallback((fn: (() => void) | undefined): void => {
+    showCurrentPlanHandlerRef.current = fn
+  }, [])
   const sideChatsHostRef = useRef<HTMLDivElement>(null)
   const prePreviewFocusRef = useRef<HTMLElement | null>(null)
   const wasPreviewOpenRef = useRef(false)
+
+  const sessionId = selectedSession?.id ?? ''
   const previewOpen = Boolean(
     props.skillDocumentPanel || props.workspaceChangesPanel || props.projectFilePanel,
   )
+  const hasSideChatsTab = Boolean(
+    selectedSession && !selectedSession.parentSessionId && props.sideChatsPanel,
+  )
+  const planAvailable = Boolean(selectedSession && planPane?.sessionId === selectedSession.id)
+  const rightContextOpen = props.sessionSettingsOpen || Boolean(props.sideChatsOpen) || previewOpen
+
+  // Track external panel arrivals synchronously during render so the sliding-pill tab follows immediately.
+  const hasChangesPanel = Boolean(props.workspaceChangesPanel)
+  const hasFilePanel = Boolean(props.skillDocumentPanel || props.projectFilePanel)
+  const changesNavigationToken = props.changesNavigationToken
+  const fileNavigationToken = props.fileNavigationToken
+  const changesFallbackSignal =
+    changesNavigationToken === undefined && props.workspaceChangesPanel
+      ? `${props.workspaceChangesPanel.sessionId}:${props.workspaceChangesPanel.changeSetId}:${props.workspaceChangesPanel.path}`
+      : ''
+  const fileFallbackSignal =
+    fileNavigationToken === undefined
+      ? props.skillDocumentPanel
+        ? `skill:${props.skillDocumentPanel.sessionId}:${props.skillDocumentPanel.skill.id}`
+        : props.projectFilePanel
+          ? `file:${props.projectFilePanel.target.path}:${props.projectFilePanel.target.lineStart ?? ''}:${props.projectFilePanel.target.lineEnd ?? ''}`
+          : ''
+      : ''
+  const sideChatNavigationToken = props.sideChatNavigationToken ?? 0
+  const sessionSettingsNavigationToken = props.sessionSettingsNavigationToken ?? 0
+  const overlayCloseToken = props.overlayCloseToken ?? 0
+  const [prevSignals, setPrevSignals] = useState<InspectorSyncSignals>({
+    sessionId,
+    hasChanges: hasChangesPanel,
+    changesNavigationToken,
+    changesFallbackSignal,
+    hasFile: hasFilePanel,
+    fileNavigationToken,
+    fileFallbackSignal,
+    sideChats: Boolean(props.sideChatsOpen),
+    sideChatNavigationToken,
+    settings: props.sessionSettingsOpen,
+    sessionSettingsNavigationToken,
+    overlayCloseToken,
+  })
+
+  if (
+    prevSignals.sessionId !== sessionId ||
+    prevSignals.hasChanges !== hasChangesPanel ||
+    prevSignals.changesNavigationToken !== changesNavigationToken ||
+    prevSignals.changesFallbackSignal !== changesFallbackSignal ||
+    prevSignals.hasFile !== hasFilePanel ||
+    prevSignals.fileNavigationToken !== fileNavigationToken ||
+    prevSignals.fileFallbackSignal !== fileFallbackSignal ||
+    prevSignals.sideChats !== Boolean(props.sideChatsOpen) ||
+    prevSignals.sideChatNavigationToken !== sideChatNavigationToken ||
+    prevSignals.settings !== props.sessionSettingsOpen ||
+    prevSignals.sessionSettingsNavigationToken !== sessionSettingsNavigationToken ||
+    prevSignals.overlayCloseToken !== overlayCloseToken
+  ) {
+    const sessionChanged = prevSignals.sessionId !== sessionId
+    const changesRequested =
+      hasChangesPanel &&
+      (changesNavigationToken !== undefined
+        ? prevSignals.changesNavigationToken !== changesNavigationToken ||
+          !prevSignals.hasChanges ||
+          sessionChanged
+        : Boolean(
+            changesFallbackSignal && changesFallbackSignal !== prevSignals.changesFallbackSignal,
+          ))
+    const fileRequested =
+      hasFilePanel &&
+      (fileNavigationToken !== undefined
+        ? prevSignals.fileNavigationToken !== fileNavigationToken ||
+          !prevSignals.hasFile ||
+          sessionChanged
+        : Boolean(fileFallbackSignal && fileFallbackSignal !== prevSignals.fileFallbackSignal))
+    const sideChatRequested =
+      prevSignals.sideChatNavigationToken !== sideChatNavigationToken ||
+      !prevSignals.sideChats ||
+      sessionChanged
+    const settingsRequested =
+      prevSignals.sessionSettingsNavigationToken !== sessionSettingsNavigationToken ||
+      !prevSignals.settings ||
+      sessionChanged
+    const overlayClosed = prevSignals.overlayCloseToken !== overlayCloseToken
+    setPrevSignals({
+      sessionId,
+      hasChanges: hasChangesPanel,
+      changesNavigationToken,
+      changesFallbackSignal,
+      hasFile: hasFilePanel,
+      fileNavigationToken,
+      fileFallbackSignal,
+      sideChats: Boolean(props.sideChatsOpen),
+      sideChatNavigationToken,
+      settings: props.sessionSettingsOpen,
+      sessionSettingsNavigationToken,
+      overlayCloseToken,
+    })
+    if (sessionChanged) {
+      setSideChatsMountedSessionId(props.sideChatsOpen && sessionId ? sessionId : undefined)
+    }
+    if (overlayClosed) {
+      setPlanPane((current) => (current ? { ...current, open: false, expanded: false } : current))
+    }
+    if (changesRequested) {
+      setRequestedTab('changes')
+    } else if (fileRequested) {
+      setRequestedTab('file')
+    } else if (props.sideChatsOpen && sideChatRequested) {
+      setRequestedTab('sidechats')
+      if (sessionId) setSideChatsMountedSessionId(sessionId)
+    } else if (props.sessionSettingsOpen && settingsRequested) {
+      setRequestedTab('settings')
+    } else if (
+      !hasChangesPanel &&
+      !hasFilePanel &&
+      (prevSignals.hasChanges || prevSignals.hasFile) &&
+      props.sideChatsOpen
+    ) {
+      setRequestedTab('sidechats')
+    }
+  }
+
+  if (props.sideChatsOpen && sessionId && sideChatsMountedSessionId !== sessionId) {
+    setSideChatsMountedSessionId(sessionId)
+  }
+
   useEffect(() => {
     if (previewOpen && !wasPreviewOpenRef.current) {
       const active = document.activeElement
@@ -252,36 +459,324 @@ export function WorkspaceView(props: WorkspaceViewProps): React.JSX.Element {
     }
     wasPreviewOpenRef.current = previewOpen
   }, [previewOpen, props.sideChatsOpen])
-  const rightContextOpen = props.sessionSettingsOpen || Boolean(props.sideChatsOpen) || previewOpen
-  const planAvailable = Boolean(selectedSession && planPane?.sessionId === selectedSession.id)
-  const planOpen = Boolean(planAvailable && planPane?.open && !rightContextOpen)
-  const acceptPlanTask = useCallback((sessionId: string, taskId?: string): void => {
-    setPlanPane((current) =>
-      taskId
-        ? current?.sessionId === sessionId && current.taskId === taskId
-          ? current
-          : { sessionId, taskId, open: true, expanded: false }
-        : current?.sessionId === sessionId
-          ? undefined
-          : current,
-    )
-  }, [])
-  const onSessionSettingsOpenChange = props.onSessionSettingsOpenChange
-  const openPlan = useCallback((): void => {
-    onSessionSettingsOpenChange(false)
-    setPlanPane((current) => (current ? { ...current, open: true } : current))
-  }, [onSessionSettingsOpenChange])
-  const closePlan = useCallback(
-    (): void =>
-      setPlanPane((current) => (current ? { ...current, open: false, expanded: false } : current)),
-    [],
+
+  const activePlanVersion =
+    props.collaborationTask &&
+    !props.collaborationTask.ending &&
+    props.collaborationTask.planVersion > 0
+      ? props.collaborationTask.planVersion
+      : undefined
+
+  const availableTabIds = useMemo<ContextInspectorTab[]>(() => {
+    if (!selectedSession || props.settingsPage) return []
+    const ids: ContextInspectorTab[] = []
+    if (planAvailable) ids.push('plan')
+    if (hasSideChatsTab) ids.push('sidechats')
+    if (props.workspaceChangesPanel) ids.push('changes')
+    if (props.projectFilePanel || props.skillDocumentPanel) ids.push('file')
+    if (props.sessionSettingsOpen) ids.push('settings')
+    return ids
+  }, [
+    selectedSession,
+    props.settingsPage,
+    planAvailable,
+    hasSideChatsTab,
+    props.workspaceChangesPanel,
+    props.projectFilePanel,
+    props.skillDocumentPanel,
+    props.sessionSettingsOpen,
+  ])
+
+  const effectiveActiveTab: ContextInspectorTab = useMemo(() => {
+    if (availableTabIds.includes(requestedTab)) return requestedTab
+    if (props.skillDocumentPanel || props.projectFilePanel) return 'file'
+    if (props.workspaceChangesPanel) return 'changes'
+    if (props.sessionSettingsOpen) return 'settings'
+    if (props.sideChatsOpen && hasSideChatsTab) return 'sidechats'
+    if (planAvailable) return 'plan'
+    return availableTabIds[0] ?? 'sidechats'
+  }, [
+    availableTabIds,
+    requestedTab,
+    props.skillDocumentPanel,
+    props.projectFilePanel,
+    props.workspaceChangesPanel,
+    props.sessionSettingsOpen,
+    props.sideChatsOpen,
+    hasSideChatsTab,
+    planAvailable,
+  ])
+
+  const planOpen = Boolean(planAvailable && planPane?.open)
+  const isInspectorOpen = Boolean(
+    selectedSession && !props.settingsPage && (rightContextOpen || planOpen),
   )
+  const isPlanActive = isInspectorOpen && effectiveActiveTab === 'plan'
+  const sideChatsMounted = Boolean(
+    hasSideChatsTab &&
+    selectedSession &&
+    (sideChatsMountedSessionId === selectedSession.id ||
+      props.sideChatsOpen ||
+      (isInspectorOpen && effectiveActiveTab === 'sidechats')),
+  )
+
+  const { onInspectorStateChange } = props
+  useLayoutEffect(() => {
+    onInspectorStateChange?.({ open: isInspectorOpen, activeTab: effectiveActiveTab })
+  }, [isInspectorOpen, effectiveActiveTab, onInspectorStateChange])
+
+  const acceptedPlanTaskRef = useRef<{ sessionId: string; taskId: string } | undefined>(undefined)
+  const rightContextOpenRef = useRef(rightContextOpen)
+  useEffect(() => {
+    rightContextOpenRef.current = rightContextOpen
+  }, [rightContextOpen])
+
+  const acceptPlanTask = useCallback((nextSessionId: string, taskId?: string): void => {
+    if (!taskId) {
+      if (acceptedPlanTaskRef.current?.sessionId === nextSessionId) {
+        acceptedPlanTaskRef.current = undefined
+      }
+      setPlanPane((current) => (current?.sessionId === nextSessionId ? undefined : current))
+      return
+    }
+    const previous = acceptedPlanTaskRef.current
+    if (previous?.sessionId === nextSessionId && previous.taskId === taskId) {
+      return
+    }
+    acceptedPlanTaskRef.current = { sessionId: nextSessionId, taskId }
+    setPlanPane((current) =>
+      current?.sessionId === nextSessionId && current.taskId === taskId
+        ? current
+        : { sessionId: nextSessionId, taskId, open: true, expanded: false },
+    )
+    if (!rightContextOpenRef.current) {
+      setRequestedTab('plan')
+    }
+  }, [])
+
+  const openPlan = useCallback((): void => {
+    setPlanPane((current) => (current ? { ...current, open: true } : current))
+    setRequestedTab('plan')
+  }, [])
 
   const setPlanExpanded = useCallback((expanded: boolean): void => {
     setPlanPane((current) => (current ? { ...current, expanded } : current))
   }, [])
+
+  const {
+    onSessionSettingsOpenChange,
+    onOpenSideChats,
+    onOpenSessionSettings,
+    onInspectorNavigate,
+    sessionSettingsEditorState,
+    sessionSettingsLoading,
+    settingsPage,
+    sideChatsOpen,
+  } = props
+
+  const closeInspector = useCallback((): void => {
+    setPlanPane((current) => (current ? { ...current, open: false, expanded: false } : current))
+    onInspectorNavigate?.()
+    onInspectorStateChange?.({ open: false, activeTab: effectiveActiveTab })
+    onSessionSettingsOpenChange(false)
+  }, [onSessionSettingsOpenChange, onInspectorNavigate, onInspectorStateChange, effectiveActiveTab])
+
+  const openInspector = useCallback((): void => {
+    if (!selectedSession || settingsPage) return
+    onInspectorNavigate?.()
+    if (planAvailable && (requestedTab === 'plan' || !hasSideChatsTab)) {
+      setPlanPane((current) => (current ? { ...current, open: true } : current))
+      setRequestedTab('plan')
+      onInspectorStateChange?.({ open: true, activeTab: 'plan' })
+      return
+    }
+    if (hasSideChatsTab) {
+      setSideChatsMountedSessionId(selectedSession.id)
+      setRequestedTab('sidechats')
+      onInspectorStateChange?.({ open: true, activeTab: 'sidechats' })
+      if (!sideChatsOpen) onOpenSideChats?.()
+      return
+    }
+    if (planAvailable) {
+      setPlanPane((current) => (current ? { ...current, open: true } : current))
+      setRequestedTab('plan')
+      onInspectorStateChange?.({ open: true, activeTab: 'plan' })
+      return
+    }
+    onOpenSessionSettings(selectedSession.id)
+  }, [
+    selectedSession,
+    settingsPage,
+    planAvailable,
+    requestedTab,
+    hasSideChatsTab,
+    sideChatsOpen,
+    onOpenSideChats,
+    onOpenSessionSettings,
+    onInspectorNavigate,
+    onInspectorStateChange,
+  ])
+
+  const handleSelectInspectorTab = useCallback(
+    (tab: ContextInspectorTab): void => {
+      setRequestedTab(tab)
+      onInspectorNavigate?.()
+      onInspectorStateChange?.({ open: true, activeTab: tab })
+      if (tab === 'sidechats' && selectedSession) {
+        setSideChatsMountedSessionId(selectedSession.id)
+        if (!sideChatsOpen) onOpenSideChats?.()
+      } else if (tab === 'plan') {
+        setPlanPane((current) => (current ? { ...current, open: true } : current))
+      } else if (
+        tab === 'settings' &&
+        selectedSession &&
+        !sessionSettingsEditorState &&
+        !sessionSettingsLoading
+      ) {
+        onOpenSessionSettings(selectedSession.id)
+      }
+    },
+    [
+      selectedSession,
+      sideChatsOpen,
+      onOpenSideChats,
+      onOpenSessionSettings,
+      sessionSettingsEditorState,
+      sessionSettingsLoading,
+      onInspectorNavigate,
+      onInspectorStateChange,
+    ],
+  )
+
   const navigationAvailable = Boolean(props.settingsPage || props.projects.length > 0)
   const [navigationVisible, setNavigationVisible] = useState(navigationAvailable)
+
+  const isSessionNativeRecoveryLocked = (ownerSessionId: string | undefined): boolean => {
+    if (!ownerSessionId) return false
+    if (props.sideChatConversation?.sessionId === ownerSessionId) {
+      return nativeRecoveryTargets(props.sideChatConversation).length > 0
+    }
+    if (props.conversation?.sessionId === ownerSessionId) {
+      return nativeRecoveryTargets(props.conversation).length > 0
+    }
+    return false
+  }
+  const isSideChatPreview = Boolean(props.sideChatsOpen && props.onBackToSideChat)
+
+  let changesPanelNode: ReactNode
+  let changesStageKey: string | undefined
+  if (selectedSession && !props.settingsPage && props.workspaceChangesPanel) {
+    const state = props.workspaceChangesPanel
+    if (isSideChatPreview) {
+      changesStageKey = `changes:${state.sessionId}:${state.changeSetId}`
+    }
+    changesPanelNode = (
+      <WorkspaceChangesPanel
+        key={`${state.sessionId}:${state.changeSetId}`}
+        state={state}
+        expanded={props.projectFilePanelExpanded}
+        onClose={closeInspector}
+        onBackToSideChat={props.onBackToSideChat}
+        onExpandedChange={props.onProjectFilePanelExpandedChange}
+        onSelectFile={(path) =>
+          props.onOpenWorkspaceChanges(
+            state.changeSetId,
+            path,
+            undefined,
+            state.revision,
+            state.sessionId,
+          )
+        }
+        onUndoFile={props.onUndoWorkspaceFile}
+        navigationEpoch={props.inspectorNavigationEpoch}
+        onRegisterNavigationGuard={props.onRegisterChangesNavigationGuard}
+        onConfirmExternalNavigation={props.onConfirmExternalWorkspaceChanges}
+        onFocusChanges={props.onFocusChangesTab}
+        onCreateComment={props.onCreateFileComment}
+        commentingDisabled={isSessionNativeRecoveryLocked(state.sessionId)}
+      />
+    )
+  }
+
+  let filePanelNode: ReactNode
+  let fileStageKey: string | undefined
+  if (selectedSession && !props.settingsPage) {
+    if (props.skillDocumentPanel) {
+      if (isSideChatPreview) {
+        fileStageKey = `skill:${props.skillDocumentPanel.sessionId}:${props.skillDocumentPanel.skill.id}`
+      }
+      filePanelNode = (
+        <SkillDocumentPanel
+          state={props.skillDocumentPanel}
+          expanded={props.projectFilePanelExpanded}
+          onExpandedChange={props.onProjectFilePanelExpandedChange}
+          onClose={closeInspector}
+          onBackToSideChat={props.onBackToSideChat}
+          onRetry={props.onRetrySkillDocument}
+        />
+      )
+    } else if (props.projectFilePanel) {
+      if (isSideChatPreview) {
+        fileStageKey = `file:${props.projectFilePanel.target.path}`
+      }
+      filePanelNode = (
+        <ProjectFilePanel
+          state={props.projectFilePanel}
+          expanded={props.projectFilePanelExpanded}
+          onClose={closeInspector}
+          onBackToSideChat={props.onBackToSideChat}
+          onExpandedChange={props.onProjectFilePanelExpandedChange}
+          onRetry={props.onRetryProjectFile}
+          onCreateComment={props.onCreateFileComment}
+          commentingDisabled={isSessionNativeRecoveryLocked(
+            props.projectFileSessionId ?? selectedSession.id,
+          )}
+        />
+      )
+    }
+  }
+
+  const settingsPanelNode =
+    selectedSession && !props.settingsPage && props.sessionSettingsOpen ? (
+      <SessionSettingsPanel
+        key={`${selectedSession.id}-${props.sessionSettingsEditorState?.session.settingsRevision ?? 'loading'}`}
+        editorState={props.sessionSettingsEditorState}
+        runtimePreparation={props.runtimePreparation}
+        conversation={
+          props.conversation && props.collaborationTask !== undefined
+            ? { ...props.conversation, collaborationTask: props.collaborationTask }
+            : props.conversation
+        }
+        loading={props.sessionSettingsLoading}
+        saving={props.savingSessionSettings}
+        error={props.sessionError}
+        onClose={closeInspector}
+        onRetry={() => props.onRetrySessionSettings(selectedSession.id)}
+        onSave={(settings) => props.onSaveSessionSettings(selectedSession.id, settings)}
+      />
+    ) : undefined
+
+  const embeddedSideChatsPanel = useMemo<ReactNode>(() => {
+    if (!props.sideChatsPanel) return undefined
+    if (
+      isValidElement<SideChatsPanelProps>(props.sideChatsPanel) &&
+      props.sideChatsPanel.type === SideChatsPanel
+    ) {
+      return cloneElement(props.sideChatsPanel, {
+        embeddedInInspector: props.sideChatsPanel.props.embeddedInInspector ?? false,
+        onClose: closeInspector,
+      })
+    }
+    return (
+      <SideChatsInspectorContext.Provider value={false}>
+        {props.sideChatsPanel}
+      </SideChatsInspectorContext.Provider>
+    )
+  }, [props.sideChatsPanel, closeInspector])
+
+  const canRenderInspector = Boolean(
+    selectedSession && !props.settingsPage && (availableTabIds.length > 0 || isInspectorOpen),
+  )
 
   return (
     <WorkspaceShell
@@ -333,16 +828,51 @@ export function WorkspaceView(props: WorkspaceViewProps): React.JSX.Element {
             <div className="min-w-0 flex-1">
               <SessionHeader
                 session={selectedSession}
+                collaborationTask={props.collaborationTask}
                 projectName={selectedProject?.name}
                 saving={props.renamingSessionId === selectedSession.id}
                 onSave={(title) => props.onRenameSession(selectedSession.id, title)}
-                onOpenSettings={() => props.onOpenSessionSettings(selectedSession.id)}
+                settingsOpen={isInspectorOpen && effectiveActiveTab === 'settings'}
+                onOpenSettings={() => {
+                  if (isInspectorOpen && effectiveActiveTab === 'settings') closeInspector()
+                  else if (props.sessionSettingsOpen) handleSelectInspectorTab('settings')
+                  else props.onOpenSessionSettings(selectedSession.id)
+                }}
                 settingsButtonRef={sessionSettingsFocusRef}
-                sideChatsOpen={props.sideChatsOpen && !previewOpen}
+                planAvailable={planAvailable}
+                planOpen={isPlanActive}
+                planVersion={activePlanVersion}
+                onTogglePlan={() => {
+                  if (isPlanActive) closeInspector()
+                  else if (showCurrentPlanHandlerRef.current) showCurrentPlanHandlerRef.current()
+                  else handleSelectInspectorTab('plan')
+                }}
+                planButtonRef={planRestoreFocusRef}
+                changesAvailable={Boolean(props.workspaceChangesPanel)}
+                changesOpen={isInspectorOpen && effectiveActiveTab === 'changes'}
+                onToggleChanges={() => {
+                  if (isInspectorOpen && effectiveActiveTab === 'changes') closeInspector()
+                  else handleSelectInspectorTab('changes')
+                }}
+                fileAvailable={Boolean(props.projectFilePanel || props.skillDocumentPanel)}
+                fileOpen={isInspectorOpen && effectiveActiveTab === 'file'}
+                fileLabel={props.skillDocumentPanel ? 'Skill' : 'File'}
+                onToggleFile={() => {
+                  if (isInspectorOpen && effectiveActiveTab === 'file') closeInspector()
+                  else handleSelectInspectorTab('file')
+                }}
+                sideChatsOpen={isInspectorOpen && effectiveActiveTab === 'sidechats'}
                 sideChatActiveCount={props.sideChatActiveCount}
                 sideChatAttentionCount={props.sideChatAttentionCount}
                 sideChatUnreadCount={props.sideChatUnreadCount}
-                onOpenSideChats={props.onOpenSideChats}
+                onOpenSideChats={
+                  props.onOpenSideChats
+                    ? () => {
+                        if (isInspectorOpen && effectiveActiveTab === 'sidechats') closeInspector()
+                        else handleSelectInspectorTab('sidechats')
+                      }
+                    : undefined
+                }
                 sideChatsButtonRef={sideChatsButtonRef}
               />
             </div>
@@ -359,37 +889,46 @@ export function WorkspaceView(props: WorkspaceViewProps): React.JSX.Element {
       }
       agentActionsEnabled={props.agentActionsEnabled}
       isSettingsView={Boolean(props.settingsPage)}
-      contextPanelOpen={rightContextOpen || planOpen}
-      contextPanelExpanded={planOpen ? planPane?.expanded : props.projectFilePanelExpanded}
-      contextPanelWidthLimited={!planOpen}
+      nativePresentationSuspended={props.nativePresentationSuspended}
+      contextPanelOpen={isInspectorOpen}
+      contextPanelExpanded={
+        isPlanActive
+          ? planPane?.expanded
+          : effectiveActiveTab === 'file' || effectiveActiveTab === 'changes'
+            ? props.projectFilePanelExpanded
+            : false
+      }
+      contextPanelWidthLimited={!isPlanActive}
       contextPanelRestoreFocusRef={
-        planOpen
+        isPlanActive
           ? planRestoreFocusRef
-          : props.sideChatsOpen && !previewOpen
+          : effectiveActiveTab === 'sidechats'
             ? sideChatsButtonRef
-            : props.sessionSettingsOpen && !previewOpen
+            : effectiveActiveTab === 'settings'
               ? sessionSettingsFocusRef
               : undefined
       }
       onContextPanelOpenChange={(open) => {
-        if (rightContextOpen) props.onSessionSettingsOpenChange(open)
-        else if (planAvailable)
-          setPlanPane((current) =>
-            current && current.open !== open
-              ? { ...current, open, expanded: open && current.expanded }
-              : current,
-          )
+        if (open === isInspectorOpen) return
+        if (open) openInspector()
+        else closeInspector()
       }}
       showContextToggle={false}
       contextPanel={
-        rightContextOpen ? (
-          <ContextPanel
-            viewProps={props}
-            selectedSession={selectedSession}
-            hostRef={sideChatsHostRef}
+        canRenderInspector ? (
+          <ContextInspector
+            activeTab={effectiveActiveTab}
+            planAvailable={planAvailable}
+            onPlanHostRef={setPlanHost}
+            sideChatsMounted={sideChatsMounted}
+            sideChatsHostRef={sideChatsHostRef}
+            sideChatsPanel={embeddedSideChatsPanel}
+            changesPanel={changesPanelNode}
+            filePanel={filePanelNode}
+            settingsPanel={settingsPanelNode}
+            changesStageKey={changesStageKey}
+            fileStageKey={fileStageKey}
           />
-        ) : planAvailable ? (
-          <div ref={setPlanHost} className="h-full min-h-0" />
         ) : undefined
       }
       workspace={
@@ -398,125 +937,21 @@ export function WorkspaceView(props: WorkspaceViewProps): React.JSX.Element {
           selectedSession={selectedSession}
           creatingProject={creatingProject}
           activeProject={activeProject}
+          isChangesActive={isInspectorOpen && effectiveActiveTab === 'changes'}
+          onRegisterShowCurrentPlan={registerShowCurrentPlan}
           planPane={{
             host: planHost,
             available: planAvailable,
-            open: planOpen,
-            expanded: Boolean(planOpen && planPane?.expanded),
+            open: isPlanActive,
+            expanded: Boolean(isPlanActive && planPane?.expanded),
             onExpandedChange: setPlanExpanded,
             onAvailable: acceptPlanTask,
             onOpen: openPlan,
-            onClose: closePlan,
+            onClose: closeInspector,
             restoreFocusRef: planRestoreFocusRef,
           }}
         />
       }
-    />
-  )
-}
-
-function ContextPanel({
-  viewProps: props,
-  selectedSession,
-  hostRef,
-}: {
-  viewProps: WorkspaceViewProps
-  selectedSession: CollaborationSession | undefined
-  hostRef: React.RefObject<HTMLDivElement | null>
-}): ReactNode {
-  if (!selectedSession || props.settingsPage) return undefined
-  const nativeRecoveryLocked = nativeRecoveryTargets(props.conversation).length > 0
-  let previewKey: string | undefined
-  let previewPanel: ReactNode
-  if (props.skillDocumentPanel) {
-    previewKey = `skill:${props.skillDocumentPanel.sessionId}:${props.skillDocumentPanel.skill.id}`
-    previewPanel = (
-      <SkillDocumentPanel
-        state={props.skillDocumentPanel}
-        expanded={props.projectFilePanelExpanded}
-        onExpandedChange={props.onProjectFilePanelExpandedChange}
-        onClose={() => props.onSessionSettingsOpenChange(false)}
-        onBackToSideChat={props.onBackToSideChat}
-        onRetry={props.onRetrySkillDocument}
-      />
-    )
-  } else if (props.workspaceChangesPanel) {
-    const state = props.workspaceChangesPanel
-    previewKey = `changes:${state.sessionId}:${state.changeSetId}:${state.path}`
-    previewPanel = (
-      <WorkspaceChangesPanel
-        key={`${state.sessionId}:${state.changeSetId}`}
-        state={state}
-        expanded={props.projectFilePanelExpanded}
-        onClose={() => props.onSessionSettingsOpenChange(false)}
-        onBackToSideChat={props.onBackToSideChat}
-        onExpandedChange={props.onProjectFilePanelExpandedChange}
-        onSelectFile={(path) =>
-          props.onOpenWorkspaceChanges(
-            state.changeSetId,
-            path,
-            undefined,
-            state.revision,
-            state.sessionId,
-          )
-        }
-      />
-    )
-  } else if (props.projectFilePanel) {
-    previewKey = `file:${props.projectFilePanel.target.path}:${props.projectFilePanel.target.lineStart ?? ''}`
-    previewPanel = (
-      <ProjectFilePanel
-        state={props.projectFilePanel}
-        expanded={props.projectFilePanelExpanded}
-        onClose={() => props.onSessionSettingsOpenChange(false)}
-        onBackToSideChat={props.onBackToSideChat}
-        onExpandedChange={props.onProjectFilePanelExpandedChange}
-        onRetry={props.onRetryProjectFile}
-        onCreateComment={props.onCreateFileComment}
-        commentingDisabled={nativeRecoveryLocked}
-      />
-    )
-  }
-
-  if (props.sideChatsOpen && props.sideChatsPanel) {
-    return (
-      <div className="relative h-full min-h-0 overflow-hidden bg-surface-raised">
-        <div
-          ref={hostRef}
-          className="h-full min-h-0"
-          hidden={Boolean(previewPanel)}
-          inert={Boolean(previewPanel)}
-          aria-hidden={Boolean(previewPanel)}
-        >
-          {props.sideChatsPanel}
-        </div>
-        {previewPanel ? (
-          <div className="absolute inset-0 bg-surface-raised">
-            <SideChatStage stageKey={previewKey ?? 'preview'} depth={2}>
-              {previewPanel}
-            </SideChatStage>
-          </div>
-        ) : null}
-      </div>
-    )
-  }
-  if (previewPanel) return previewPanel
-  return (
-    <SessionSettingsPanel
-      key={`${selectedSession.id}-${props.sessionSettingsEditorState?.session.settingsRevision ?? 'loading'}`}
-      editorState={props.sessionSettingsEditorState}
-      runtimePreparation={props.runtimePreparation}
-      conversation={
-        props.conversation && props.collaborationTask !== undefined
-          ? { ...props.conversation, collaborationTask: props.collaborationTask }
-          : props.conversation
-      }
-      loading={props.sessionSettingsLoading}
-      saving={props.savingSessionSettings}
-      error={props.sessionError}
-      onClose={() => props.onSessionSettingsOpenChange(false)}
-      onRetry={() => props.onRetrySessionSettings(selectedSession.id)}
-      onSave={(settings) => props.onSaveSessionSettings(selectedSession.id, settings)}
     />
   )
 }
@@ -526,12 +961,16 @@ function WorkspaceContent({
   selectedSession,
   creatingProject,
   activeProject,
+  isChangesActive,
+  onRegisterShowCurrentPlan,
   planPane,
 }: {
   props: WorkspaceViewProps
   selectedSession: CollaborationSession | undefined
   creatingProject: Project | undefined
   activeProject: Project | undefined
+  isChangesActive: boolean
+  onRegisterShowCurrentPlan: (fn: (() => void) | undefined) => void
   planPane: {
     host: HTMLElement | null
     available: boolean
@@ -564,6 +1003,16 @@ function WorkspaceContent({
     )
   }
   if (selectedSession) {
+    const resolvedActiveWorkspaceDiff = isChangesActive
+      ? (props.activeWorkspaceDiff ??
+        (props.workspaceChangesPanel
+          ? {
+              sessionId: props.workspaceChangesPanel.sessionId,
+              changeSetId: props.workspaceChangesPanel.changeSetId,
+              path: props.workspaceChangesPanel.path,
+            }
+          : undefined))
+      : undefined
     return (
       <div className="relative h-full min-h-0 overflow-hidden">
         {props.settingsPage ? (
@@ -575,13 +1024,15 @@ function WorkspaceContent({
           inert={Boolean(props.settingsPage)}
         >
           <ConversationErrorBoundary key={selectedSession.id}>
-            <ConversationView
+            <ConversationViewWithDiff
               planPanelHost={planPane.host}
               planPanelOpen={planPane.open}
               planPanelExpanded={planPane.expanded}
               onPlanPanelExpandedChange={planPane.onExpandedChange}
               planAvailable={planPane.available}
               planRestoreFocusRef={planPane.restoreFocusRef}
+              showPlanHeaderButton={false}
+              onRegisterShowCurrentPlan={onRegisterShowCurrentPlan}
               onPlanAvailable={planPane.onAvailable}
               onOpenPlan={planPane.onOpen}
               onClosePlan={planPane.onClose}
@@ -636,6 +1087,16 @@ function WorkspaceContent({
               onAcceptPeerProposal={props.onAcceptPeerProposal}
               onDismissPeerProposal={props.onDismissPeerProposal}
               onUndoWorkspaceChanges={props.onUndoWorkspaceChanges}
+              onUndoWorkspaceFile={props.onUndoWorkspaceFile}
+              activeWorkspaceDiff={resolvedActiveWorkspaceDiff}
+              activeWorkspaceFilePath={
+                isChangesActive
+                  ? (props.activeWorkspaceFilePath ??
+                    (props.workspaceChangesPanel?.sessionId === selectedSession.id
+                      ? props.workspaceChangesPanel.path
+                      : undefined))
+                  : undefined
+              }
               onRespondNativePermission={props.onRespondNativePermission}
               onRespondNativeInput={props.onRespondNativeInput}
               nativeInputDrafts={props.nativeInputDrafts}

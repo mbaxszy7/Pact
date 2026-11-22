@@ -18,6 +18,10 @@ import { closeDiagnostics, receiveDiagnostic, recordDiagnostic } from '../diagno
 import { hasLogicalIpcFixtureNonce, LogicalIpcWorkerTraffic } from '../shared/logical-ipc-traffic'
 import { AppUpdates } from './app-updates/app-updates'
 import { handleAppearanceRequest } from './appearance/handler'
+import {
+  configureDefaultAgyStorageTransport,
+  ElectronParentPortAgyStorageTransport,
+} from './conversation/agy-storage-runner'
 import { Conversation } from './conversation/conversation'
 import { ConversationImages } from './conversation/conversation-images'
 import {
@@ -36,6 +40,22 @@ import { UtilityDirectoryFileClient } from './workspace-changes/directory-file-c
 import { WorkspaceChanges } from './workspace-changes/workspace-changes'
 
 const parentPort = process.parentPort
+
+function isRetryableUnconfirmedProcessError(error: unknown): boolean {
+  let current: unknown = error
+  const seen = new Set<unknown>()
+  while (current && typeof current === 'object' && !seen.has(current)) {
+    seen.add(current)
+    if (
+      Reflect.get(current, 'code') === 'unconfirmed_process' &&
+      Reflect.get(current, 'retryable') === true
+    ) {
+      return true
+    }
+    current = Reflect.get(current, 'cause')
+  }
+  return false
+}
 const databaseFile = process.argv[2]
 const migrationsFolder = process.argv[3]
 const workspaceStorageRoot = workspaceStorageRootSchema.parse(process.argv[5])
@@ -43,6 +63,7 @@ let database: PactDatabase | undefined
 let conversation: Conversation | undefined
 let workspaceChanges: WorkspaceChanges | undefined
 let directoryFiles: UtilityDirectoryFileClient | undefined
+let agyStorageTransportOwner: ElectronParentPortAgyStorageTransport | undefined
 let runtimePreparationOwner: RuntimePreparation | undefined
 let providerUsageOwner: ProviderUsage | undefined
 let eventLoopProbe: ReturnType<typeof monitorEventLoopDelay> | undefined
@@ -176,6 +197,9 @@ async function bootstrap(
   )
   await images.initialize()
   const relayCredentialClient = new UtilityRelayCredentialClient(parentPort)
+  const agyStorageTransport = new ElectronParentPortAgyStorageTransport(parentPort)
+  agyStorageTransportOwner = agyStorageTransport
+  configureDefaultAgyStorageTransport(agyStorageTransport)
   conversation = new Conversation(
     openedDatabase.conversationRepository,
     openedDatabase.sessionRepository,
@@ -240,6 +264,64 @@ async function bootstrap(
   let activeRequests = 0
   let resolveIdle: (() => void) | undefined
   let shutdown: Promise<void> | undefined
+  let shutdownBaseDone = false
+  let shutdownCompleted = false
+  let permanentShutdownError: Error | undefined
+  let databaseClosed = false
+
+  const finalizeShutdownTeardown = async (): Promise<void> => {
+    if (databaseClosed) return
+    databaseClosed = true
+    agyStorageTransport.dispose()
+    configureDefaultAgyStorageTransport(undefined)
+    directoryOwner.dispose()
+    openedDatabase.close()
+    database = undefined
+    if (runtimeDatabaseFile === ':memory:')
+      await rm(runtimeWorkspaceStorageRoot, { recursive: true, force: true })
+  }
+  const convergeConversationShutdown = async (
+    initialError: unknown,
+    deadlineAt: number | undefined,
+  ): Promise<void> => {
+    if (deadlineAt === undefined || !isRetryableUnconfirmedProcessError(initialError)) {
+      permanentShutdownError = new Error('Conversation cleanup did not finish successfully.', {
+        cause: initialError,
+      })
+      await finalizeShutdownTeardown()
+      throw permanentShutdownError
+    }
+    let lastError: unknown = initialError
+    let permanentCause: unknown
+    let hasPermanentError = false
+    while (Date.now() < deadlineAt) {
+      const waitMs = Math.min(25, Math.max(1, deadlineAt - Date.now()))
+      // oxlint-disable-next-line no-await-in-loop -- Bounded single-shutdown wait for late physical release confirmation before deadlineAt.
+      await new Promise<void>((resolve) => setTimeout(resolve, waitMs))
+      try {
+        // oxlint-disable-next-line no-await-in-loop -- Re-check late physical release convergence under the same shutdown deadline.
+        await conversationOwner.dispose({ flushDeadlineAt: deadlineAt })
+        return
+      } catch (retryError) {
+        if (!isRetryableUnconfirmedProcessError(retryError)) {
+          permanentCause = retryError
+          hasPermanentError = true
+          break
+        }
+        lastError = retryError
+      }
+    }
+    if (hasPermanentError) {
+      permanentShutdownError = new Error('Conversation cleanup did not finish successfully.', {
+        cause: permanentCause,
+      })
+      await finalizeShutdownTeardown()
+      throw permanentShutdownError
+    }
+    // Keep openedDatabase and parentPort storage transport alive when physical release
+    // remains unconfirmed past deadlineAt, without falsely acknowledging flushed.
+    throw lastError
+  }
   // No second request queue: count the async handlers already owned here. Quit
   // has one idle waiter; Main's shutdown deadline bounds its lifetime.
   const runRequest = (work: () => Promise<void>): void => {
@@ -259,6 +341,7 @@ async function bootstrap(
 
   parentPort.on('message', (event) => {
     if (relayCredentialClient.consume(event.data)) return
+    if (agyStorageTransport.consume(event.data, event.ports)) return
     if (receiveDiagnostic(event.data)) return
     const request = utilityRequestSchema.safeParse(event.data)
     if (!request.success) return
@@ -572,37 +655,103 @@ async function bootstrap(
       case 'runtime.shutdown.request': {
         const requestId = request.data.requestId
         const flushDeadlineAt = request.data.flushDeadlineAt
-        shutdown ??= (async () => {
+        if (shutdownCompleted) {
+          parentPort.postMessage(
+            utilityResponseSchema.parse({
+              type: 'runtime.shutdown.response',
+              requestId,
+              result: {
+                ok: true,
+                value: {
+                  flushed: true,
+                },
+              },
+            }),
+          )
+          return
+        }
+        if (permanentShutdownError) {
+          parentPort.postMessage(
+            utilityResponseSchema.parse({
+              type: 'runtime.shutdown.response',
+              requestId,
+              result: {
+                ok: false,
+                error: { code: 'INTERNAL', message: 'Pact could not finish its shutdown flush.' },
+              },
+            }),
+          )
+          return
+        }
+        const currentAttempt = (shutdown ??= (async () => {
           closing = true
-          unsubscribeScheduling()
-          unsubscribeNotifications()
-          await appUpdates.dispose()
-          projectCatalog.dispose()
-          const drainRequests =
-            activeRequests === 0
-              ? Promise.resolve()
-              : new Promise<void>((resolve) => {
-                  resolveIdle = resolve
-                })
-          // Await every request before closing its database, even if one owner's
-          // cleanup fails. A failed owner never produces a successful flush ACK.
-          // Close credential admission before Conversation disposal; the private
-          // consume route stays alive on parentPort through cleanup.
-          relayCredentialClient.dispose()
-          const results = await Promise.allSettled([
-            runtimePreparation.dispose(),
-            providerUsage.dispose(),
-            flushDeadlineAt === undefined
-              ? conversationOwner.dispose()
-              : conversationOwner.dispose({ flushDeadlineAt }),
-            defaultSessionSettings.dispose(),
-            projectFileReader.dispose(),
-            drainRequests,
-          ])
+          if (!shutdownBaseDone) {
+            unsubscribeScheduling()
+            unsubscribeNotifications()
+            await appUpdates.dispose()
+            projectCatalog.dispose()
+            const drainRequests =
+              activeRequests === 0
+                ? Promise.resolve()
+                : new Promise<void>((resolve) => {
+                    resolveIdle = resolve
+                  })
+            // Await every request before closing its database, even if one owner's
+            // cleanup fails. A failed owner never produces a successful flush ACK.
+            // Close credential admission before Conversation disposal; the private
+            // consume routes stay alive on parentPort through cleanup.
+            relayCredentialClient.dispose()
+            const [
+              runtimePrepResult,
+              providerUsageResult,
+              conversationResult,
+              defaultSettingsResult,
+              projectFileResult,
+              drainResult,
+            ] = await Promise.allSettled([
+              runtimePreparation.dispose(flushDeadlineAt),
+              providerUsage.dispose(flushDeadlineAt),
+              flushDeadlineAt === undefined
+                ? conversationOwner.dispose()
+                : conversationOwner.dispose({ flushDeadlineAt }),
+              defaultSessionSettings.dispose(flushDeadlineAt),
+              projectFileReader.dispose(),
+              drainRequests,
+            ])
+            let workspaceError: unknown
+            try {
+              await workspaceOwner.dispose()
+            } catch (error) {
+              workspaceError = error
+            }
+            const nonConversationFailed =
+              workspaceError !== undefined ||
+              runtimePrepResult.status === 'rejected' ||
+              providerUsageResult.status === 'rejected' ||
+              defaultSettingsResult.status === 'rejected' ||
+              projectFileResult.status === 'rejected' ||
+              drainResult.status === 'rejected'
+            if (nonConversationFailed) {
+              permanentShutdownError = new Error(
+                'Conversation cleanup did not finish successfully.',
+              )
+              await finalizeShutdownTeardown()
+              throw permanentShutdownError
+            }
+            shutdownBaseDone = true
+            if (conversationResult.status === 'rejected') {
+              await convergeConversationShutdown(conversationResult.reason, flushDeadlineAt)
+            }
+          } else {
+            try {
+              await (flushDeadlineAt === undefined
+                ? conversationOwner.dispose()
+                : conversationOwner.dispose({ flushDeadlineAt }))
+            } catch (error) {
+              await convergeConversationShutdown(error, flushDeadlineAt)
+            }
+          }
           try {
-            await workspaceOwner.dispose()
-            if (results.some((result) => result.status === 'rejected'))
-              throw new Error('Conversation cleanup did not finish successfully.')
             parentPort.postMessage(
               utilityEventSchema.parse({
                 type: 'native-presence.quit-recent.event',
@@ -611,26 +760,31 @@ async function bootstrap(
               }),
             )
           } finally {
-            directoryOwner.dispose()
-            openedDatabase.close()
-            database = undefined
-            if (runtimeDatabaseFile === ':memory:')
-              await rm(runtimeWorkspaceStorageRoot, { recursive: true, force: true })
+            await finalizeShutdownTeardown()
           }
-        })()
-        void shutdown.then(
+          shutdownCompleted = true
+        })())
+        void currentAttempt.then(
           () => {
             closeDiagnostics()
             parentPort.postMessage(
               utilityResponseSchema.parse({
                 type: 'runtime.shutdown.response',
                 requestId,
-                result: { ok: true, value: { flushed: true } },
+                result: {
+                  ok: true,
+                  value: {
+                    flushed: true,
+                  },
+                },
               }),
             )
             return undefined
           },
           () => {
+            if (shutdown === currentAttempt && !permanentShutdownError && !shutdownCompleted) {
+              shutdown = undefined
+            }
             parentPort.postMessage(
               utilityResponseSchema.parse({
                 type: 'runtime.shutdown.response',
@@ -682,18 +836,25 @@ async function bootstrap(
         )
         return
 
-      case 'runtime-preparation.get.request':
+      case 'runtime-preparation.get.request': {
+        const { input, requestId } = request.data
         runRequest(async () => {
-          const result = await runtimePreparation.inspectReadiness()
+          const result = await runtimePreparation.inspectReadiness(
+            undefined,
+            undefined,
+            undefined,
+            input?.forceRefresh === true ? { forceRefresh: true } : undefined,
+          )
           parentPort.postMessage(
             utilityResponseSchema.parse({
               type: 'runtime-preparation.response',
-              requestId: request.data.requestId,
+              requestId,
               result,
             }),
           )
         })
         return
+      }
 
       case 'runtime-preparation.path.update.request': {
         const { input, requestId } = request.data
@@ -1889,12 +2050,16 @@ process.once('exit', () => {
   void runtimePreparationOwner?.dispose().catch(() => undefined)
   database?.close()
   directoryFiles?.dispose()
+  agyStorageTransportOwner?.dispose()
+  configureDefaultAgyStorageTransport(undefined)
 })
 
 void bootstrap(databaseFile, migrationsFolder, workspaceStorageRoot).catch(
   async (cause: unknown) => {
     eventLoopProbe?.disable()
     directoryFiles?.dispose()
+    agyStorageTransportOwner?.dispose()
+    configureDefaultAgyStorageTransport(undefined)
     const failure = runtimeStartupFailureSchema.parse({
       type: 'runtime.startup-failed.event',
       failureId: randomUUID(),
