@@ -23,6 +23,8 @@ import { tmpdir } from 'node:os'
 import { basename, isAbsolute, join, relative, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
+import type { RuntimeAgentId } from '../../packages/contracts/src/index.js'
+
 import { codexProcessEnvironment } from '../../apps/desktop/src/utility/conversation/codex-process-environment.js'
 import { OwnedProcessGroup } from '../../apps/desktop/src/utility/owned-process-group.js'
 import { PactDatabase } from '../../packages/persistence/src/index.js'
@@ -63,7 +65,7 @@ import {
 import {
   loadProviderConfiguration,
   prepareProviderEnvironment,
-  type ProviderConfiguration,
+  type AnyProviderConfiguration,
 } from './provider-environment.js'
 import {
   writeWindowsNodeLauncher,
@@ -143,7 +145,8 @@ export interface RuntimeFixtureOptions {
   realProviderProtection?: boolean
   redactText?: (text: string) => string
   mode?: 'ui' | 'real' | 'deterministic'
-  configuration?: ProviderConfiguration
+  activePair?: readonly [RuntimeAgentId, RuntimeAgentId]
+  configuration?: AnyProviderConfiguration
   transportFault?: NativeTransportFault
   firstUse?: boolean
   sessionTitles?: boolean
@@ -195,10 +198,10 @@ export interface RuntimeFixture {
   readTransportFacts(): Promise<TransportFacts[]>
   openCodexClient(originator?: 'pact' | 'Codex Desktop'): Promise<NativeRpc>
   runNativeCommand(
-    agentId: 'claude' | 'codex',
+    agentId: 'claude' | 'codex' | 'agy',
     args: string[],
   ): Promise<{ exitCode: number; stdout: string; stderr: string }>
-  readConfigurationModels(): { claude: string | null; codex: string | null }
+  readConfigurationModels(): { claude: string | null; codex: string | null; agy?: string | null }
   appJobDiagnostic(this: void): ReturnType<WindowsLaunchOwner['diagnostic']> | undefined
   observeWindowsProcessTree(
     this: void,
@@ -208,6 +211,7 @@ export interface RuntimeFixture {
   databaseFile: string
   claudeHome: string
   codexHome: string
+  geminiHome: string
   createProjectDirectory(name: string, git?: boolean): Promise<string>
   launch(extraEnvironment?: Record<string, string>): Promise<ElectronApplication>
   captureUiFailure(info: TestInfo): Promise<void>
@@ -587,13 +591,29 @@ export async function createRuntimeFixture(
         Buffer.byteLength(JSON.stringify(options.codexModels)) > 16 * 1024)
     )
       throw new Error('Synthetic models require one bounded protocol fixture catalog.')
+    if (options.activePair) {
+      const validAgents = new Set<RuntimeAgentId>(['claude', 'codex', 'agy'])
+      if (
+        options.activePair.length !== 2 ||
+        options.activePair[0] === options.activePair[1] ||
+        !validAgents.has(options.activePair[0]) ||
+        !validAgents.has(options.activePair[1])
+      )
+        throw new Error('A fixture activePair requires two distinct valid Agents')
+    }
+    const useCodexAgyProfile =
+      mode === 'real' &&
+      Boolean(options.activePair?.includes('agy')) &&
+      !options.activePair?.includes('claude')
     // Missing credentials fail before creating an app, a CLI process or a Native Session.
     const configuration =
       mode === 'real'
         ? (options.configuration ??
-          (process.env['PACT_E2E_PROVIDER_ENV_FILE']
-            ? await readCiProviderConfiguration()
-            : await loadProviderConfiguration()))
+          (useCodexAgyProfile
+            ? await loadProviderConfiguration(undefined, process.env, {}, { profile: 'codex-agy' })
+            : process.env['PACT_E2E_PROVIDER_ENV_FILE']
+              ? await readCiProviderConfiguration()
+              : await loadProviderConfiguration()))
         : undefined
     if (creationCancelled) throw new Error('E2E fixture construction was cancelled')
     const directory = await mkdtemp(join(tmpdir(), 'pact-runtime-e2e-'))
@@ -617,7 +637,7 @@ export async function createRuntimeFixture(
     let disposed = false
     let timeout: ReturnType<typeof setTimeout> | undefined
     let environment: Awaited<ReturnType<typeof prepareProviderEnvironment>>
-    let claudePath: string
+    let claudePath: string | null
     let codexPath: string
     let transport: NativeTransportFaultFiles | undefined
     let credentialStore: MacCredentialStore | undefined
@@ -932,11 +952,19 @@ export async function createRuntimeFixture(
           )
         : undefined
       let agyPath: string | undefined
+      const effectivePair: readonly [RuntimeAgentId, RuntimeAgentId] = options.activePair ?? [
+        'codex',
+        'claude',
+      ]
       if (mode === 'real') {
         claudePath = configuration!.claudePath
         codexPath = configuration!.codexPath
-        if (configuration!.agyPath) {
-          agyPath = configuration!.agyPath
+        agyPath = environment.agyPath ?? configuration!.agyPath
+        if (effectivePair.includes('claude') && !claudePath) {
+          throw new Error('A Claude executable is required for the selected activePair')
+        }
+        if (effectivePair.includes('agy') && !agyPath) {
+          throw new Error('An Antigravity executable is required for the selected activePair')
         }
         if (options.transportFault) {
           transport = await writeNativeTransportFault(directory, codexPath, options.transportFault)
@@ -951,15 +979,17 @@ export async function createRuntimeFixture(
       }
       const database = await PactDatabase.open({ filePath: databaseFile, migrationsFolder })
       try {
-        database.runtimePreparationRepository.saveSelectedExecutablePath('claude', claudePath)
+        if (claudePath) {
+          database.runtimePreparationRepository.saveSelectedExecutablePath('claude', claudePath)
+        }
         database.runtimePreparationRepository.saveSelectedExecutablePath('codex', codexPath)
         if (agyPath) {
           database.runtimePreparationRepository.saveSelectedExecutablePath('agy', agyPath)
         }
         if (options.firstUse !== true) {
           database.defaultSessionSettingsRepository.save({
-            primaryAgentId: 'codex',
-            secondaryAgentId: 'claude',
+            primaryAgentId: effectivePair[0],
+            secondaryAgentId: effectivePair[1],
             agents: {
               claude: { model: null, effort: null },
               codex: { model: null, effort: null },
@@ -985,6 +1015,7 @@ export async function createRuntimeFixture(
         databaseFile,
         claudeHome: environment.claudeHome,
         codexHome: environment.codexHome,
+        geminiHome: environment.geminiHome,
         configurationFingerprint: configuration?.configurationFingerprint ?? null,
         redactDiagnostic: redact,
         readTransportFacts: () => {
@@ -1039,7 +1070,11 @@ export async function createRuntimeFixture(
             if (disposed) throw new Error('E2E fixture is disposed')
             if (args.length > 16 || args.some((arg) => arg.length > 4096))
               throw new Error('Native probe arguments exceed their bound')
-            const executable = agentId === 'claude' ? claudePath : codexPath
+            const executable =
+              agentId === 'claude' ? claudePath : agentId === 'agy' ? agyPath : codexPath
+            if (!executable) {
+              throw new Error(`No executable configured for ${agentId}`)
+            }
             if (process.platform === 'win32') {
               if (commandOwners >= 2 || launchCount >= 64)
                 throw new Error('Windows command ownership capacity exceeded')
@@ -1111,7 +1146,7 @@ export async function createRuntimeFixture(
               ])
               for (const key of Object.keys(extraEnvironment)) {
                 if (permitted.has(key)) continue
-                if (!['CLAUDE_CONFIG_DIR', 'CODEX_HOME'].includes(key))
+                if (!['CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'ANTIGRAVITY_GEMINI_DIR'].includes(key))
                   throw new Error('Test environment cannot override provider or isolation state')
                 if (extraEnvironment[key] === environment.env[key]) continue
                 // oxlint-disable-next-line eslint/no-await-in-loop -- Validate each alias before any app launches; both path reads run together.

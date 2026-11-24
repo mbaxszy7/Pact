@@ -25,6 +25,18 @@ const command = (agent: RuntimeAgentId): NativeApprovalDetails => ({
     },
   ],
 })
+const makeAgyEdit = (
+  tool: 'edit_file' | 'write_file',
+  pathLine = 'parse-port.mjs',
+): NativeApprovalDetails => ({
+  kind: 'approval',
+  title: 'File parse-port.mjs',
+  detail: `Tool: ${tool}\nPath: ${pathLine}`,
+  actions: [
+    { id: 'agy-allow-once', kind: 'allow', label: 'Allow once' },
+    { id: 'agy-reject-once', kind: 'decline', label: 'Decline and continue' },
+  ],
+})
 it.each(['codex', 'claude'] as const)(
   'allows only the exact %s owned verification action',
   (agent) => {
@@ -123,4 +135,107 @@ it.each([
       scope(agent),
     ),
   ).toBeUndefined()
+})
+
+it('limits agy approvals strictly to Allow once on parameterized single-file edits without commands or path traversal', () => {
+  const agyScope = {
+    directory,
+    stage: 'implement' as const,
+    actor: 'agy' as const,
+    secondary: 'agy' as const,
+    requestedAgent: 'agy' as const,
+    targetFile: 'parse-port.mjs',
+    testFile: 'parse-port.test.mjs',
+  }
+
+  expect(stageRoleApprovalLabel(makeAgyEdit('edit_file'), agyScope)).toBe('Allow once')
+  expect(stageRoleApprovalLabel(makeAgyEdit('write_file'), agyScope)).toBe('Allow once')
+  expect(
+    stageRoleApprovalLabel(makeAgyEdit('edit_file'), {
+      ...agyScope,
+      stage: 'collaborate',
+      allowCollaborateEdit: true,
+    }),
+  ).toBe('Allow once')
+  expect(
+    stageRoleApprovalLabel(makeAgyEdit('edit_file'), {
+      ...agyScope,
+      stage: 'collaborate',
+      allowCollaborateEdit: false,
+    }),
+  ).toBeUndefined()
+
+  // Reject wrong stage, wrong test file, traversal, absolute paths, commands, and non-once actions.
+  expect(
+    stageRoleApprovalLabel(makeAgyEdit('edit_file'), { ...agyScope, stage: 'plan_review' }),
+  ).toBeUndefined()
+  expect(
+    stageRoleApprovalLabel(makeAgyEdit('edit_file'), { ...agyScope, stage: 'code_review' }),
+  ).toBeUndefined()
+  expect(
+    stageRoleApprovalLabel(makeAgyEdit('edit_file', 'parse-port.test.mjs'), agyScope),
+  ).toBeUndefined()
+  expect(
+    stageRoleApprovalLabel(makeAgyEdit('edit_file', '../outside.mjs'), agyScope),
+  ).toBeUndefined()
+  expect(
+    stageRoleApprovalLabel(
+      makeAgyEdit('edit_file', resolve(directory, 'parse-port.mjs')),
+      agyScope,
+    ),
+  ).toBeUndefined()
+  expect(
+    stageRoleApprovalLabel(
+      {
+        kind: 'approval',
+        title: 'Run command',
+        detail: 'Tool: run_command\nCommand: node --test parse-port.test.mjs',
+        actions: [{ id: 'agy-allow-once', kind: 'allow', label: 'Allow once' }],
+      },
+      agyScope,
+    ),
+  ).toBeUndefined()
+  expect(
+    stageRoleApprovalLabel(
+      {
+        ...makeAgyEdit('edit_file'),
+        actions: [{ id: 'other-allow', kind: 'allow', label: 'Allow once' }],
+      },
+      agyScope,
+    ),
+  ).toBeUndefined()
+})
+
+it('supports parameterized Codex file and test targets in dual-agent implement/code_review stages', () => {
+  const codexScope = {
+    directory,
+    stage: 'implement' as const,
+    actor: 'codex' as const,
+    secondary: 'codex' as const,
+    requestedAgent: 'codex' as const,
+    targetFile: 'parse-port.mjs',
+    testFile: 'parse-port.test.mjs',
+  }
+  expect(
+    stageRoleApprovalLabel(
+      {
+        kind: 'approval',
+        title: 'Codex wants to apply file changes',
+        detail: `File: ${resolve(directory, 'parse-port.mjs')}\nWorking directory: ${directory}`,
+        actions: [{ id: 'once', kind: 'allow', label: 'Allow these file changes' }],
+      },
+      codexScope,
+    ),
+  ).toBe('Allow these file changes')
+  expect(
+    stageRoleApprovalLabel(
+      {
+        kind: 'approval',
+        title: 'Codex wants to run a command',
+        detail: `Command: node --test parse-port.test.mjs\nWorking directory: ${directory}`,
+        actions: [{ id: 'once', kind: 'allow', label: 'Allow this command' }],
+      },
+      { ...codexScope, stage: 'code_review' },
+    ),
+  ).toBe('Allow this command')
 })

@@ -7,6 +7,7 @@ import { delimiter, isAbsolute, join, resolve } from 'node:path'
 import { collaborationTaskSchema, type DesktopBridge } from '../../packages/contracts/src/index.js'
 import { PactDatabase } from '../../packages/persistence/src/index.js'
 import { quitPact } from './native-quit.js'
+import { DEFAULT_REAL_AGY_MODEL, isExternalPullRequestEnvironment } from './provider-environment.js'
 import { ReadonlyFixtureDatabase } from './readonly-fixture-database.js'
 import {
   copyIsolatedAgyAuthConfig,
@@ -21,6 +22,7 @@ import {
 
 export {
   copyIsolatedAgyAuthConfig,
+  isExternalPullRequestEnvironment,
   isUnsafeWindowsCmdPath,
   requireExplicitAgyAuthDir,
   verifyAgyMinimumVersion,
@@ -232,21 +234,6 @@ function openReadonlySqlite(filePath: string): ReadonlySqliteDatabase {
   return new ctor(filePath, { readonly: true, fileMustExist: true, timeout: 0 })
 }
 
-export function isExternalPullRequestEnvironment(env: NodeJS.ProcessEnv = process.env): boolean {
-  if (env.GITHUB_EVENT_NAME === 'pull_request' || env.GITHUB_EVENT_NAME === 'pull_request_target') {
-    return true
-  }
-  if (
-    Boolean(env.CI) &&
-    Boolean(env.GITHUB_HEAD_REF) &&
-    Boolean(env.GITHUB_HEAD_REPOSITORY) &&
-    env.GITHUB_REPOSITORY !== env.GITHUB_HEAD_REPOSITORY
-  ) {
-    return true
-  }
-  return false
-}
-
 export function isRealAgySmokeAuthorized(env: NodeJS.ProcessEnv = process.env): boolean {
   if (env.PACT_E2E_REAL_AGY !== '1') return false
   if (isExternalPullRequestEnvironment(env)) {
@@ -420,7 +407,11 @@ test(
           agents: {
             claude: { model: null, effort: null, speed: 'native' },
             codex: { model: null, effort: null, speed: 'native' },
-            agy: { model: null, effort: null, speed: 'native' },
+            agy: {
+              model: process.env.PACT_E2E_AGY_MODEL?.trim() || DEFAULT_REAL_AGY_MODEL,
+              effort: 'low',
+              speed: 'native',
+            },
           },
           maxDiscussionRounds: 4,
           maxReviewCycles: 2,
@@ -926,10 +917,13 @@ test(
           const agyContext = snapshot.nativeContexts.find((c) => c.agentId === 'agy')
           const permissionEvents = readDb.drizzle.query.agentEventJournal
             .findMany({
-              where: (table, { and, eq }) =>
+              where: (table, { and, eq, inArray }) =>
                 and(
                   eq(table.sessionId, activeSessionId),
-                  eq(table.eventType, 'native.permission.requested'),
+                  inArray(table.eventType, [
+                    'native.permission_requested',
+                    'native.permission_decided',
+                  ]),
                 ),
             })
             .sync()
@@ -1043,7 +1037,7 @@ test(
         }
         return { planSync: result.value.view.planSync, accepted: result.value.view.accepted }
       }, activeSessionId)
-      expect(collaborationView.planSync).not.toBe('recovery_required')
+      expect(collaborationView.planSync).toBeUndefined()
 
       const turn2Trajectory = await readTrajectorySummaryCopy(
         fixture.directory,

@@ -9,8 +9,12 @@ import { fileURLToPath } from 'node:url'
 
 import { check } from './check-e2e-coverage.mjs'
 import {
+  AGY_COLLAB_OPT_IN,
+  agyCollaborationGrep,
+  agyCollaborationRealCases,
   realCases,
   coreRealGrep,
+  evaluateAgyCollaborationReport,
   evaluateRealReport,
   realReportMarkdown,
   realCaseRequired,
@@ -78,7 +82,7 @@ await test('actual Playwright discovery is completely classified and core select
       .toSorted(compare),
   )
   assert.equal(core.size, 1)
-  assert.equal(listed.size - core.size, 78)
+  assert.equal(listed.size - core.size, 80)
   assert.deepEqual(
     realCases.filter((item) => item.tier === 'core').map((item) => item.title),
     ['real @all completes each Agent once and keeps ordered distinct response rows'],
@@ -97,7 +101,7 @@ await test('core success reports every deferred case without claiming a complete
     notRun: 0,
     notApplicable: 0,
   })
-  assert.equal(report.tiers.extended.notRun + report.tiers.extended.notApplicable, 78)
+  assert.equal(report.tiers.extended.notRun + report.tiers.extended.notApplicable, 80)
   assert(
     report.cases
       .filter((item) => item.tier === 'extended')
@@ -343,7 +347,7 @@ await test('the reporting entry still lists all cases and fails when CI identity
       (error) => error.status === 1,
     )
     const report = JSON.parse(await readFile(join(directory, 'real-summary.json'), 'utf8'))
-    assert.equal(report.cases.length, 79)
+    assert.equal(report.cases.length, 81)
     assert.equal(report.gatePassed, false)
     assert(report.issues.includes('missing-or-invalid-ci-code-identity'))
   } finally {
@@ -375,7 +379,7 @@ await test('the actual CI reporting entry preserves exact source and run metadat
       },
     )
     const report = JSON.parse(await readFile(join(directory, 'real-summary.json'), 'utf8'))
-    assert.equal(report.cases.length, 79)
+    assert.equal(report.cases.length, 81)
     assert.equal(report.gatePassed, true)
     assert.deepEqual(report.identity, reportIdentity)
     assert.equal(JSON.stringify(report).includes(privateCanary), false)
@@ -422,7 +426,7 @@ await test('CI report entry rejects local or null metadata while preserving ever
     const report = JSON.parse(await readFile(join(directory, 'real-summary.json')))
     assert.equal(report.gatePassed, false)
     assert.equal(report.identity, null)
-    assert.equal(report.cases.length, 79)
+    assert.equal(report.cases.length, 81)
     assert(report.issues.includes('missing-or-invalid-ci-code-identity'))
   }
 })
@@ -494,4 +498,137 @@ await test('opt-in extended Antigravity case is deferred when not opted in and s
     assert.equal(failedEntry.failureCategory, 'case-failed')
     assert.equal(failedReport.gatePassed, false)
   }
+})
+
+await test('agy collaboration gate requires opt-in, exact registered cases without skips/retries, and rejects unexpected cases', () => {
+  const synthCases = [
+    {
+      path: 'tests/e2e/agy-collaboration-real.spec.ts',
+      title: 'case-a (Primary agy)',
+      tier: 'extended',
+      optIn: AGY_COLLAB_OPT_IN,
+      scenario: 'collaboration',
+    },
+    {
+      path: 'tests/e2e/agy-collaboration-real.spec.ts',
+      title: 'case-b [codex/agy]',
+      tier: 'extended',
+      optIn: AGY_COLLAB_OPT_IN,
+      scenario: 'collaboration',
+    },
+  ]
+  const registeredCollabCases = agyCollaborationRealCases()
+  assert.equal(registeredCollabCases.length, 2)
+  const defaultGrep = new RegExp(agyCollaborationGrep(), 'u')
+  for (const item of registeredCollabCases) {
+    assert.equal(item.path, 'tests/e2e/agy-collaboration-real.spec.ts')
+    const playwrightLabel = ` real ${item.path.replace(/^tests\/e2e\//u, '')} ${item.title} @real @real-extended`
+    assert.match(playwrightLabel, defaultGrep)
+  }
+
+  const grep = new RegExp(agyCollaborationGrep(synthCases), 'u')
+  assert.match(
+    ' real agy-collaboration-real.spec.ts case-a (Primary agy) @real @real-extended',
+    grep,
+  )
+  assert.match('agy-collaboration-real.spec.ts case-b [codex/agy]', grep)
+  assert.doesNotMatch(' real agy-collaboration-real.spec.ts case-a (Primary agy) extra @real', grep)
+  assert.doesNotMatch(' real other.spec.ts case-a (Primary agy) @real', grep)
+  assert.throws(() => agyCollaborationGrep([]), /No real Antigravity collaboration E2E cases/u)
+  assert.deepEqual(agyCollaborationRealCases([]), [])
+
+  const passReport = {
+    errors: [],
+    suites: [
+      {
+        specs: synthCases.map((item) => ({
+          file: item.path,
+          title: item.title,
+          tests: [
+            {
+              projectName: 'real',
+              expectedStatus: 'passed',
+              status: 'expected',
+              results: [{ status: 'passed', duration: 1200 }],
+            },
+          ],
+        })),
+      },
+    ],
+  }
+
+  assert.equal(
+    evaluateAgyCollaborationReport(passReport, {
+      cases: synthCases,
+      platform: 'darwin',
+      env: { [AGY_COLLAB_OPT_IN]: '1' },
+    }).gatePassed,
+    true,
+  )
+  assert.equal(
+    evaluateAgyCollaborationReport(passReport, {
+      cases: synthCases,
+      platform: 'darwin',
+      env: {},
+    }).gatePassed,
+    false,
+  )
+
+  const missingSecond = {
+    errors: [],
+    suites: [{ specs: [passReport.suites[0].specs[0]] }],
+  }
+  assert.equal(
+    evaluateAgyCollaborationReport(missingSecond, {
+      cases: synthCases,
+      platform: 'darwin',
+      env: { [AGY_COLLAB_OPT_IN]: '1' },
+    }).gatePassed,
+    false,
+  )
+
+  const skippedReport = structuredClone(passReport)
+  skippedReport.suites[0].specs[1].tests[0].status = 'skipped'
+  skippedReport.suites[0].specs[1].tests[0].results[0].status = 'skipped'
+  assert.equal(
+    evaluateAgyCollaborationReport(skippedReport, {
+      cases: synthCases,
+      platform: 'darwin',
+      env: { [AGY_COLLAB_OPT_IN]: '1' },
+    }).gatePassed,
+    false,
+  )
+
+  const retriedReport = structuredClone(passReport)
+  retriedReport.suites[0].specs[0].tests[0].results.push({ status: 'passed', duration: 500 })
+  assert.equal(
+    evaluateAgyCollaborationReport(retriedReport, {
+      cases: synthCases,
+      platform: 'darwin',
+      env: { [AGY_COLLAB_OPT_IN]: '1' },
+    }).gatePassed,
+    false,
+  )
+
+  const unexpectedCaseReport = structuredClone(passReport)
+  unexpectedCaseReport.suites[0].specs.push({
+    file: 'tests/e2e/other-real.spec.ts',
+    title: 'unrelated',
+    tests: [
+      {
+        projectName: 'real',
+        expectedStatus: 'passed',
+        status: 'expected',
+        results: [{ status: 'passed', duration: 1 }],
+      },
+    ],
+  })
+  assert.equal(
+    evaluateAgyCollaborationReport(unexpectedCaseReport, {
+      cases: synthCases,
+      platform: 'darwin',
+      env: { [AGY_COLLAB_OPT_IN]: '1' },
+    }).gatePassed,
+    false,
+  )
 })

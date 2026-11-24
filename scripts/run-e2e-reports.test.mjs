@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 
-import { realCases } from './real-e2e-policy.mjs'
+import { AGY_COLLAB_OPT_IN, realCases } from './real-e2e-policy.mjs'
 import { mainWithReports } from './run-e2e.mjs'
 
 function reportFixture() {
@@ -180,6 +180,100 @@ await test('a failed local deterministic lane preserves bounded traces beside it
     assert.equal((await readdir(evidence)).includes('execution.json'), false)
     assert.equal(JSON.stringify(inventory).includes('raw-execution-only-canary'), false)
     await assert.rejects(lstat(join(privateArtifacts, '..')), /ENOENT/)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+await test('agy collaboration report gate fails even on exit code 0 when any registered case is missing or skipped, and passes only on full 1-run pass', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pact-agy-collab-report-test-'))
+  const synthCases = [
+    {
+      path: 'tests/e2e/agy-collaboration-real.spec.ts',
+      title: 'collab-case-1',
+      tier: 'extended',
+      optIn: AGY_COLLAB_OPT_IN,
+      scenario: 'collaboration',
+    },
+    {
+      path: 'tests/e2e/agy-collaboration-real.spec.ts',
+      title: 'collab-case-2',
+      tier: 'extended',
+      optIn: AGY_COLLAB_OPT_IN,
+      scenario: 'collaboration',
+    },
+  ]
+  const runCollabReport = async (specs) =>
+    mainWithReports({
+      lane: 'real',
+      realProfile: 'agy-collaboration',
+      env: { [AGY_COLLAB_OPT_IN]: '1' },
+      reportWorkspace: root,
+      selectCollaborationCases: () => synthCases,
+      loadConfiguration: async () => ({
+        redact: (text) => text,
+        assertSourceIntegrity: async () => {},
+      }),
+      runJob: async (args) => {
+        if (args[0] === 'build') return 0
+        await writeFile(
+          process.env.PLAYWRIGHT_JSON_OUTPUT_FILE,
+          JSON.stringify({ errors: [], suites: [{ specs }] }),
+        )
+        return 0
+      },
+    })
+
+  try {
+    // Missing second case -> exit 0 overridden to gate failure (exit 1)!
+    const missingCode = await runCollabReport([
+      {
+        file: synthCases[0].path,
+        title: synthCases[0].title,
+        tests: [
+          {
+            projectName: 'real',
+            expectedStatus: 'passed',
+            status: 'expected',
+            results: [{ status: 'passed', duration: 100 }],
+          },
+        ],
+      },
+    ])
+    assert.equal(missingCode, 1)
+
+    const passCode = await runCollabReport(
+      synthCases.map((item) => ({
+        file: item.path,
+        title: item.title,
+        tests: [
+          {
+            projectName: 'real',
+            expectedStatus: 'passed',
+            status: 'expected',
+            results: [{ status: 'passed', duration: 100 }],
+          },
+        ],
+      })),
+    )
+    assert.equal(passCode, 0)
+
+    const reportsDir = join(root, '.pact-data', 'e2e-reports')
+    const entries = await readdir(reportsDir)
+    assert.equal(entries.length, 2)
+    const summaries = await Promise.all(
+      entries.map(async (entry) =>
+        JSON.parse(await readFile(join(reportsDir, entry, 'real-summary.json'), 'utf8')),
+      ),
+    )
+    assert.equal(
+      summaries.some((summary) => summary.gatePassed === false),
+      true,
+    )
+    assert.equal(
+      summaries.some((summary) => summary.gatePassed === true),
+      true,
+    )
   } finally {
     await rm(root, { recursive: true, force: true })
   }

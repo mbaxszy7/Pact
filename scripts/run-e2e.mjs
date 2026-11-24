@@ -4,11 +4,23 @@ import { mkdtemp, writeFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
-import { loadProviderConfiguration } from '../tests/e2e/provider-environment.ts'
+import {
+  isExternalPullRequestEnvironment,
+  loadProviderConfiguration,
+} from '../tests/e2e/provider-environment.ts'
 import { collectUiDiagnostics, writeUiReports } from './ci-ui-diagnostics.mjs'
 import { publicReportIdentity, readE2EJson, reportRepository } from './e2e-report.mjs'
-import { coreRealGrep, requireRealScope } from './real-e2e-policy.mjs'
-import { evaluateRealReport, writeRealReport } from './real-e2e-policy.mjs'
+import {
+  AGY_COLLAB_OPT_IN,
+  agyCollaborationGrep,
+  agyCollaborationRealCases,
+  coreRealGrep,
+  evaluateAgyCollaborationReport,
+  evaluateRealReport,
+  requireRealScope,
+  writeAgyCollaborationReport,
+  writeRealReport,
+} from './real-e2e-policy.mjs'
 import { isScriptEntry } from './script-entry.mjs'
 
 const outputLimit = 256 * 1024
@@ -778,8 +790,11 @@ export async function runNaturally(args, timeout, options = {}) {
 export async function main({
   lane = 'all',
   realScope = 'full',
+  realProfile = 'default',
   forwarded = [],
-  loadConfiguration = loadProviderConfiguration,
+  env = process.env,
+  selectCollaborationCases = agyCollaborationRealCases,
+  loadConfiguration,
   runJob = run,
   beforeBuild,
 } = {}) {
@@ -787,20 +802,63 @@ export async function main({
     throw failure('Choose E2E lane: all, ui, real or deterministic')
   }
   requireRealScope(realScope)
+  if (!['default', 'agy-collaboration'].includes(realProfile)) {
+    throw failure('Choose real E2E profile: default or agy-collaboration')
+  }
   if (realScope === 'core' && lane !== 'real')
     throw failure('Core selection applies only to the real E2E lane')
+  if (realProfile === 'agy-collaboration' && lane !== 'real')
+    throw failure('Antigravity collaboration profile applies only to the real E2E lane')
+  if (realProfile === 'agy-collaboration' && realScope !== 'full')
+    throw failure('Antigravity collaboration profile requires full real E2E scope')
   const argumentsForTests = forwarded.filter((value) => value !== '--')
   if (realScope === 'core' && argumentsForTests.some((value) => value !== '--reporter=line,json'))
     throw failure('Core E2E selection cannot be narrowed by forwarded arguments')
+  if (
+    realProfile === 'agy-collaboration' &&
+    argumentsForTests.some((value) => value !== '--reporter=line,json')
+  )
+    throw failure(
+      'Antigravity collaboration E2E selection cannot be narrowed by forwarded arguments',
+    )
   if (argumentsForTests.some((value) => value.startsWith('--project'))) {
     throw failure('Select the E2E lane through this command, not a second --project override')
   }
+  if (realProfile === 'agy-collaboration') {
+    if (isExternalPullRequestEnvironment(env)) {
+      throw failure('Paid real Antigravity E2E cannot be authorized on external pull requests')
+    }
+    if (env?.[AGY_COLLAB_OPT_IN] !== '1') {
+      throw failure(
+        `Set ${AGY_COLLAB_OPT_IN}=1 to authorize local real Antigravity collaboration E2E`,
+      )
+    }
+  }
+  const effectiveLoadConfiguration =
+    loadConfiguration ??
+    (realProfile === 'agy-collaboration'
+      ? () => loadProviderConfiguration(undefined, env, {}, { profile: 'codex-agy' })
+      : () => loadProviderConfiguration())
   let configuration
   let result
   let problem
   const deadline = Date.now() + totalDeadline
   try {
-    configuration = ['all', 'real'].includes(lane) ? await loadConfiguration() : null
+    let collabCases = null
+    let collabGrep = null
+    if (realProfile === 'agy-collaboration') {
+      try {
+        collabCases = selectCollaborationCases()
+        collabGrep = agyCollaborationGrep(collabCases)
+      } catch (error) {
+        throw failure(
+          error instanceof Error
+            ? error.message
+            : 'No real Antigravity collaboration E2E cases are registered',
+        )
+      }
+    }
+    configuration = ['all', 'real'].includes(lane) ? await effectiveLoadConfiguration() : null
     const redact = (text) => configuration?.redact(text) ?? text
     await beforeBuild?.({ redact })
     const built = await runJob(
@@ -811,13 +869,19 @@ export async function main({
     result = built
     if (built === 0) {
       const projects = lane === 'all' ? ['ui', 'real', 'deterministic'] : [lane]
+      const targetArguments =
+        realProfile === 'agy-collaboration'
+          ? [...new Set(collabCases.map((item) => item.path)), '--grep', collabGrep]
+          : realScope === 'core'
+            ? ['--grep', coreRealGrep()]
+            : []
       result = await runJob(
         [
           'exec',
           'playwright',
           'test',
           ...projects.map((project) => `--project=${project}`),
-          ...(realScope === 'core' ? ['--grep', coreRealGrep()] : []),
+          ...targetArguments,
           ...argumentsForTests,
         ],
         Math.max(1, deadline - Date.now()),
@@ -875,7 +939,10 @@ async function localCodeIdentity() {
 export async function mainWithReports({
   lane = 'all',
   realScope = 'full',
+  realProfile = 'default',
   forwarded = [],
+  env = process.env,
+  selectCollaborationCases = agyCollaborationRealCases,
   runJob = runNaturally,
   reportWorkspace = repositoryRoot,
   ...options
@@ -897,6 +964,9 @@ export async function mainWithReports({
     code = await main({
       lane,
       realScope,
+      realProfile,
+      env,
+      selectCollaborationCases,
       ...options,
       runJob,
       forwarded: [...forwarded, '--reporter=line,json'],
@@ -935,19 +1005,35 @@ export async function mainWithReports({
         /* Admission failure still gets a safe complete inventory. */
       }
       if (projects.includes('real')) {
-        const report = evaluateRealReport(raw, {
-          suite: realScope,
-          gate: realScope,
-          identity,
-          execution: completed ? 'completed' : 'unavailable',
-        })
-        const receipt = await writeRealReport(report, directory, undefined, {
-          workspace: reportWorkspace,
-        })
-        console.log(
-          `Safe real E2E report: ${receipt.report.reportFiles.localDirectory}/real-summary.md`,
-        )
-        if (!forwarded.length && !report.gatePassed) code = 1
+        if (realProfile === 'agy-collaboration') {
+          const report = evaluateAgyCollaborationReport(raw, {
+            cases: selectCollaborationCases(),
+            identity,
+            execution: completed ? 'completed' : 'unavailable',
+            env,
+          })
+          const receipt = await writeAgyCollaborationReport(report, directory, undefined, {
+            workspace: reportWorkspace,
+          })
+          console.log(
+            `Safe real Antigravity collaboration E2E report: ${receipt.report.reportFiles.localDirectory}/real-summary.md`,
+          )
+          if (!report.gatePassed) code = 1
+        } else {
+          const report = evaluateRealReport(raw, {
+            suite: realScope,
+            gate: realScope,
+            identity,
+            execution: completed ? 'completed' : 'unavailable',
+          })
+          const receipt = await writeRealReport(report, directory, undefined, {
+            workspace: reportWorkspace,
+          })
+          console.log(
+            `Safe real E2E report: ${receipt.report.reportFiles.localDirectory}/real-summary.md`,
+          )
+          if (!forwarded.length && !report.gatePassed) code = 1
+        }
       }
       if (projects.some((project) => project !== 'real')) {
         if (raw)
@@ -1020,10 +1106,13 @@ export async function mainWithReports({
 }
 
 if (isScriptEntry(import.meta.url)) {
-  const core = process.argv[2] === 'real-core'
+  const command = process.argv[2]
+  const core = command === 'real-core'
+  const agyCollab = command === 'real-agy-collaboration'
   void mainWithReports({
-    lane: core ? 'real' : (process.argv[2] ?? 'all'),
+    lane: core || agyCollab ? 'real' : (command ?? 'all'),
     realScope: core ? 'core' : 'full',
+    realProfile: agyCollab ? 'agy-collaboration' : 'default',
     forwarded: process.argv.slice(3),
   }).then(
     (code) => {
