@@ -330,6 +330,7 @@ export function logicalIpcTrafficSnapshot(
     ['utility-image-codec-worker', 'utility-image'],
     ['utility-native-json-worker', 'utility-native-json'],
     ['utility-native-fork-worker', 'utility-native-fork'],
+    ['utility-terminal-worker', 'utility-terminal'],
     ['main-diagnostic-log-worker', 'main-diagnostic-log'],
     ['renderer-monaco-workers', 'renderer-monaco'],
   ]
@@ -411,7 +412,7 @@ export function projectLogicalIpcTraffic(
   for (const owner of previous?.owners ?? [])
     if (!current.owners.some((value) => value.owner === owner.owner))
       issues.add(`${owner.owner}:missing-owner`)
-  if (current.owners.length !== 9) issues.add('missing-ipc-owner')
+  if (current.owners.length !== 10) issues.add('missing-ipc-owner')
   if (!current.complete) issues.add('partial-ipc-coverage')
   for (const hop of current.uncovered) issues.add(`uncovered:${hop}`)
   return {

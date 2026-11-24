@@ -24,6 +24,11 @@ import {
   validateAgySqliteFileManifest,
 } from '../apps/desktop/build/agy-sqlite-file-resource.mjs'
 import {
+  inspectTerminalHelperResource,
+  terminalHelperResourcePrefix,
+  validateTerminalHelperManifest,
+} from '../apps/desktop/build/terminal-helper-resource.mjs'
+import {
   inspectWindowsOwnedProcessResource,
   validateWindowsOwnedProcessManifest,
 } from '../apps/desktop/build/windows-owned-process-resource.mjs'
@@ -332,6 +337,7 @@ export async function readDistributionManifest(path) {
   }
   validateWindowsOwnedProcessManifest(manifest)
   validateAgySqliteFileManifest(manifest)
+  validateTerminalHelperManifest(manifest)
   return manifest
 }
 
@@ -366,6 +372,7 @@ export async function verifyApplication(
   }
   const windowsOwnedProcess = validateWindowsOwnedProcessManifest(manifest)
   const agySqliteFile = validateAgySqliteFileManifest(manifest)
+  const terminalHelper = validateTerminalHelperManifest(manifest)
   const executable = resolveWithin(application, manifest.application.executable)
   if (windowsOwnedProcess) {
     const observed = await inspectWindowsOwnedProcessResource(
@@ -393,6 +400,26 @@ export async function verifyApplication(
     throw new Error(
       'Installed agy-sqlite-file module differs from its exact distribution identity.',
     )
+  }
+  if (terminalHelper) {
+    const observedTerminal = await inspectTerminalHelperResource(
+      join(application, terminalHelperResourcePrefix(manifest.platform)),
+      manifest.platform,
+      manifest.arch,
+      terminalHelper.sourceSha256,
+      {
+        verifyLoad:
+          verifyNativeLoad &&
+          manifest.platform === process.platform &&
+          manifest.arch === process.arch,
+        allowSignedBinary: manifest.platform === 'darwin',
+      },
+    )
+    if (JSON.stringify(observedTerminal) !== JSON.stringify(terminalHelper)) {
+      throw new Error(
+        'Installed terminal helper binary differs from its exact distribution identity.',
+      )
+    }
   }
   if (!(await pathExists(executable)))
     throw new Error('The explicit packaged executable is missing or not executable.')

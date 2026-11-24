@@ -36,6 +36,7 @@ import { ProjectFileReader } from './project-file/project-file-reader'
 import { ProviderUsage } from './provider-usage/provider-usage'
 import { RuntimePreparation } from './runtime-preparation/runtime-preparation'
 import { SessionWorkspace } from './session-workspace/session-workspace'
+import { TerminalManager, type TerminalDisposeSummary } from './terminal/terminal-manager'
 import { UtilityDirectoryFileClient } from './workspace-changes/directory-file-client'
 import { WorkspaceChanges } from './workspace-changes/workspace-changes'
 
@@ -66,6 +67,7 @@ let directoryFiles: UtilityDirectoryFileClient | undefined
 let agyStorageTransportOwner: ElectronParentPortAgyStorageTransport | undefined
 let runtimePreparationOwner: RuntimePreparation | undefined
 let providerUsageOwner: ProviderUsage | undefined
+let terminalManagerOwner: TerminalManager | undefined
 let eventLoopProbe: ReturnType<typeof monitorEventLoopDelay> | undefined
 let resourceHighWater = 0
 let workerTraffic: LogicalIpcWorkerTraffic | undefined
@@ -145,7 +147,13 @@ async function bootstrap(
   database = openedDatabase
   if (measurePerformance) {
     workerTraffic = new LogicalIpcWorkerTraffic(
-      ['utility-markdown', 'utility-image', 'utility-native-json', 'utility-native-fork'],
+      [
+        'utility-markdown',
+        'utility-image',
+        'utility-native-json',
+        'utility-native-fork',
+        'utility-terminal',
+      ],
       randomUUID(),
     )
     eventLoopProbe = monitorEventLoopDelay({ resolution: 10 })
@@ -200,6 +208,30 @@ async function bootstrap(
   const agyStorageTransport = new ElectronParentPortAgyStorageTransport(parentPort)
   agyStorageTransportOwner = agyStorageTransport
   configureDefaultAgyStorageTransport(agyStorageTransport)
+  const rawTerminalHelperArg = process.argv[8]
+  const terminalHelperExecutablePath =
+    rawTerminalHelperArg && isAbsolute(rawTerminalHelperArg) ? rawTerminalHelperArg : undefined
+  const terminalManager = new TerminalManager({
+    projectCatalog: openedDatabase.projectCatalogRepository,
+    helperExecutablePath: terminalHelperExecutablePath,
+    traffic: workerTraffic?.collector('utility-terminal'),
+    onOutputEvent: (event) => {
+      try {
+        parentPort.postMessage(utilityEventSchema.parse({ type: 'terminal.output.event', event }))
+      } catch {
+        // Ignore oversized/late output events during teardown.
+      }
+    },
+    onStateEvent: (event) => {
+      try {
+        parentPort.postMessage(utilityEventSchema.parse({ type: 'terminal.state.event', event }))
+      } catch {
+        // Ignore late state events during teardown.
+      }
+    },
+    isQuitSealed: () => Boolean(conversation?.isTerminalQuitSealed()),
+  })
+  terminalManagerOwner = terminalManager
   conversation = new Conversation(
     openedDatabase.conversationRepository,
     openedDatabase.sessionRepository,
@@ -237,6 +269,7 @@ async function bootstrap(
         return null
       return opened.key
     },
+    terminalManager,
   )
   const unsubscribeScheduling = conversation.subscribeSchedulingChanges(() => {
     parentPort.postMessage(utilityEventSchema.parse({ type: 'scheduling.changed.event' }))
@@ -266,6 +299,9 @@ async function bootstrap(
   let shutdown: Promise<void> | undefined
   let shutdownBaseDone = false
   let shutdownCompleted = false
+  let terminalShutdownSummary: TerminalDisposeSummary = {
+    unconfirmedCount: 0,
+  }
   let permanentShutdownError: Error | undefined
   let databaseClosed = false
 
@@ -664,6 +700,11 @@ async function bootstrap(
                 ok: true,
                 value: {
                   flushed: true,
+                  ...(terminalShutdownSummary.unconfirmedCount > 0
+                    ? {
+                        unconfirmedTerminals: terminalShutdownSummary.unconfirmedCount,
+                      }
+                    : {}),
                 },
               },
             }),
@@ -707,6 +748,7 @@ async function bootstrap(
               conversationResult,
               defaultSettingsResult,
               projectFileResult,
+              terminalDisposeResult,
               drainResult,
             ] = await Promise.allSettled([
               runtimePreparation.dispose(flushDeadlineAt),
@@ -716,8 +758,12 @@ async function bootstrap(
                 : conversationOwner.dispose({ flushDeadlineAt }),
               defaultSessionSettings.dispose(flushDeadlineAt),
               projectFileReader.dispose(),
+              terminalManager.dispose(flushDeadlineAt),
               drainRequests,
             ])
+            if (terminalDisposeResult.status === 'fulfilled') {
+              terminalShutdownSummary = terminalDisposeResult.value
+            }
             let workspaceError: unknown
             try {
               await workspaceOwner.dispose()
@@ -775,6 +821,11 @@ async function bootstrap(
                   ok: true,
                   value: {
                     flushed: true,
+                    ...(terminalShutdownSummary.unconfirmedCount > 0
+                      ? {
+                          unconfirmedTerminals: terminalShutdownSummary.unconfirmedCount,
+                        }
+                      : {}),
                   },
                 },
               }),
@@ -2013,6 +2064,85 @@ async function bootstrap(
         return
       }
 
+      case 'terminal.list.request': {
+        parentPort.postMessage(
+          utilityResponseSchema.parse({
+            type: 'terminal.list.response',
+            requestId: request.data.requestId,
+            result: terminalManager.list(request.data.input),
+          }),
+        )
+        return
+      }
+      case 'terminal.create.request': {
+        const { input, requestId } = request.data
+        runRequest(async () => {
+          const result = closing
+            ? {
+                ok: false as const,
+                error: { code: 'RUNTIME_UNAVAILABLE' as const, message: 'Pact is shutting down.' },
+              }
+            : await terminalManager.create(input)
+          parentPort.postMessage(
+            utilityResponseSchema.parse({ type: 'terminal.create.response', requestId, result }),
+          )
+        })
+        return
+      }
+      case 'terminal.write.request': {
+        parentPort.postMessage(
+          utilityResponseSchema.parse({
+            type: 'terminal.write.response',
+            requestId: request.data.requestId,
+            result: terminalManager.write(request.data.input),
+          }),
+        )
+        return
+      }
+      case 'terminal.resize.request': {
+        const { input, requestId } = request.data
+        runRequest(async () => {
+          const result = await terminalManager.resize(input)
+          parentPort.postMessage(
+            utilityResponseSchema.parse({ type: 'terminal.resize.response', requestId, result }),
+          )
+        })
+        return
+      }
+      case 'terminal.visibility.request': {
+        const { input, requestId } = request.data
+        runRequest(async () => {
+          const result = await terminalManager.setVisibility(input)
+          parentPort.postMessage(
+            utilityResponseSchema.parse({
+              type: 'terminal.visibility.response',
+              requestId,
+              result,
+            }),
+          )
+        })
+        return
+      }
+      case 'terminal.close.request': {
+        const { input, requestId } = request.data
+        runRequest(async () => {
+          const result = await terminalManager.close(input)
+          parentPort.postMessage(
+            utilityResponseSchema.parse({ type: 'terminal.close.response', requestId, result }),
+          )
+        })
+        return
+      }
+      case 'terminal.snapshot.request': {
+        const { input, requestId } = request.data
+        runRequest(async () => {
+          const result = await terminalManager.readSnapshot(input)
+          parentPort.postMessage(
+            utilityResponseSchema.parse({ type: 'terminal.snapshot.response', requestId, result }),
+          )
+        })
+        return
+      }
       case 'appearance.get.request':
       case 'appearance.update.request':
       case 'appearance.reset.request':
@@ -2045,6 +2175,7 @@ process.on('uncaughtExceptionMonitor', (_error, origin) => {
 
 process.once('exit', () => {
   eventLoopProbe?.disable()
+  void terminalManagerOwner?.dispose().catch(() => undefined)
   void conversation?.dispose()
   void providerUsageOwner?.dispose().catch(() => undefined)
   void runtimePreparationOwner?.dispose().catch(() => undefined)
@@ -2078,6 +2209,7 @@ void bootstrap(databaseFile, migrationsFolder, workspaceStorageRoot).catch(
         : {}),
     })
     recordDiagnostic({ operation: 'utility', phase: 'failed', level: 'error', code: failure.code })
+    await terminalManagerOwner?.dispose().catch(() => undefined)
     await conversation?.dispose()
     await providerUsageOwner?.dispose().catch(() => undefined)
     await runtimePreparationOwner?.dispose().catch(() => undefined)

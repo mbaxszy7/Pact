@@ -25,6 +25,12 @@ import {
   validateAgySqliteFileManifest,
 } from '../apps/desktop/build/agy-sqlite-file-resource.mjs'
 import {
+  inspectTerminalHelperResource,
+  terminalHelperResourcePrefix,
+  terminalHelperSourceHash,
+  validateTerminalHelperManifest,
+} from '../apps/desktop/build/terminal-helper-resource.mjs'
+import {
   inspectWindowsOwnedProcessResource,
   validateWindowsOwnedProcessManifest,
   windowsOwnedProcessSourceHash,
@@ -534,6 +540,13 @@ export async function main(args = process.argv.slice(2)) {
       await agySqliteFileSourceHash(),
       { verifyLoad: true, allowSignedBinary: options.platform === 'darwin' },
     )
+    const terminalHelper = await inspectTerminalHelperResource(
+      join(application.appPath, terminalHelperResourcePrefix(options.platform)),
+      options.platform,
+      options.arch,
+      await terminalHelperSourceHash(options.platform),
+      { verifyLoad: true, allowSignedBinary: options.platform === 'darwin' },
+    )
     if (windowsSharp)
       requireSharpInspection(
         'packaged',
@@ -576,6 +589,7 @@ export async function main(args = process.argv.slice(2)) {
       artifacts,
       windowsOwnedProcess,
       agySqliteFile,
+      terminalHelper,
       signing: { mac: 'ad-hoc', windows: 'none', notarized: false },
       verification: {
         packagedSmoke: 'pending',
@@ -585,6 +599,7 @@ export async function main(args = process.argv.slice(2)) {
     }
     validateWindowsOwnedProcessManifest(manifest)
     validateAgySqliteFileManifest(manifest)
+    validateTerminalHelperManifest(manifest)
     const bytes = `${JSON.stringify(manifest, null, 2)}\n`
     if (Buffer.byteLength(bytes) > MAX_MANIFEST_BYTES)
       throw new Error('Distribution manifest exceeds its metadata bound.')

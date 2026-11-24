@@ -1,4 +1,5 @@
 import { prepareAgySqliteFileResource } from './agy-sqlite-file-resource.mjs'
+import { prepareTerminalHelperResource } from './terminal-helper-resource.mjs'
 import { prepareWindowsOwnedProcessResource } from './windows-owned-process-resource.mjs'
 
 /** All package entry points share the same native build preparation. */
@@ -7,6 +8,7 @@ export default async function beforePack(context) {
   if (context.electronPlatformName === 'win32') {
     await prepareWindowsOwnedProcessResource(arch)
     await prepareAgySqliteFileResource(arch, 'win32')
+    await prepareTerminalHelperResource(arch, 'win32')
     return
   }
   if (
@@ -15,5 +17,6 @@ export default async function beforePack(context) {
     arch === process.arch
   ) {
     await prepareAgySqliteFileResource(arch, context.electronPlatformName)
+    await prepareTerminalHelperResource(arch, context.electronPlatformName)
   }
 }

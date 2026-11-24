@@ -22,6 +22,10 @@ import {
 import { ApplicationMenu } from './modules/application-menu'
 import { DiagnosticLogs } from './modules/diagnostics'
 import {
+  createNativeLastExitNoticeStore,
+  type NativeLastExitNoticeStore,
+} from './modules/native-last-exit-notice'
+import {
   developmentNativeInvocation,
   NativePresence,
   nativeLaunchData,
@@ -47,6 +51,7 @@ const rendererTrust = createRendererTrust({
 let removeDesktopModules: (() => void) | undefined
 let appearanceSettings: AppearanceController
 let diagnostics: DiagnosticLogs | undefined
+let lastExitNotice: NativeLastExitNoticeStore | undefined
 let applicationMenu: ApplicationMenu | undefined
 let applicationUpdates: ApplicationUpdates | undefined
 let nativePresence: NativePresence | undefined
@@ -157,10 +162,17 @@ async function bootstrap(): Promise<void> {
     traffic?.collector('main-utility'),
     traffic?.collector('main-diagnostic-log'),
   )
+  lastExitNotice = createNativeLastExitNoticeStore(paths.databaseFile)
   utilityClient.start({
     ...paths,
     diagnostics,
     onExit: () => {
+      if (!quitting && lastExitNotice) {
+        const openCount = utilityClient.trackedOpenTerminalCount?.() ?? 0
+        if (openCount > 0) {
+          void lastExitNotice.record('utility_exited_unconfirmed', openCount).catch(() => undefined)
+        }
+      }
       if (quitting) void finishQuit()
     },
     ...(traffic ? { traffic } : {}),
@@ -228,6 +240,7 @@ async function bootstrap(): Promise<void> {
     appearanceSettings,
     nativePresence,
     (event) => diagnostics?.record(event),
+    lastExitNotice,
   )
 
   app.on('browser-window-created', (_, window) => {
@@ -272,10 +285,12 @@ void bootstrap().catch(() => {
 let quitting = false
 let quitReady = false
 let quitApproval: Promise<void> | undefined
+let quitNoticeTask: Promise<void> | undefined
 let quitCompletion: Promise<void> | undefined
 function finishQuit(): Promise<void> {
   quitCompletion ??= (async () => {
     await utilityClient.settlement()
+    if (quitNoticeTask) await quitNoticeTask.catch(() => undefined)
     try {
       await diagnostics?.close()
     } catch {
@@ -314,8 +329,39 @@ app.on('before-quit', (event) => {
     if (!accepted) return
     quitting = true
     applicationUpdates?.stop()
-    const result = await utilityClient.shutdown()
-    if (!result.ok) console.error('Pact shutdown was not acknowledged:', result.error.code)
+    const openCount = utilityClient.trackedOpenTerminalCount?.() ?? 0
+    const noticeTask = (async () => {
+      const result = await utilityClient.shutdown()
+      if (!result.ok) console.error('Pact shutdown was not acknowledged:', result.error.code)
+      let noticeWriteFailed = false
+      if (result.ok && result.value.unconfirmedTerminals && result.value.unconfirmedTerminals > 0) {
+        const recorded = await (
+          lastExitNotice?.record('worker_cleanup_failed', result.value.unconfirmedTerminals) ??
+          Promise.resolve(true)
+        ).catch(() => false)
+        noticeWriteFailed = !recorded
+      } else if (!result.ok && openCount > 0) {
+        const reason =
+          result.error.code === 'TIMEOUT' ? 'shutdown_timeout' : 'utility_exited_unconfirmed'
+        const recorded = await (
+          lastExitNotice?.record(reason, openCount) ?? Promise.resolve(true)
+        ).catch(() => false)
+        noticeWriteFailed = !recorded
+      }
+      if (noticeWriteFailed && !(nativePresence?.isSystemEnding?.() ?? false)) {
+        await dialog
+          .showMessageBox({
+            type: 'warning',
+            title: 'Pact',
+            message: 'Background terminal cleanup could not be recorded cleanly.',
+            detail: 'Some terminal processes may still need manual inspection after Pact exits.',
+            buttons: ['Close'],
+          })
+          .catch(() => undefined)
+      }
+    })()
+    quitNoticeTask = noticeTask
+    await noticeTask
     if (!utilityClient.isRunning()) await finishQuit()
     else nativePresence?.shutdownUnconfirmed()
   })().finally(() => {

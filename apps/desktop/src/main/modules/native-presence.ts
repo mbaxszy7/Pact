@@ -742,6 +742,10 @@ export class NativePresence {
     return completion.promise
   }
 
+  isSystemEnding(): boolean {
+    return this.systemEnding
+  }
+
   shutdownUnconfirmed(): void {
     const state = this.quitState
     if (!state) return
@@ -861,13 +865,22 @@ export class NativePresence {
       !this.quitUiAvailable()
     ) {
       const state = this.quitState
+      const detailLines: string[] = []
+      if (state.message) detailLines.push(state.message)
+      if (state.activeCount > 0) detailLines.push(`Active items: ${state.activeCount}`)
+      for (const session of state.sessions.slice(0, 5)) {
+        detailLines.push(`• ${session.title} (${session.state})`)
+      }
+      if (detailLines.length === 0) {
+        detailLines.push(
+          'The Pact interface is unavailable. Saved conversations and files remain on your device.',
+        )
+      }
       const result = await dialog.showMessageBox({
         type: 'warning',
         title: 'Exit Pact?',
         message: 'Exiting Pact may interrupt active tasks.',
-        detail:
-          state.message ??
-          'The Pact interface is unavailable. Saved conversations and files remain on your device.',
+        detail: detailLines.join('\n'),
         buttons: ['Cancel', 'Exit Pact'],
         defaultId: 0,
         cancelId: 0,

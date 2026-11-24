@@ -7,6 +7,7 @@ import {
   MessagesSquare,
   Pencil,
   SlidersHorizontal,
+  SquareTerminal,
   X,
 } from 'lucide-react'
 import { useRef, useState } from 'react'
@@ -40,6 +41,10 @@ interface SessionHeaderProps {
   sideChatUnreadCount?: number | undefined
   onOpenSideChats?: (() => void) | undefined
   sideChatsButtonRef?: React.RefObject<HTMLButtonElement | null> | undefined
+  terminalOpen?: boolean | undefined
+  terminalCount?: number | undefined
+  onToggleTerminal?: (() => void) | undefined
+  terminalButtonRef?: React.RefObject<HTMLButtonElement | null> | undefined
 }
 
 type StatusTone = 'ready' | 'warning' | 'danger' | 'info'
@@ -137,6 +142,10 @@ export function SessionHeader({
   sideChatUnreadCount = 0,
   onOpenSideChats,
   sideChatsButtonRef,
+  terminalOpen = false,
+  terminalCount = 0,
+  onToggleTerminal,
+  terminalButtonRef,
 }: SessionHeaderProps): React.JSX.Element {
   const showSideChats = !session.parentSessionId && Boolean(onOpenSideChats)
   const statusPill = deriveQuietStatus(session.activity, collaborationTask)
@@ -254,6 +263,22 @@ export function SessionHeader({
                 aria-label={`${sideChatUnreadCount} unread side chat${sideChatUnreadCount === 1 ? '' : 's'}`}
                 title={`${sideChatUnreadCount} unread side chat${sideChatUnreadCount === 1 ? '' : 's'}`}
               />
+            ) : null}
+          </button>
+        ) : null}
+        {onToggleTerminal ? (
+          <button
+            ref={terminalButtonRef}
+            className={`${headerButtonClass(terminalOpen)} ${terminalCount > 0 ? 'gap-1.5 px-2' : 'w-8'}`}
+            type="button"
+            aria-label="Terminal"
+            aria-expanded={terminalOpen}
+            title="Terminal (Ctrl+`)"
+            onClick={onToggleTerminal}
+          >
+            <SquareTerminal aria-hidden="true" className="size-4 shrink-0" strokeWidth={1.75} />
+            {terminalCount > 0 ? (
+              <span className="text-caption font-medium text-secondary">{terminalCount}</span>
             ) : null}
           </button>
         ) : null}

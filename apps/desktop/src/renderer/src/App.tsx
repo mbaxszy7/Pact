@@ -317,6 +317,25 @@ function App(): React.JSX.Element {
     if (utilityRecovery > 0) refreshAfterUtilityRecovery()
   }, [utilityRecovery])
 
+  const exitNoticeCheckedRef = useRef(false)
+  useEffect(() => {
+    if (exitNoticeCheckedRef.current || !runtime.preparation || runtime.preparation.firstUse) {
+      return
+    }
+    exitNoticeCheckedRef.current = true
+    void window.pact
+      .consumeTerminalLastExitNotice?.()
+      .then((result) => {
+        if (!result?.ok || !result.value) return undefined
+        const { unconfirmedCount } = result.value
+        notifications.showWarning(
+          `${unconfirmedCount} background ${unconfirmedCount === 1 ? 'terminal session' : 'terminal sessions'} may not have finished closing before the previous exit.`,
+        )
+        return undefined
+      })
+      .catch(() => undefined)
+  }, [runtime.preparation, notifications])
+
   const updates = useAppUpdates(
     () => {
       presence.setNativeAttentionOpen(false)
@@ -481,6 +500,9 @@ function App(): React.JSX.Element {
       setSelectedProjectId(projectId)
     },
     onProjectArchived: (projectId) => {
+      void import('./components/terminal/terminal-view-cache')
+        .then((module) => module.disposeProjectTerminalViews(projectId))
+        .catch(() => undefined)
       const selectedSession = sessionWorkspace.catalog?.sessions.find(
         (session) => session.id === selectedSessionIdRef.current,
       )

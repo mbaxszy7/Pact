@@ -16,6 +16,7 @@ export function NativeQuitConfirmation({ state }: { state: NativeQuitState }): R
   const descriptionId = useId()
   const confirming = state.phase === 'confirming'
   const canRespond = confirming && !pending
+  const shownCount = state.sessions.length
   const onlyUnconfirmedWork =
     state.sessions.length > 0 &&
     state.activeCount === state.sessions.length &&
@@ -126,11 +127,11 @@ export function NativeQuitConfirmation({ state }: { state: NativeQuitState }): R
             ))}
           </ul>
         ) : null}
-        {state.activeCount > state.sessions.length ? (
+        {state.activeCount > shownCount ? (
           <p className="text-caption text-secondary">
-            {state.activeCount - state.sessions.length} additional{' '}
-            {state.activeCount - state.sessions.length === 1 ? 'operation' : 'operations'} may also
-            be interrupted.
+            {state.activeCount - shownCount} additional{' '}
+            {state.activeCount - shownCount === 1 ? 'operation' : 'operations'} may also be
+            interrupted.
           </p>
         ) : null}
         {state.message && !confirming && state.phase !== 'unconfirmed' ? (

@@ -61,13 +61,25 @@
     background-color: transparent;
   }
 
-  html[data-material='translucent'] #workspace-center {
+  html[data-material='translucent'] #workspace-center:not([data-center-sheets='true']) {
     position: relative;
     background-color: var(--pact-material-chat);
     border-radius: var(--pact-sheet-radius);
   }
 
-  html[data-material='translucent'] #workspace-center::before,
+  html[data-material='translucent'] #workspace-center[data-center-sheets='true'] {
+    background-color: transparent;
+    border-radius: 0;
+    box-shadow: none;
+  }
+
+  html[data-material='translucent'] #workspace-center:not([data-center-sheets='true'])::before,
+  html[data-material='translucent']
+    #workspace-center[data-center-sheets='true']
+    .pact-center-sheet-frame::before,
+  html[data-material='translucent']
+    #workspace-center[data-center-sheets='true']
+    .pact-terminal-sheet-frame::before,
   html[data-material='translucent']
     .workspace-layout:not([data-context-expanded='true'])
     > #workspace-context[data-panel][data-open='true']::before,
@@ -118,6 +130,28 @@
     box-shadow: none;
   }
 
+  html[data-material='translucent']
+    #workspace-center[data-center-sheets='true']
+    .pact-workspace-chat-sheet.workspace-sheet {
+    z-index: 1;
+    background-color: var(--pact-material-chat);
+    box-shadow: none;
+  }
+
+  html[data-material='translucent']
+    #workspace-center[data-center-sheets='true']
+    .pact-terminal-shell.workspace-sheet {
+    z-index: 1;
+    background-color: var(--pact-terminal-surface);
+    box-shadow: none;
+  }
+
+  html[data-material='translucent']
+    #workspace-center[data-center-sheets='true']
+    .pact-terminal-separator {
+    background-color: var(--pact-material-navigation);
+  }
+
   html[data-material='translucent'] #workspace-context {
     background-color: transparent;
     border-radius: 0;
@@ -166,7 +200,11 @@
   }
 
   html[data-material='translucent'] #workspace-navigation > div,
-  html[data-material='translucent'] #workspace-center > div,
+  html[data-material='translucent'] #workspace-center:not([data-center-sheets='true']) > div,
+  html[data-material='translucent']
+    #workspace-center[data-center-sheets='true']
+    .pact-workspace-chat-sheet
+    > div,
   html[data-material='translucent'] [data-workspace-shell] > div.bg-surface,
   html[data-material='translucent'] [data-context-inspector],
   html[data-material='translucent'] [data-context-inspector] [data-inspector-pane],

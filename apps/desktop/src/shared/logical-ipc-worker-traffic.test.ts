@@ -86,8 +86,8 @@ describe('physical Worker traffic seams', () => {
       main.snapshot(),
       traffic.snapshots().filter((value) => value.owner !== 'main-utility'),
     )
-    expect(complete.owners).toHaveLength(9)
-    expect(complete.owners.reduce((n, value) => n + value.counters.length, 0)).toBe(25)
+    expect(complete.owners).toHaveLength(10)
+    expect(complete.owners.reduce((n, value) => n + value.counters.length, 0)).toBe(27)
     expect(ipcTrafficSchema.safeParse(complete).success).toBe(true)
     const missing = structuredClone(complete)
     missing.owners = missing.owners.filter((value) => value.owner !== 'utility-image')

@@ -33,6 +33,7 @@ export interface WorkspaceShellProps {
   contextPanelWidthLimited?: boolean | undefined
   contextPanelRestoreFocusRef?: React.RefObject<HTMLElement | null> | undefined
   showContextToggle?: boolean
+  centerSheetManaged?: boolean | undefined
   initialState?: WorkspaceLayoutState
 }
 
@@ -151,10 +152,18 @@ function ResizeSeparator({
   )
 }
 
-function PrimaryPane({ children }: { children: ReactNode }): React.JSX.Element {
+function PrimaryPane({
+  children,
+  managed = false,
+}: {
+  children: ReactNode
+  managed?: boolean | undefined
+}): React.JSX.Element {
   return (
     <section className="flex h-full min-h-0 flex-col" aria-label="Workspace">
-      <div className="min-h-0 flex-1 overflow-auto">{children}</div>
+      <div className={managed ? 'min-h-0 flex-1 overflow-hidden' : 'min-h-0 flex-1 overflow-auto'}>
+        {children}
+      </div>
     </section>
   )
 }
@@ -178,6 +187,7 @@ export function WorkspaceShell({
   contextPanelWidthLimited = true,
   contextPanelRestoreFocusRef,
   showContextToggle = true,
+  centerSheetManaged = false,
   initialState = defaultLayoutState,
 }: WorkspaceShellProps): React.JSX.Element {
   const initialViewport = getWorkspaceViewport()
@@ -636,14 +646,15 @@ export function WorkspaceShell({
             label="Resize navigation"
           />
           <Panel
-            className="workspace-sheet min-w-0"
+            className={centerSheetManaged ? 'min-w-0 bg-transparent' : 'workspace-sheet min-w-0'}
+            data-center-sheets={centerSheetManaged ? 'true' : undefined}
             elementRef={setCenterPanelElement}
             id="workspace-center"
             minSize="24rem"
             aria-hidden={isContextExpanded}
             inert={isContextExpanded}
           >
-            <PrimaryPane>{workspace}</PrimaryPane>
+            <PrimaryPane managed={centerSheetManaged}>{workspace}</PrimaryPane>
           </Panel>
           <ResizeSeparator
             isVisible={isContextVisible && !isContextExpanded}
@@ -738,14 +749,15 @@ export function WorkspaceShell({
             label="Resize navigation"
           />
           <Panel
-            className="workspace-sheet min-w-0"
+            className={centerSheetManaged ? 'min-w-0 bg-transparent' : 'workspace-sheet min-w-0'}
+            data-center-sheets={centerSheetManaged ? 'true' : undefined}
             elementRef={setCenterPanelElement}
             id="workspace-center"
             minSize="24rem"
             aria-hidden={isContextExpanded}
             inert={isContextExpanded}
           >
-            <PrimaryPane>{workspace}</PrimaryPane>
+            <PrimaryPane managed={centerSheetManaged}>{workspace}</PrimaryPane>
           </Panel>
         </Group>
         {isContextOverlayRendered && !isSettingsView ? (

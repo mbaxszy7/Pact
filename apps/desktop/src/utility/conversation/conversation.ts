@@ -43,6 +43,7 @@ import type {
   RpcResult,
   RuntimeAgentId,
   SessionPermissionMode,
+  TerminalQuitSummaryRow,
   WorkspaceChangesReadInput,
   WorkspaceChangesPage,
   WorkspaceChangeFileReadInput,
@@ -1214,6 +1215,12 @@ interface NativeInteractionOwner {
   valid: () => boolean
 }
 
+export interface ConversationTerminalCoordinator {
+  listBlockingProjectSummaries(projectId: string): TerminalQuitSummaryRow[]
+  acquireProjectArchiveLock(projectId: string): () => void
+  releaseIdleProjectTerminals(projectId: string): Promise<void>
+}
+
 export class Conversation {
   private readonly nativeIncarnation = randomUUID()
   private nativeRevision = 0
@@ -1376,6 +1383,7 @@ export class Conversation {
       signal: AbortSignal
       deadlineAt: number
     }) => Promise<string | null> | string | null,
+    private readonly terminalCoordinator?: ConversationTerminalCoordinator,
   ) {
     this.contextBroker = new CrossAgentContextBroker({
       conversations,
@@ -2600,6 +2608,12 @@ export class Conversation {
     return this.nativeQuitSealed()
   }
 
+  isTerminalQuitSealed(): boolean {
+    return (
+      this.disposed || Boolean(this.nativeQuitPreparation && !this.nativeQuitPreparation.expired)
+    )
+  }
+
   private nativeQuitSealed(): boolean {
     return this.nativeQuitPreparation?.sealed === true
   }
@@ -2621,6 +2635,10 @@ export class Conversation {
         this.readWorkspaceArchive(operationId)
       const context = this.conversations.archives.context(input.scope)
       const work = this.archiveWork(input.scope)
+      const terminals =
+        input.scope.kind === 'project'
+          ? (this.terminalCoordinator?.listBlockingProjectSummaries(input.scope.projectId) ?? [])
+          : []
       return {
         ok: true,
         value: this.conversations.archives.prepare(
@@ -2629,6 +2647,7 @@ export class Conversation {
             scope: input.scope,
             ...context,
             tasks: work.tasks,
+            ...(terminals.length > 0 ? { terminals } : {}),
             ...(work.blockedReason ? { blockedReason: work.blockedReason } : {}),
             expiresAt: new Date(Date.now() + WORKSPACE_ARCHIVE_PREVIEW_MS).toISOString(),
           },
@@ -2760,11 +2779,17 @@ export class Conversation {
         return !foreground || Boolean(this.conversations.findRun(foreground.run.id)?.nativeOutcome)
       }) ||
       this.conversations.archives.hasNativeWork(scope, runs)
+    const blockingTerminals =
+      scope.kind === 'project'
+        ? (this.terminalCoordinator?.listBlockingProjectSummaries(scope.projectId) ?? [])
+        : []
     const blockedReason = exceedsTaskLimit
       ? 'More than 5 tasks are active across this Session and its side chats. Wait for tasks to finish before archiving. Nothing was stopped.'
       : unsupported
         ? 'Wait for active agent work (recovery, fork, rebuild, background tasks, or unconfirmed endings) to finish before archiving. Nothing was stopped.'
-        : undefined
+        : blockingTerminals.length > 0
+          ? 'Close running project terminals before archiving this project. Nothing was stopped.'
+          : undefined
     return {
       tasks,
       ...(blockedReason ? { blockedReason } : {}),
@@ -2782,6 +2807,7 @@ export class Conversation {
     const outcomes: WorkspaceArchiveReceipt['tasks'] = []
     let confirmedTasks: WorkspaceArchiveTask[] = []
     let claimed = false
+    let releaseTerminalLock: (() => void) | undefined
     try {
       const previous = this.conversations.archives.read(id)
       if (previous && JSON.stringify(previous.preview.scope) !== JSON.stringify(scope))
@@ -2791,12 +2817,19 @@ export class Conversation {
           throw new WorkspaceArchiveConflictError('This receipt belongs to another item.')
         return readCommitted()
       }
+      if (scope.kind === 'project' && this.terminalCoordinator) {
+        releaseTerminalLock = this.terminalCoordinator.acquireProjectArchiveLock(scope.projectId)
+      }
       if (!operationId) {
         const preview = this.prepareWorkspaceArchive({ operationId: id, scope })
         if (!preview.ok) return preview
-        if (preview.value.tasks.length || preview.value.blockedReason)
+        if (
+          preview.value.tasks.length ||
+          (preview.value.terminals?.length ?? 0) > 0 ||
+          preview.value.blockedReason
+        )
           throw new WorkspaceArchiveConflictError(
-            'Review the running tasks before archiving this item.',
+            preview.value.blockedReason ?? 'Review the running tasks before archiving this item.',
           )
       }
       const work = this.archiveWork(scope)
@@ -2805,6 +2838,14 @@ export class Conversation {
         throw new WorkspaceArchiveConflictError(
           'Archive operations are busy. Nothing new was stopped; try again shortly.',
         )
+      if (
+        scope.kind === 'project' &&
+        (this.terminalCoordinator?.listBlockingProjectSummaries(scope.projectId).length ?? 0) > 0
+      ) {
+        throw new WorkspaceArchiveConflictError(
+          'Close running project terminals before archiving this project. Nothing was stopped.',
+        )
+      }
       const ownedRunIds = [...this.activeExecutions.values()]
         .filter((entry) => work.tasks.some((task) => task.sessionId === entry.run.sessionId))
         .map((entry) => entry.run.id)
@@ -2946,11 +2987,21 @@ export class Conversation {
         throw new WorkspaceArchiveConflictError(
           'Pact closed or timed out before archiving finished. Nothing was archived.',
         )
+      if (scope.kind === 'project' && this.terminalCoordinator) {
+        if (this.terminalCoordinator.listBlockingProjectSummaries(scope.projectId).length > 0) {
+          throw new WorkspaceArchiveConflictError(
+            'Close running project terminals before archiving this project. Nothing was stopped.',
+          )
+        }
+        await this.terminalCoordinator.releaseIdleProjectTerminals(scope.projectId)
+      }
       const archivedResult = this.conversations.archives.finish(id, outcomes, () => {
         const result = commit(id)
         if (!result.ok) throw new WorkspaceArchiveConflictError(result.error.message)
         return result
       })
+      releaseTerminalLock?.()
+      releaseTerminalLock = undefined
       const archivedSessionIds = new Set<string>(scopeSessionIds)
       if (scope.kind === 'session') {
         archivedSessionIds.add(scope.sessionId)
@@ -3019,6 +3070,7 @@ export class Conversation {
       return Conversation.sendFailure(error)
     } finally {
       if (claimed) this.archiveOperations.delete(id)
+      releaseTerminalLock?.()
     }
   }
 

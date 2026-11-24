@@ -1,6 +1,8 @@
+import { FolderClosed, SquareTerminal } from 'lucide-react'
 import {
   cloneElement,
   isValidElement,
+  memo,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -62,6 +64,11 @@ import {
   type WorkspaceChangesPanelState,
 } from '../project-file/WorkspaceChangesPanel'
 import { SessionSettingsPanel } from '../settings/session/SessionSettingsPanel'
+import { TerminalPanel } from '../terminal/TerminalPanel'
+import {
+  useWorkspaceTerminals,
+  type WorkspaceTerminalsState,
+} from '../terminal/useWorkspaceTerminals'
 import { ContextInspector, type ContextInspectorTab } from './ContextInspector'
 import { ConversationErrorBoundary } from './ConversationErrorBoundary'
 import { ProjectNavigation } from './ProjectNavigation'
@@ -305,6 +312,9 @@ export function WorkspaceView(props: WorkspaceViewProps): React.JSX.Element {
   const planRestoreFocusRef = useRef<HTMLButtonElement>(null)
   const sessionSettingsFocusRef = useRef<HTMLButtonElement>(null)
   const sideChatsButtonRef = useRef<HTMLButtonElement>(null)
+  const terminalButtonRef = useRef<HTMLButtonElement>(null)
+  const terminalRestoreFocusRef = useRef<HTMLElement | null>(null)
+  const terminalHostContainerRef = useRef<HTMLDivElement>(null)
   const showCurrentPlanHandlerRef = useRef<(() => void) | undefined>(undefined)
   const registerShowCurrentPlan = useCallback((fn: (() => void) | undefined): void => {
     showCurrentPlanHandlerRef.current = fn
@@ -512,6 +522,120 @@ export function WorkspaceView(props: WorkspaceViewProps): React.JSX.Element {
     selectedSession && !props.settingsPage && (rightContextOpen || planOpen),
   )
   const isPlanActive = isInspectorOpen && effectiveActiveTab === 'plan'
+  const isContextExpanded =
+    (isPlanActive && (planPane?.expanded ?? false)) ||
+    ((effectiveActiveTab === 'file' || effectiveActiveTab === 'changes') &&
+      props.projectFilePanelExpanded)
+
+  const restoreFocusAfterTerminalCollapse = useCallback((): void => {
+    window.requestAnimationFrame(() => {
+      const previous = terminalRestoreFocusRef.current
+      terminalRestoreFocusRef.current = null
+      if (
+        previous &&
+        previous.isConnected &&
+        !previous.closest('[hidden]') &&
+        !previous.closest('[inert]')
+      ) {
+        previous.focus({ preventScroll: true })
+        return
+      }
+      const composer = document.querySelector<HTMLElement>('.pact-composer-editor')
+      if (
+        composer &&
+        composer.isConnected &&
+        !composer.closest('[hidden]') &&
+        !composer.closest('[inert]')
+      ) {
+        composer.focus({ preventScroll: true })
+        return
+      }
+      terminalButtonRef.current?.focus({ preventScroll: true })
+    })
+  }, [])
+
+  const workspaceTerminals = useWorkspaceTerminals(
+    activeProject?.id,
+    restoreFocusAfterTerminalCollapse,
+  )
+
+  useEffect(() => {
+    const activeProjectIds = new Set(props.projects.map((p) => p.id))
+    for (const cachedProjectId of Object.keys(workspaceTerminals.terminalsByProject)) {
+      if (!activeProjectIds.has(cachedProjectId)) {
+        workspaceTerminals.disposeProject(cachedProjectId)
+      }
+    }
+  }, [props.projects, workspaceTerminals])
+
+  const activeTerminalProjectId = activeProject?.id
+  const activeTerminalList = activeTerminalProjectId
+    ? (workspaceTerminals.terminalsByProject[activeTerminalProjectId] ?? [])
+    : []
+  const activeTerminalUi = activeTerminalProjectId
+    ? workspaceTerminals.uiByProject[activeTerminalProjectId]
+    : undefined
+  const activeTerminalOpen = Boolean(
+    activeTerminalProjectId &&
+    !props.settingsPage &&
+    !creatingProject &&
+    !props.nativePresentationSuspended &&
+    activeTerminalUi?.open,
+  )
+
+  const handleToggleActiveProjectTerminal = useCallback((): void => {
+    if (!activeTerminalProjectId) return
+    const isCurrentlyOpen = Boolean(workspaceTerminals.uiByProject[activeTerminalProjectId]?.open)
+    if (!isCurrentlyOpen) {
+      terminalRestoreFocusRef.current =
+        document.activeElement instanceof HTMLElement ? document.activeElement : null
+    }
+    void workspaceTerminals.toggleProjectTerminal(activeTerminalProjectId)
+  }, [activeTerminalProjectId, workspaceTerminals])
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent): void => {
+      if (
+        event.isComposing ||
+        !event.ctrlKey ||
+        event.metaKey ||
+        event.altKey ||
+        event.shiftKey ||
+        (event.code !== 'Backquote' && event.key !== '`')
+      ) {
+        return
+      }
+      if (
+        !activeTerminalProjectId ||
+        props.settingsPage ||
+        creatingProject ||
+        props.nativePresentationSuspended ||
+        isContextExpanded
+      ) {
+        return
+      }
+      if (document.querySelector('dialog[open]')) return
+      if (
+        document.querySelector(
+          '[data-workspace-viewport="narrow"] #workspace-navigation[data-open="true"]',
+        ) ||
+        document.querySelector('.workspace-context-overlay[data-open="true"]')
+      ) {
+        return
+      }
+      event.preventDefault()
+      handleToggleActiveProjectTerminal()
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [
+    activeTerminalProjectId,
+    props.settingsPage,
+    creatingProject,
+    props.nativePresentationSuspended,
+    isContextExpanded,
+    handleToggleActiveProjectTerminal,
+  ])
   const sideChatsMounted = Boolean(
     hasSideChatsTab &&
     selectedSession &&
@@ -778,6 +902,30 @@ export function WorkspaceView(props: WorkspaceViewProps): React.JSX.Element {
     selectedSession && !props.settingsPage && (availableTabIds.length > 0 || isInspectorOpen),
   )
 
+  const planPaneValue = useMemo(
+    () => ({
+      host: planHost,
+      available: planAvailable,
+      open: isPlanActive,
+      expanded: Boolean(isPlanActive && planPane?.expanded),
+      onExpandedChange: setPlanExpanded,
+      onAvailable: acceptPlanTask,
+      onOpen: openPlan,
+      onClose: closeInspector,
+      restoreFocusRef: planRestoreFocusRef,
+    }),
+    [
+      planHost,
+      planAvailable,
+      isPlanActive,
+      planPane?.expanded,
+      setPlanExpanded,
+      acceptPlanTask,
+      openPlan,
+      closeInspector,
+    ],
+  )
+
   return (
     <WorkspaceShell
       workspaceTitle={null}
@@ -874,8 +1022,49 @@ export function WorkspaceView(props: WorkspaceViewProps): React.JSX.Element {
                     : undefined
                 }
                 sideChatsButtonRef={sideChatsButtonRef}
+                terminalOpen={activeTerminalOpen}
+                terminalCount={activeTerminalList.length}
+                onToggleTerminal={
+                  activeTerminalProjectId ? handleToggleActiveProjectTerminal : undefined
+                }
+                terminalButtonRef={terminalButtonRef}
               />
             </div>
+          </div>
+        ) : activeProject && !props.settingsPage && !creatingProject ? (
+          <div className="flex h-full min-w-0 items-center justify-between gap-group">
+            <div className="flex min-w-0 items-center gap-2">
+              <span className="grid size-7 shrink-0 place-items-center text-secondary">
+                <FolderClosed aria-hidden="true" className="size-4" strokeWidth={1.75} />
+              </span>
+              <span
+                className="truncate text-body font-medium text-primary"
+                title={activeProject.name}
+              >
+                {activeProject.name}
+              </span>
+            </div>
+            <button
+              ref={terminalButtonRef}
+              type="button"
+              aria-label="Terminal"
+              aria-expanded={activeTerminalOpen}
+              title="Terminal (Ctrl+`)"
+              onClick={handleToggleActiveProjectTerminal}
+              data-titlebar-interactive
+              className={`pact-pressable relative inline-flex h-8 shrink-0 items-center justify-center rounded-xl border text-caption font-medium transition-colors duration-150 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus ${
+                activeTerminalOpen
+                  ? 'border-border bg-surface text-primary shadow-sheet'
+                  : 'border-transparent text-secondary hover:bg-row-hover hover:text-primary'
+              } ${activeTerminalList.length > 0 ? 'gap-1.5 px-2' : 'w-8'}`}
+            >
+              <SquareTerminal aria-hidden="true" className="size-4 shrink-0" strokeWidth={1.75} />
+              {activeTerminalList.length > 0 ? (
+                <span className="text-caption font-medium text-secondary">
+                  {activeTerminalList.length}
+                </span>
+              ) : null}
+            </button>
           </div>
         ) : undefined
       }
@@ -914,6 +1103,7 @@ export function WorkspaceView(props: WorkspaceViewProps): React.JSX.Element {
         else closeInspector()
       }}
       showContextToggle={false}
+      centerSheetManaged
       contextPanel={
         canRenderInspector ? (
           <ContextInspector
@@ -932,29 +1122,164 @@ export function WorkspaceView(props: WorkspaceViewProps): React.JSX.Element {
         ) : undefined
       }
       workspace={
-        <WorkspaceContent
+        <WorkspaceContentWithTerminals
           props={props}
           selectedSession={selectedSession}
           creatingProject={creatingProject}
           activeProject={activeProject}
           isChangesActive={isInspectorOpen && effectiveActiveTab === 'changes'}
           onRegisterShowCurrentPlan={registerShowCurrentPlan}
-          planPane={{
-            host: planHost,
-            available: planAvailable,
-            open: isPlanActive,
-            expanded: Boolean(isPlanActive && planPane?.expanded),
-            onExpandedChange: setPlanExpanded,
-            onAvailable: acceptPlanTask,
-            onOpen: openPlan,
-            onClose: closeInspector,
-            restoreFocusRef: planRestoreFocusRef,
-          }}
+          workspaceTerminals={workspaceTerminals}
+          terminalHostContainerRef={terminalHostContainerRef}
+          restoreFocusAfterTerminalCollapse={restoreFocusAfterTerminalCollapse}
+          planPane={planPaneValue}
         />
       }
     />
   )
 }
+
+function WorkspaceContentWithTerminals({
+  props,
+  selectedSession,
+  creatingProject,
+  activeProject,
+  isChangesActive,
+  onRegisterShowCurrentPlan,
+  workspaceTerminals,
+  terminalHostContainerRef,
+  restoreFocusAfterTerminalCollapse,
+  planPane,
+}: {
+  props: WorkspaceViewProps
+  selectedSession: CollaborationSession | undefined
+  creatingProject: Project | undefined
+  activeProject: Project | undefined
+  isChangesActive: boolean
+  onRegisterShowCurrentPlan: (fn: (() => void) | undefined) => void
+  workspaceTerminals: WorkspaceTerminalsState
+  terminalHostContainerRef: React.RefObject<HTMLDivElement | null>
+  restoreFocusAfterTerminalCollapse: () => void
+  planPane: {
+    host: HTMLElement | null
+    available: boolean
+    open: boolean
+    expanded: boolean
+    onExpandedChange: (expanded: boolean) => void
+    onAvailable: (sessionId: string, taskId?: string) => void
+    onOpen: () => void
+    onClose: () => void
+    restoreFocusRef: React.RefObject<HTMLButtonElement | null>
+  }
+}): ReactNode {
+  const activeProjectId = activeProject?.id
+  const activeUi = activeProjectId ? workspaceTerminals.uiByProject[activeProjectId] : undefined
+  const activeTerminalVisible = Boolean(
+    activeProjectId &&
+    !props.settingsPage &&
+    !creatingProject &&
+    !props.nativePresentationSuspended &&
+    activeUi?.open,
+  )
+  const activeTerminalMaximized = Boolean(activeTerminalVisible && activeUi?.maximized)
+  const mountedProjectIds = useMemo(() => {
+    const ids = new Set<string>()
+    for (const project of props.projects) {
+      if (
+        workspaceTerminals.uiByProject[project.id]?.open ||
+        (workspaceTerminals.terminalsByProject[project.id]?.length ?? 0) > 0
+      ) {
+        ids.add(project.id)
+      }
+    }
+    return [...ids]
+  }, [props.projects, workspaceTerminals.uiByProject, workspaceTerminals.terminalsByProject])
+
+  return (
+    <div ref={terminalHostContainerRef} className="flex h-full min-h-0 flex-col overflow-hidden">
+      <div
+        className="pact-center-sheet-frame flex-1 min-h-0"
+        hidden={activeTerminalMaximized}
+        inert={activeTerminalMaximized || undefined}
+      >
+        <div className="workspace-sheet pact-workspace-chat-sheet flex h-full min-h-0 flex-col overflow-hidden">
+          <div className="min-h-0 flex-1 overflow-auto">
+            <MemoizedWorkspaceContent
+              props={props}
+              selectedSession={selectedSession}
+              creatingProject={creatingProject}
+              activeProject={activeProject}
+              isChangesActive={isChangesActive}
+              onRegisterShowCurrentPlan={onRegisterShowCurrentPlan}
+              planPane={planPane}
+            />
+          </div>
+        </div>
+      </div>
+      {mountedProjectIds.map((projectId) => {
+        const list = workspaceTerminals.terminalsByProject[projectId] ?? []
+        const ui = workspaceTerminals.uiByProject[projectId] ?? {
+          open: false,
+          maximized: false,
+          height: 248,
+        }
+        const isCurrentProject =
+          activeProjectId === projectId &&
+          !props.settingsPage &&
+          !creatingProject &&
+          !props.nativePresentationSuspended
+        const activeTerminalForProject =
+          list.find((item) => item.id === ui.activeTerminalId) ?? list[0]
+        const pendingForProject =
+          workspaceTerminals.pendingClose &&
+          list.some((item) => item.id === workspaceTerminals.pendingClose?.terminalId)
+            ? workspaceTerminals.pendingClose
+            : undefined
+        return (
+          <TerminalPanel
+            key={projectId}
+            projectId={projectId}
+            active={isCurrentProject}
+            platform={props.platform}
+            workspaceContainerRef={terminalHostContainerRef}
+            terminals={list}
+            uiState={ui}
+            busy={Boolean(workspaceTerminals.busyByProject[projectId])}
+            error={workspaceTerminals.errorByProject[projectId]}
+            inputError={
+              activeTerminalForProject
+                ? workspaceTerminals.inputErrorByTerminal[activeTerminalForProject.id]
+                : undefined
+            }
+            pendingClose={pendingForProject}
+            onSelectTab={(terminalId) =>
+              workspaceTerminals.selectTerminalTab(projectId, terminalId)
+            }
+            onCreateTab={() => void workspaceTerminals.createTab(projectId)}
+            onRequestCloseTab={(terminalId) =>
+              void workspaceTerminals.requestCloseTab(projectId, terminalId)
+            }
+            onConfirmCloseTab={() => void workspaceTerminals.confirmPendingClose()}
+            onCancelCloseTab={() => workspaceTerminals.cancelPendingClose()}
+            onToggleMaximize={() =>
+              workspaceTerminals.setProjectMaximized(projectId, !ui.maximized)
+            }
+            onCollapse={() => {
+              workspaceTerminals.collapseProjectTerminal(projectId)
+              restoreFocusAfterTerminalCollapse()
+            }}
+            onHeightChange={(height) => workspaceTerminals.setProjectHeight(projectId, height)}
+            onInputError={(terminalId, message) =>
+              workspaceTerminals.setTerminalInputError(terminalId, message)
+            }
+          />
+        )
+      })}
+    </div>
+  )
+}
+
+const MemoizedWorkspaceContent = memo(WorkspaceContent)
 
 function WorkspaceContent({
   props,

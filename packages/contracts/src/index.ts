@@ -79,6 +79,7 @@ import {
 } from './scheduling-settings.js'
 export * from './workspace-archive.js'
 export * from './native-presence.js'
+export * from './terminal.js'
 import {
   conversationImageSchema,
   conversationImagesSchema,
@@ -112,6 +113,48 @@ import {
   type NativeNavigationIntent,
   type NativeNavigationAckInput,
 } from './native-presence.js'
+import {
+  MAX_TOTAL_TERMINALS,
+  terminalCloseInputSchema,
+  terminalCloseResultSchema,
+  terminalCreateInputSchema,
+  terminalListInputSchema,
+  terminalListResultSchema,
+  terminalOutputEventSchema,
+  terminalResizeInputSchema,
+  terminalResizeResultSchema,
+  terminalSnapshotInputSchema,
+  terminalSnapshotResultSchema,
+  terminalStateEventSchema,
+  terminalSummarySchema,
+  terminalVisibilityInputSchema,
+  terminalVisibilityResultSchema,
+  terminalWriteInputSchema,
+  terminalWriteResultSchema,
+  type TerminalAckOutputInput,
+  type TerminalAckOutputResult,
+  type TerminalCloseInput,
+  type TerminalCloseResult,
+  type TerminalCreateInput,
+  type TerminalLastExitNotice,
+  type TerminalListInput,
+  type TerminalListResult,
+  type TerminalOutputEvent,
+  type TerminalReleaseProjectViewsInput,
+  type TerminalReleaseProjectViewsResult,
+  type TerminalResizeInput,
+  type TerminalResizeResult,
+  type TerminalSnapshotInput,
+  type TerminalSnapshotResult,
+  type TerminalStateEvent,
+  type TerminalSubscribeInput,
+  type TerminalSubscribeResult,
+  type TerminalSummary,
+  type TerminalUnsubscribeInput,
+  type TerminalUnsubscribeResult,
+  type TerminalWriteInput,
+  type TerminalWriteResult,
+} from './terminal.js'
 import {
   workspaceArchivePrepareInputSchema,
   workspaceArchiveOperationInputSchema,
@@ -388,6 +431,19 @@ export const IPC_CHANNELS = {
   sideChatList: 'pact:side-chat:list',
   sideChatSyncMain: 'pact:side-chat:sync-main',
   sideChatSyncMainReceipt: 'pact:side-chat:sync-main-receipt',
+  terminalList: 'pact:terminal:list',
+  terminalCreate: 'pact:terminal:create',
+  terminalSubscribe: 'pact:terminal:subscribe',
+  terminalUnsubscribe: 'pact:terminal:unsubscribe',
+  terminalAckOutput: 'pact:terminal:ack-output',
+  terminalReleaseProjectViews: 'pact:terminal:release-project-views',
+  terminalWrite: 'pact:terminal:write',
+  terminalResize: 'pact:terminal:resize',
+  terminalClose: 'pact:terminal:close',
+  terminalReadSnapshot: 'pact:terminal:read-snapshot',
+  terminalLastExitNotice: 'pact:terminal:last-exit-notice',
+  terminalOutput: 'pact:terminal:output',
+  terminalState: 'pact:terminal:state',
 } as const
 
 export const appErrorSchema = z.object({
@@ -464,6 +520,7 @@ export const IPC_TRAFFIC_OWNER_CATEGORIES = {
     'utility-native-fork.control',
     'native-fork-utility.reply',
   ],
+  'utility-terminal': ['utility-terminal.request', 'terminal-utility.reply'],
   'main-diagnostic-log': [
     'main-diagnostic-log.init',
     'main-diagnostic-log.request',
@@ -479,6 +536,7 @@ export const ipcTrafficOwnerSchema = z.enum([
   'utility-image',
   'utility-native-json',
   'utility-native-fork',
+  'utility-terminal',
   'main-diagnostic-log',
   'renderer-monaco',
 ])
@@ -503,6 +561,8 @@ export const ipcTrafficCategorySchema = z.enum([
   'utility-native-fork.init',
   'utility-native-fork.control',
   'native-fork-utility.reply',
+  'utility-terminal.request',
+  'terminal-utility.reply',
   'main-diagnostic-log.init',
   'main-diagnostic-log.request',
   'diagnostic-log-main.reply',
@@ -579,6 +639,7 @@ export const ipcTrafficUncoveredSchema = z.enum([
   'utility-image-codec-worker',
   'utility-native-json-worker',
   'utility-native-fork-worker',
+  'utility-terminal-worker',
   'main-diagnostic-log-worker',
   'renderer-monaco-workers',
 ])
@@ -645,8 +706,8 @@ export const ipcTrafficSchema = z
     schemaVersion: z.literal(1),
     unit: z.literal(IPC_TRAFFIC_UNIT),
     complete: z.boolean(),
-    owners: z.array(ipcTrafficOwnerSnapshotSchema).max(9),
-    uncovered: z.array(ipcTrafficUncoveredSchema).max(9),
+    owners: z.array(ipcTrafficOwnerSnapshotSchema).max(10),
+    uncovered: z.array(ipcTrafficUncoveredSchema).max(10),
   })
   .refine(
     (value) =>
@@ -664,7 +725,7 @@ export const ipcTrafficSchema = z
         ),
       ) &&
       (!value.complete ||
-        (value.owners.length === 9 &&
+        (value.owners.length === 10 &&
           value.uncovered.length === 0 &&
           value.owners.every((owner) => owner.complete))),
   )
@@ -3699,6 +3760,41 @@ export const utilityRequestSchema = z.discriminatedUnion('type', [
     requestId: z.string().uuid(),
     input: readSideChatReceiptInputSchema,
   }),
+  z.strictObject({
+    type: z.literal('terminal.list.request'),
+    requestId: z.string().uuid(),
+    input: terminalListInputSchema,
+  }),
+  z.strictObject({
+    type: z.literal('terminal.create.request'),
+    requestId: z.string().uuid(),
+    input: terminalCreateInputSchema,
+  }),
+  z.strictObject({
+    type: z.literal('terminal.visibility.request'),
+    requestId: z.string().uuid(),
+    input: terminalVisibilityInputSchema,
+  }),
+  z.strictObject({
+    type: z.literal('terminal.write.request'),
+    requestId: z.string().uuid(),
+    input: terminalWriteInputSchema,
+  }),
+  z.strictObject({
+    type: z.literal('terminal.resize.request'),
+    requestId: z.string().uuid(),
+    input: terminalResizeInputSchema,
+  }),
+  z.strictObject({
+    type: z.literal('terminal.close.request'),
+    requestId: z.string().uuid(),
+    input: terminalCloseInputSchema,
+  }),
+  z.strictObject({
+    type: z.literal('terminal.snapshot.request'),
+    requestId: z.string().uuid(),
+    input: terminalSnapshotInputSchema,
+  }),
 ])
 
 export type UtilityRequest = z.infer<typeof utilityRequestSchema>
@@ -3793,7 +3889,12 @@ export const utilityResponseSchema = z.discriminatedUnion('type', [
   z.object({
     type: z.literal('runtime.shutdown.response'),
     requestId: z.string().uuid(),
-    result: rpcResultSchema(z.object({ flushed: z.literal(true) })),
+    result: rpcResultSchema(
+      z.object({
+        flushed: z.literal(true),
+        unconfirmedTerminals: z.number().int().nonnegative().max(MAX_TOTAL_TERMINALS).optional(),
+      }),
+    ),
   }),
   z.object({
     type: z.literal('native-presence.read.response'),
@@ -4030,6 +4131,41 @@ export const utilityResponseSchema = z.discriminatedUnion('type', [
     requestId: z.string().uuid(),
     result: rpcResultSchema(sideChatSyncMainReceiptSchema.nullable()),
   }),
+  z.strictObject({
+    type: z.literal('terminal.list.response'),
+    requestId: z.string().uuid(),
+    result: rpcResultSchema(terminalListResultSchema),
+  }),
+  z.strictObject({
+    type: z.literal('terminal.create.response'),
+    requestId: z.string().uuid(),
+    result: rpcResultSchema(terminalSummarySchema),
+  }),
+  z.strictObject({
+    type: z.literal('terminal.visibility.response'),
+    requestId: z.string().uuid(),
+    result: rpcResultSchema(terminalVisibilityResultSchema),
+  }),
+  z.strictObject({
+    type: z.literal('terminal.write.response'),
+    requestId: z.string().uuid(),
+    result: rpcResultSchema(terminalWriteResultSchema),
+  }),
+  z.strictObject({
+    type: z.literal('terminal.resize.response'),
+    requestId: z.string().uuid(),
+    result: rpcResultSchema(terminalResizeResultSchema),
+  }),
+  z.strictObject({
+    type: z.literal('terminal.close.response'),
+    requestId: z.string().uuid(),
+    result: rpcResultSchema(terminalCloseResultSchema),
+  }),
+  z.strictObject({
+    type: z.literal('terminal.snapshot.response'),
+    requestId: z.string().uuid(),
+    result: rpcResultSchema(terminalSnapshotResultSchema),
+  }),
 ])
 
 export type UtilityResponse = z.infer<typeof utilityResponseSchema>
@@ -4082,6 +4218,14 @@ export const utilityEventSchema = z.discriminatedUnion('type', [
   z.strictObject({
     type: z.literal('session.notification.event'),
     event: sessionNotificationEventSchema,
+  }),
+  z.strictObject({
+    type: z.literal('terminal.output.event'),
+    event: terminalOutputEventSchema,
+  }),
+  z.strictObject({
+    type: z.literal('terminal.state.event'),
+    event: terminalStateEventSchema,
   }),
 ])
 export type UtilityEvent = z.infer<typeof utilityEventSchema>
@@ -4301,6 +4445,23 @@ export interface DesktopBridge {
   updateAppearanceSettings(input: AppearanceSettingsUpdate): Promise<RpcResult<AppearanceSnapshot>>
   resetAppearanceSettings(input: AppearanceSettingsReset): Promise<RpcResult<AppearanceSnapshot>>
   onAppearanceSettingsChanged(listener: (snapshot: AppearanceSnapshot) => void): () => void
+  listTerminals(input: TerminalListInput): Promise<RpcResult<TerminalListResult>>
+  createTerminal(input: TerminalCreateInput): Promise<RpcResult<TerminalSummary>>
+  subscribeTerminal(input: TerminalSubscribeInput): Promise<RpcResult<TerminalSubscribeResult>>
+  unsubscribeTerminal(
+    input: TerminalUnsubscribeInput,
+  ): Promise<RpcResult<TerminalUnsubscribeResult>>
+  ackTerminalOutput(input: TerminalAckOutputInput): Promise<RpcResult<TerminalAckOutputResult>>
+  releaseProjectTerminalViews(
+    input: TerminalReleaseProjectViewsInput,
+  ): Promise<RpcResult<TerminalReleaseProjectViewsResult>>
+  writeTerminal(input: TerminalWriteInput): Promise<RpcResult<TerminalWriteResult>>
+  resizeTerminal(input: TerminalResizeInput): Promise<RpcResult<TerminalResizeResult>>
+  closeTerminal(input: TerminalCloseInput): Promise<RpcResult<TerminalCloseResult>>
+  readTerminalSnapshot(input: TerminalSnapshotInput): Promise<RpcResult<TerminalSnapshotResult>>
+  consumeTerminalLastExitNotice(): Promise<RpcResult<TerminalLastExitNotice | null>>
+  onTerminalOutput(listener: (event: TerminalOutputEvent) => void): () => void
+  onTerminalState(listener: (event: TerminalStateEvent) => void): () => void
 }
 
 export * from './handoff-guidance.js'

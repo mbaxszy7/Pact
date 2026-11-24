@@ -55,6 +55,9 @@ Forward execution preserves native tools and user permissions. Recorded Changes 
 - Revise plan opens a confirmation on a settled `/plan` result, then re-runs the fixed planner and reviewer; a fresh Implement approval is required even when the Plan text is unchanged. Keep current plan dismisses only the exact recorded revision request without starting work; the task stays paused on its original scope.
 - macOS and Windows share functional requirements; each platform's actual native effects and release verification must be established separately.
 
+- Accessibility & Inclusion work covers keyboard-only operation, reduced motion, contrast and live Light/Dark/Translucent themes cleanly.
+- Integrated Project terminals (`Ctrl+\`` or the header toggle) run real native shells inside the Project's directory without disturbing Agent Sessions, blocking Project Archive until open terminals are closed, confirming before stopping active commands on tab close, and terminating gracefully during App Quit without blocking exit with a confirmation dialog.
+
 ## Brand Commitments
 
 - Name: Pact.

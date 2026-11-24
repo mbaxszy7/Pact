@@ -532,6 +532,23 @@ forced colors and keyboard focus share the same composition. A system dialog is 
 Renderer is unavailable. This native module remains subject to actual platform inspection and user
 visual acceptance before formal verification.
 
+## Integrated Terminal panel
+
+An active Project can dock or maximize an Integrated Terminal panel as an independent floating
+rounded card (`14px` sheet radius matching the workspace sheets, separated from the session
+sheet above by an `8px` gutter) (`Ctrl+\`` or the header Terminal toggle). It renders on a calm
+Light porcelain well (`#f3f7fb`) and Dark midnight-slate `--pact-code-block-surface` (`#0e1620`,
+preserving `--pact-material-code-alpha`under Translucent material) in`13px`/`1.42`line-height`JetBrains Mono Variable`, with opaque crisp glyphs, a soft neutral `2px × 14px`vertically centered rounded bar caret (muted
+when unfocused), legible`SGR 7` reverse-video contrast, soft Iris selection tints in both themes,
+and automatic selection clearing on copy, paste, or typed input. A single 36 px header carries a
+subtle terminal icon,`tablist`tabs (status dot with screen-reader label and reserved close-button
+slot), a`+`creation action, Maximize/Restore, and Collapse; a centered pill resize separator inside
+the`8px`gutter matching`.workspace-separator`resizes cleanly with`140 px`minimum height, and a`220 ms` `--ease-silk-out` height and opacity transition (`100 ms`fade under reduced motion,`fill:
+'forwards'` during collapse) avoids post-fade flicker while moving focus into the ready terminal
+immediately on open. Closing a tab with an active subprocess opens an inline non-modal confirmation
+with Keep open focused first, while App Quit terminates open terminals gracefully without blocking
+exit.
+
 ## Do's and Don'ts
 
 ### Do:

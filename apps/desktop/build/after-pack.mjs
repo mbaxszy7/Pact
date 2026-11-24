@@ -6,6 +6,10 @@ import {
   inspectAgySqliteFileResource,
 } from './agy-sqlite-file-resource.mjs'
 import {
+  inspectTerminalHelperResource,
+  terminalHelperSourceHash,
+} from './terminal-helper-resource.mjs'
+import {
   assertNoWindowsOwnedProcessResource,
   inspectWindowsOwnedProcessResource,
   windowsOwnedProcessSourceHash,
@@ -109,6 +113,13 @@ export default async function afterPack(context) {
     context.electronPlatformName,
     arch,
     await agySqliteFileSourceHash(),
+    { verifyLoad: context.electronPlatformName === process.platform && arch === process.arch },
+  )
+  await inspectTerminalHelperResource(
+    join(resources, 'native'),
+    context.electronPlatformName,
+    arch,
+    await terminalHelperSourceHash(context.electronPlatformName),
     { verifyLoad: context.electronPlatformName === process.platform && arch === process.arch },
   )
 

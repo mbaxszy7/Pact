@@ -10,7 +10,8 @@
     "./images": "./src/images.ts",
     "./directory-file-operations": "./src/directory-file-operations.ts",
     "./workspace-changes": "./src/workspace-changes.ts",
-    "./decision-physical-witness": "./src/decision-physical-witness.ts"
+    "./decision-physical-witness": "./src/decision-physical-witness.ts",
+    "./terminal": "./src/terminal.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json --composite false"

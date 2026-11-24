@@ -8,12 +8,17 @@ import type { NativePresence } from './native-presence'
 import { registerAppearanceIpcHandlers } from './appearance/ipc'
 import { registerConversationIpcHandlers } from './conversation/ipc'
 import { registerFoundationIpcHandlers } from './foundation/ipc'
+import {
+  createNativeLastExitNoticeStore,
+  type NativeLastExitNoticeStore,
+} from './native-last-exit-notice'
 import { registerProviderUsageIpcHandlers } from './provider-usage/ipc'
 import { createRuntimePreparationController } from './runtime-preparation/controller'
 import { registerRuntimePreparationIpcHandlers } from './runtime-preparation/ipc'
 import { SessionNotificationController } from './session-notifications/controller'
 import { registerSessionNotificationIpcHandlers } from './session-notifications/ipc'
 import { registerSettingsIpcHandlers } from './settings/ipc'
+import { registerTerminalIpcHandlers } from './terminal/ipc'
 import { registerWorkspaceIpcHandlers } from './workspace/ipc'
 import { createProjectCatalogController } from './workspace/project-catalog-controller'
 
@@ -23,6 +28,7 @@ export function registerDesktopModules(
   appearance: AppearanceController,
   nativePresence?: NativePresence,
   recordDiagnostic?: (event: DiagnosticEvent) => void,
+  lastExitNotice: NativeLastExitNoticeStore = createNativeLastExitNoticeStore(':memory:'),
 ): () => void {
   const runtimePreparation = createRuntimePreparationController(utilityClient)
   const projectCatalog = createProjectCatalogController(utilityClient)
@@ -49,6 +55,7 @@ export function registerDesktopModules(
     registerRuntimePreparationIpcHandlers(trust, runtimePreparation),
     registerProviderUsageIpcHandlers(trust, utilityClient),
     registerSettingsIpcHandlers(trust, utilityClient),
+    registerTerminalIpcHandlers(trust, utilityClient, lastExitNotice),
     registerWorkspaceIpcHandlers(trust, utilityClient, projectCatalog),
   ]
 

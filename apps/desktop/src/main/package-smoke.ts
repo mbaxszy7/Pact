@@ -1,5 +1,5 @@
 import { app, type BrowserWindow } from 'electron'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { isAbsolute, join } from 'node:path'
 import { Worker } from 'node:worker_threads'
@@ -71,6 +71,135 @@ async function verifyPackagedRelayCredential(window: BrowserWindow): Promise<voi
   `)
   if (verified !== true) throw new Error('Packaged credential verification failed.')
   process.stdout.write(`PACT_RELAY_CREDENTIAL_SMOKE:PASS:${phase}\n`)
+}
+
+/** Exercise packaged DesktopBridge terminal startup, real PTY I/O, snapshot read, and cleanup. */
+async function verifyPackagedTerminal(
+  window: BrowserWindow,
+  utilityClient: UtilityProcessClient,
+): Promise<void> {
+  const projectDir = await realpath(await mkdtemp(join(app.getPath('userData'), 'terminal-smoke-')))
+  const pidFile = join(projectDir, 'child.pid')
+  let projectId: string | undefined
+  let childPid: number | undefined
+  try {
+    const added = await utilityClient.addProjectDirectory({ directoryPath: projectDir })
+    if (!added.ok)
+      throw new Error(`Packaged terminal smoke could not add Project: ${added.error.message}`)
+    const createdProject = added.value.projects.find((item) => item.directoryPath === projectDir)
+    if (!createdProject) throw new Error('Packaged terminal smoke project was not found.')
+    projectId = createdProject.id
+
+    const command =
+      process.platform === 'win32'
+        ? `Set-Content -Path '${pidFile}' -Value $PID -NoNewline; Write-Output 'PACT_TERM_SMOKE_OK'; Start-Sleep -Seconds 30\r`
+        : `sh -c "echo $$ > '${pidFile}'; echo PACT_TERM_SMOKE_OK; sleep 30"\r`
+
+    const roundtrip: unknown = await window.webContents.executeJavaScript(`
+      (async () => {
+        const bridge = window.pact
+        const projectId = ${JSON.stringify(projectId)}
+        const command = ${JSON.stringify(command)}
+        const created = await bridge.createTerminal({
+          projectId,
+          requestId: crypto.randomUUID(),
+          cols: 80,
+          rows: 24,
+        })
+        if (!created.ok) return { ok: false, stage: 'create', message: created.error.message }
+        const terminalId = created.value.id
+        const epoch = created.value.inputEpoch
+        const subscriptionId = crypto.randomUUID()
+        let collected = ''
+        let lastSeq = 0
+        const unsub = bridge.onTerminalOutput((ev) => {
+          if (ev.terminalId !== terminalId) return
+          collected += ev.data
+          lastSeq = Math.max(lastSeq, ev.seq)
+        })
+        const sub = await bridge.subscribeTerminal({ terminalId, subscriptionId })
+        if (!sub.ok) {
+          unsub()
+          return { ok: false, stage: 'subscribe', message: sub.error.message }
+        }
+        const written = await bridge.writeTerminal({
+          terminalId,
+          streamId: crypto.randomUUID(),
+          chunkSeq: 0,
+          expectedEpoch: epoch,
+          data: command,
+        })
+        if (!written.ok) {
+          await bridge.unsubscribeTerminal({ subscriptionId }).catch(() => undefined)
+          unsub()
+          return { ok: false, stage: 'write', message: written.error.message }
+        }
+        const deadline = Date.now() + 8000
+        while (!collected.includes('PACT_TERM_SMOKE_OK') && Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 40))
+        }
+        if (lastSeq > 0) {
+          await bridge.ackTerminalOutput({
+            subscriptionId,
+            terminalId,
+            ackedSeq: lastSeq,
+            ackedBytes: Math.max(1, new TextEncoder().encode(collected).byteLength),
+          })
+        }
+        const snap = await bridge.readTerminalSnapshot({ terminalId, offset: 0 })
+        await bridge.unsubscribeTerminal({ subscriptionId })
+        unsub()
+        const closed = await bridge.closeTerminal({ terminalId, force: true })
+        const listAfter = await bridge.listTerminals({ projectId })
+        return {
+          ok:
+            collected.includes('PACT_TERM_SMOKE_OK') &&
+            snap.ok &&
+            closed.ok &&
+            closed.value.closed &&
+            listAfter.ok &&
+            listAfter.value.terminals.length === 0,
+          hasMarker: collected.includes('PACT_TERM_SMOKE_OK'),
+          snapOk: snap.ok,
+          closedOk: closed.ok && closed.value.closed,
+          remainingCount: listAfter.ok ? listAfter.value.terminals.length : -1,
+        }
+      })()
+    `)
+    if (!roundtrip || typeof roundtrip !== 'object' || Reflect.get(roundtrip, 'ok') !== true) {
+      throw new Error(`Packaged terminal roundtrip failed: ${JSON.stringify(roundtrip)}`)
+    }
+    const pidText = await readFile(pidFile, 'utf8').catch(() => '')
+    const parsedPid = Number.parseInt(pidText.trim(), 10)
+    if (Number.isSafeInteger(parsedPid) && parsedPid > 1) {
+      childPid = parsedPid
+      const deadline = Date.now() + 1500
+      let alive = true
+      while (Date.now() < deadline) {
+        try {
+          process.kill(childPid, 0)
+          // oxlint-disable-next-line no-await-in-loop -- Bounded 1.5s poll confirming OS process release after closeTerminal.
+          await new Promise((resolveDelay) => setTimeout(resolveDelay, 40))
+        } catch {
+          alive = false
+          break
+        }
+      }
+      if (alive) {
+        try {
+          process.kill(childPid, 'SIGKILL')
+        } catch {
+          // Best-effort cleanup after failure.
+        }
+        throw new Error(`Packaged terminal child process ${childPid} remained alive after close.`)
+      }
+    }
+    if (projectId) {
+      await utilityClient.archiveProject({ projectId }).catch(() => undefined)
+    }
+  } finally {
+    await rm(projectDir, { recursive: true, force: true }).catch(() => undefined)
+  }
 }
 export function isPackageSmoke(): boolean {
   return process.env[PACKAGE_SMOKE_ENV] === '1'
@@ -406,6 +535,9 @@ export async function completePackagedSmoke(
   }
 
   await verifyPackagedRelayCredential(window)
+  if (phase === 'verify') {
+    await verifyPackagedTerminal(window, utilityClient)
+  }
   process.stdout.write('PACT_PACKAGE_SMOKE:PASS\n')
   app.quit()
 }

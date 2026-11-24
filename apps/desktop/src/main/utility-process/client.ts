@@ -139,6 +139,22 @@ import {
   type NativeQuitPreparation,
   type NativeResultSchema,
   NATIVE_METADATA_TIMEOUT_MS,
+  type TerminalCloseInput,
+  type TerminalCloseResult,
+  type TerminalCreateInput,
+  type TerminalListInput,
+  type TerminalListResult,
+  type TerminalOutputEvent,
+  type TerminalResizeInput,
+  type TerminalResizeResult,
+  type TerminalSnapshotInput,
+  type TerminalSnapshotResult,
+  type TerminalStateEvent,
+  type TerminalSummary,
+  type TerminalVisibilityInput,
+  type TerminalVisibilityResult,
+  type TerminalWriteInput,
+  type TerminalWriteResult,
   utilityEventSchema,
   utilityResponseSchema,
   utilityRequestSchema,
@@ -421,6 +437,20 @@ export interface UtilityProcessClient {
     input: WorkspaceChangeFileReadInput,
   ): Promise<RpcResult<WorkspaceChangeFilePreview>>
   undoWorkspaceChanges(input: WorkspaceChangesUndoInput): Promise<RpcResult<ConversationPatch>>
+  listTerminals(input: TerminalListInput): Promise<RpcResult<TerminalListResult>>
+  createTerminal(input: TerminalCreateInput): Promise<RpcResult<TerminalSummary>>
+  setTerminalVisibility(
+    input: TerminalVisibilityInput,
+  ): Promise<RpcResult<TerminalVisibilityResult>>
+  releaseProjectTerminalViews(projectId: string): Promise<RpcResult<{ released: true }>>
+  writeTerminal(input: TerminalWriteInput): Promise<RpcResult<TerminalWriteResult>>
+  resizeTerminal(input: TerminalResizeInput): Promise<RpcResult<TerminalResizeResult>>
+  closeTerminal(input: TerminalCloseInput): Promise<RpcResult<TerminalCloseResult>>
+  readTerminalSnapshot(input: TerminalSnapshotInput): Promise<RpcResult<TerminalSnapshotResult>>
+  subscribeTerminalOutput(listener: (event: TerminalOutputEvent) => void): () => void
+  subscribeTerminalState(listener: (event: TerminalStateEvent) => void): () => void
+  getTrackedTerminal?(terminalId: string): TerminalSummary | undefined
+  trackedOpenTerminalCount?(): number
   request(
     request: UtilityRequestPayload,
     expectedResponseType: UtilityResponse['type'],
@@ -428,7 +458,12 @@ export interface UtilityProcessClient {
   ): Promise<UtilityTransportResult>
   dispose(): void
   isRunning(): boolean
-  shutdown(): Promise<RpcResult<{ flushed: true }>>
+  shutdown(): Promise<
+    RpcResult<{
+      flushed: true
+      unconfirmedTerminals?: number | undefined
+    }>
+  >
   settlement(): Promise<void>
 }
 
@@ -473,7 +508,14 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
     string,
     { child: UtilityProcess; controller: AbortController }
   >()
-  private shutdownTask: Promise<RpcResult<{ flushed: true }>> | undefined
+  private shutdownTask:
+    | Promise<
+        RpcResult<{
+          flushed: true
+          unconfirmedTerminals?: number | undefined
+        }>
+      >
+    | undefined
   private child: UtilityProcess | undefined
   private readyChild: UtilityProcess | undefined
   private startupDeadline: number | undefined
@@ -522,6 +564,9 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
   private readonly nativeQuitRecentListeners = new Set<
     (version: NativePresenceVersion, sessions: NativeSessionRow[]) => void
   >()
+  private readonly terminalOutputListeners = new Set<(event: TerminalOutputEvent) => void>()
+  private readonly terminalStateListeners = new Set<(event: TerminalStateEvent) => void>()
+  private readonly trackedTerminals = new Map<string, TerminalSummary>()
 
   getNativePresence(): Promise<RpcResult<NativePresenceSnapshot>> {
     return this.nativeRequest(
@@ -660,6 +705,7 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
     this.restartOptions = options
     this.diagnostics = options.diagnostics
     this.shutdownTask = undefined
+    this.trackedTerminals.clear()
     this.terminatingChild = undefined
     this.readyChild = undefined
     this.startupDeadline = performance.now() + STARTUP_TIMEOUT_MS
@@ -678,6 +724,15 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
               app.isPackaged ? process.resourcesPath : dirname(__dirname),
               'native',
               `owned-process-group-win32-${process.arch}.exe`,
+            )
+          : '',
+        process.platform === 'darwin' || process.platform === 'win32'
+          ? join(
+              app.isPackaged ? process.resourcesPath : dirname(__dirname),
+              'native',
+              process.platform === 'darwin'
+                ? `terminal-darwin-${process.arch}`
+                : `terminal-win32-${process.arch}.exe`,
             )
           : '',
       ],
@@ -942,6 +997,7 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
                   'utility-image',
                   'utility-native-json',
                   'utility-native-fork',
+                  'utility-terminal',
                 ].includes(owner.owner),
               ) ?? []),
             ]),
@@ -2447,7 +2503,185 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
     )
   }
 
-  shutdown(): Promise<RpcResult<{ flushed: true }>> {
+  async listTerminals(input: TerminalListInput): Promise<RpcResult<TerminalListResult>> {
+    const result = await this.request(
+      { type: 'terminal.list.request', input },
+      'terminal.list.response',
+      WORKSPACE_OPERATION_TIMEOUT_MS,
+    )
+    if (result.kind !== 'response') return { ok: false, error: result.error }
+    if (result.response.type !== 'terminal.list.response') {
+      return {
+        ok: false,
+        error: { code: 'INTERNAL', message: 'Unexpected terminal list response.' },
+      }
+    }
+    if (result.response.result.ok) {
+      const listedIds = new Set(result.response.result.value.terminals.map((item) => item.id))
+      for (const [existingId, existing] of this.trackedTerminals) {
+        if (existing.projectId === input.projectId && !listedIds.has(existingId)) {
+          this.trackedTerminals.delete(existingId)
+        }
+      }
+      for (const terminal of result.response.result.value.terminals) {
+        this.trackedTerminals.set(terminal.id, terminal)
+      }
+    }
+    return result.response.result
+  }
+
+  async createTerminal(input: TerminalCreateInput): Promise<RpcResult<TerminalSummary>> {
+    const result = await this.request(
+      { type: 'terminal.create.request', input },
+      'terminal.create.response',
+      6_000,
+    )
+    if (result.kind !== 'response') return { ok: false, error: result.error }
+    if (result.response.type !== 'terminal.create.response') {
+      return {
+        ok: false,
+        error: { code: 'INTERNAL', message: 'Unexpected terminal create response.' },
+      }
+    }
+    if (result.response.result.ok) {
+      const terminal = result.response.result.value
+      this.trackedTerminals.set(terminal.id, terminal)
+    }
+    return result.response.result
+  }
+
+  async setTerminalVisibility(
+    input: TerminalVisibilityInput,
+  ): Promise<RpcResult<TerminalVisibilityResult>> {
+    const result = await this.request(
+      { type: 'terminal.visibility.request', input },
+      'terminal.visibility.response',
+      WORKSPACE_OPERATION_TIMEOUT_MS,
+    )
+    if (result.kind !== 'response') return { ok: false, error: result.error }
+    return result.response.type === 'terminal.visibility.response'
+      ? result.response.result
+      : {
+          ok: false,
+          error: { code: 'INTERNAL', message: 'Unexpected terminal visibility response.' },
+        }
+  }
+
+  async releaseProjectTerminalViews(projectId: string): Promise<RpcResult<{ released: true }>> {
+    const projectTerminals = [...this.trackedTerminals.values()].filter(
+      (terminal) => terminal.projectId === projectId,
+    )
+    await Promise.all(
+      projectTerminals.map((terminal) =>
+        this.setTerminalVisibility({
+          terminalId: terminal.id,
+          visible: false,
+          rendererRetained: false,
+          backpressurePaused: false,
+        }).catch(() => undefined),
+      ),
+    )
+    return { ok: true, value: { released: true } }
+  }
+
+  async writeTerminal(input: TerminalWriteInput): Promise<RpcResult<TerminalWriteResult>> {
+    const result = await this.request(
+      { type: 'terminal.write.request', input },
+      'terminal.write.response',
+      WORKSPACE_OPERATION_TIMEOUT_MS,
+    )
+    if (result.kind !== 'response') return { ok: false, error: result.error }
+    return result.response.type === 'terminal.write.response'
+      ? result.response.result
+      : { ok: false, error: { code: 'INTERNAL', message: 'Unexpected terminal write response.' } }
+  }
+
+  async resizeTerminal(input: TerminalResizeInput): Promise<RpcResult<TerminalResizeResult>> {
+    const result = await this.request(
+      { type: 'terminal.resize.request', input },
+      'terminal.resize.response',
+      WORKSPACE_OPERATION_TIMEOUT_MS,
+    )
+    if (result.kind !== 'response') return { ok: false, error: result.error }
+    return result.response.type === 'terminal.resize.response'
+      ? result.response.result
+      : { ok: false, error: { code: 'INTERNAL', message: 'Unexpected terminal resize response.' } }
+  }
+
+  async closeTerminal(input: TerminalCloseInput): Promise<RpcResult<TerminalCloseResult>> {
+    const result = await this.request(
+      { type: 'terminal.close.request', input },
+      'terminal.close.response',
+      6_000,
+    )
+    if (result.kind !== 'response') return { ok: false, error: result.error }
+    if (result.response.type !== 'terminal.close.response') {
+      return {
+        ok: false,
+        error: { code: 'INTERNAL', message: 'Unexpected terminal close response.' },
+      }
+    }
+    if (result.response.result.ok && result.response.result.value.closed) {
+      this.trackedTerminals.delete(input.terminalId)
+    }
+    return result.response.result
+  }
+
+  async readTerminalSnapshot(
+    input: TerminalSnapshotInput,
+  ): Promise<RpcResult<TerminalSnapshotResult>> {
+    const result = await this.request(
+      { type: 'terminal.snapshot.request', input },
+      'terminal.snapshot.response',
+      WORKSPACE_FILE_READ_TIMEOUT_MS,
+    )
+    if (result.kind !== 'response') return { ok: false, error: result.error }
+    return result.response.type === 'terminal.snapshot.response'
+      ? result.response.result
+      : {
+          ok: false,
+          error: { code: 'INTERNAL', message: 'Unexpected terminal snapshot response.' },
+        }
+  }
+
+  subscribeTerminalOutput(listener: (event: TerminalOutputEvent) => void): () => void {
+    this.terminalOutputListeners.add(listener)
+    return () => this.terminalOutputListeners.delete(listener)
+  }
+
+  subscribeTerminalState(listener: (event: TerminalStateEvent) => void): () => void {
+    this.terminalStateListeners.add(listener)
+    return () => this.terminalStateListeners.delete(listener)
+  }
+
+  getTrackedTerminal(terminalId: string): TerminalSummary | undefined {
+    return this.trackedTerminals.get(terminalId)
+  }
+
+  trackedOpenTerminalCount(): number {
+    let count = 0
+    for (const terminal of this.trackedTerminals.values()) {
+      if (ElectronUtilityProcessClient.isBlockingTerminal(terminal)) count += 1
+    }
+    return count
+  }
+
+  private static isBlockingTerminal(terminal: TerminalSummary): boolean {
+    return (
+      terminal.state === 'starting' ||
+      terminal.state === 'running' ||
+      terminal.state === 'closing' ||
+      terminal.state === 'unconfirmed' ||
+      (terminal.state === 'exited' && terminal.hasActiveChild)
+    )
+  }
+
+  shutdown(): Promise<
+    RpcResult<{
+      flushed: true
+      unconfirmedTerminals?: number | undefined
+    }>
+  > {
     const target = this.child
     if (target)
       this.settleStartup(target, {
@@ -2465,43 +2699,55 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
       { type: 'runtime.shutdown.request', flushDeadlineAt },
       'runtime.shutdown.response',
       WORKSPACE_OPERATION_TIMEOUT_MS - 1_000,
-    ).then(async (result): Promise<RpcResult<{ flushed: true }>> => {
-      const acknowledged: RpcResult<{ flushed: true }> =
-        result.kind !== 'response'
-          ? { ok: false, error: result.error }
-          : result.response.type === 'runtime.shutdown.response'
-            ? result.response.result
-            : {
-                ok: false,
-                error: { code: 'INTERNAL', message: 'Unexpected shutdown acknowledgement.' },
-              }
-      this.dispose()
-      if (!(await cryptoJoined))
-        return {
-          ok: false,
-          error: {
-            code: 'UNCERTAIN',
-            message: 'Couldn’t confirm that background tasks exited cleanly.',
-          },
-        }
-      if (!(await this.agyStorageOperations.settlement(deadline)))
-        return {
-          ok: false,
-          error: {
-            code: 'UNCERTAIN',
-            message: 'Couldn’t confirm that background tasks exited cleanly.',
-          },
-        }
-      if (target && !(await this.waitForExit(target, deadline)))
-        return {
-          ok: false,
-          error: {
-            code: 'UNCERTAIN',
-            message: 'Couldn’t confirm that background tasks exited cleanly.',
-          },
-        }
-      return acknowledged
-    })
+    ).then(
+      async (
+        result,
+      ): Promise<
+        RpcResult<{
+          flushed: true
+          unconfirmedTerminals?: number | undefined
+        }>
+      > => {
+        const acknowledged: RpcResult<{
+          flushed: true
+          unconfirmedTerminals?: number | undefined
+        }> =
+          result.kind !== 'response'
+            ? { ok: false, error: result.error }
+            : result.response.type === 'runtime.shutdown.response'
+              ? result.response.result
+              : {
+                  ok: false,
+                  error: { code: 'INTERNAL', message: 'Unexpected shutdown acknowledgement.' },
+                }
+        this.dispose()
+        if (!(await cryptoJoined))
+          return {
+            ok: false,
+            error: {
+              code: 'UNCERTAIN',
+              message: 'Couldn’t confirm that background tasks exited cleanly.',
+            },
+          }
+        if (!(await this.agyStorageOperations.settlement(deadline)))
+          return {
+            ok: false,
+            error: {
+              code: 'UNCERTAIN',
+              message: 'Couldn’t confirm that background tasks exited cleanly.',
+            },
+          }
+        if (target && !(await this.waitForExit(target, deadline)))
+          return {
+            ok: false,
+            error: {
+              code: 'UNCERTAIN',
+              message: 'Couldn’t confirm that background tasks exited cleanly.',
+            },
+          }
+        return acknowledged
+      },
+    )
     return this.shutdownTask
   }
 
@@ -2543,6 +2789,8 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
     this.sessionNotificationListeners.clear()
     this.nativePresenceListeners.clear()
     this.nativeQuitRecentListeners.clear()
+    this.terminalOutputListeners.clear()
+    this.terminalStateListeners.clear()
     const target = this.child
     this.readyChild = undefined
     this.startupDeadline = undefined
@@ -2911,6 +3159,18 @@ class ElectronUtilityProcessClient implements UtilityProcessClient {
       }
       if (event.data.type === 'session.notification.event') {
         for (const listener of this.sessionNotificationListeners) listener(event.data.event)
+      }
+      if (event.data.type === 'terminal.output.event') {
+        for (const listener of this.terminalOutputListeners) listener(event.data.event)
+      }
+      if (event.data.type === 'terminal.state.event') {
+        const stateEvent = event.data.event
+        if (stateEvent.kind === 'removed') {
+          this.trackedTerminals.delete(stateEvent.terminalId)
+        } else {
+          this.trackedTerminals.set(stateEvent.terminal.id, stateEvent.terminal)
+        }
+        for (const listener of this.terminalStateListeners) listener(stateEvent)
       }
       return
     }

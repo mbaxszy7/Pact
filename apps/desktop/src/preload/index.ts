@@ -67,6 +67,29 @@ import {
   runtimePreparationGetInputSchema,
   sideChatSyncMainInputSchema,
   sideChatSyncMainReceiptSchema,
+  terminalAckOutputInputSchema,
+  terminalAckOutputResultSchema,
+  terminalCloseInputSchema,
+  terminalCloseResultSchema,
+  terminalCreateInputSchema,
+  terminalLastExitNoticeResultSchema,
+  terminalListInputSchema,
+  terminalListResultSchema,
+  terminalOutputEventSchema,
+  terminalReleaseProjectViewsInputSchema,
+  terminalReleaseProjectViewsResultSchema,
+  terminalResizeInputSchema,
+  terminalResizeResultSchema,
+  terminalSnapshotInputSchema,
+  terminalSnapshotResultSchema,
+  terminalStateEventSchema,
+  terminalSubscribeInputSchema,
+  terminalSubscribeResultSchema,
+  terminalSummarySchema,
+  terminalUnsubscribeInputSchema,
+  terminalUnsubscribeResultSchema,
+  terminalWriteInputSchema,
+  terminalWriteResultSchema,
 } from '@pact/contracts'
 
 import {
@@ -226,6 +249,18 @@ const onNativeQuitStateChanged = eventSubscription(
 const onSessionReminderChanged = eventSubscription(
   IPC_CHANNELS.sessionReminderChanged,
   sessionReminderStateSchema,
+  'business',
+)
+
+const onTerminalOutput = eventSubscription(
+  IPC_CHANNELS.terminalOutput,
+  terminalOutputEventSchema,
+  'business',
+)
+
+const onTerminalState = eventSubscription(
+  IPC_CHANNELS.terminalState,
+  terminalStateEventSchema,
   'business',
 )
 
@@ -571,6 +606,55 @@ const bridge: DesktopBridge = {
     rpcResultSchema(providerUsageCancelResultSchema).parse(
       await invoke(IPC_CHANNELS.providerUsageCancel, providerUsageCancelInputSchema.parse(input)),
     ),
+  listTerminals: async (input) =>
+    rpcResultSchema(terminalListResultSchema).parse(
+      await invoke(IPC_CHANNELS.terminalList, terminalListInputSchema.parse(input)),
+    ),
+  createTerminal: async (input) =>
+    rpcResultSchema(terminalSummarySchema).parse(
+      await invoke(IPC_CHANNELS.terminalCreate, terminalCreateInputSchema.parse(input)),
+    ),
+  subscribeTerminal: async (input) =>
+    rpcResultSchema(terminalSubscribeResultSchema).parse(
+      await invoke(IPC_CHANNELS.terminalSubscribe, terminalSubscribeInputSchema.parse(input)),
+    ),
+  unsubscribeTerminal: async (input) =>
+    rpcResultSchema(terminalUnsubscribeResultSchema).parse(
+      await invoke(IPC_CHANNELS.terminalUnsubscribe, terminalUnsubscribeInputSchema.parse(input)),
+    ),
+  ackTerminalOutput: async (input) =>
+    rpcResultSchema(terminalAckOutputResultSchema).parse(
+      await invoke(IPC_CHANNELS.terminalAckOutput, terminalAckOutputInputSchema.parse(input)),
+    ),
+  releaseProjectTerminalViews: async (input) =>
+    rpcResultSchema(terminalReleaseProjectViewsResultSchema).parse(
+      await invoke(
+        IPC_CHANNELS.terminalReleaseProjectViews,
+        terminalReleaseProjectViewsInputSchema.parse(input),
+      ),
+    ),
+  writeTerminal: async (input) =>
+    rpcResultSchema(terminalWriteResultSchema).parse(
+      await invoke(IPC_CHANNELS.terminalWrite, terminalWriteInputSchema.parse(input)),
+    ),
+  resizeTerminal: async (input) =>
+    rpcResultSchema(terminalResizeResultSchema).parse(
+      await invoke(IPC_CHANNELS.terminalResize, terminalResizeInputSchema.parse(input)),
+    ),
+  closeTerminal: async (input) =>
+    rpcResultSchema(terminalCloseResultSchema).parse(
+      await invoke(IPC_CHANNELS.terminalClose, terminalCloseInputSchema.parse(input)),
+    ),
+  readTerminalSnapshot: async (input) =>
+    rpcResultSchema(terminalSnapshotResultSchema).parse(
+      await invoke(IPC_CHANNELS.terminalReadSnapshot, terminalSnapshotInputSchema.parse(input)),
+    ),
+  consumeTerminalLastExitNotice: async () =>
+    rpcResultSchema(terminalLastExitNoticeResultSchema).parse(
+      await invoke(IPC_CHANNELS.terminalLastExitNotice),
+    ),
+  onTerminalOutput,
+  onTerminalState,
 }
 
 contextBridge.exposeInMainWorld('pact', bridge)

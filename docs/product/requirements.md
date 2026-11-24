@@ -669,11 +669,12 @@ Additional ordinary-conversation automatic timing policies, model-generated Summ
 ### Further artifacts and capabilities
 
 - Formal Requirements: background/goal/scenarios/scope/rules/interaction/constraints/acceptance/assumptions/questions/provenance/history; distinguish user decision, Agent inference, code evidence, agreement and unconfirmed proposal.
-- Derived Summary: goal, confirmed requirements, decisions, open questions, progress, next step with source versions/navigation. Never overwrite Journal/user decision/approved Plan.
-- Fuller Plan/amendment UI: objective/scope/assumptions/acceptance/tasks/dependencies/owners/files/verification/risks/questions; approval binds version and changed scope requires reapproval. Extend existing plan seam.
-- Decision UI: disagreement/both positions/evidence/tradeoffs/impact/recommendation and choose/request evidence/assign/defer. Native questions and natural review reports do not require a separate automatic Gate engine.
-- Test/Delivery results: actual commands/duration/exit/status/acceptance/files/risks/unknown/unrun scope. Unsupported Usage/cost is unavailable. Integrated terminal, arbitrary attachments and full test/delivery dashboard are not shipped.
-- Capabilities: namespaced Skill/MCP/Plugin source/version/status/snapshot time with honest Best effort metadata. External Context retains producing Agent/capability/sanitized result/time/expiry/source without sharing credentials/tools. Plugin management/config conversion is excluded.
+- Derived Summary: goal/decisions/questions/progress/next step with source links; never overwrite Journal/decisions/approved Plan.
+- Fuller Plan/amendment UI: objective/scope/assumptions/acceptance/tasks/dependencies/owners/verification/risks/questions; changed scope requires reapproval.
+- Decision UI: positions/evidence/tradeoffs/recommendation and choose/defer actions. Native questions/reviews do not require an automatic Gate engine.
+- Test/Delivery results: actual commands/duration/exit/status/acceptance/files/risks/unknowns. Arbitrary attachments and a full test/delivery dashboard are not shipped.
+- Integrated terminal (macOS/Windows): active non-archived Project PTY/ConPTY shell (`Ctrl+\``/header toggle), single-row 36 px tab bar (up to 8 App-wide and per-Project), resizable/maximizable panel preserved across Session/Project switches, blocking Project Archive until open terminals finish, tab-close confirmation for running processes, non-blocking graceful teardown on App Quit, and a count-only one-time startup notice on unconfirmed exit.
+- Capabilities: namespaced Skill/MCP/Plugin status with Best effort metadata. External Context keeps provenance/expiry without sharing credentials/tools. Plugin config conversion is excluded.
 
 Full Journal replay/disaster recovery requires versioned event envelopes, deterministic reducers, the last-applied per-Session sequence, verified projection checkpoints and bounded Journal reads. Normal startup can use a verified projection; missing/lagging/damaged projections replay the appropriate checkpoint and later facts. Retention/GC cannot discard facts referenced by a Session, Comment, artifact, Checkpoint or audit record. Current persisted projections and recovery checks do not establish this complete replay feature.
 

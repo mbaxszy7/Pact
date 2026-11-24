@@ -1,4 +1,4 @@
-import { Archive, Check, LoaderCircle, MessageSquare, X } from 'lucide-react'
+import { Archive, Check, LoaderCircle, MessageSquare, SquareTerminal, X } from 'lucide-react'
 import { useEffect, useId, useRef } from 'react'
 
 import type { WorkspaceArchivePreview, WorkspaceArchiveReceipt } from '@pact/contracts'
@@ -144,6 +144,24 @@ export function ArchiveConfirmation({
                 </li>
               )
             })}
+          </ul>
+        ) : null}
+        {preview.terminals && preview.terminals.length > 0 ? (
+          <ul className="pact-archive-tasks" aria-label="Affected Terminals">
+            {preview.terminals.map((terminal) => (
+              <li key={terminal.terminalId}>
+                <SquareTerminal
+                  aria-hidden="true"
+                  className="size-4 shrink-0 text-secondary"
+                  strokeWidth={1.75}
+                />
+                <span className="pact-archive-task-title text-body">{terminal.title}</span>
+                <span className="pact-archive-task-state text-caption text-secondary">
+                  {terminal.foregroundCommand ??
+                    (terminal.hasActiveChild ? 'Active command' : 'Open shell')}
+                </span>
+              </li>
+            ))}
           </ul>
         ) : null}
         {error || receipt?.message ? (

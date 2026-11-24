@@ -125,6 +125,13 @@ export const diagnosticRequestTypeSchema = z.enum([
   'side-chat.discard-empty.request',
   'side-chat.sync-main.request',
   'side-chat.sync-main-receipt.request',
+  'terminal.list.request',
+  'terminal.create.request',
+  'terminal.visibility.request',
+  'terminal.write.request',
+  'terminal.resize.request',
+  'terminal.close.request',
+  'terminal.snapshot.request',
 ])
 export const diagnosticNativeMethodSchema = z.enum([
   'initialize',
