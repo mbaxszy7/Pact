@@ -715,6 +715,10 @@ export class AgyAcpConnection {
     return this.taintError
   }
 
+  get closeReason(): Error | undefined {
+    return this.taintError ?? this.closeError
+  }
+
   get workingMemoryBytes(): number {
     return this.memory.bytes
   }
@@ -1212,6 +1216,7 @@ export class AgyAcpConnection {
     return {
       updateSessionId: (sessionId: string | undefined) => {
         entry.knownSessionId = sessionId
+        this.updateStdoutPause()
       },
       dispose: () => {
         if (this.serverRequestOwners.get(input.ownerId) === entry) {
@@ -1289,6 +1294,7 @@ export class AgyAcpConnection {
       )
     } else {
       this.sessionConsumers.set(sessionId, consumer)
+      this.updateStdoutPause()
     }
 
     const abandon = (): void => {
@@ -1487,6 +1493,7 @@ export class AgyAcpConnection {
   ): void {
     if (consumer.abandoned || consumer.producerSealed) return
     consumer.producerSealed = true
+    this.updateStdoutPause()
     const endItem: Extract<AgyIngress, { kind: 'end' }> = {
       kind: 'end',
       seq: ++this.nextInboundSeq,
@@ -2683,11 +2690,25 @@ export class AgyAcpConnection {
     this.updateStdoutPause()
   }
 
+  private hasDirectServerRequestOwner(): boolean {
+    for (const owner of this.serverRequestOwners.values()) {
+      const consumer =
+        owner.knownSessionId !== undefined
+          ? this.sessionConsumers.get(owner.knownSessionId)
+          : undefined
+      const routedViaOrderedStream = Boolean(
+        consumer && consumer.ordered && !consumer.abandoned && !consumer.producerSealed,
+      )
+      if (!routedViaOrderedStream) return true
+    }
+    return false
+  }
+
   private updateStdoutPause(): void {
     const canWaitForConsumer =
       this.pendingRequests.size === 0 &&
       this.serverRequestListeners.size === 0 &&
-      this.serverRequestOwners.size === 0
+      !this.hasDirectServerRequestOwner()
     const queued = this.queuedInboundCount
     this.notificationQueuePaused =
       !this.closed &&

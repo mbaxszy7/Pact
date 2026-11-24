@@ -3760,7 +3760,7 @@ export function inspectAgyTrajectory(input: AgyColdInspectionInput): AgyColdInsp
       canonicalRoot,
       parentSegments: ['conversations'],
       leafName: `${input.nativeSessionId}.db`,
-      maxSnapshotBytes: AGY_MAX_HISTORY_BYTES,
+      maxSnapshotBytes: MAX_FALLBACK_SNAPSHOT_TOTAL_BYTES,
       ...(input.signal !== undefined ? { signal: input.signal } : {}),
       ...(input.deadlineAt !== undefined ? { deadlineAt: input.deadlineAt } : {}),
     })
@@ -3824,7 +3824,8 @@ export function inspectAgyTrajectory(input: AgyColdInspectionInput): AgyColdInsp
       throw new Error('Invalid Antigravity execution_id.')
     }
 
-    // Enforce BLOB byte budgets BEFORE full row hydration!
+    // Enforce executor_metadata BLOB budget BEFORE hydration, while streaming steps
+    // per-execution instead of charging all historical turns against the 8 MiB text budget.
     const preflightExecBytes = measureTableColumnsTotalBytes(db, 'executor_metadata', ['data'])
     if (preflightExecBytes > AGY_MAX_HISTORY_BYTES) {
       throw new AgentExecutionError(
@@ -3833,28 +3834,16 @@ export function inspectAgyTrajectory(input: AgyColdInspectionInput): AgyColdInsp
         false,
       )
     }
-    const preflightStepBytes = measureTableColumnsTotalBytes(db, 'steps', [
-      'metadata',
-      schema.stepPayloadColumn,
-    ])
-    if (preflightExecBytes + preflightStepBytes > AGY_MAX_HISTORY_BYTES) {
-      throw new AgentExecutionError(
-        'response_too_large',
-        'Antigravity steps exceed the 32 MiB history budget.',
-        false,
-      )
-    }
 
-    let totalBlobBytes = 0
-    let imageBytes = 0
+    let totalExecBytes = 0
     const execStmt = db.prepare<[], { idx: number; data: Buffer }>(
       'SELECT idx, data FROM "executor_metadata" ORDER BY idx ASC',
     )
     const execByExecutionId = new Map<string, DecodedExecutorMetadata>()
     for (const row of execStmt.iterate()) {
       if (!Buffer.isBuffer(row.data)) throw new Error('Invalid executor_metadata.data BLOB.')
-      totalBlobBytes += row.data.byteLength
-      if (totalBlobBytes > AGY_MAX_HISTORY_BYTES) {
+      totalExecBytes += row.data.byteLength
+      if (totalExecBytes > AGY_MAX_HISTORY_BYTES) {
         throw new AgentExecutionError(
           'response_too_large',
           'Antigravity executor_metadata exceeds read budget.',
@@ -3871,11 +3860,27 @@ export function inspectAgyTrajectory(input: AgyColdInspectionInput): AgyColdInsp
     }
 
     const stepPayloadSql = quoteSqlIdentifier(schema.stepPayloadColumn)
-    const stepSelectSql = schema.hasStepFormatColumn
-      ? `SELECT idx, step_type, status, has_subtrajectory, metadata, ${stepPayloadSql} AS step_blob, step_format FROM "steps" ORDER BY idx ASC`
-      : `SELECT idx, step_type, status, has_subtrajectory, metadata, ${stepPayloadSql} AS step_blob FROM "steps" ORDER BY idx ASC`
-    const stepStmt = db.prepare<
+    const headerSelectSql = schema.hasStepFormatColumn
+      ? `SELECT idx, step_type, status, metadata, typeof(${stepPayloadSql}) AS payload_type, LENGTH(${stepPayloadSql}) AS payload_len, step_format FROM "steps" ORDER BY idx ASC`
+      : `SELECT idx, step_type, status, metadata, typeof(${stepPayloadSql}) AS payload_type, LENGTH(${stepPayloadSql}) AS payload_len FROM "steps" ORDER BY idx ASC`
+    const headerStmt = db.prepare<
       [],
+      {
+        idx: number
+        step_type: number
+        status: number
+        metadata: Buffer | null
+        payload_type: string
+        payload_len: number | null
+        step_format?: unknown
+      }
+    >(headerSelectSql)
+
+    const fullStepSelectSql = schema.hasStepFormatColumn
+      ? `SELECT idx, step_type, status, has_subtrajectory, metadata, ${stepPayloadSql} AS step_blob, step_format FROM "steps" WHERE idx = ?`
+      : `SELECT idx, step_type, status, has_subtrajectory, metadata, ${stepPayloadSql} AS step_blob FROM "steps" WHERE idx = ?`
+    const fullStepByIdxStmt = db.prepare<
+      [number],
       {
         idx: number
         step_type: number
@@ -3885,24 +3890,18 @@ export function inspectAgyTrajectory(input: AgyColdInspectionInput): AgyColdInsp
         step_blob: Buffer | null
         step_format?: unknown
       }
-    >(stepSelectSql)
+    >(fullStepSelectSql)
 
     const artifactOps: ParsedArtifactStepOp[] = []
+    let retainedArtifactOpBytes = 0
     const seenStepExecutionIds = new Set<string>()
+    const stepExecutionIds: Array<string | undefined> = []
+    const stepPayloadLengths: number[] = []
     const rootUserSeenExecutions = new Set<string>()
     const pactRunMatchedExecutions = new Set<string>()
-    const inspectedSteps: Array<{
-      idx: number
-      stepType: number
-      status: number
-      columnPayloadMatches: boolean
-      decodedStep: DecodedAgyStep
-      meta: DecodedCortexStepMetadata
-      pactIdentity?: ExtractedPactPromptIdentity
-    }> = []
 
     let expectedIdx = 0
-    for (const row of stepStmt.iterate()) {
+    for (const row of headerStmt.iterate()) {
       if ((expectedIdx & 0x3f) === 0) {
         assertIdentityNotCancelledOrExpired(input.signal, input.deadlineAt)
       }
@@ -3910,28 +3909,16 @@ export function inspectAgyTrajectory(input: AgyColdInspectionInput): AgyColdInsp
         throw new Error('Antigravity steps table has a non-contiguous step index gap.')
       }
       assertCompatibleStepRowFormat(row.step_format, schema.hasStepFormatColumn, row.idx)
-      if (!Buffer.isBuffer(row.step_blob)) {
+      if (
+        row.payload_type !== 'blob' ||
+        typeof row.payload_len !== 'number' ||
+        row.payload_len < 0
+      ) {
         throw new Error(
           `Antigravity step ${row.idx} is missing its ${schema.stepPayloadColumn} BLOB.`,
         )
       }
-      totalBlobBytes += row.step_blob.byteLength + (row.metadata?.byteLength ?? 0)
-      const decodedStep = decodeAgyStep(row.step_blob)
-      const columnPayloadMatches =
-        decodedStep.type === row.step_type && decodedStep.status === row.status
-      if (decodedStep.userInput) {
-        for (const media of decodedStep.userInput.media) {
-          imageBytes += media.inlineData?.byteLength ?? 0
-        }
-      }
-      if (totalBlobBytes > AGY_MAX_HISTORY_BYTES) {
-        throw new AgentExecutionError(
-          'response_too_large',
-          'Antigravity steps exceed the 32 MiB history budget.',
-          false,
-        )
-      }
-      if (totalBlobBytes - imageBytes > AGY_TEXT_BUDGET_BYTES) {
+      if ((row.metadata?.byteLength ?? 0) > AGY_TEXT_BUDGET_BYTES) {
         throw new AgentExecutionError(
           'response_too_large',
           'Antigravity text/metadata exceeds the 8 MiB inspection budget.',
@@ -3939,49 +3926,179 @@ export function inspectAgyTrajectory(input: AgyColdInspectionInput): AgyColdInsp
         )
       }
 
-      const meta = extractEffectiveStepMetadata(row.metadata, decodedStep)
-      if (meta.executionId) {
-        seenStepExecutionIds.add(meta.executionId)
-      }
-      if (input.includePlan && columnPayloadMatches) {
-        const parsedOp = parseArtifactOperationFromStep(
-          row.idx,
-          row.status,
-          decodedStep,
-          meta,
-          canonicalRoot,
-          input.nativeSessionId,
-          configuredRoot,
-        )
-        if (parsedOp) artifactOps.push(parsedOp)
+      const columnMeta =
+        row.metadata && row.metadata.length > 0 ? decodeCortexStepMetadata(row.metadata) : undefined
+      const isUserInput = row.step_type === CORTEX_STEP_TYPE_USER_INPUT
+      const needsPayloadMeta = !columnMeta?.executionId
+
+      let execId: string | undefined
+      if (isUserInput || needsPayloadMeta) {
+        if (row.payload_len > AGY_MAX_HISTORY_BYTES) {
+          throw new AgentExecutionError(
+            'response_too_large',
+            'Antigravity steps exceed the 32 MiB history budget.',
+            false,
+          )
+        }
+        const bounded =
+          row.payload_len > 0
+            ? readBoundedStepMetadataAndUserIdentity(
+                db,
+                stepPayloadSql,
+                row.idx,
+                row.payload_len,
+                isUserInput,
+                { bytes: AGY_TEXT_BUDGET_BYTES },
+              )
+            : {}
+        const payloadMeta = bounded.payloadMeta
+        if (!columnMeta && !payloadMeta) {
+          throw new Error('Antigravity step is missing CortexStepMetadata.')
+        }
+        if (
+          columnMeta?.executionId &&
+          payloadMeta?.executionId &&
+          columnMeta.executionId !== payloadMeta.executionId
+        ) {
+          throw new Error(
+            'Antigravity step column metadata and payload metadata execution_id disagree.',
+          )
+        }
+        if (columnMeta?.stepId && payloadMeta?.stepId && columnMeta.stepId !== payloadMeta.stepId) {
+          throw new Error('Antigravity step column metadata and payload metadata step_id disagree.')
+        }
+        execId = columnMeta?.executionId ?? payloadMeta?.executionId
+        if (
+          isUserInput &&
+          bounded.stepType === CORTEX_STEP_TYPE_USER_INPUT &&
+          bounded.hasUserInput
+        ) {
+          const pactRunId = bounded.userIdentity?.pactRunId
+          if (execId && !rootUserSeenExecutions.has(execId)) {
+            rootUserSeenExecutions.add(execId)
+            if (pactRunId === input.nativeTurnId) {
+              pactRunMatchedExecutions.add(execId)
+            }
+          } else if (execId && pactRunId === input.nativeTurnId) {
+            throw new Error('Antigravity non-root user input unexpectedly carries root pactRunId.')
+          }
+        }
+      } else {
+        execId = columnMeta.executionId
       }
 
-      let pactIdentity: ExtractedPactPromptIdentity | undefined
-      if (
-        row.step_type === CORTEX_STEP_TYPE_USER_INPUT &&
-        decodedStep.type === CORTEX_STEP_TYPE_USER_INPUT &&
-        decodedStep.userInput
-      ) {
-        pactIdentity = extractPactPromptIdentity(decodedStep.userInput.text)
-        if (meta.executionId && !rootUserSeenExecutions.has(meta.executionId)) {
-          rootUserSeenExecutions.add(meta.executionId)
-          if (pactIdentity.pactRunId === input.nativeTurnId) {
-            pactRunMatchedExecutions.add(meta.executionId)
+      stepExecutionIds.push(execId)
+      stepPayloadLengths.push(row.payload_len)
+      if (execId) {
+        seenStepExecutionIds.add(execId)
+      }
+
+      if (input.includePlan) {
+        const colCall = columnMeta?.modifiedToolCall ?? columnMeta?.toolCall
+        let isPlanCandidate = false
+        if (colCall !== undefined) {
+          if (colCall.name === 'write_file' || colCall.name === 'edit_file') {
+            if (!colCall.argumentsJson) {
+              isPlanCandidate = true
+            } else {
+              let parsedArgs: unknown
+              try {
+                parsedArgs = JSON.parse(colCall.argumentsJson)
+              } catch {
+                parsedArgs = undefined
+              }
+              if (isPlainObject(parsedArgs)) {
+                const rawPath =
+                  (typeof parsedArgs['Path'] === 'string' ? parsedArgs['Path'] : undefined) ??
+                  (typeof parsedArgs['path'] === 'string' ? parsedArgs['path'] : undefined) ??
+                  (typeof parsedArgs['TargetFile'] === 'string'
+                    ? parsedArgs['TargetFile']
+                    : undefined) ??
+                  (typeof parsedArgs['targetFile'] === 'string'
+                    ? parsedArgs['targetFile']
+                    : undefined)
+                isPlanCandidate =
+                  rawPath === undefined ||
+                  resolveBrainMarkdownPath(
+                    rawPath,
+                    canonicalRoot,
+                    input.nativeSessionId,
+                    configuredRoot,
+                  ) !== undefined
+              }
+            }
           }
-        } else if (meta.executionId && pactIdentity.pactRunId === input.nativeTurnId) {
-          throw new Error('Antigravity non-root user input unexpectedly carries root pactRunId.')
+        } else {
+          isPlanCandidate =
+            row.step_type !== CORTEX_STEP_TYPE_USER_INPUT &&
+            row.step_type !== CORTEX_STEP_TYPE_PLANNER_RESPONSE
+        }
+        if (isPlanCandidate) {
+          if (row.payload_len > AGY_MAX_HISTORY_BYTES) {
+            throw new AgentExecutionError(
+              'response_too_large',
+              'Antigravity steps exceed the 32 MiB history budget.',
+              false,
+            )
+          }
+          const fullRow = fullStepByIdxStmt.get(row.idx)
+          if (!fullRow || !Buffer.isBuffer(fullRow.step_blob)) {
+            throw new Error(
+              `Antigravity step ${row.idx} is missing its ${schema.stepPayloadColumn} BLOB.`,
+            )
+          }
+          const decodedStep = decodeAgyStep(fullRow.step_blob)
+          let stepImageBytes = 0
+          if (decodedStep.userInput) {
+            for (const media of decodedStep.userInput.media) {
+              stepImageBytes += media.inlineData?.byteLength ?? 0
+            }
+          }
+          if (
+            fullRow.step_blob.byteLength + (fullRow.metadata?.byteLength ?? 0) - stepImageBytes >
+            AGY_TEXT_BUDGET_BYTES
+          ) {
+            throw new AgentExecutionError(
+              'response_too_large',
+              'Antigravity text/metadata exceeds the 8 MiB inspection budget.',
+              false,
+            )
+          }
+          const columnPayloadMatches =
+            decodedStep.type === fullRow.step_type && decodedStep.status === fullRow.status
+          const meta = extractEffectiveStepMetadata(fullRow.metadata, decodedStep)
+          if (columnPayloadMatches) {
+            const parsedOp = parseArtifactOperationFromStep(
+              fullRow.idx,
+              fullRow.status,
+              decodedStep,
+              meta,
+              canonicalRoot,
+              input.nativeSessionId,
+              configuredRoot,
+            )
+            if (parsedOp) {
+              retainedArtifactOpBytes +=
+                Buffer.byteLength(parsedOp.executionId, 'utf8') +
+                Buffer.byteLength(parsedOp.nativeId, 'utf8') +
+                Buffer.byteLength(parsedOp.filePath, 'utf8') +
+                Buffer.byteLength(parsedOp.content ?? '', 'utf8') +
+                Buffer.byteLength(parsedOp.target ?? '', 'utf8') +
+                Buffer.byteLength(parsedOp.replacement ?? '', 'utf8') +
+                128
+              if (retainedArtifactOpBytes > AGY_TEXT_BUDGET_BYTES) {
+                throw new AgentExecutionError(
+                  'response_too_large',
+                  'Antigravity text/metadata exceeds the 8 MiB inspection budget.',
+                  false,
+                )
+              }
+              artifactOps.push(parsedOp)
+            }
+          }
         }
       }
 
-      inspectedSteps.push({
-        idx: row.idx,
-        stepType: row.step_type,
-        status: row.status,
-        columnPayloadMatches,
-        decodedStep,
-        meta,
-        ...(pactIdentity ? { pactIdentity } : {}),
-      })
       expectedIdx += 1
     }
 
@@ -4013,8 +4130,17 @@ export function inspectAgyTrajectory(input: AgyColdInspectionInput): AgyColdInsp
     }
 
     const matchedExec = execByExecutionId.get(resolvedExecutionId)
+    const lastStepIdx = matchedExec?.lastStepIdx
+    const targetStepIndices: number[] = []
+    for (let idx = 0; idx < expectedIdx; idx += 1) {
+      if (stepExecutionIds[idx] === resolvedExecutionId || idx === lastStepIdx) {
+        targetStepIndices.push(idx)
+      }
+    }
+
     const consumedInputs: AgyConsumedInputReceipt[] = []
     const plannerItems: Array<{ id: string; text: string }> = []
+    let retainedPlannerBytes = 0
     let hasCompletedPactPublishPlan = false
     const completedPactPublishPlanTokens: string[] = []
     const completedPactPublishPlanCalls: AgyCompletedPactPublishPlanCall[] = []
@@ -4024,17 +4150,75 @@ export function inspectAgyTrajectory(input: AgyColdInspectionInput): AgyColdInsp
     let hasCanceledStep = false
     let hasFailedCoreStep = false
     let hasMetadataContradiction = false
+    let lastStepSummary:
+      | {
+          readonly columnPayloadMatches: boolean
+          readonly executionId: string | undefined
+          readonly status: number
+          readonly decodedStatus: number
+          readonly hasError: boolean
+          readonly genericHasError: boolean
+        }
+      | undefined
 
-    for (const step of inspectedSteps) {
-      if (step.meta.executionId !== resolvedExecutionId) continue
+    for (let pos = 0; pos < targetStepIndices.length; pos += 1) {
+      if ((pos & 0x3f) === 0) {
+        assertIdentityNotCancelledOrExpired(input.signal, input.deadlineAt)
+      }
+      const idx = targetStepIndices[pos]!
+      const payloadLen = stepPayloadLengths[idx] ?? 0
+      if (payloadLen > AGY_MAX_HISTORY_BYTES) {
+        throw new AgentExecutionError(
+          'response_too_large',
+          'Antigravity steps exceed the 32 MiB history budget.',
+          false,
+        )
+      }
+      const fullRow = fullStepByIdxStmt.get(idx)
+      if (!fullRow || !Buffer.isBuffer(fullRow.step_blob)) {
+        throw new Error(`Antigravity step ${idx} is missing its ${schema.stepPayloadColumn} BLOB.`)
+      }
+      const decodedStep = decodeAgyStep(fullRow.step_blob)
+      let stepImageBytes = 0
+      if (decodedStep.userInput) {
+        for (const media of decodedStep.userInput.media) {
+          stepImageBytes += media.inlineData?.byteLength ?? 0
+        }
+      }
+      if (
+        fullRow.step_blob.byteLength + (fullRow.metadata?.byteLength ?? 0) - stepImageBytes >
+        AGY_TEXT_BUDGET_BYTES
+      ) {
+        throw new AgentExecutionError(
+          'response_too_large',
+          'Antigravity text/metadata exceeds the 8 MiB inspection budget.',
+          false,
+        )
+      }
+      const columnPayloadMatches =
+        decodedStep.type === fullRow.step_type && decodedStep.status === fullRow.status
+      const meta = extractEffectiveStepMetadata(fullRow.metadata, decodedStep)
+
+      if (idx === lastStepIdx) {
+        lastStepSummary = {
+          columnPayloadMatches,
+          executionId: meta.executionId,
+          status: fullRow.status,
+          decodedStatus: decodedStep.status,
+          hasError: decodedStep.hasError,
+          genericHasError: decodedStep.genericHasError,
+        }
+      }
+      if (meta.executionId !== resolvedExecutionId) continue
+
       seenExecutionSteps += 1
-      if (step.idx > maxSeenExecutionStepIdx) maxSeenExecutionStepIdx = step.idx
+      if (fullRow.idx > maxSeenExecutionStepIdx) maxSeenExecutionStepIdx = fullRow.idx
 
       const publishPlanEntry = extractCompletedPactPublishPlanStepCall(
-        step.meta,
-        step.status,
-        step.decodedStep,
-        step.columnPayloadMatches,
+        meta,
+        fullRow.status,
+        decodedStep,
+        columnPayloadMatches,
       )
       if (publishPlanEntry !== undefined) {
         hasCompletedPactPublishPlan = true
@@ -4064,7 +4248,7 @@ export function inspectAgyTrajectory(input: AgyColdInspectionInput): AgyColdInsp
         }
       }
 
-      if (!step.columnPayloadMatches) {
+      if (!columnPayloadMatches) {
         hasMetadataContradiction = true
         hasActiveStep = true
       }
@@ -4076,51 +4260,61 @@ export function inspectAgyTrajectory(input: AgyColdInspectionInput): AgyColdInsp
           CORTEX_STEP_STATUS_GENERATING,
           CORTEX_STEP_STATUS_WAITING,
           CORTEX_STEP_STATUS_QUEUED,
-        ].includes(step.status)
+        ].includes(fullRow.status)
       ) {
         hasActiveStep = true
       } else if (
-        step.status === CORTEX_STEP_STATUS_CANCELED ||
-        step.status === CORTEX_STEP_STATUS_INTERRUPTED
+        fullRow.status === CORTEX_STEP_STATUS_CANCELED ||
+        fullRow.status === CORTEX_STEP_STATUS_INTERRUPTED
       ) {
         hasCanceledStep = true
       } else if (
-        (step.stepType === CORTEX_STEP_TYPE_USER_INPUT ||
-          step.stepType === CORTEX_STEP_TYPE_PLANNER_RESPONSE) &&
-        (step.status === CORTEX_STEP_STATUS_ERROR ||
-          step.status === CORTEX_STEP_STATUS_INVALID ||
-          step.decodedStep.hasError)
+        (fullRow.step_type === CORTEX_STEP_TYPE_USER_INPUT ||
+          fullRow.step_type === CORTEX_STEP_TYPE_PLANNER_RESPONSE) &&
+        (fullRow.status === CORTEX_STEP_STATUS_ERROR ||
+          fullRow.status === CORTEX_STEP_STATUS_INVALID ||
+          decodedStep.hasError)
       ) {
         hasFailedCoreStep = true
       }
 
       if (
-        step.columnPayloadMatches &&
-        step.stepType === CORTEX_STEP_TYPE_USER_INPUT &&
-        step.status === CORTEX_STEP_STATUS_DONE &&
-        step.decodedStep.userInput
+        columnPayloadMatches &&
+        fullRow.step_type === CORTEX_STEP_TYPE_USER_INPUT &&
+        fullRow.status === CORTEX_STEP_STATUS_DONE &&
+        decodedStep.userInput
       ) {
+        const pactIdentity = extractPactPromptIdentity(decodedStep.userInput.text)
         consumedInputs.push({
-          stepIndex: step.idx,
-          ...(step.meta.stepId ? { stepId: step.meta.stepId } : {}),
-          ...(step.decodedStep.userInput.clientMessageId
-            ? { clientMessageId: step.decodedStep.userInput.clientMessageId }
+          stepIndex: fullRow.idx,
+          ...(meta.stepId ? { stepId: meta.stepId } : {}),
+          ...(decodedStep.userInput.clientMessageId
+            ? { clientMessageId: decodedStep.userInput.clientMessageId }
             : {}),
-          ...(step.pactIdentity?.messageId ? { pactMessageId: step.pactIdentity.messageId } : {}),
-          ...(step.pactIdentity?.pactRunId ? { pactRunId: step.pactIdentity.pactRunId } : {}),
-          textSha256: sha256Hex(step.decodedStep.userInput.text),
+          ...(pactIdentity.messageId ? { pactMessageId: pactIdentity.messageId } : {}),
+          ...(pactIdentity.pactRunId ? { pactRunId: pactIdentity.pactRunId } : {}),
+          textSha256: sha256Hex(decodedStep.userInput.text),
         })
       } else if (
-        step.stepType === CORTEX_STEP_TYPE_PLANNER_RESPONSE &&
-        step.decodedStep.type === CORTEX_STEP_TYPE_PLANNER_RESPONSE &&
-        step.decodedStep.plannerResponse &&
-        step.decodedStep.plannerResponse.canonicalText.length > 0 &&
-        step.status !== CORTEX_STEP_STATUS_INVALID &&
-        step.decodedStep.status !== CORTEX_STEP_STATUS_INVALID
+        fullRow.step_type === CORTEX_STEP_TYPE_PLANNER_RESPONSE &&
+        decodedStep.type === CORTEX_STEP_TYPE_PLANNER_RESPONSE &&
+        decodedStep.plannerResponse &&
+        decodedStep.plannerResponse.canonicalText.length > 0 &&
+        fullRow.status !== CORTEX_STEP_STATUS_INVALID &&
+        decodedStep.status !== CORTEX_STEP_STATUS_INVALID
       ) {
+        retainedPlannerBytes +=
+          Buffer.byteLength(decodedStep.plannerResponse.canonicalText, 'utf8') + 128
+        if (retainedPlannerBytes > AGY_TEXT_BUDGET_BYTES) {
+          throw new AgentExecutionError(
+            'response_too_large',
+            'Antigravity text/metadata exceeds the 8 MiB inspection budget.',
+            false,
+          )
+        }
         plannerItems.push({
-          id: step.meta.stepId ?? `step:${step.idx}`,
-          text: step.decodedStep.plannerResponse.canonicalText,
+          id: meta.stepId ?? `step:${fullRow.idx}`,
+          text: decodedStep.plannerResponse.canonicalText,
         })
       }
     }
@@ -4136,21 +4330,19 @@ export function inspectAgyTrajectory(input: AgyColdInspectionInput): AgyColdInsp
       }
     }
 
-    const lastStepRow =
-      matchedExec?.lastStepIdx !== undefined ? inspectedSteps[matchedExec.lastStepIdx] : undefined
     const storedTerminalComplete =
       !hasMetadataContradiction &&
       seenExecutionSteps > 0 &&
       consumedInputs.length > 0 &&
-      matchedExec?.lastStepIdx !== undefined &&
-      lastStepRow !== undefined &&
-      lastStepRow.columnPayloadMatches &&
-      lastStepRow.meta.executionId === resolvedExecutionId &&
-      maxSeenExecutionStepIdx === matchedExec.lastStepIdx &&
-      lastStepRow.status === CORTEX_STEP_STATUS_DONE &&
-      lastStepRow.decodedStep.status === CORTEX_STEP_STATUS_DONE &&
-      !lastStepRow.decodedStep.hasError &&
-      !lastStepRow.decodedStep.genericHasError
+      lastStepIdx !== undefined &&
+      lastStepSummary !== undefined &&
+      lastStepSummary.columnPayloadMatches &&
+      lastStepSummary.executionId === resolvedExecutionId &&
+      maxSeenExecutionStepIdx === lastStepIdx &&
+      lastStepSummary.status === CORTEX_STEP_STATUS_DONE &&
+      lastStepSummary.decodedStatus === CORTEX_STEP_STATUS_DONE &&
+      !lastStepSummary.hasError &&
+      !lastStepSummary.genericHasError
 
     let status: 'completed' | 'failed' | 'canceled' | 'running'
     if (hasMetadataContradiction) {
@@ -6259,6 +6451,8 @@ function readBoundedStepMetadataAndUserIdentity(
   wantUserIdentity: boolean,
   remainingLargeUserTextBudget: { bytes: number },
 ): {
+  stepType?: number | undefined
+  hasUserInput?: boolean | undefined
   payloadMeta?: DecodedCortexStepMetadata | undefined
   userIdentity?: ExtractedPactPromptIdentity | undefined
 } {
@@ -6281,6 +6475,8 @@ function readBoundedStepMetadataAndUserIdentity(
     return row.chunk
   }
 
+  let stepType: number | undefined
+  let hasUserInput = false
   let payloadMeta: DecodedCortexStepMetadata | undefined
   let userIdentity: ExtractedPactPromptIdentity | undefined
   let pos = 0
@@ -6297,6 +6493,9 @@ function readBoundedStepMetadataAndUserIdentity(
 
     if (wireType === PROTOBUF_WIRE_VARINT) {
       const valRead = readVarint(headerWindow, tagRead.nextOffset)
+      if (fieldNumber === 1) {
+        stepType = toSafeInt32(valRead.value, 'Step.type')
+      }
       pos += valRead.nextOffset
     } else if (wireType === PROTOBUF_WIRE_FIXED64) {
       if (pos + tagRead.nextOffset + 8 > totalBlobLen) {
@@ -6324,99 +6523,104 @@ function readBoundedStepMetadataAndUserIdentity(
           )
         }
         payloadMeta = decodeCortexStepMetadata(readSlice(dataStart, byteLen))
-      } else if (wantUserIdentity && fieldNumber === 19 && byteLen > 0) {
-        let innerPos = dataStart
-        const innerEnd = dataStart + byteLen
-        let userResponseTail: string | undefined
-        let userResponseFullRange: { offset: number; length: number } | undefined
-        const smallItemTexts: string[] = []
-        const largeItemRanges: Array<{ offset: number; length: number }> = []
-        while (innerPos < innerEnd) {
-          const innerWin = readSlice(innerPos, Math.min(32, innerEnd - innerPos))
-          const iTag = readVarint(innerWin, 0)
-          const iWire = Number(iTag.value & 0x07n)
-          const iFieldBig = iTag.value >> 3n
-          if (iFieldBig <= 0n || iFieldBig > BigInt(MAX_PROTOBUF_FIELD_NUMBER)) {
-            throw new Error(`Invalid nested Protobuf field in Antigravity user step ${idx}.`)
-          }
-          const iField = Number(iFieldBig)
-          if (iWire === PROTOBUF_WIRE_VARINT) {
-            const iVal = readVarint(innerWin, iTag.nextOffset)
-            innerPos += iVal.nextOffset
-          } else if (iWire === PROTOBUF_WIRE_FIXED64) {
-            if (innerPos + iTag.nextOffset + 8 > innerEnd) {
-              throw new Error(`Truncated nested fixed64 in Antigravity user step ${idx}.`)
+      } else if (fieldNumber === 19) {
+        hasUserInput = true
+        if (wantUserIdentity && byteLen > 0) {
+          let innerPos = dataStart
+          const innerEnd = dataStart + byteLen
+          let userResponseTail: string | undefined
+          let userResponseFullRange: { offset: number; length: number } | undefined
+          const smallItemTexts: string[] = []
+          const largeItemRanges: Array<{ offset: number; length: number }> = []
+          while (innerPos < innerEnd) {
+            const innerWin = readSlice(innerPos, Math.min(32, innerEnd - innerPos))
+            const iTag = readVarint(innerWin, 0)
+            const iWire = Number(iTag.value & 0x07n)
+            const iFieldBig = iTag.value >> 3n
+            if (iFieldBig <= 0n || iFieldBig > BigInt(MAX_PROTOBUF_FIELD_NUMBER)) {
+              throw new Error(`Invalid nested Protobuf field in Antigravity user step ${idx}.`)
             }
-            innerPos += iTag.nextOffset + 8
-          } else if (iWire === PROTOBUF_WIRE_FIXED32) {
-            if (innerPos + iTag.nextOffset + 4 > innerEnd) {
-              throw new Error(`Truncated nested fixed32 in Antigravity user step ${idx}.`)
-            }
-            innerPos += iTag.nextOffset + 4
-          } else if (iWire === PROTOBUF_WIRE_BYTES) {
-            const iLenRead = readVarint(innerWin, iTag.nextOffset)
-            const iLen = Number(iLenRead.value)
-            const iDataStart = innerPos + iLenRead.nextOffset
-            if (iLen < 0 || iDataStart + iLen > innerEnd) {
-              throw new Error(`Truncated nested bytes in Antigravity user step ${idx}.`)
-            }
-            if (iField === 2 && iLen > 0) {
-              const tailLen = Math.min(iLen, BOUNDED_USER_TAIL_BYTES)
-              const tailSlice = readSlice(iDataStart + (iLen - tailLen), tailLen)
-              userResponseTail = decodeUtf8TailWindow(tailSlice, iLen > tailLen)
-              if (iLen > tailLen) {
-                userResponseFullRange = { offset: iDataStart, length: iLen }
+            const iField = Number(iFieldBig)
+            if (iWire === PROTOBUF_WIRE_VARINT) {
+              const iVal = readVarint(innerWin, iTag.nextOffset)
+              innerPos += iVal.nextOffset
+            } else if (iWire === PROTOBUF_WIRE_FIXED64) {
+              if (innerPos + iTag.nextOffset + 8 > innerEnd) {
+                throw new Error(`Truncated nested fixed64 in Antigravity user step ${idx}.`)
               }
-            } else if (iField === 3 && iLen > 0) {
-              if (iLen <= BOUNDED_USER_TAIL_BYTES) {
-                smallItemTexts.push(decodeTextOrScopeItem(readSlice(iDataStart, iLen)))
-              } else {
-                largeItemRanges.push({ offset: iDataStart, length: iLen })
+              innerPos += iTag.nextOffset + 8
+            } else if (iWire === PROTOBUF_WIRE_FIXED32) {
+              if (innerPos + iTag.nextOffset + 4 > innerEnd) {
+                throw new Error(`Truncated nested fixed32 in Antigravity user step ${idx}.`)
               }
+              innerPos += iTag.nextOffset + 4
+            } else if (iWire === PROTOBUF_WIRE_BYTES) {
+              const iLenRead = readVarint(innerWin, iTag.nextOffset)
+              const iLen = Number(iLenRead.value)
+              const iDataStart = innerPos + iLenRead.nextOffset
+              if (iLen < 0 || iDataStart + iLen > innerEnd) {
+                throw new Error(`Truncated nested bytes in Antigravity user step ${idx}.`)
+              }
+              if (iField === 2 && iLen > 0) {
+                const tailLen = Math.min(iLen, BOUNDED_USER_TAIL_BYTES)
+                const tailSlice = readSlice(iDataStart + (iLen - tailLen), tailLen)
+                userResponseTail = decodeUtf8TailWindow(tailSlice, iLen > tailLen)
+                if (iLen > tailLen) {
+                  userResponseFullRange = { offset: iDataStart, length: iLen }
+                }
+              } else if (iField === 3 && iLen > 0) {
+                if (iLen <= BOUNDED_USER_TAIL_BYTES) {
+                  smallItemTexts.push(decodeTextOrScopeItem(readSlice(iDataStart, iLen)))
+                } else {
+                  largeItemRanges.push({ offset: iDataStart, length: iLen })
+                }
+              }
+              // Note: field 9 (`media`, inline images) is skipped in O(1) without reading bytes!
+              innerPos = iDataStart + iLen
+            } else {
+              throw new Error(`Unsupported nested wire type (${iWire}) in Antigravity step ${idx}.`)
             }
-            // Note: field 9 (`media`, inline images) is skipped in O(1) without reading bytes!
-            innerPos = iDataStart + iLen
-          } else {
-            throw new Error(`Unsupported nested wire type (${iWire}) in Antigravity step ${idx}.`)
           }
-        }
-        const candidateText =
-          userResponseTail && userResponseTail.length > 0
-            ? userResponseTail
-            : smallItemTexts.join('')
-        if (candidateText.length > 0) {
-          userIdentity = extractPactPromptIdentity(candidateText)
-        }
-        if (
-          !userIdentity?.pactRunId &&
-          (userResponseFullRange !== undefined || largeItemRanges.length > 0)
-        ) {
-          if (userResponseFullRange !== undefined) {
-            // Only read full >128 KiB user text when within the 8 MiB prefix budget; post-cut >8 MiB steps
-            // cannot belong to any valid Fork prefix and are skipped without loading into memory.
-            if (
-              userResponseFullRange.length <= AGY_TEXT_BUDGET_BYTES &&
-              remainingLargeUserTextBudget.bytes >= userResponseFullRange.length
-            ) {
-              remainingLargeUserTextBudget.bytes -= userResponseFullRange.length
-              const fullText = decodeUtf8Strict(
-                readSlice(userResponseFullRange.offset, userResponseFullRange.length),
-              )
-              userIdentity = extractPactPromptIdentity(fullText)
-            }
-          } else {
-            const totalItemBytes = largeItemRanges.reduce((acc, r) => acc + r.length, 0)
-            if (
-              totalItemBytes <= AGY_TEXT_BUDGET_BYTES &&
-              remainingLargeUserTextBudget.bytes >= totalItemBytes
-            ) {
-              remainingLargeUserTextBudget.bytes -= totalItemBytes
-              const mergedItems = [
-                ...smallItemTexts,
-                ...largeItemRanges.map((r) => decodeTextOrScopeItem(readSlice(r.offset, r.length))),
-              ].join('')
-              if (mergedItems.length > 0) {
-                userIdentity = extractPactPromptIdentity(mergedItems)
+          const candidateText =
+            userResponseTail && userResponseTail.length > 0
+              ? userResponseTail
+              : smallItemTexts.join('')
+          if (candidateText.length > 0) {
+            userIdentity = extractPactPromptIdentity(candidateText)
+          }
+          if (
+            !userIdentity?.pactRunId &&
+            (userResponseFullRange !== undefined || largeItemRanges.length > 0)
+          ) {
+            if (userResponseFullRange !== undefined) {
+              // Only read full >128 KiB user text when within the 8 MiB prefix budget; post-cut >8 MiB steps
+              // cannot belong to any valid Fork prefix and are skipped without loading into memory.
+              if (
+                userResponseFullRange.length <= AGY_TEXT_BUDGET_BYTES &&
+                remainingLargeUserTextBudget.bytes >= userResponseFullRange.length
+              ) {
+                remainingLargeUserTextBudget.bytes -= userResponseFullRange.length
+                const fullText = decodeUtf8Strict(
+                  readSlice(userResponseFullRange.offset, userResponseFullRange.length),
+                )
+                userIdentity = extractPactPromptIdentity(fullText)
+              }
+            } else {
+              const totalItemBytes = largeItemRanges.reduce((acc, r) => acc + r.length, 0)
+              if (
+                totalItemBytes <= AGY_TEXT_BUDGET_BYTES &&
+                remainingLargeUserTextBudget.bytes >= totalItemBytes
+              ) {
+                remainingLargeUserTextBudget.bytes -= totalItemBytes
+                const mergedItems = [
+                  ...smallItemTexts,
+                  ...largeItemRanges.map((r) =>
+                    decodeTextOrScopeItem(readSlice(r.offset, r.length)),
+                  ),
+                ].join('')
+                if (mergedItems.length > 0) {
+                  userIdentity = extractPactPromptIdentity(mergedItems)
+                }
               }
             }
           }
@@ -6429,6 +6633,8 @@ function readBoundedStepMetadataAndUserIdentity(
   }
 
   return {
+    ...(stepType !== undefined ? { stepType } : {}),
+    ...(hasUserInput ? { hasUserInput } : {}),
     ...(payloadMeta !== undefined ? { payloadMeta } : {}),
     ...(userIdentity !== undefined ? { userIdentity } : {}),
   }

@@ -179,6 +179,14 @@ const AGY_MAX_FOREGROUND_DEDUP_ID_COUNT = 4_096
 const AGY_MAX_FOREGROUND_DEDUP_BYTES = 512 * 1024
 const AGY_MAX_REASONING_ITEMS = 64
 const AGY_MAX_REASONING_BYTES = 2 * 1024 * 1024
+const AGY_MAX_PRE_PROMPT_REPLAY_TOOL_IDS = 4_096
+const AGY_SESSION_METADATA_UPDATES = new Set<string>([
+  'session_info_update',
+  'available_commands_update',
+  'current_mode_update',
+  'config_option_update',
+  'usage_update',
+])
 const AGY_MAX_STEERING_INPUTS = 63
 const AGY_SESSION_MODE_CACHE_LIMIT = 64
 const AGY_EVIDENCE_CACHE_LIMIT = 8
@@ -6132,6 +6140,7 @@ export class AgyAgentAdapter implements AgentAdapter {
     const observation = new AbortController()
     const runFinalizer = Promise.withResolvers<void>()
     let stopStreamPump: (() => void) | undefined
+    let stopPrePromptDrain: ((drainRemaining?: boolean) => Promise<void>) | undefined
     let handoffOrderedStreamToBackground: (() => void) | undefined
 
     const loadHostTrajectoryIdentity = async (
@@ -6444,6 +6453,7 @@ export class AgyAgentAdapter implements AgentAdapter {
           cancelGraceTimer = undefined
         }
         promptRpcAbort.abort()
+        await stopPrePromptDrain?.(false).catch(() => undefined)
         stopStreamPump?.()
         foregroundReleased = true
         if (options.emergency || emergencyCleanedUp) {
@@ -6918,6 +6928,31 @@ export class AgyAgentAdapter implements AgentAdapter {
         },
       })
 
+      const prePromptReplayedToolCallIds = new Set<string>()
+      const observePrePromptNotification = (note: object, targetSessionId: string): void => {
+        this.observeSessionTitleFromNotification(note, targetSessionId, input)
+        if (!isPlainObject(note) || asString(Reflect.get(note, 'method')) !== 'session/update') {
+          return
+        }
+        const params = Reflect.get(note, 'params')
+        if (!isPlainObject(params)) return
+        const sid = asString(params.sessionId ?? params.session_id)
+        if (sid !== undefined && sid !== targetSessionId) return
+        const update = params.update
+        if (!isPlainObject(update)) return
+        const sessionUpdate = asString(update.sessionUpdate)
+        if (sessionUpdate !== 'tool_call' && sessionUpdate !== 'tool_call_update') return
+        const toolCallId = asString(update.toolCallId ?? update.id)
+        if (!toolCallId || toolCallId.length > 1024) return
+        if (!prePromptReplayedToolCallIds.has(toolCallId)) {
+          if (prePromptReplayedToolCallIds.size >= AGY_MAX_PRE_PROMPT_REPLAY_TOOL_IDS) {
+            const oldest = prePromptReplayedToolCallIds.values().next().value
+            if (oldest !== undefined) prePromptReplayedToolCallIds.delete(oldest)
+          }
+          prePromptReplayedToolCallIds.add(toolCallId)
+        }
+      }
+
       let descriptor: AcpSessionDescriptor
       if (input.nativeSessionId) {
         resolvedSessionId = input.nativeSessionId
@@ -6946,7 +6981,7 @@ export class AgyAgentAdapter implements AgentAdapter {
             wakeEventLoop = fn
           },
           onNotification: (replayed) => {
-            this.observeSessionTitleFromNotification(replayed, input.nativeSessionId!, input)
+            observePrePromptNotification(replayed, input.nativeSessionId!)
             const notifiedOptions = this.extractConfigOptionsFromNotification(
               replayed,
               input.nativeSessionId,
@@ -7016,7 +7051,7 @@ export class AgyAgentAdapter implements AgentAdapter {
             continue
           }
           if (initialItem.kind !== 'notification') continue
-          this.observeSessionTitleFromNotification(initialItem.message, resolvedSessionId, input)
+          observePrePromptNotification(initialItem.message, resolvedSessionId)
           const notifiedOptions = this.extractConfigOptionsFromNotification(
             initialItem.message,
             resolvedSessionId,
@@ -7036,6 +7071,13 @@ export class AgyAgentAdapter implements AgentAdapter {
         sessionId: resolvedSessionId,
         descriptor,
         sessionState,
+        sessionStream,
+        onMetadataNotification: (note) => {
+          observePrePromptNotification(note, resolvedSessionId!)
+        },
+        onServerRequest: (req) => {
+          handleOrderedServerRequest(req)
+        },
         readOnlyStage,
         permissionMode: effectivePermissionMode,
         signal: runSignal,
@@ -7048,7 +7090,7 @@ export class AgyAgentAdapter implements AgentAdapter {
         descriptor,
         sessionStream,
         onMetadataNotification: (note) => {
-          this.observeSessionTitleFromNotification(note, resolvedSessionId!, input)
+          observePrePromptNotification(note, resolvedSessionId!)
         },
         onServerRequest: (req) => {
           handleOrderedServerRequest(req)
@@ -7057,6 +7099,88 @@ export class AgyAgentAdapter implements AgentAdapter {
         requestedEffort: input.effort,
         signal: runSignal,
       })
+
+      let prePromptStreamEnd: Extract<AgyIngress, { kind: 'end' }> | undefined
+      const handlePrePromptIngressItem = (item: AgyIngress): boolean => {
+        if (item.kind === 'end') {
+          prePromptStreamEnd ??= item
+          return false
+        }
+        if (item.kind === 'server_request') {
+          handleOrderedServerRequest(item)
+          return true
+        }
+        if (item.kind === 'notification') {
+          observePrePromptNotification(item.message, resolvedSessionId!)
+        }
+        return true
+      }
+      const drainPrePromptBuffered = (): void => {
+        if (!sessionStream || prePromptStreamEnd) return
+        while (true) {
+          const item = sessionStream.shift()
+          if (!item) break
+          if (!handlePrePromptIngressItem(item)) break
+        }
+      }
+      let prePromptDrainAbort: AbortController | undefined
+      let prePromptDrainTask: Promise<void> | undefined
+      stopPrePromptDrain = async (drainRemaining = true): Promise<void> => {
+        const abort = prePromptDrainAbort
+        const task = prePromptDrainTask
+        prePromptDrainAbort = undefined
+        prePromptDrainTask = undefined
+        abort?.abort()
+        if (task) {
+          await task.catch(() => undefined)
+        }
+        if (drainRemaining) {
+          drainPrePromptBuffered()
+        }
+      }
+      if (sessionStream) {
+        const activePrePromptStream = sessionStream
+        const drainAbort = new AbortController()
+        prePromptDrainAbort = drainAbort
+        prePromptDrainTask = (async () => {
+          while (!drainAbort.signal.aborted && !prePromptStreamEnd) {
+            drainPrePromptBuffered()
+            if (drainAbort.signal.aborted || prePromptStreamEnd) break
+            let nextItem: AgyIngress
+            try {
+              // oxlint-disable-next-line no-await-in-loop -- Drain trailing session/load replay continuously across pre-prompt setup.
+              nextItem = await activePrePromptStream.nextIngress(undefined, drainAbort.signal)
+            } catch (err) {
+              if (drainAbort.signal.aborted) break
+              prePromptStreamEnd ??= {
+                kind: 'end',
+                seq: 0,
+                cause: 'transport',
+                incomplete: true,
+                detail: err instanceof Error ? err.message : String(err),
+              }
+              break
+            }
+            handlePrePromptIngressItem(nextItem)
+          }
+        })()
+      }
+      const throwIfPrePromptStreamClosed = async (): Promise<void> => {
+        if (!prePromptStreamEnd && connection.isOpen) return
+        await stopPrePromptDrain?.(false)
+        recordHostBeforeRootStart()
+        input.recordDispatch?.('rejected', resolvedSessionId, activeExecutorId)
+        if (connection.closeReason instanceof AgentExecutionError) {
+          throw connection.closeReason
+        }
+        throw new AgentExecutionError(
+          prePromptStreamEnd?.cause === 'deadline' ? 'transient_transport' : 'agent_process_crash',
+          prePromptStreamEnd?.detail ??
+            connection.closeReason?.message ??
+            'Antigravity ACP connection closed before prompt dispatch.',
+          prePromptStreamEnd?.cause === 'deadline',
+        )
+      }
 
       let earlyEvent = shiftPendingEvent()
       while (earlyEvent !== undefined) {
@@ -7286,6 +7410,8 @@ export class AgyAgentAdapter implements AgentAdapter {
         }
       }
 
+      await throwIfPrePromptStreamClosed()
+
       yield {
         agentId: 'agy',
         type: 'session.started',
@@ -7476,6 +7602,9 @@ export class AgyAgentAdapter implements AgentAdapter {
           ? { _meta: { antigravity: { systemPrompt: { append: systemAppend } } } }
           : {}),
       }
+
+      await stopPrePromptDrain(true)
+      await throwIfPrePromptStreamClosed()
 
       promptEnteredTransport = true
       const promptOp = connection.requestOwned('session/prompt', promptParams, {
@@ -7823,6 +7952,16 @@ export class AgyAgentAdapter implements AgentAdapter {
           return
         }
 
+        if (
+          activeRun!.resumedExistingSession &&
+          (sessionUpdate === 'tool_call' || sessionUpdate === 'tool_call_update') &&
+          !validated.toolCallIdInvalid &&
+          validated.toolCallId !== undefined &&
+          prePromptReplayedToolCallIds.has(validated.toolCallId)
+        ) {
+          return
+        }
+
         const updateMeta = Reflect.get(update, '_meta')
         const steerId =
           sessionUpdate === 'user_message_chunk'
@@ -8010,6 +8149,21 @@ export class AgyAgentAdapter implements AgentAdapter {
           if (item.kind === 'server_request') {
             handleOrderedServerRequest(item)
             return
+          }
+          if (!rootFirstByteWritten && item.kind === 'notification') {
+            const method = asString(Reflect.get(item.message, 'method'))
+            const params = Reflect.get(item.message, 'params')
+            const update = isPlainObject(params) ? Reflect.get(params, 'update') : undefined
+            const sessionUpdate = isPlainObject(update) ? asString(update.sessionUpdate) : undefined
+            if (
+              method === 'session/update' &&
+              (!sessionUpdate || !AGY_SESSION_METADATA_UPDATES.has(sessionUpdate))
+            ) {
+              if (resolvedSessionId !== undefined) {
+                observePrePromptNotification(item.message, resolvedSessionId)
+              }
+              return
+            }
           }
           const validated = validateAgyFrame(
             item,
@@ -8594,6 +8748,7 @@ export class AgyAgentAdapter implements AgentAdapter {
       } finally {
         clearPendingEvents()
         clearStagedPreBindNotifications()
+        prePromptReplayedToolCallIds.clear()
         answer.dispose()
       }
     } catch (error) {
@@ -8607,6 +8762,7 @@ export class AgyAgentAdapter implements AgentAdapter {
         cancelGraceTimer = undefined
       }
       promptRpcAbort.abort()
+      await stopPrePromptDrain?.(false).catch(() => undefined)
       stopStreamPump?.()
       this.invalidateNonTerminalEvidence(input.runId, resolvedSessionId)
       await recordingTail.catch(() => undefined)
@@ -10598,12 +10754,32 @@ export class AgyAgentAdapter implements AgentAdapter {
     sessionId: string,
     modeId: string,
     signal: AbortSignal,
+    options?: {
+      sessionStream?: AgyOrderedSessionStream | undefined
+      onMetadataNotification?: ((notification: object) => void) | undefined
+      onServerRequest?: ((req: Extract<AgyIngress, { kind: 'server_request' }>) => void) | undefined
+    },
   ): Promise<void> {
-    const response = await connection.request(
+    const sessionStream = options?.sessionStream
+    const op = connection.requestOwned(
       'session/set_mode',
       { sessionId, modeId },
-      { timeoutMs: AGY_CONTROL_RPC_TIMEOUT_MS, signal },
+      {
+        timeoutMs: AGY_CONTROL_RPC_TIMEOUT_MS,
+        signal,
+        ...(sessionStream ? { replyTo: sessionStream } : {}),
+      },
     )
+    const response = sessionStream
+      ? await this.runWithConcurrentReplayDrain(
+          op.result,
+          sessionStream,
+          (note) => options?.onMetadataNotification?.(note),
+          undefined,
+          op.requestId,
+          options?.onServerRequest,
+        )
+      : await op.result
     const error = Reflect.get(response, 'error')
     const result = Reflect.get(response, 'result')
     if (error || !isPlainObject(result)) {
@@ -10620,6 +10796,9 @@ export class AgyAgentAdapter implements AgentAdapter {
     sessionId: string
     descriptor: AcpSessionDescriptor
     sessionState: SessionModeState
+    sessionStream?: AgyOrderedSessionStream | undefined
+    onMetadataNotification?: ((notification: object) => void) | undefined
+    onServerRequest?: ((req: Extract<AgyIngress, { kind: 'server_request' }>) => void) | undefined
     readOnlyStage: boolean
     permissionMode: SessionPermissionMode
     signal: AbortSignal
@@ -10629,10 +10808,14 @@ export class AgyAgentAdapter implements AgentAdapter {
       sessionId,
       descriptor,
       sessionState,
+      sessionStream,
+      onMetadataNotification,
+      onServerRequest,
       readOnlyStage,
       permissionMode,
       signal,
     } = params
+    const drainOptions = { sessionStream, onMetadataNotification, onServerRequest }
 
     if (readOnlyStage) {
       if (descriptor.availableModes && !descriptor.availableModes.includes('plan')) {
@@ -10640,7 +10823,7 @@ export class AgyAgentAdapter implements AgentAdapter {
           'Antigravity does not advertise native Plan mode required for read-only collaboration stages.',
         )
       }
-      await this.setAndConfirmSessionMode(connection, sessionId, 'plan', signal)
+      await this.setAndConfirmSessionMode(connection, sessionId, 'plan', signal, drainOptions)
       sessionState.currentModeId = 'plan'
       sessionState.enteredPlanModeByPact = true
       return
@@ -10653,7 +10836,7 @@ export class AgyAgentAdapter implements AgentAdapter {
       descriptor.currentModeId === 'plan'
 
     if (permissionMode === 'ask') {
-      await this.setAndConfirmSessionMode(connection, sessionId, 'default', signal)
+      await this.setAndConfirmSessionMode(connection, sessionId, 'default', signal, drainOptions)
       sessionState.currentModeId = 'default'
       sessionState.enteredPlanModeByPact = false
       return
@@ -10665,7 +10848,7 @@ export class AgyAgentAdapter implements AgentAdapter {
           'Antigravity does not offer Auto permission mode for this session.',
         )
       }
-      await this.setAndConfirmSessionMode(connection, sessionId, 'auto', signal)
+      await this.setAndConfirmSessionMode(connection, sessionId, 'auto', signal, drainOptions)
       sessionState.currentModeId = 'auto'
       sessionState.enteredPlanModeByPact = false
       return
@@ -10674,7 +10857,13 @@ export class AgyAgentAdapter implements AgentAdapter {
     if (permissionMode === 'native' || permissionMode === 'full') {
       if (needsPlanRetirement) {
         const restoreMode = sessionState.initialNonPlanModeId || 'default'
-        await this.setAndConfirmSessionMode(connection, sessionId, restoreMode, signal)
+        await this.setAndConfirmSessionMode(
+          connection,
+          sessionId,
+          restoreMode,
+          signal,
+          drainOptions,
+        )
         sessionState.currentModeId = restoreMode
         sessionState.enteredPlanModeByPact = false
       }

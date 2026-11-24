@@ -7878,7 +7878,6 @@ export class Conversation {
                 'quota_or_rate_limit',
                 'permission_blocked',
                 'runtime_incompatible',
-                'response_too_large',
               ].includes(classified.kind)
                 ? 'retry'
                 : 'rebuild',

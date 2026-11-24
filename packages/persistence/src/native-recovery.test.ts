@@ -20,6 +20,7 @@ import {
   nativeRebuildOperations,
   schema,
 } from './schema/index.js'
+import { projectSessionIssues } from './session-issues.js'
 
 const migrationsFolder = resolve(import.meta.dirname, '../drizzle')
 const settings: DefaultSessionSettings = {
@@ -1183,6 +1184,96 @@ it('offers a first Retry after observation loss and upgrades only an unsuccessfu
     expect(f.repo.nativeContext(f.sessionId, 'codex')?.recoveryAction).toBe('rebuild')
     expect(f.repo.findRun(run.id)?.dispatchPhase).toBe('possibly_sent')
     expect(f.repo.findRun(run.id)?.nativeOutcome).toBeUndefined()
+  } finally {
+    f.db.close()
+  }
+})
+
+it('projects response_too_large as retry_check while recoveryAction is retry and as rebuild_offer once recoveryAction is rebuild', async () => {
+  const f = await fixture()
+  try {
+    const agySessionId = randomUUID()
+    f.db.sessionRepository.create(
+      {
+        id: agySessionId,
+        projectId: f.projectId,
+        title: 'Recovery Agy',
+        createdAt: new Date().toISOString(),
+      },
+      { ...settings, primaryAgentId: 'agy', secondaryAgentId: 'codex' },
+    )
+    const agyFixture: Fixture = { ...f, sessionId: agySessionId }
+    const run = start(agyFixture, 'agy').run
+    const nativeSessionId = randomUUID()
+    f.repo.applyEvent(agySessionId, run.id, {
+      type: 'session.started',
+      agentId: 'agy',
+      nativeSessionId,
+    })
+    f.repo.recordDispatch(run.id, 'possibly_sent', nativeSessionId, randomUUID())
+    f.repo.recordNativeEvidence(
+      {
+        kind: 'no_evidence',
+        reason: 'Notification queue overflowed.',
+        identity: {
+          sessionId: agySessionId,
+          agentId: 'agy',
+          runId: run.id,
+          requestId: run.id,
+          nativeSessionId,
+          bindingGeneration: 1,
+        },
+      },
+      'retry',
+    )
+    f.repo.failRun(
+      run.id,
+      'response_too_large',
+      'Antigravity notification queue exceeded its 8 MiB / 4096-item capacity.',
+      false,
+    )
+
+    const retryContext = f.repo.nativeContext(agySessionId, 'agy')!
+    expect(retryContext.recoveryAction).toBe('retry')
+    const retryIssues = projectSessionIssues(agySessionId, [retryContext], [f.repo.findRun(run.id)])
+    expect(retryIssues.agents.find((issue) => issue.agentId === 'agy')).toMatchObject({
+      agentId: 'agy',
+      phase: 'warning',
+      action: 'retry_check',
+    })
+
+    // Simulating a checkNativeBinding failure that persists `response_too_large` with `recoveryAction: 'rebuild'`.
+    f.repo.setContinuation(
+      agySessionId,
+      'agy',
+      'recovery_required',
+      'Native state check failed: Antigravity text/metadata exceeds the 8 MiB inspection budget.',
+      retryContext.bindingGeneration,
+      {
+        kind: 'response_too_large',
+        message: 'Antigravity text/metadata exceeds the 8 MiB inspection budget.',
+        action: 'rebuild',
+      },
+    )
+    const rebuildContext = f.repo.nativeContext(agySessionId, 'agy')!
+    expect(rebuildContext.recoveryAction).toBe('rebuild')
+    const rebuildIssues = projectSessionIssues(
+      agySessionId,
+      [rebuildContext],
+      [f.repo.findRun(run.id)],
+      [],
+      [],
+      [],
+      { sanitize: (value) => value },
+    )
+    expect(rebuildIssues.inputGate).toBe('read_only')
+    expect(rebuildIssues.agents.find((issue) => issue.agentId === 'agy')).toMatchObject({
+      agentId: 'agy',
+      phase: 'rebuild_offer',
+      action: 'rebuild',
+      title: 'Antigravity response too large',
+      reason: 'The response exceeds Pact’s size limit.',
+    })
   } finally {
     f.db.close()
   }

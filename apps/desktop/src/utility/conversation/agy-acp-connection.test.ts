@@ -4602,4 +4602,84 @@ describe('AgyIngress ordered stream, exit-drain separation, invalid_reply tainti
     })
     await pool.dispose()
   })
+
+  it('activates stdout backpressure hysteresis when a serverRequestOwner is backed by an active ordered sessionStream, while keeping unstreamed owners unpaused', async () => {
+    const fake = fakeAcpChild()
+    const connection = new AgyAcpConnection(fake.child, '/tmp/proj-owner-bp', 'standard')
+    const stream = connection.openSessionStream('sid-streamed', { ordered: true })
+
+    // Initially registered with an unstreamed knownSessionId (direct owner) -> stdout stays unpaused even past high-water!
+    const owner = connection.registerServerRequestOwner({
+      ownerId: 'owner-run-1',
+      knownSessionId: 'sid-unstreamed',
+      handler: () => true,
+    })
+
+    const chunk128KiB = 'b'.repeat(128 * 1024)
+    const countToHighWater = Math.ceil(AGY_QUEUE_HIGH_WATER_BYTES / (128 * 1024)) + 1
+    for (let i = 0; i < countToHighWater; i += 1) {
+      fake.send({
+        jsonrpc: '2.0',
+        method: 'session/update',
+        params: { sessionId: 'sid-streamed', text: chunk128KiB },
+      })
+    }
+
+    await vi.waitFor(() => {
+      expect(connection.diagnostics().queuedInboundBytes).toBeGreaterThanOrEqual(
+        AGY_QUEUE_HIGH_WATER_BYTES,
+      )
+    })
+    expect(connection.diagnostics().stdoutPaused).toBe(false)
+
+    // Updating the owner to the active ordered sessionStream switches it off the direct path and pauses stdout!
+    owner.updateSessionId('sid-streamed')
+    expect(connection.diagnostics().stdoutPaused).toBe(true)
+
+    // Draining queued frames below low-water resumes stdout cleanly.
+    while (connection.diagnostics().queuedInboundBytes > AGY_QUEUE_LOW_WATER_BYTES) {
+      await stream.nextIngress(1_000)
+    }
+    await vi.waitFor(() => {
+      expect(connection.diagnostics().stdoutPaused).toBe(false)
+    })
+
+    // Also verify opening the ordered stream AFTER registering the owner updates stdout pause immediately.
+    const lateOwner = connection.registerServerRequestOwner({
+      ownerId: 'owner-run-2',
+      knownSessionId: 'sid-late-stream',
+      handler: () => true,
+    })
+    // Push queued bytes past high-water again (still unstreamed due to lateOwner) -> stdout remains unpaused.
+    for (let i = 0; i < countToHighWater; i += 1) {
+      fake.send({
+        jsonrpc: '2.0',
+        method: 'session/update',
+        params: { sessionId: 'sid-streamed', text: chunk128KiB },
+      })
+    }
+    await vi.waitFor(() => {
+      expect(connection.diagnostics().queuedInboundBytes).toBeGreaterThanOrEqual(
+        AGY_QUEUE_HIGH_WATER_BYTES,
+      )
+    })
+    expect(connection.diagnostics().stdoutPaused).toBe(false)
+
+    const lateStream = connection.openSessionStream('sid-late-stream', { ordered: true })
+    expect(connection.diagnostics().stdoutPaused).toBe(true)
+
+    while (connection.diagnostics().queuedInboundBytes > AGY_QUEUE_LOW_WATER_BYTES) {
+      const shifted = stream.shift()
+      if (!shifted) break
+    }
+    await vi.waitFor(() => {
+      expect(connection.diagnostics().stdoutPaused).toBe(false)
+    })
+
+    lateOwner.dispose()
+    owner.dispose()
+    lateStream.abandon()
+    stream.abandon()
+    await connection.close(new Error('done'))
+  })
 })

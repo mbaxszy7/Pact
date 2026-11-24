@@ -123,6 +123,12 @@ const harness = vi.hoisted(() => ({
         signal: AbortSignal,
       ) => Promise<import('@pact/agent-runtime').AgentNativeContextRebuildResult | undefined>)
     | undefined,
+  statusCheckHandler: undefined as
+    | ((
+        input: import('@pact/agent-runtime').AgentNativeProbeInput,
+        signal: AbortSignal,
+      ) => Promise<import('@pact/contracts').NativeProbeResult | undefined>)
+    | undefined,
 }))
 
 function createMockAdapter(agentId: RuntimeAgentId) {
@@ -190,6 +196,25 @@ function createMockAdapter(agentId: RuntimeAgentId) {
           ? harness.rebuildCheckHandler(input, source, signal)
           : Promise.resolve(undefined),
       )
+      return {
+        result,
+        physicalCompletion: result.then(
+          () => undefined,
+          () => undefined,
+        ),
+      }
+    }
+
+    beginNativeStatusCheck(
+      input: import('@pact/agent-runtime').AgentNativeProbeInput,
+      signal: AbortSignal,
+    ) {
+      const result = Promise.resolve().then(() => {
+        if (harness.statusCheckHandler) {
+          return harness.statusCheckHandler(input, signal)
+        }
+        throw new Error('Unexpected beginNativeStatusCheck call')
+      })
       return {
         result,
         physicalCompletion: result.then(
@@ -304,6 +329,7 @@ afterEach(async () => {
   harness.nextRunGenerator = undefined
   harness.rebuildHandler = undefined
   harness.rebuildCheckHandler = undefined
+  harness.statusCheckHandler = undefined
   vi.restoreAllMocks()
 })
 
@@ -3654,5 +3680,88 @@ describe('Module 5 Conversation 3-Agent & Antigravity Orchestration', () => {
     expect(assistantEntry.message.content).toBe(
       'Truncated prefix before unresolved pre-bind frames',
     )
+  })
+
+  it('transitions checkNativeBinding response_too_large failures to recoveryAction rebuild instead of looping Check session', async () => {
+    const { AgentExecutionError } = await import('./agent-execution-error.js')
+    const f = await createOrchestrationFixture({
+      primaryAgentId: 'agy',
+      secondaryAgentId: 'codex',
+    })
+    const repo = f.db.conversationRepository
+    const nativeSessionId = randomUUID()
+    const executorId = '00000000-0000-4000-8000-0000000000a1'
+
+    harness.nextRunGenerator = async function* (_agentId, input) {
+      input.recordDispatch?.('possibly_sent', nativeSessionId, executorId)
+      yield { type: 'session.started', agentId: 'agy', nativeSessionId }
+      throw new AgentExecutionError(
+        'response_too_large',
+        'Antigravity notification queue exceeded its 8 MiB / 4096-item capacity.',
+        false,
+      )
+    }
+
+    const res = await f.sendMessage(f.sessionId, 'Resume overflowing session', {
+      route: { type: 'agent', agentId: 'agy' },
+    })
+    expect(res.ok).toBe(true)
+    await f.waitForIdle()
+
+    const run = harness.runs.at(-1)!
+    // Force initial recovery state (`retry` / `response_too_large`) and verify first `retry` check hitting
+    // `response_too_large` upgrades `recoveryAction` to `rebuild` and projects `action: 'rebuild'`.
+    repo.setContinuation(
+      f.sessionId,
+      'agy',
+      'recovery_required',
+      'Antigravity notification queue exceeded its 8 MiB / 4096-item capacity.',
+      1,
+      {
+        kind: 'response_too_large',
+        message: 'Antigravity notification queue exceeded its 8 MiB / 4096-item capacity.',
+        action: 'retry',
+      },
+    )
+
+    harness.statusCheckHandler = async () => {
+      throw new AgentExecutionError(
+        'response_too_large',
+        'Antigravity text/metadata exceeds the 8 MiB inspection budget.',
+        false,
+      )
+    }
+
+    const checkResult = await f.flow.retry({
+      sessionId: f.sessionId,
+      agentId: 'agy',
+      runId: run.input.runId,
+    })
+    expect(checkResult).toMatchObject({
+      ok: false,
+      error: { code: 'NATIVE_CONTEXT_RECOVERY_REQUIRED' },
+    })
+
+    const updatedContext = repo.nativeContext(f.sessionId, 'agy')
+    expect(updatedContext).toMatchObject({
+      continuationState: 'recovery_required',
+      recoveryFailureKind: 'response_too_large',
+      recoveryAction: 'rebuild',
+    })
+
+    const loaded = await f.flow.load({ scope: 'messages', sessionId: f.sessionId })
+    expect(loaded.ok).toBe(true)
+    if (!loaded.ok || loaded.value.scope !== 'messages') {
+      throw new Error('Expected messages page')
+    }
+    expect(
+      loaded.value.header.sessionIssues?.agents.find((issue) => issue.agentId === 'agy'),
+    ).toMatchObject({
+      agentId: 'agy',
+      phase: 'rebuild_offer',
+      action: 'rebuild',
+      title: 'Antigravity response too large',
+      reason: 'The response exceeds Pact’s size limit.',
+    })
   })
 })

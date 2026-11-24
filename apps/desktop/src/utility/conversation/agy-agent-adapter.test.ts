@@ -20738,4 +20738,438 @@ describe('AgyAgentAdapter Wave-6 audit regressions', () => {
       }
     }
   })
+
+  it('drains trailing session/load replay continuously across set_mode, set_config_option, and trajectory identity read without queue overflow or phantom file edits', async () => {
+    const { cwd, appDataDir } = await createEnv()
+    const targetPath = join(cwd, 'historical.ts')
+    await writeFile(targetPath, 'export const live = true\n', 'utf8')
+    const harness = createAcpHarness()
+    const nativeSessionId = 'sid-preprompt-drain'
+
+    const emitEditReplayBatch = (prefix: string, count: number): void => {
+      const lines: string[] = []
+      for (let i = 0; i < count; i += 1) {
+        lines.push(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: nativeSessionId,
+              update: {
+                sessionUpdate: i % 2 === 0 ? 'tool_call' : 'tool_call_update',
+                toolCallId: `tc-hist-${prefix}-${Math.floor(i / 2)}`,
+                name: 'edit_file',
+                status: i % 2 === 0 ? 'in_progress' : 'completed',
+                args: { Path: targetPath, Target: 'a', Replacement: 'b' },
+                content: [
+                  {
+                    type: 'diff',
+                    path: targetPath,
+                    oldText: 'export const live = false\n',
+                    newText: 'export const live = true\n',
+                  },
+                ],
+              },
+            },
+          }),
+        )
+      }
+      harness.sendRawStdout(`${lines.join('\n')}\n`)
+    }
+
+    let readTrajectoryStarted = Promise.withResolvers<void>()
+    let releaseReadTrajectory = Promise.withResolvers<void>()
+
+    harness.onClientFrame(async (frame) => {
+      if (frame.method === 'initialize') {
+        harness.sendToClient({ jsonrpc: '2.0', id: frame.id, result: { protocolVersion: 1 } })
+        return
+      }
+      if (frame.method === 'session/load') {
+        harness.sendToClient({
+          jsonrpc: '2.0',
+          id: frame.id,
+          result: defaultSessionNewResult(nativeSessionId),
+        })
+        return
+      }
+      if (frame.method === 'session/set_mode') {
+        // Stream 1,800 replay frames during session/set_mode before returning the RPC reply!
+        for (let b = 0; b < 6; b += 1) {
+          emitEditReplayBatch(`mode-${b}`, 300)
+          await new Promise<void>((r) => setImmediate(r))
+        }
+        harness.sendToClient({
+          jsonrpc: '2.0',
+          id: frame.id,
+          result: { currentModeId: (frame.params as Record<string, unknown>)?.modeId ?? 'default' },
+        })
+        return
+      }
+      if (frame.method === 'session/set_config_option') {
+        // Stream 1,800 replay frames during session/set_config_option before returning!
+        for (let b = 0; b < 6; b += 1) {
+          emitEditReplayBatch(`cfg-${b}`, 300)
+          await new Promise<void>((r) => setImmediate(r))
+        }
+        harness.sendToClient({
+          jsonrpc: '2.0',
+          id: frame.id,
+          result: {
+            configOptions: [
+              { id: 'model', currentValue: 'gemini-4-carbon' },
+              { id: 'thought_level', currentValue: 'high' },
+            ],
+          },
+        })
+        return
+      }
+      if (frame.method === 'session/prompt') {
+        harness.sendToClient({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: nativeSessionId,
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: 'Live turn reply.' },
+            },
+          },
+        })
+        harness.sendToClient({ jsonrpc: '2.0', id: frame.id, result: { stopReason: 'end_turn' } })
+      }
+    })
+
+    const recordedChanges: unknown[] = []
+    const effectStates: string[] = []
+    const adapter = new AgyAgentAdapter({
+      appDataDir,
+      processFactory: () => harness.child,
+      storageClient: {
+        readTrajectoryIdentity: async () => {
+          readTrajectoryStarted.resolve()
+          // While readTrajectoryIdentity awaits, emit another 1,800 replay frames (total 5,400 > 4,096!)
+          for (let b = 0; b < 6; b += 1) {
+            emitEditReplayBatch(`traj-${b}`, 300)
+            await new Promise<void>((r) => setImmediate(r))
+          }
+          await releaseReadTrajectory.promise
+          return {
+            status: 'ok',
+            trajectoryId: randomUUID(),
+            stepCount: 700,
+          }
+        },
+      },
+    })
+
+    try {
+      const runPromise = collectEvents(
+        adapter.run(
+          makeBaseRunInput(cwd, {
+            nativeSessionId,
+            recordFileChange: async (change) => {
+              recordedChanges.push(change)
+            },
+            reportNativeEffects: (report) => {
+              effectStates.push(report.state)
+            },
+          }),
+          new AbortController().signal,
+        ),
+      )
+      await readTrajectoryStarted.promise
+      releaseReadTrajectory.resolve()
+      const events = await runPromise
+      const answerText = events
+        .filter(
+          (ev): ev is Extract<NormalizedAgentEvent, { type: 'text.completed' }> =>
+            ev.type === 'text.completed',
+        )
+        .map((ev) => ev.text)
+        .join('')
+      expect(answerText).toBe('Live turn reply.')
+      expect(recordedChanges).toEqual([])
+      expect(effectStates).not.toContain('unknown')
+      expect(effectStates).toContain('settled')
+    } finally {
+      await adapter.dispose()
+    }
+  })
+
+  it('rejects before session/prompt with zero phantom file edits and settled native effects if pre-prompt stream closes while historical edit_file replay is buffered', async () => {
+    const { cwd, appDataDir } = await createEnv()
+    const targetPath = join(cwd, 'phantom.ts')
+    await writeFile(targetPath, 'export const phantom = 1\n', 'utf8')
+    const harness = createAcpHarness()
+    const nativeSessionId = 'sid-preprompt-close'
+
+    harness.onClientFrame((frame) => {
+      if (frame.method === 'initialize') {
+        harness.sendToClient({ jsonrpc: '2.0', id: frame.id, result: { protocolVersion: 1 } })
+        return
+      }
+      if (frame.method === 'session/load') {
+        harness.sendToClient({
+          jsonrpc: '2.0',
+          id: frame.id,
+          result: defaultSessionNewResult(nativeSessionId),
+        })
+        return
+      }
+      if (frame.method === 'session/set_mode' || frame.method === 'session/set_config_option') {
+        harness.sendToClient({
+          jsonrpc: '2.0',
+          id: frame.id,
+          result: {
+            configOptions: [
+              { id: 'model', currentValue: 'gemini-4-carbon' },
+              { id: 'thought_level', currentValue: 'high' },
+            ],
+          },
+        })
+      }
+    })
+
+    const recordedChanges: unknown[] = []
+    const effectStates: string[] = []
+    const dispatchPhases: string[] = []
+    const adapter = new AgyAgentAdapter({
+      appDataDir,
+      processFactory: () => harness.child,
+      storageClient: {
+        readTrajectoryIdentity: async () => {
+          // Emit historical edit_file updates immediately followed by child termination during pre-prompt gap!
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: nativeSessionId,
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'tc-hist-close-1',
+                name: 'edit_file',
+                status: 'in_progress',
+                args: { Path: targetPath, Target: '1', Replacement: '2' },
+              },
+            },
+          })
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: nativeSessionId,
+              update: {
+                sessionUpdate: 'tool_call_update',
+                toolCallId: 'tc-hist-close-1',
+                name: 'edit_file',
+                status: 'completed',
+                content: [
+                  {
+                    type: 'diff',
+                    path: targetPath,
+                    oldText: 'export const phantom = 0\n',
+                    newText: 'export const phantom = 1\n',
+                  },
+                ],
+              },
+            },
+          })
+          harness.child.kill('SIGTERM')
+          return {
+            status: 'ok',
+            trajectoryId: randomUUID(),
+            stepCount: 42,
+          }
+        },
+      },
+    })
+
+    try {
+      await expect(
+        collectEvents(
+          adapter.run(
+            makeBaseRunInput(cwd, {
+              nativeSessionId,
+              recordDispatch: (phase) => {
+                dispatchPhases.push(phase)
+              },
+              recordFileChange: async (change) => {
+                recordedChanges.push(change)
+              },
+              reportNativeEffects: (report) => {
+                effectStates.push(report.state)
+              },
+            }),
+            new AbortController().signal,
+          ),
+        ),
+      ).rejects.toThrow(/Antigravity/u)
+
+      expect(harness.requests.some((r) => r.method === 'session/prompt')).toBe(false)
+      expect(dispatchPhases).toContain('rejected')
+      expect(dispatchPhases).not.toContain('possibly_sent')
+      expect(recordedChanges).toEqual([])
+      expect(effectStates).not.toContain('unknown')
+      expect(effectStates).toContain('settled')
+    } finally {
+      await adapter.dispose()
+    }
+  })
+
+  it('drops post-prompt tool_call_update carrying a pre-prompt replayed toolCallId while still recording fresh live file edits', async () => {
+    const { cwd, appDataDir } = await createEnv()
+    const replayedFile = join(cwd, 'replayed.ts')
+    const liveFile = join(cwd, 'live.ts')
+    await writeFile(replayedFile, 'export const replayed = 1\n', 'utf8')
+    await writeFile(liveFile, 'export const live = 2\n', 'utf8')
+    const harness = createAcpHarness()
+    const nativeSessionId = 'sid-split-replay'
+
+    harness.onClientFrame((frame) => {
+      if (frame.method === 'initialize') {
+        harness.sendToClient({ jsonrpc: '2.0', id: frame.id, result: { protocolVersion: 1 } })
+        return
+      }
+      if (frame.method === 'session/load') {
+        // Emit only the opening `tool_call` during historical session/load replay.
+        harness.sendToClient({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: nativeSessionId,
+            update: {
+              sessionUpdate: 'tool_call',
+              toolCallId: 'tc-replayed-split-1',
+              name: 'edit_file',
+              status: 'in_progress',
+              args: { Path: replayedFile },
+            },
+          },
+        })
+        harness.sendToClient({
+          jsonrpc: '2.0',
+          id: frame.id,
+          result: defaultSessionNewResult(nativeSessionId),
+        })
+        return
+      }
+      if (frame.method === 'session/set_mode' || frame.method === 'session/set_config_option') {
+        harness.sendToClient({
+          jsonrpc: '2.0',
+          id: frame.id,
+          result: {
+            configOptions: [
+              { id: 'model', currentValue: 'gemini-4-carbon' },
+              { id: 'thought_level', currentValue: 'high' },
+            ],
+          },
+        })
+        return
+      }
+      if (frame.method === 'session/prompt') {
+        // First emit the split completion of the historical pre-prompt toolCallId -> MUST be dropped!
+        harness.sendToClient({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: nativeSessionId,
+            update: {
+              sessionUpdate: 'tool_call_update',
+              toolCallId: 'tc-replayed-split-1',
+              name: 'edit_file',
+              status: 'completed',
+              content: [
+                {
+                  type: 'diff',
+                  path: replayedFile,
+                  oldText: 'export const replayed = 0\n',
+                  newText: 'export const replayed = 1\n',
+                },
+              ],
+            },
+          },
+        })
+        // Then emit a genuine live edit_file with a fresh toolCallId -> MUST be recorded!
+        harness.sendToClient({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: nativeSessionId,
+            update: {
+              sessionUpdate: 'tool_call',
+              toolCallId: 'tc-live-fresh-2',
+              name: 'edit_file',
+              status: 'in_progress',
+              args: { Path: liveFile },
+            },
+          },
+        })
+        harness.sendToClient({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: nativeSessionId,
+            update: {
+              sessionUpdate: 'tool_call_update',
+              toolCallId: 'tc-live-fresh-2',
+              name: 'edit_file',
+              status: 'completed',
+              content: [
+                {
+                  type: 'diff',
+                  path: liveFile,
+                  oldText: 'export const live = 1\n',
+                  newText: 'export const live = 2\n',
+                },
+              ],
+            },
+          },
+        })
+        harness.sendToClient({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: nativeSessionId,
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: 'Done.' },
+            },
+          },
+        })
+        harness.sendToClient({ jsonrpc: '2.0', id: frame.id, result: { stopReason: 'end_turn' } })
+      }
+    })
+
+    const recordedChanges: Array<{ path: string; kind: string }> = []
+    const adapter = new AgyAgentAdapter({
+      appDataDir,
+      processFactory: () => harness.child,
+      storageClient: {
+        readTrajectoryIdentity: async () => ({
+          status: 'ok',
+          trajectoryId: randomUUID(),
+          stepCount: 10,
+        }),
+      },
+    })
+
+    try {
+      const events = await collectEvents(
+        adapter.run(
+          makeBaseRunInput(cwd, {
+            nativeSessionId,
+            recordFileChange: async (change) => {
+              recordedChanges.push({ path: change.path, kind: change.kind })
+            },
+          }),
+          new AbortController().signal,
+        ),
+      )
+      expect(events.some((ev) => ev.type === 'text.completed' && ev.text === 'Done.')).toBe(true)
+      expect(recordedChanges).toEqual([{ path: 'live.ts', kind: 'modified' }])
+    } finally {
+      await adapter.dispose()
+    }
+  })
 })

@@ -274,7 +274,10 @@ export function projectSessionIssues(
       action = 'none'
       title = `${name} request was not started`
       reason = 'Your message wasn’t sent. This session is ready.'
-    } else if (repairRuntime) {
+    } else if (
+      repairRuntime &&
+      !(currentFailure === 'response_too_large' && context?.recoveryAction === 'rebuild')
+    ) {
       action = context ? 'retry_check' : 'none'
     } else if (currentFailure === 'native_session_occupied' && (blocked || lostForeground)) {
       inputGate = 'read_only'
@@ -291,6 +294,9 @@ export function projectSessionIssues(
       } else if (context?.state === 'missing') {
         title = `${name} session not found`
         reason = 'The saved session could not be found.'
+      } else if (currentFailure === 'response_too_large') {
+        title = `${name} response too large`
+        reason = 'The response exceeds Pact’s size limit.'
       } else title = `${name} session check failed`
     } else if (
       run?.dispatchPhase === 'ended' &&

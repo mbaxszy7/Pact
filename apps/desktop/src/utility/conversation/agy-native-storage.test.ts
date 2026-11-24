@@ -156,6 +156,7 @@ import {
   encodeBoundedOpenPlanProgressToken,
 } from '@pact/contracts'
 
+import { AgentExecutionError } from './agent-execution-error'
 import {
   AGY_TRAJECTORY_ID_PATTERN,
   AgyTransientIdentityChurnError,
@@ -8812,5 +8813,299 @@ describe('agy-native-storage Wave-6 audit remediation regressions', () => {
       }),
     ).toThrow(/Refusing to overwrite or delete unverified file/u)
     expect(readFileSync(unrelatedAtStage, 'utf8')).toBe('unrelated-user-payload')
+  })
+
+  it('streams inspectAgyTrajectory over >10 MiB multi-turn history and skips >8 MiB non-brain workspace .md steps while still enforcing per-step and retained planner 8 MiB budgets', () => {
+    const storageRoot = makeStorageRoot()
+    const sid = randomUUID()
+    const { dbPath, trajectoryId } = createZeroTurnShell(storageRoot, sid)
+
+    // 1. Seed 11 MiB+ of completed historical turns (each step ~1 MiB, individually < 8 MiB).
+    const chunk950KiB = 'h'.repeat(950 * 1024)
+    for (let turnIdx = 0; turnIdx < 12; turnIdx += 1) {
+      appendCompletedTurn(storageRoot, sid, trajectoryId, {
+        executionId: `exec-hist-${turnIdx}`,
+        inputs: [{ text: `Historical prompt ${turnIdx}` }],
+        responses: [{ text: `${chunk950KiB}-turn-${turnIdx}` }],
+      })
+    }
+
+    // 2. Append a historical non-brain workspace `.md` `write_file` step whose `step_payload` is >8.5 MiB
+    //    while its column `metadata` stays compact: `includePlan: true` must skip hydrating this row!
+    const workspaceMdPath = join(storageRoot, 'README.md')
+    const largeNonBrainExecId = 'exec-hist-huge-workspace-md'
+    const db = new Database(dbPath)
+    let latestInputIdx = 0
+    try {
+      const insertStep = db.prepare(
+        'INSERT INTO "steps" ("idx", "step_type", "status", "has_subtrajectory", "metadata", "step_payload", "step_format") VALUES (?, ?, ?, 0, ?, ?, 0)',
+      )
+      let nextIdx = db
+        .prepare<[], { nextIdx: number }>(
+          'SELECT COALESCE(MAX(idx) + 1, 0) AS nextIdx FROM "steps"',
+        )
+        .get()!.nextIdx
+      let nextExecIdx = db
+        .prepare<[], { nextIdx: number }>(
+          'SELECT COALESCE(MAX(idx) + 1, 0) AS nextIdx FROM "executor_metadata"',
+        )
+        .get()!.nextIdx
+
+      const uHugeMeta = encodeCortexStepMetadata({
+        createdAtSeconds: 1_710_100_000n,
+        source: 1,
+        executionId: largeNonBrainExecId,
+        trajectoryId,
+        stepIndex: nextIdx,
+        cascadeId: sid,
+        stepId: 'step-huge-md-u',
+      })
+      insertStep.run(
+        nextIdx,
+        CORTEX_STEP_TYPE_USER_INPUT,
+        CORTEX_STEP_STATUS_DONE,
+        uHugeMeta,
+        encodeAgyUserInputStep({ metadata: uHugeMeta, text: 'Write workspace README' }),
+      )
+      nextIdx += 1
+
+      const nonBrainToolBytes = encodeProtobufFields([
+        encodeStringField(1, 'call-nonbrain-md'),
+        encodeStringField(2, 'write_file'),
+        encodeStringField(3, JSON.stringify({ Path: workspaceMdPath })),
+      ])
+      const nonBrainMeta = encodeProtobufFields([
+        ...decodeProtobufFields(
+          encodeCortexStepMetadata({
+            createdAtSeconds: 1_710_100_001n,
+            source: 2,
+            executionId: largeNonBrainExecId,
+            trajectoryId,
+            stepIndex: nextIdx,
+            cascadeId: sid,
+            stepId: 'step-huge-md-tool',
+          }),
+        ),
+        encodeBytesField(4, nonBrainToolBytes),
+      ])
+      const nonBrainPayload = encodeProtobufFields([
+        encodeVarintField(1, CORTEX_STEP_TYPE_GENERIC),
+        encodeVarintField(4, CORTEX_STEP_STATUS_DONE),
+        encodeBytesField(5, nonBrainMeta),
+        encodeStringField(512, 'm'.repeat(8_500_000)),
+      ])
+      insertStep.run(
+        nextIdx,
+        CORTEX_STEP_TYPE_GENERIC,
+        CORTEX_STEP_STATUS_DONE,
+        nonBrainMeta,
+        nonBrainPayload,
+      )
+      const nonBrainCut = nextIdx
+      nextIdx += 1
+
+      const nonBrainExecBlob = encodeExecutorMetadata({
+        terminationReason: EXECUTOR_TERMINATION_REASON_NO_TOOL_CALL,
+        numGeneratorInvocations: 1,
+        lastStepIdx: nonBrainCut,
+        executionId: largeNonBrainExecId,
+      })
+      db.prepare('INSERT INTO "executor_metadata" ("idx", "data", "size") VALUES (?, ?, ?)').run(
+        nextExecIdx,
+        nonBrainExecBlob,
+        nonBrainExecBlob.byteLength,
+      )
+      nextExecIdx += 1
+
+      // 3. Append the latest execution with a valid brain/*.md plan step and small final answer.
+      const latestExecId = 'exec-latest-compact'
+      const brainDir = join(storageRoot, 'brain', sid)
+      mkdirSync(brainDir, { recursive: true, mode: 0o700 })
+      const planPath = join(brainDir, 'implementation_plan.md')
+      const planBody = '# Compact Plan\n- Ready\n'
+      writeFileSync(planPath, planBody, { mode: 0o600 })
+
+      const uLatestMeta = encodeCortexStepMetadata({
+        createdAtSeconds: 1_710_200_000n,
+        source: 1,
+        executionId: latestExecId,
+        trajectoryId,
+        stepIndex: nextIdx,
+        cascadeId: sid,
+        stepId: 'step-latest-u',
+      })
+      const latestInputMessageId = randomUUID()
+      latestInputIdx = nextIdx
+      insertStep.run(
+        nextIdx,
+        CORTEX_STEP_TYPE_USER_INPUT,
+        CORTEX_STEP_STATUS_DONE,
+        uLatestMeta,
+        encodeAgyUserInputStep({
+          metadata: uLatestMeta,
+          text: wrapPactPrompt('Latest prompt', latestInputMessageId, 'pact-run-latest'),
+          clientMessageId: 'client-msg-latest',
+        }),
+      )
+      nextIdx += 1
+
+      const brainPlanToolBytes = encodeProtobufFields([
+        encodeStringField(1, 'call-brain-plan'),
+        encodeStringField(2, 'write_file'),
+        encodeStringField(
+          3,
+          JSON.stringify({
+            Path: planPath,
+            Content: planBody,
+            ArtifactMetadata: { Summary: 'Plan', UserFacing: true, RequestFeedback: true },
+          }),
+        ),
+      ])
+      const brainPlanMeta = encodeProtobufFields([
+        ...decodeProtobufFields(
+          encodeCortexStepMetadata({
+            createdAtSeconds: 1_710_200_001n,
+            source: 2,
+            executionId: latestExecId,
+            trajectoryId,
+            stepIndex: nextIdx,
+            cascadeId: sid,
+            stepId: 'step-latest-plan',
+          }),
+        ),
+        encodeBytesField(4, brainPlanToolBytes),
+      ])
+      insertStep.run(
+        nextIdx,
+        CORTEX_STEP_TYPE_GENERIC,
+        CORTEX_STEP_STATUS_DONE,
+        brainPlanMeta,
+        encodeProtobufFields([
+          encodeVarintField(1, CORTEX_STEP_TYPE_GENERIC),
+          encodeVarintField(4, CORTEX_STEP_STATUS_DONE),
+          encodeBytesField(5, brainPlanMeta),
+        ]),
+      )
+      nextIdx += 1
+
+      const pLatestMeta = encodeCortexStepMetadata({
+        createdAtSeconds: 1_710_200_002n,
+        source: 2,
+        executionId: latestExecId,
+        trajectoryId,
+        stepIndex: nextIdx,
+        cascadeId: sid,
+        stepId: 'step-latest-p',
+      })
+      insertStep.run(
+        nextIdx,
+        CORTEX_STEP_TYPE_PLANNER_RESPONSE,
+        CORTEX_STEP_STATUS_DONE,
+        pLatestMeta,
+        encodeAgyPlannerResponseStep({
+          metadata: pLatestMeta,
+          response: 'Compact final answer after long history.',
+        }),
+      )
+      const latestCut = nextIdx
+      const latestExecBlob = encodeExecutorMetadata({
+        terminationReason: EXECUTOR_TERMINATION_REASON_NO_TOOL_CALL,
+        numGeneratorInvocations: 1,
+        lastStepIdx: latestCut,
+        executionId: latestExecId,
+      })
+      db.prepare('INSERT INTO "executor_metadata" ("idx", "data", "size") VALUES (?, ?, ?)').run(
+        nextExecIdx,
+        latestExecBlob,
+        latestExecBlob.byteLength,
+      )
+
+      const totalSteps = latestCut + 1
+      db.close()
+
+      // Case A: Unsent nativeTurnId succeeds across >10 MiB history without response_too_large!
+      const unsent = inspectAgyTrajectory({
+        storageRoot,
+        cwd: storageRoot,
+        nativeSessionId: sid,
+        nativeTurnId: 'exec-never-sent',
+      })
+      expect(unsent.exists).toBe(true)
+      expect(unsent.stepCount).toBe(totalSteps)
+      expect(unsent.terminalState).toBeUndefined()
+
+      // Case B: Inspecting the latest execution with includePlan recovers answer, consumedInputs, and brain plan!
+      const latest = inspectAgyTrajectory({
+        storageRoot,
+        cwd: storageRoot,
+        nativeSessionId: sid,
+        nativeTurnId: latestExecId,
+        includePlan: true,
+      })
+      expect(latest.terminalState).toMatchObject({
+        executionId: latestExecId,
+        status: 'completed',
+        answer: 'Compact final answer after long history.',
+        plan: {
+          nativeId: buildBoundedNativePlanId(sid, 'call-brain-plan'),
+          text: planBody,
+        },
+      })
+      expect(latest.terminalState?.consumedInputs).toEqual([
+        expect.objectContaining({
+          stepIndex: latestInputIdx,
+          stepId: 'step-latest-u',
+          clientMessageId: 'client-msg-latest',
+          pactMessageId: latestInputMessageId,
+          pactRunId: 'pact-run-latest',
+        }),
+      ])
+
+      // Case C: Inspecting an execution that ITSELF contains a >8 MiB single step STILL fails with response_too_large!
+      let singleStepErr: unknown
+      try {
+        inspectAgyTrajectory({
+          storageRoot,
+          cwd: storageRoot,
+          nativeSessionId: sid,
+          nativeTurnId: largeNonBrainExecId,
+        })
+      } catch (err) {
+        singleStepErr = err
+      }
+      expect(singleStepErr).toBeInstanceOf(AgentExecutionError)
+      if (!(singleStepErr instanceof AgentExecutionError)) {
+        throw new Error('Expected AgentExecutionError')
+      }
+      expect(singleStepErr.kind).toBe('response_too_large')
+    } finally {
+      if (db.open) db.close()
+    }
+
+    // Case D: Retained plannerItems >8 MiB in the inspected execution STILL fails with response_too_large!
+    const sidRetained = randomUUID()
+    const { trajectoryId: retainedTrajId } = createZeroTurnShell(storageRoot, sidRetained)
+    const fourPointFiveMiB = 'p'.repeat(4_500_000)
+    appendCompletedTurn(storageRoot, sidRetained, retainedTrajId, {
+      executionId: 'exec-retained-overflow',
+      inputs: [{ text: 'Produce massive answer' }],
+      responses: [{ text: fourPointFiveMiB }, { text: fourPointFiveMiB }],
+    })
+    let retainedErr: unknown
+    try {
+      inspectAgyTrajectory({
+        storageRoot,
+        cwd: storageRoot,
+        nativeSessionId: sidRetained,
+        nativeTurnId: 'exec-retained-overflow',
+      })
+    } catch (err) {
+      retainedErr = err
+    }
+    expect(retainedErr).toBeInstanceOf(AgentExecutionError)
+    if (!(retainedErr instanceof AgentExecutionError)) {
+      throw new Error('Expected AgentExecutionError')
+    }
+    expect(retainedErr.kind).toBe('response_too_large')
   })
 })
