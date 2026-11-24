@@ -328,8 +328,21 @@ export async function main(args = process.argv.slice(2), source = process.env) {
       // oxlint-disable-next-line eslint/no-await-in-loop -- Required commands run in order and stop at the first failure.
       await pnpm([command], env, undefined, undefined, workspace)
     }
-    // One worker avoids competing large-source fixtures; no deadline or assertion is relaxed.
-    await pnpm(['exec', 'vitest', 'run', '--maxWorkers=1'], env, undefined, undefined, workspace)
+    const nativeHelperArgs = process.platform === 'win32' ? ['--auto-msvc'] : []
+    for (const script of [
+      'scripts/build-agy-sqlite-file.mjs',
+      'scripts/build-terminal-helper.mjs',
+    ]) {
+      // oxlint-disable-next-line eslint/no-await-in-loop -- Host native helpers must exist before unit and infra tests run on a clean runner.
+      const code = await run([join(workspace, script), ...nativeHelperArgs], 5 * 60_000, {
+        executable: process.execPath,
+        cwd: workspace,
+        env,
+      })
+      if (code !== 0) throw new Error('Required CI command failed')
+    }
+    // One worker avoids competing large-source fixtures; 30m bounds serial CI runtime without relaxing any test assertion or deadline.
+    await pnpm(['exec', 'vitest', 'run', '--maxWorkers=1'], env, 30 * 60_000, undefined, workspace)
   } else if (lane === 'infra') {
     const states = [],
       ownership = []

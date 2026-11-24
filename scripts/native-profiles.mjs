@@ -40,6 +40,8 @@ export const windowsOwnerNativeCases = Object.freeze(
         `recovers an exact flushed receipt after the Utility exits while ${phase}, rejects altered births and hardlinks, and retires only after commit`,
     ),
     'keeps cleanup unconfirmed when the bridge crashes before its empty receipt even after independent handles show kernel cleanup',
+    'deletes an allocated zero-byte receipt via abort-allocated on pre-witness failure and rejects non-empty, mismatched, or junction paths',
+    'notifies whenReleased() and frees working memory once after a tight close deadline converges late on Windows',
   ].map((title) => `Windows product OwnedProcessGroup ${title}`),
 )
 export const agyNativeFiles = Object.freeze(['tests/native/agy-native.test.ts'])

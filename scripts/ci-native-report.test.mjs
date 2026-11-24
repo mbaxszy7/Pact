@@ -301,14 +301,14 @@ function exactNativeFixture(name) {
   }
 }
 
-await test('Windows ownership acceptance requires all thirteen real cases and five host seams on Windows, never skipped macOS observations', () => {
+await test('Windows ownership acceptance requires all fifteen real cases and five host seams on Windows, never skipped macOS observations', () => {
   const raw = exactNativeFixture('windows-owner')
   const options = { completed: true, exitCode: 0, profile: 'windows-owner' }
   const report = nativeReport(raw, options)
   const supported = nativeProfileSupports(nativeProfile(options.profile))
   assert.equal(report.status, supported ? 'passed' : 'blocked')
   assert.deepEqual(report.windowsOwnerEvidence, {
-    nativeRequired: 13,
+    nativeRequired: 15,
     hostSeamRequired: 5,
     nativeAcceptance: supported,
   })

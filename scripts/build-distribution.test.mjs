@@ -329,6 +329,8 @@ void test('helper resources reject changed bytes and oversized metadata, while m
     [
       'native/agy-sqlite-file-darwin-${arch}.node',
       'native/agy-sqlite-file-darwin-${arch}.node.json',
+      'native/terminal-darwin-${arch}',
+      'native/terminal-darwin-${arch}.json',
     ],
   )
   assert.deepEqual(
@@ -338,6 +340,8 @@ void test('helper resources reject changed bytes and oversized metadata, while m
       'native/owned-process-group-win32-${arch}.exe.json',
       'native/agy-sqlite-file-win32-${arch}.node',
       'native/agy-sqlite-file-win32-${arch}.node.json',
+      'native/terminal-win32-${arch}.exe',
+      'native/terminal-win32-${arch}.exe.json',
     ],
   )
   assert.equal(base.win.signExecutable, false)
@@ -352,10 +356,13 @@ void test('the actual builder matcher excludes every Windows helper from ASAR an
   for (const arch of ['x64', 'arm64']) {
     const filename = `owned-process-group-win32-${arch}.exe`
     const agyFilename = `agy-sqlite-file-win32-${arch}.node`
+    const terminalFilename = `terminal-win32-${arch}.exe`
     assert.equal(filter(join(source, 'out/native', filename), stat), false)
     assert.equal(filter(join(source, 'out/native', `${filename}.json`), stat), false)
     assert.equal(filter(join(source, 'out/native', agyFilename), stat), false)
     assert.equal(filter(join(source, 'out/native', `${agyFilename}.json`), stat), false)
+    assert.equal(filter(join(source, 'out/native', terminalFilename), stat), false)
+    assert.equal(filter(join(source, 'out/native', `${terminalFilename}.json`), stat), false)
     for (const resource of base.win.extraResources) {
       const matcher = new FileMatcher(
         join(source, resource.from),
@@ -366,13 +373,17 @@ void test('the actual builder matcher excludes every Windows helper from ASAR an
         matcher.from.endsWith(filename) ||
           matcher.from.endsWith(`${filename}.json`) ||
           matcher.from.endsWith(agyFilename) ||
-          matcher.from.endsWith(`${agyFilename}.json`),
+          matcher.from.endsWith(`${agyFilename}.json`) ||
+          matcher.from.endsWith(terminalFilename) ||
+          matcher.from.endsWith(`${terminalFilename}.json`),
       )
       assert(
         matcher.to.endsWith(filename) ||
           matcher.to.endsWith(`${filename}.json`) ||
           matcher.to.endsWith(agyFilename) ||
-          matcher.to.endsWith(`${agyFilename}.json`),
+          matcher.to.endsWith(`${agyFilename}.json`) ||
+          matcher.to.endsWith(terminalFilename) ||
+          matcher.to.endsWith(`${terminalFilename}.json`),
       )
     }
   }

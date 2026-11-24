@@ -137,9 +137,9 @@ await test('Antigravity native profile isolates its dedicated CLI inventory from
 await test('Windows owner inventory keeps exact obligations and a separate native platform gate', async () => {
   const windows = nativeProfile('windows-owner')
   assert.equal(windows.files, windowsOwnerNativeFiles)
-  assert.equal(windowsOwnerNativeCases.length, 13)
+  assert.equal(windowsOwnerNativeCases.length, 15)
   assert.equal(windowsOwnerHostCases.length, 5)
-  assert.equal(new Set(windows.cases).size, 18)
+  assert.equal(new Set(windows.cases).size, 20)
   for (const arch of ['x64', 'arm64']) {
     assert(nativeProfileSupports(windows, 'win32', arch))
     assert(nativeProfileSetupSupports(windows, 'win32', arch))
