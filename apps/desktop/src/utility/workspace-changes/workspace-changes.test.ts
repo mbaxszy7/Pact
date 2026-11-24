@@ -909,4 +909,179 @@ describe('Passive native file results and whole-card Undo', () => {
       await rm(f.directory, { recursive: true })
     }
   })
+
+  it('skips startup projection and readPage access for finalized 0-file uncertain-effects rounds', async () => {
+    const f = await fixture()
+    let reopened: PactDatabase | undefined, module: WorkspaceChanges | undefined
+    let originalClosed = false
+    try {
+      f.module.observeUncertainEffects(f.run.id)
+      const finished = await f.module.finish(f.run.id)
+      expect(finished).toMatchObject({
+        id: f.run.id,
+        state: 'ready',
+        fileCount: 0,
+        effectsUncertain: true,
+      })
+      let beforeReopenError: unknown
+      try {
+        f.module.readPage({ changeSetId: f.run.id })
+      } catch (error) {
+        beforeReopenError = error
+      }
+      expect(beforeReopenError).toBeInstanceOf(WorkspaceChangeError)
+      expect(beforeReopenError).toMatchObject({ code: 'VALIDATION' })
+      await f.module.dispose()
+      f.db.close()
+      originalClosed = true
+      reopened = await PactDatabase.open({ filePath: f.filePath, migrationsFolder })
+      module = new WorkspaceChanges(
+        reopened.workspaceChangesRepository,
+        reopened.sessionRepository,
+        reopened.projectCatalogRepository,
+        f.storage,
+        runDirectoryWorker,
+        f.filePath,
+      )
+      expect(await module.initialize()).toEqual([])
+      expect(reopened.conversationRepository.findRun(f.run.id)?.workspaceChanges).toBeUndefined()
+      let afterReopenError: unknown
+      try {
+        module.readPage({ changeSetId: f.run.id })
+      } catch (error) {
+        afterReopenError = error
+      }
+      expect(afterReopenError).toBeInstanceOf(WorkspaceChangeError)
+      expect(afterReopenError).toMatchObject({ code: 'VALIDATION' })
+    } finally {
+      await module?.dispose()
+      await f.module.dispose()
+      if (!originalClosed) f.db.close()
+      reopened?.close()
+      await rm(f.directory, { recursive: true })
+    }
+  })
+
+  it('converges twice-initialized legacy 0-file pending rows, retracts empty premature cards, and preserves 0-file recovery_required sets', async () => {
+    const f = await fixture()
+    let reopened1: PactDatabase | undefined,
+      module1: WorkspaceChanges | undefined,
+      reopened2: PactDatabase | undefined,
+      module2: WorkspaceChanges | undefined
+    let originalClosed = false
+    try {
+      // Publish premature 1-file summary while active, then undo back to original bytes so net fileCount becomes 0.
+      await writeFile(join(f.root, 'retract.ts'), 'after\n')
+      await f.module.record(
+        f.run.id,
+        {
+          path: 'retract.ts',
+          kind: 'modified',
+          operationId: 'op-1',
+          before: 'before\n',
+          after: 'after\n',
+        },
+        f.signal,
+      )
+      f.db.conversationRepository.recordWorkspaceChanges(f.module.summary(f.run.id)!)
+      expect(f.db.conversationRepository.findRun(f.run.id)?.workspaceChanges).toMatchObject({
+        fileCount: 1,
+      })
+
+      await writeFile(join(f.root, 'retract.ts'), 'before\n')
+      await f.module.record(
+        f.run.id,
+        {
+          path: 'retract.ts',
+          kind: 'modified',
+          operationId: 'op-2',
+          before: 'after\n',
+          after: 'before\n',
+        },
+        f.signal,
+      )
+      await f.module.finish(f.run.id)
+      await f.module.dispose()
+      f.db.close()
+      originalClosed = true
+
+      reopened1 = await PactDatabase.open({ filePath: f.filePath, migrationsFolder })
+      module1 = new WorkspaceChanges(
+        reopened1.workspaceChangesRepository,
+        reopened1.sessionRepository,
+        reopened1.projectCatalogRepository,
+        f.storage,
+        runDirectoryWorker,
+        f.filePath,
+      )
+      const pass1 = await module1.initialize()
+      expect(pass1.some((s) => s.id === f.run.id && s.fileCount === 0)).toBe(true)
+      for (const s of pass1) reopened1.conversationRepository.recordWorkspaceChanges(s)
+      expect(reopened1.conversationRepository.findRun(f.run.id)?.workspaceChanges).toBeUndefined()
+      await module1.dispose()
+      reopened1.close()
+
+      reopened2 = await PactDatabase.open({ filePath: f.filePath, migrationsFolder })
+      module2 = new WorkspaceChanges(
+        reopened2.workspaceChangesRepository,
+        reopened2.sessionRepository,
+        reopened2.projectCatalogRepository,
+        f.storage,
+        runDirectoryWorker,
+        f.filePath,
+      )
+      expect(await module2.initialize()).toEqual([])
+      expect(reopened2.conversationRepository.findRun(f.run.id)?.workspaceChanges).toBeUndefined()
+
+      // 0-file recovery_required row still projects and remains readable.
+      const recSessionId = crypto.randomUUID()
+      reopened2.sessionRepository.create(
+        {
+          id: recSessionId,
+          projectId: reopened2.sessionRepository.find(f.run.sessionId)!.projectId,
+          title: 'Interrupted zero-file recovery',
+          createdAt: new Date().toISOString(),
+        },
+        settings,
+      )
+      const recRun = reopened2.conversationRepository.beginRun({
+        sessionId: recSessionId,
+        clientMessageId: crypto.randomUUID(),
+        content: 'Interrupted zero-file recovery',
+        expectedCommentsRevision: 0,
+        commentIds: [],
+        agentId: 'codex',
+        settingsRevision: 1,
+        model: null,
+        effort: null,
+      }).run
+      reopened2.workspaceChangesRepository.begin({
+        runId: recRun.id,
+        sessionId: recSessionId,
+        projectId: reopened2.sessionRepository.find(f.run.sessionId)!.projectId,
+        agentId: 'codex',
+        root: f.root,
+        rootDevice: '1',
+        rootInode: '1',
+        stagingRoot: f.storage,
+      })
+      reopened2.workspaceChangesRepository.markRecoveryRequired(recRun.id, 'Interrupted op')
+      const recSummary = reopened2.workspaceChangesRepository.finalize(recRun.id)
+      expect(recSummary).toMatchObject({ id: recRun.id, state: 'recovery_required', fileCount: 0 })
+      reopened2.conversationRepository.recordWorkspaceChanges(recSummary)
+      expect(reopened2.conversationRepository.findRun(recRun.id)?.workspaceChanges).toMatchObject({
+        id: recRun.id,
+        state: 'recovery_required',
+      })
+      expect(module2.readPage({ changeSetId: recRun.id }).changeSet.state).toBe('recovery_required')
+    } finally {
+      await module2?.dispose()
+      reopened2?.close()
+      await module1?.dispose()
+      reopened1?.close()
+      await f.module.dispose()
+      if (!originalClosed) f.db.close()
+      await rm(f.directory, { recursive: true })
+    }
+  })
 })

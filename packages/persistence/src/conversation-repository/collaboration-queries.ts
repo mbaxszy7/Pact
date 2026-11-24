@@ -2203,7 +2203,10 @@ export function finishCollaboration(
         : undefined
     const planner = collaborationPlanMode(frozen, auth)
     const canPublishPlan = planner || collaborationOpenPlanPublishAllowed(frozen, auth)
-    if (!report && !plan) {
+    if (
+      (!report && !plan) ||
+      ((auth.stage === 'plan_review' || auth.stage === 'code_review') && !report)
+    ) {
       Object.assign(task, settleCollaborationStage(task, { kind: 'unavailable', reason: 'source' }))
       task.revision++
       saveCollaboration(repo, task)

@@ -14,6 +14,7 @@ import {
   collaborationAvailableActions,
   collaborationDocumentSchema,
   CONVERSATION_PATCH_BYTES,
+  CONVERSATION_PATCH_TEXT_BYTES,
   conversationPatchSchema,
   collaborationTaskSchema,
   decisionInputSchema,
@@ -4309,5 +4310,312 @@ describe('Open-mode plan publish intent, recovery, failure matrix, legacy repair
     })
     expect(recoveredAfterStop?.planSyncPaused).toBeUndefined()
     expect(recoveredAfterStop?.notice).toBeUndefined()
+  })
+
+  it('preserves Full response text isn’t available notice and allows late output recovery when settleKnownNativeEnding runs on a completed run with empty response and no output failure', async () => {
+    const f = await fixture()
+    f.finish()
+    f.finish(advance(f).id, { verdict: 'accepted' })
+    const impl = advance(f, 'execute')
+    recordCodeChange(f, impl.id, 'parse-port.mjs')
+    f.finish(impl.id, { answer: 'Implemented.' })
+    const reviewRun = advance(f, 'review_code')
+    const nativeSessionId = `fixture-${reviewRun.agentId}`
+    const nativeTurnId = `turn-${reviewRun.id}`
+
+    f.repo.applyEvent(f.sessionId, reviewRun.id, {
+      type: 'session.started',
+      agentId: reviewRun.agentId,
+      nativeSessionId,
+    })
+    f.repo.applyEvent(f.sessionId, reviewRun.id, {
+      type: 'turn.started',
+      agentId: reviewRun.agentId,
+      turnId: nativeTurnId,
+    })
+    f.repo.recordWorkflowReview(reviewRun.id, { verdict: 'accepted' })
+    f.repo.recordNativeEvidence({
+      kind: 'ended',
+      source: 'stored_terminal',
+      outcome: 'completed',
+      identity: {
+        sessionId: f.sessionId,
+        agentId: reviewRun.agentId,
+        requestId: reviewRun.id,
+        runId: reviewRun.id,
+        nativeSessionId,
+        nativeTurnId,
+        bindingGeneration: reviewRun.bindingGeneration ?? 1,
+      },
+    })
+    f.repo.recordNativeEffects(reviewRun.id, 'settled')
+    f.repo.applyEvent(f.sessionId, reviewRun.id, {
+      type: 'turn.completed',
+      agentId: reviewRun.agentId,
+      turnId: nativeTurnId,
+      outcome: 'completed',
+    })
+    f.repo.settleKnownNativeEnding(reviewRun.id)
+
+    const failedTask = f.repo.collaboration(f.sessionId)
+    expect(failedTask).toMatchObject({
+      status: 'failed',
+      automation: 'paused',
+      pauseReason: 'failure',
+      notice: 'Full response text isn’t available.',
+    })
+    expect(
+      f.db.drizzle
+        .select({ applied: workflowTurns.applied })
+        .from(workflowTurns)
+        .where(eq(workflowTurns.runId, reviewRun.id))
+        .get()?.applied,
+    ).toBe(false)
+
+    await f.repo.recordNativeOutputComplete(
+      reviewRun.id,
+      {
+        outputId: `recovered-${reviewRun.id}`,
+        text: 'Reviewed parse-port implementation and verified edge cases.',
+        completeness: 'complete',
+      },
+      new AbortController().signal,
+    )
+    f.repo.reconcileCompletedCollaboration(reviewRun.id)
+
+    expect(f.repo.collaboration(f.sessionId)).toMatchObject({
+      status: 'waiting',
+      stage: 'code_review',
+      review: {
+        runId: reviewRun.id,
+        actor: reviewRun.agentId,
+        stage: 'code_review',
+        verdict: 'accepted',
+      },
+    })
+    expect(f.repo.collaboration(f.sessionId)?.notice).toBeUndefined()
+    expect(
+      f.db.drizzle
+        .select({ applied: workflowTurns.applied })
+        .from(workflowTurns)
+        .where(eq(workflowTurns.runId, reviewRun.id))
+        .get()?.applied,
+    ).toBe(true)
+  })
+
+  it('never settles accepted on <=16KiB or >16KiB incomplete partial reports and lets observationUnavailable runs settle after cold recovery', async () => {
+    for (const partialLength of [120, CONVERSATION_PATCH_TEXT_BYTES + 1]) {
+      // oxlint-disable-next-line eslint/no-await-in-loop -- Run clean independent DB fixtures sequentially.
+      const f = await fixture()
+      f.finish()
+      f.finish(advance(f).id, { verdict: 'accepted' })
+      const impl = advance(f, 'execute')
+      recordCodeChange(f, impl.id, 'parse-port.mjs')
+      f.finish(impl.id, { answer: 'Implemented.' })
+      const reviewRun = advance(f, 'review_code')
+      const nativeSessionId = `fixture-${reviewRun.agentId}`
+      const nativeTurnId = `turn-${reviewRun.id}`
+
+      f.repo.applyEvent(f.sessionId, reviewRun.id, {
+        type: 'session.started',
+        agentId: reviewRun.agentId,
+        nativeSessionId,
+      })
+      f.repo.applyEvent(f.sessionId, reviewRun.id, {
+        type: 'turn.started',
+        agentId: reviewRun.agentId,
+        turnId: nativeTurnId,
+      })
+      // oxlint-disable-next-line eslint/no-await-in-loop -- Commit bounded partial body sequentially per subcase.
+      await f.repo.recordNativeOutputComplete(
+        reviewRun.id,
+        {
+          outputId: `partial-${reviewRun.id}`,
+          text: 'p'.repeat(partialLength),
+          completeness: 'partial',
+        },
+        new AbortController().signal,
+      )
+      f.repo.recordWorkflowReview(reviewRun.id, { verdict: 'accepted' })
+      f.repo.recordNativeEvidence({
+        kind: 'ended',
+        source: 'stored_terminal',
+        outcome: 'completed',
+        identity: {
+          sessionId: f.sessionId,
+          agentId: reviewRun.agentId,
+          requestId: reviewRun.id,
+          runId: reviewRun.id,
+          nativeSessionId,
+          nativeTurnId,
+          bindingGeneration: reviewRun.bindingGeneration ?? 1,
+        },
+      })
+      f.repo.recordNativeEffects(reviewRun.id, 'settled')
+      f.repo.applyEvent(f.sessionId, reviewRun.id, {
+        type: 'turn.completed',
+        agentId: reviewRun.agentId,
+        turnId: nativeTurnId,
+        outcome: 'completed',
+      })
+      f.repo.settleKnownNativeEnding(reviewRun.id)
+
+      expect(f.repo.collaboration(f.sessionId)).toMatchObject({
+        status: 'failed',
+        pauseReason: 'failure',
+        notice: 'Full response text isn’t available.',
+      })
+      expect(
+        f.db.drizzle
+          .select({ applied: workflowTurns.applied })
+          .from(workflowTurns)
+          .where(eq(workflowTurns.runId, reviewRun.id))
+          .get()?.applied,
+      ).toBe(false)
+
+      // Committing complete output later allows normal accepted settlement.
+      // oxlint-disable-next-line eslint/no-await-in-loop -- Commit complete output sequentially after partial rejection check.
+      await f.repo.recordNativeOutputComplete(
+        reviewRun.id,
+        {
+          outputId: `complete-${reviewRun.id}`,
+          text: 'Complete review body accepting implementation.',
+          completeness: 'complete',
+        },
+        new AbortController().signal,
+      )
+      f.repo.reconcileCompletedCollaboration(reviewRun.id)
+      expect(f.repo.collaboration(f.sessionId)).toMatchObject({
+        status: 'waiting',
+        stage: 'code_review',
+        review: { runId: reviewRun.id, verdict: 'accepted' },
+      })
+    }
+
+    // observationUnavailable (`transient_transport`) -> cold completed before body recovery -> stays unapplied, then recovers.
+    const fObs = await fixture()
+    fObs.finish()
+    fObs.finish(advance(fObs).id, { verdict: 'accepted' })
+    const implObs = advance(fObs, 'execute')
+    recordCodeChange(fObs, implObs.id, 'parse-port.mjs')
+    fObs.finish(implObs.id, { answer: 'Implemented.' })
+    const reviewObs = advance(fObs, 'review_code')
+    const sidObs = `fixture-${reviewObs.agentId}`
+    const turnObs = `turn-${reviewObs.id}`
+
+    fObs.repo.applyEvent(fObs.sessionId, reviewObs.id, {
+      type: 'session.started',
+      agentId: reviewObs.agentId,
+      nativeSessionId: sidObs,
+    })
+    fObs.repo.applyEvent(fObs.sessionId, reviewObs.id, {
+      type: 'turn.started',
+      agentId: reviewObs.agentId,
+      turnId: turnObs,
+    })
+    fObs.repo.observationUnavailable(reviewObs.id, 'Stream disconnected before terminal delivery.')
+    fObs.repo.recordWorkflowReview(reviewObs.id, { verdict: 'accepted' })
+    fObs.repo.recordNativeEvidence({
+      kind: 'ended',
+      source: 'stored_terminal',
+      outcome: 'completed',
+      identity: {
+        sessionId: fObs.sessionId,
+        agentId: reviewObs.agentId,
+        requestId: reviewObs.id,
+        runId: reviewObs.id,
+        nativeSessionId: sidObs,
+        nativeTurnId: turnObs,
+        bindingGeneration: reviewObs.bindingGeneration ?? 1,
+      },
+    })
+    fObs.repo.recordNativeEffects(reviewObs.id, 'settled')
+    fObs.repo.settleKnownNativeEnding(reviewObs.id)
+
+    expect(fObs.repo.collaboration(fObs.sessionId)).toMatchObject({
+      status: 'failed',
+      notice: 'Full response text isn’t available.',
+    })
+    expect(
+      fObs.db.drizzle
+        .select({ applied: workflowTurns.applied })
+        .from(workflowTurns)
+        .where(eq(workflowTurns.runId, reviewObs.id))
+        .get()?.applied,
+    ).toBe(false)
+
+    await fObs.repo.recordNativeOutputComplete(
+      reviewObs.id,
+      {
+        outputId: `recovered-obs-${reviewObs.id}`,
+        text: 'Recovered complete review after transport interruption.',
+        completeness: 'complete',
+      },
+      new AbortController().signal,
+    )
+    fObs.repo.reconcileCompletedCollaboration(reviewObs.id)
+    expect(fObs.repo.collaboration(fObs.sessionId)).toMatchObject({
+      status: 'waiting',
+      stage: 'code_review',
+      review: { runId: reviewObs.id, verdict: 'accepted' },
+    })
+
+    // Explicit output failure (`pact.output_unavailable`) applies interrupted rather than source unavailability.
+    const fOutFail = await fixture()
+    fOutFail.finish()
+    fOutFail.finish(advance(fOutFail).id, { verdict: 'accepted' })
+    const implOutFail = advance(fOutFail, 'execute')
+    recordCodeChange(fOutFail, implOutFail.id, 'parse-port.mjs')
+    fOutFail.finish(implOutFail.id, { answer: 'Implemented.' })
+    const reviewFail = advance(fOutFail, 'review_code')
+    const sidFail = `fixture-${reviewFail.agentId}`
+    const turnFail = `turn-${reviewFail.id}`
+
+    fOutFail.repo.applyEvent(fOutFail.sessionId, reviewFail.id, {
+      type: 'session.started',
+      agentId: reviewFail.agentId,
+      nativeSessionId: sidFail,
+    })
+    fOutFail.repo.applyEvent(fOutFail.sessionId, reviewFail.id, {
+      type: 'turn.started',
+      agentId: reviewFail.agentId,
+      turnId: turnFail,
+    })
+    fOutFail.repo.recordNativeEvidence({
+      kind: 'ended',
+      source: 'stored_terminal',
+      outcome: 'completed',
+      identity: {
+        sessionId: fOutFail.sessionId,
+        agentId: reviewFail.agentId,
+        requestId: reviewFail.id,
+        runId: reviewFail.id,
+        nativeSessionId: sidFail,
+        nativeTurnId: turnFail,
+        bindingGeneration: reviewFail.bindingGeneration ?? 1,
+      },
+    })
+    fOutFail.repo.recordNativeEffects(reviewFail.id, 'settled')
+    fOutFail.repo.applyEvent(fOutFail.sessionId, reviewFail.id, {
+      type: 'turn.completed',
+      agentId: reviewFail.agentId,
+      turnId: turnFail,
+      outcome: 'completed',
+    })
+    fOutFail.repo.settleKnownNativeEnding(reviewFail.id, {
+      kind: 'response_too_large',
+      message: 'Assistant response exceeded output limit.',
+    })
+    expect(fOutFail.repo.collaboration(fOutFail.sessionId)).toMatchObject({
+      status: 'failed',
+      notice: 'Assistant response exceeded output limit.',
+    })
+    expect(
+      fOutFail.db.drizzle
+        .select({ applied: workflowTurns.applied })
+        .from(workflowTurns)
+        .where(eq(workflowTurns.runId, reviewFail.id))
+        .get()?.applied,
+    ).toBe(true)
   })
 })

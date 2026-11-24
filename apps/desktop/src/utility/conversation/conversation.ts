@@ -9958,7 +9958,12 @@ export class Conversation {
       return
     }
     const summary = await this.workspaceChanges?.finish(runId)
-    if (summary && (summary.fileCount > 0 || summary.state === 'recovery_required'))
+    if (
+      summary &&
+      (summary.fileCount > 0 ||
+        summary.state === 'recovery_required' ||
+        run.workspaceChanges !== undefined)
+    )
       this.publish(this.conversations.recordWorkspaceChanges(summary))
   }
 

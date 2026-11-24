@@ -1883,7 +1883,12 @@ export class WorkspaceChanges {
   private validateSet(id: string) {
     const changeSet = this.repository.find(id)
     const session = changeSet ? this.sessions.find(changeSet.sessionId) : undefined
-    if (!changeSet || !session || session.status === 'archived')
+    if (
+      !changeSet ||
+      (changeSet.fileCount === 0 && changeSet.state !== 'recovery_required') ||
+      !session ||
+      session.status === 'archived'
+    )
       throw new WorkspaceChangeError('VALIDATION', 'This saved round is unavailable.')
     return changeSet
   }

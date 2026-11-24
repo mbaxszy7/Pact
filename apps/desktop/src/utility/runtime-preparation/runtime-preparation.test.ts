@@ -1,4 +1,5 @@
 import Database from 'better-sqlite3'
+import { execFile } from 'node:child_process'
 import {
   chmod,
   mkdir,
@@ -7,19 +8,21 @@ import {
   readFile,
   rm,
   stat,
+  symlink,
   utimes,
   writeFile,
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { isAbsolute, dirname, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
+import { promisify } from 'node:util'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { RuntimeAgentId } from '@pact/contracts'
 import type { RuntimePreparationRepository } from '@pact/persistence'
 
 import { OwnedProcessGroup } from '../owned-process-group.js'
-import { isSafeAgyProbeSessionId, isUnsafeWindowsCmdPath } from './agy-acp-probe.js'
+import { isSafeAgyProbeSessionId, isUnsafeWindowsCmdPath, runAgyAcpProbe } from './agy-acp-probe.js'
 import { type AgyReadinessSessionHook, RuntimePreparation } from './runtime-preparation.js'
 
 const temporaryDirectories: string[] = []
@@ -42,6 +45,7 @@ interface AgyMockOptions {
     | 'create_nonempty_probe_db'
     | 'create_foreign_workspace_probe_db'
     | 'lock_probe_root'
+    | 'require_gemini_provider'
   probeSessionId?: string
   lockOnceFlagPath?: string
 }
@@ -194,7 +198,7 @@ async function agyExecutable(options: AgyMockOptions = {}): Promise<{
   await writeFile(
     scriptPath,
     `#!${process.execPath}
-import { appendFileSync, chmodSync, existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from 'node:fs'
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { createInterface } from 'node:readline'
 import { pathToFileURL } from 'node:url'
@@ -213,7 +217,13 @@ if (args[0] === '--version') {
 
 if (args[0] === 'acp') {
   const cwdMode = statSync(process.cwd()).mode & 0o777
-  record({ event: 'acp_spawn', args, cwd: process.cwd(), cwdMode })
+  const gIdx = args.indexOf('--gemini-dir')
+  const aIdx = args.indexOf('--app-data-dir')
+  const seededSettingsPath =
+    gIdx >= 0 && aIdx >= 0 ? join(args[gIdx + 1], args[aIdx + 1], 'settings.json') : null
+  const probeSettings =
+    seededSettingsPath && existsSync(seededSettingsPath) ? readFileSync(seededSettingsPath, 'utf8') : null
+  record({ event: 'acp_spawn', args, cwd: process.cwd(), cwdMode, probeSettings })
   const behavior = ${JSON.stringify(behavior)}
   if (behavior === 'timeout') {
     setInterval(() => {}, 1000)
@@ -238,6 +248,12 @@ if (args[0] === 'acp') {
         }) + '\\n')
       } else if (msg.method === 'session/new') {
         if (behavior === 'unauthenticated') {
+          process.stdout.write(JSON.stringify({
+            jsonrpc: '2.0',
+            id: msg.id,
+            error: { code: -32000, message: 'Authentication required' },
+          }) + '\\n')
+        } else if (behavior === 'require_gemini_provider' && probeSettings !== JSON.stringify({ modelProvider: 'gemini' })) {
           process.stdout.write(JSON.stringify({
             jsonrpc: '2.0',
             id: msg.id,
@@ -359,6 +375,7 @@ interface AgyFactRecord {
   args?: string[]
   cwd?: string
   cwdMode?: number
+  probeSettings?: string | null
   method?: string
   params?: Record<string, unknown>
 }
@@ -373,6 +390,7 @@ function parseAgyFactLine(line: string): AgyFactRecord {
   const args = Reflect.get(raw, 'args')
   const cwd = Reflect.get(raw, 'cwd')
   const cwdMode = Reflect.get(raw, 'cwdMode')
+  const probeSettings = Reflect.get(raw, 'probeSettings')
   const method = Reflect.get(raw, 'method')
   const params = Reflect.get(raw, 'params')
   return {
@@ -383,6 +401,7 @@ function parseAgyFactLine(line: string): AgyFactRecord {
       : {}),
     ...(typeof cwd === 'string' ? { cwd } : {}),
     ...(typeof cwdMode === 'number' ? { cwdMode } : {}),
+    ...(typeof probeSettings === 'string' || probeSettings === null ? { probeSettings } : {}),
     ...(typeof method === 'string' ? { method } : {}),
     ...(typeof params === 'object' && params !== null && !Array.isArray(params)
       ? { params: Object.fromEntries(Object.entries(params)) }
@@ -1522,6 +1541,166 @@ if (args[0] === 'acp') {
         value: { agentId: 'agy', state: 'unsupported_version', version: '1.5.8' },
       })
       expect(await readSpawnCount()).toBe(8)
+    },
+  )
+
+  it('seeds only modelProvider into temporary agy probe settings when configured and leaves missing settings.json absent', async () => {
+    const [claude, codex, agy] = await Promise.all([
+      executable('claude', 0, 0),
+      executable('codex', 0, 0),
+      agyExecutable({ cliVersion: '1.5.15', behavior: 'require_gemini_provider' }),
+    ])
+
+    // 1. Regular settings.json with extra keys -> seeds ONLY {"modelProvider":"gemini"}.
+    const configured = await createIsolatedEnv()
+    const cliSettingsDir = join(configured.geminiDir, 'antigravity-cli')
+    await mkdir(cliSettingsDir, { recursive: true })
+    await writeFile(
+      join(cliSettingsDir, 'settings.json'),
+      JSON.stringify({ modelProvider: 'gemini', hooks: { bad: true }, mcpServers: { x: {} } }),
+    )
+    const runtimeConfigured = trackPreparation(
+      new RuntimePreparation(repository({ claude, codex, agy: agy.path }), {
+        env: configured.env,
+      }),
+    )
+    expect(await runtimeConfigured.inspectProviderReadiness('agy')).toMatchObject({
+      ok: true,
+      value: { agentId: 'agy', state: 'ready', version: '1.5.15' },
+    })
+
+    // 2. Missing settings.json -> leaves probe settings.json absent.
+    const unconfigured = await createIsolatedEnv()
+    const runtimeUnconfigured = trackPreparation(
+      new RuntimePreparation(repository({ claude, codex, agy: agy.path }), {
+        env: unconfigured.env,
+      }),
+    )
+    expect(await runtimeUnconfigured.inspectProviderReadiness('agy')).toMatchObject({
+      ok: true,
+      value: { agentId: 'agy', state: 'authentication_required' },
+    })
+
+    const facts = (await readFile(agy.factsPath, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => parseAgyFactLine(line))
+      .filter((fact) => fact.event === 'acp_spawn')
+    expect(facts[0]?.probeSettings).toBe(JSON.stringify({ modelProvider: 'gemini' }))
+    expect(facts[1]?.probeSettings).toBeNull()
+  })
+
+  it.skipIf(process.platform === 'win32')(
+    'ignores symlinked antigravity-cli/settings.json without following it into temporary probe settings',
+    async () => {
+      const [claude, codex, agy] = await Promise.all([
+        executable('claude', 0, 0),
+        executable('codex', 0, 0),
+        agyExecutable({ cliVersion: '1.5.15', behavior: 'require_gemini_provider' }),
+      ])
+
+      const symlinked = await createIsolatedEnv()
+      const outsideFile = join(symlinked.home, 'outside-settings.json')
+      await writeFile(outsideFile, JSON.stringify({ modelProvider: 'gemini' }))
+      const symCliDir = join(symlinked.geminiDir, 'antigravity-cli')
+      await mkdir(symCliDir, { recursive: true })
+      await symlink(outsideFile, join(symCliDir, 'settings.json'))
+      const runtimeSymlinked = trackPreparation(
+        new RuntimePreparation(repository({ claude, codex, agy: agy.path }), {
+          env: symlinked.env,
+        }),
+      )
+      expect(await runtimeSymlinked.inspectProviderReadiness('agy')).toMatchObject({
+        ok: true,
+        value: { agentId: 'agy', state: 'authentication_required' },
+      })
+
+      const firstSpawnFact = (await readFile(agy.factsPath, 'utf8'))
+        .trim()
+        .split('\n')
+        .map((line) => parseAgyFactLine(line))
+        .find((fact) => fact.event === 'acp_spawn')
+      expect(firstSpawnFact?.probeSettings).toBeNull()
+    },
+  )
+
+  it.skipIf(process.platform === 'win32')(
+    'rejects FIFO antigravity-cli/settings.json without blocking and aborts/cleans runAgyAcpProbe on cancelled or expired setup budget',
+    async () => {
+      const [claude, codex, agy] = await Promise.all([
+        executable('claude', 0, 0),
+        executable('codex', 0, 0),
+        agyExecutable({ cliVersion: '1.5.15', behavior: 'require_gemini_provider' }),
+      ])
+
+      const fifoEnv = await createIsolatedEnv()
+      const fifoCliDir = join(fifoEnv.geminiDir, 'antigravity-cli')
+      await mkdir(fifoCliDir, { recursive: true })
+      const fifoPath = join(fifoCliDir, 'settings.json')
+      await promisify(execFile)('mkfifo', [fifoPath])
+
+      const runtimeFifo = trackPreparation(
+        new RuntimePreparation(repository({ claude, codex, agy: agy.path }), {
+          env: fifoEnv.env,
+        }),
+      )
+      expect(await runtimeFifo.inspectProviderReadiness('agy')).toMatchObject({
+        ok: true,
+        value: { agentId: 'agy', state: 'authentication_required' },
+      })
+      const fifoSpawnFact = (await readFile(agy.factsPath, 'utf8'))
+        .trim()
+        .split('\n')
+        .map((line) => parseAgyFactLine(line))
+        .find((fact) => fact.event === 'acp_spawn')
+      expect(fifoSpawnFact?.probeSettings).toBeNull()
+
+      // Aborted or already-expired setup budget never calls ownProbe and cleans any temp probeRoot.
+      const beforeEntries = new Set(await readdir(tmpdir()))
+      let ownProbeCalled = false
+      const expiredAbort = new AbortController()
+      expiredAbort.abort(new Error('cancelled before probe'))
+      await expect(
+        runAgyAcpProbe({
+          executablePath: agy.path,
+          env: fifoEnv.env,
+          signal: expiredAbort.signal,
+          timeoutMs: 1_000,
+          maxFrameBytes: 64 * 1024,
+          maxTotalBytes: 256 * 1024,
+          ownProbe: () => {
+            ownProbeCalled = true
+            return new OwnedProcessGroup()
+          },
+          inspectSession: async () => 'unreachable',
+        }),
+      ).rejects.toMatchObject({ name: 'AbortError' })
+      expect(ownProbeCalled).toBe(false)
+
+      await expect(
+        runAgyAcpProbe({
+          executablePath: agy.path,
+          env: fifoEnv.env,
+          initializeTimeoutMs: 500,
+          timeoutMs: 1_000,
+          businessDeadlineAt: Date.now() - 1,
+          maxFrameBytes: 64 * 1024,
+          maxTotalBytes: 256 * 1024,
+          ownProbe: () => {
+            ownProbeCalled = true
+            return new OwnedProcessGroup()
+          },
+          inspectSession: async () => 'unreachable',
+        }),
+      ).rejects.toMatchObject({ kind: 'timeout' })
+      expect(ownProbeCalled).toBe(false)
+
+      const afterEntries = await readdir(tmpdir())
+      const leakedProbeDirs = afterEntries.filter(
+        (name) => name.startsWith('pact-agy-acp-') && !beforeEntries.has(name),
+      )
+      expect(leakedProbeDirs).toEqual([])
+      expect(isAbsolute(fifoPath)).toBe(true)
     },
   )
 })

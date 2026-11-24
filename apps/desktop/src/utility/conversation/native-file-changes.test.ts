@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import {
   agyFileChanges,
   AgyRoundEffectsTracker,
+  collectAgyTargetPaths,
   isAgyBrainArtifactPath,
   isAgyCommandProvablyDisjoint,
 } from './native-file-changes.js'
@@ -427,5 +428,100 @@ describe('AgyRoundEffectsTracker and command disjointness classification', () =>
     })
     expect(editAfterCmd.invalidatesPriorEvidence).toBe(true)
     expect(editAfterCmd.uncertain).toMatch(/earlier command or tool/u)
+  })
+
+  it('rejects incomplete locations/rawInput metadata and disables Undo on conflicted calls or cross-Brain moves', async () => {
+    const { cwd, appDataDir } = await createWorkspaceAndAppData()
+    const brainPlan = join(appDataDir, 'brain', 'sid-123', 'implementation_plan.md')
+    const wsTarget = join(cwd, 'src', 'moved.ts')
+
+    expect(
+      collectAgyTargetPaths({
+        args: { Path: brainPlan },
+        locations: [{ notPath: 'missing' }],
+      }).complete,
+    ).toBe(false)
+    expect(
+      collectAgyTargetPaths({
+        args: { Path: brainPlan },
+        locations: 'invalid-non-array',
+      }).complete,
+    ).toBe(false)
+    expect(
+      collectAgyTargetPaths({
+        args: { Path: brainPlan },
+        rawInput: { Path: 42 },
+      }).complete,
+    ).toBe(false)
+
+    const conflictedCreate = agyFileChanges(
+      {
+        name: 'write_file',
+        status: 'completed',
+        args: { Path: wsTarget, Overwrite: false },
+        argsConflicted: true,
+        conflictedArgsSources: [
+          { Path: wsTarget, Overwrite: false },
+          { Path: wsTarget, Overwrite: true },
+        ],
+        content: [{ type: 'diff', path: wsTarget, newText: 'new contents\n' }],
+      },
+      cwd,
+    )
+    expect(conflictedCreate.invalidatesPriorEvidence).toBe(true)
+    expect(conflictedCreate.changes[0]).toMatchObject({
+      path: 'src/moved.ts',
+      kind: 'modified',
+    })
+    expect(conflictedCreate.changes[0]?.kind).not.toBe('added')
+    expect(conflictedCreate.changes[0]?.unavailableReason).toMatch(/conflicting arguments/u)
+
+    const crossBrainMove = agyFileChanges(
+      {
+        name: 'edit_file',
+        status: 'completed',
+        args: { Path: brainPlan },
+        content: [
+          {
+            type: 'diff',
+            path: brainPlan,
+            movePath: wsTarget,
+            oldText: '# Plan',
+            newText: 'export const x = 1\n',
+          },
+        ],
+      },
+      cwd,
+      { appDataDir, nativeSessionId: 'sid-123' },
+    )
+    expect(crossBrainMove.invalidatesPriorEvidence).toBe(true)
+    expect(crossBrainMove.changes).toEqual([
+      expect.objectContaining({
+        path: 'src/moved.ts',
+        previousPath: brainPlan,
+        kind: 'renamed',
+      }),
+    ])
+    expect(crossBrainMove.changes[0]?.unavailableReason).toBeDefined()
+
+    const tracker = new AgyRoundEffectsTracker(cwd, 'pact_peer_abc123', appDataDir, 'sid-123')
+    expect(
+      tracker.observeNonFileTool({
+        name: 'run_command',
+        argsConflicted: true,
+      }),
+    ).toMatchObject({
+      uncertain: true,
+      scope: 'recorded_files',
+    })
+    expect(
+      tracker.observeNonFileTool({
+        name: 'read_file',
+        toolIdentityConflicted: true,
+      }),
+    ).toMatchObject({
+      uncertain: true,
+      scope: 'recorded_files',
+    })
   })
 })

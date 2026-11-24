@@ -510,11 +510,15 @@ export class WorkspaceChangesRepository {
       const current = this.require(id)
       if (current.state !== 'recording') return
       const run = this.database
-        .select({ nativeEffectsState: agentRuns.nativeEffectsState })
+        .select({
+          nativeEffectsState: agentRuns.nativeEffectsState,
+          workspaceChangesJson: agentRuns.workspaceChangesJson,
+        })
         .from(agentRuns)
         .where(eq(agentRuns.id, current.runId))
         .get()
       if (run?.nativeEffectsState === 'settled') return
+      const hasPublishedRunSummary = run?.workspaceChangesJson != null
       const reason =
         'Native file recording was interrupted before completion was confirmed. Original versions, last confirmed bytes and patches are retained; the final version and Undo are unavailable.'
       for (const file of this.files(id)) {
@@ -544,7 +548,7 @@ export class WorkspaceChangesRepository {
         .update(workspaceChangeSets)
         .set({
           state: 'mixed',
-          projectionPending: true,
+          projectionPending: current.fileCount > 0 || hasPublishedRunSummary,
           revision: sql`${workspaceChangeSets.revision} + 1`,
           additions: 0,
           deletions: 0,
@@ -560,7 +564,24 @@ export class WorkspaceChangesRepository {
   finalize(id: string): WorkspaceChangeSet {
     this.database.transaction(() => {
       const current = this.require(id)
-      if (current.state !== 'recording' && current.state !== 'recovery_required') return
+      const hasPublishedRunSummary =
+        this.database
+          .select({ summary: agentRuns.workspaceChangesJson })
+          .from(agentRuns)
+          .where(eq(agentRuns.id, current.runId))
+          .get()?.summary != null
+      if (current.state !== 'recording' && current.state !== 'recovery_required') {
+        if (current.fileCount === 0 && !hasPublishedRunSummary) {
+          this.database
+            .update(workspaceChangeSets)
+            .set({ projectionPending: false })
+            .where(
+              and(eq(workspaceChangeSets.id, id), eq(workspaceChangeSets.projectionPending, true)),
+            )
+            .run()
+        }
+        return
+      }
       const unfinished = this.database
         .select({ id: workspaceChangeIntents.id })
         .from(workspaceChangeIntents)
@@ -585,10 +606,12 @@ export class WorkspaceChangesRepository {
           : roundWideReason === null && stats.undoableCount === stats.notUndoneVisibleCount
             ? ('ready' as const)
             : ('mixed' as const)
+      const shouldProject =
+        stats.visibleCount > 0 || nextState === 'recovery_required' || hasPublishedRunSummary
       this.database
         .update(workspaceChangeSets)
         .set({
-          projectionPending: true,
+          projectionPending: shouldProject,
           revision: sql`${workspaceChangeSets.revision} + 1`,
           state: nextState,
           undoUnavailableReason: nextState === 'undone' ? null : roundWideReason,

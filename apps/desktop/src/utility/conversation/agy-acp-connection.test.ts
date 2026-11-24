@@ -7,7 +7,7 @@ import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promis
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PassThrough, Writable } from 'node:stream'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { RunEffectiveExecutionSettings } from '@pact/contracts'
 
@@ -28,6 +28,8 @@ import {
   agyProcessEnvironment,
   classifyAgySessionCloseResponse,
   createAgyRootFrameNotWrittenProof,
+  formatAndValidateAgyOwnedSpawnArgs,
+  isSafeAbsoluteAgyGeminiDir,
   type AgyIngress,
   type AgyPermissionScope,
   type AgyPoolIdleRetirement,
@@ -62,11 +64,23 @@ vi.mock('./native-json-parser.js', async (original) => {
   }
 })
 
+const initialAntigravityGeminiDir = process.env.ANTIGRAVITY_GEMINI_DIR
 const tempDirs: string[] = []
+beforeEach(() => {
+  delete process.env.ANTIGRAVITY_GEMINI_DIR
+})
 afterEach(async () => {
   parserSeam.intercept = undefined
   vi.useRealTimers()
+  delete process.env.ANTIGRAVITY_GEMINI_DIR
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })))
+})
+afterAll(() => {
+  if (initialAntigravityGeminiDir === undefined) {
+    delete process.env.ANTIGRAVITY_GEMINI_DIR
+  } else {
+    process.env.ANTIGRAVITY_GEMINI_DIR = initialAntigravityGeminiDir
+  }
 })
 
 function fakeAcpChild(options: { blockWrites?: boolean } = {}) {
@@ -4681,5 +4695,298 @@ describe('AgyIngress ordered stream, exit-drain separation, invalid_reply tainti
     lateStream.abandon()
     stream.abandon()
     await connection.close(new Error('done'))
+  })
+
+  it('forwards --gemini-dir from ANTIGRAVITY_GEMINI_DIR or explicit options.geminiDir, leaks zero slots on invalid paths, and validates POSIX and Windows .cmd spawn arguments', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'pact-agy-gemini-flag-'))
+    tempDirs.push(root)
+    const projectDir = join(root, 'proj')
+    const envGeminiDir = join(root, 'env-gemini-home')
+    const explicitGeminiDir = join(root, 'explicit-gemini-home')
+    await Promise.all([
+      mkdir(projectDir, { recursive: true }),
+      mkdir(envGeminiDir, { recursive: true }),
+      mkdir(explicitGeminiDir, { recursive: true }),
+    ])
+
+    const priorGeminiDir = process.env.ANTIGRAVITY_GEMINI_DIR
+    const recordedArgs: string[][] = []
+    const createOkPool = (geminiDir?: string) =>
+      new AgyAcpConnectionPool({
+        executablePath: '/usr/local/bin/agy',
+        ...(geminiDir !== undefined ? { geminiDir } : {}),
+        processFactory(_cwd, args) {
+          recordedArgs.push([...args])
+          const fake = fakeAcpChild()
+          fake.onRequest((frame) => {
+            if (frame.method === 'initialize') {
+              fake.send({ jsonrpc: '2.0', id: frame.id, result: { protocolVersion: 1 } })
+            }
+          })
+          return fake.child
+        },
+      })
+
+    try {
+      // 1. Unset or relative ANTIGRAVITY_GEMINI_DIR omits --gemini-dir cleanly.
+      delete process.env.ANTIGRAVITY_GEMINI_DIR
+      const unsetPool = createOkPool()
+      const unsetLease = await unsetPool.acquire({
+        cwd: projectDir,
+        permissionScope: 'standard',
+        permissionMode: 'ask',
+        sessionId: 'sess-unset',
+      })
+      unsetLease.release()
+      await unsetPool.dispose()
+
+      process.env.ANTIGRAVITY_GEMINI_DIR = 'relative/gemini'
+      const relEnvPool = createOkPool()
+      const relEnvLease = await relEnvPool.acquire({
+        cwd: projectDir,
+        permissionScope: 'standard',
+        permissionMode: 'ask',
+        sessionId: 'sess-rel-env',
+      })
+      relEnvLease.release()
+      await relEnvPool.dispose()
+
+      // 2. Absolute ANTIGRAVITY_GEMINI_DIR resolves and forwards --gemini-dir.
+      process.env.ANTIGRAVITY_GEMINI_DIR = ` ${envGeminiDir}/./nested/.. `
+      const absEnvPool = createOkPool()
+      const absEnvLease = await absEnvPool.acquire({
+        cwd: projectDir,
+        permissionScope: 'standard',
+        permissionMode: 'ask',
+        sessionId: 'sess-abs-env',
+      })
+      absEnvLease.release()
+      await absEnvPool.dispose()
+
+      // 3. Explicit options.geminiDir overrides ANTIGRAVITY_GEMINI_DIR.
+      const explicitPool = createOkPool(explicitGeminiDir)
+      const explicitLease = await explicitPool.acquire({
+        cwd: projectDir,
+        permissionScope: 'full',
+        permissionMode: 'full',
+        sessionId: 'sess-explicit',
+      })
+      explicitLease.release()
+      await explicitPool.dispose()
+
+      expect(recordedArgs).toEqual([
+        ['acp', '--process-per-session', '--disable-telemetry'],
+        ['acp', '--process-per-session', '--disable-telemetry'],
+        ['acp', '--process-per-session', '--disable-telemetry', '--gemini-dir', envGeminiDir],
+        [
+          'acp',
+          '--process-per-session',
+          '--disable-telemetry',
+          '--gemini-dir',
+          explicitGeminiDir,
+          '--dangerously-skip-permissions',
+        ],
+      ])
+
+      // 4. Invalid options.geminiDir rejects with protocol_error and leaks 0 pool slots.
+      for (const badDir of [
+        'relative/dir',
+        '/tmp/bad\npath',
+        '/tmp/bad\x00nul',
+        '/' + 'a'.repeat(5000),
+      ]) {
+        const badPool = createOkPool(badDir)
+        await expect(
+          badPool.acquire({
+            cwd: projectDir,
+            permissionScope: 'standard',
+            permissionMode: 'ask',
+            sessionId: 'sess-bad-gemini',
+          }),
+        ).rejects.toMatchObject({ kind: 'protocol_error' })
+        expect(badPool.occupiedProcessSlotCount).toBe(0)
+        expect(badPool.activeLeaseCount).toBe(0)
+        expect(badPool.poolSnapshot()).toHaveLength(0)
+        await badPool.dispose()
+      }
+
+      // 5. Control-character or oversized ANTIGRAVITY_GEMINI_DIR fails closed with protocol_error.
+      process.env.ANTIGRAVITY_GEMINI_DIR = '/tmp/evil\ngemini'
+      const badEnvPool = createOkPool()
+      await expect(
+        badEnvPool.acquire({
+          cwd: projectDir,
+          permissionScope: 'standard',
+          permissionMode: 'ask',
+          sessionId: 'sess-bad-env-ctrl',
+        }),
+      ).rejects.toMatchObject({ kind: 'protocol_error' })
+      expect(badEnvPool.occupiedProcessSlotCount).toBe(0)
+      await badEnvPool.dispose()
+
+      process.env.ANTIGRAVITY_GEMINI_DIR = '/' + 'b'.repeat(5000)
+      const overEnvPool = createOkPool()
+      await expect(
+        overEnvPool.acquire({
+          cwd: projectDir,
+          permissionScope: 'standard',
+          permissionMode: 'ask',
+          sessionId: 'sess-over-env',
+        }),
+      ).rejects.toMatchObject({ kind: 'protocol_error' })
+      expect(overEnvPool.occupiedProcessSlotCount).toBe(0)
+      await overEnvPool.dispose()
+    } finally {
+      if (priorGeminiDir === undefined) delete process.env.ANTIGRAVITY_GEMINI_DIR
+      else process.env.ANTIGRAVITY_GEMINI_DIR = priorGeminiDir
+    }
+
+    // 6. Cross-platform spawn validation: POSIX & Windows .cmd quoting + cmd.exe SystemRoot enforcement.
+    expect(
+      formatAndValidateAgyOwnedSpawnArgs(
+        '/usr/local/bin/agy',
+        ['acp', '--process-per-session', '--disable-telemetry', '--gemini-dir', envGeminiDir],
+        'darwin',
+        {},
+      ),
+    ).toEqual({
+      target: '/usr/local/bin/agy',
+      spawnArgs: [
+        'acp',
+        '--process-per-session',
+        '--disable-telemetry',
+        '--gemini-dir',
+        envGeminiDir,
+      ],
+      isWindowsCommand: false,
+    })
+
+    expect(
+      formatAndValidateAgyOwnedSpawnArgs(
+        'C:\\Program Files\\agy-auth-bin\\agy.cmd',
+        [
+          'acp',
+          '--process-per-session',
+          '--disable-telemetry',
+          '--gemini-dir',
+          'C:\\Users\\Alice Smith\\gemini-home',
+        ],
+        'win32',
+        { SystemRoot: 'C:\\Windows', ComSpec: 'C:\\Evil\\cmd.exe' },
+      ),
+    ).toEqual({
+      target: 'C:\\Windows\\System32\\cmd.exe',
+      spawnArgs: [
+        '/d',
+        '/s',
+        '/c',
+        '""C:\\Program Files\\agy-auth-bin\\agy.cmd" acp --process-per-session --disable-telemetry --gemini-dir "C:\\Users\\Alice Smith\\gemini-home""',
+      ],
+      isWindowsCommand: true,
+    })
+
+    expect(() =>
+      formatAndValidateAgyOwnedSpawnArgs(
+        'C:\\bin\\agy&calc.cmd',
+        ['acp', '--process-per-session', '--disable-telemetry'],
+        'win32',
+        { SystemRoot: 'C:\\Windows' },
+      ),
+    ).toThrow(/Unsafe Antigravity executable path/u)
+
+    expect(() =>
+      formatAndValidateAgyOwnedSpawnArgs(
+        'C:\\bin\\agy.cmd',
+        ['acp', '--process-per-session', '--disable-telemetry', '--gemini-dir', 'C:\\tmp\\a&calc'],
+        'win32',
+        { SystemRoot: 'C:\\Windows' },
+      ),
+    ).toThrow(/Unsafe Antigravity storage path/u)
+
+    expect(() =>
+      formatAndValidateAgyOwnedSpawnArgs(
+        'C:\\bin\\agy.cmd',
+        ['acp', '--process-per-session', '--disable-telemetry', '--unexpected', 'value'],
+        'win32',
+        { SystemRoot: 'C:\\Windows' },
+      ),
+    ).toThrow(/Unsafe Antigravity launch arguments/u)
+
+    expect(() =>
+      formatAndValidateAgyOwnedSpawnArgs(
+        'C:\\bin\\agy.cmd',
+        ['acp', '--process-per-session', '--disable-telemetry'],
+        'win32',
+        { ComSpec: 'C:\\Evil\\cmd.exe' },
+      ),
+    ).toThrow(/Trusted Windows command interpreter could not be confirmed/u)
+
+    // 7. Cross-platform geminiDir syntax rejection & Windows cmd.exe disk-identity enforcement.
+    expect(isSafeAbsoluteAgyGeminiDir('/Users/alice/.gemini', 'darwin')).toBe(true)
+    expect(isSafeAbsoluteAgyGeminiDir('C:\\Users\\Alice\\.gemini', 'darwin')).toBe(false)
+    expect(isSafeAbsoluteAgyGeminiDir('C:\\Users\\Alice\\.gemini', 'linux')).toBe(false)
+    expect(isSafeAbsoluteAgyGeminiDir('C:\\Users\\Alice\\.gemini', 'win32')).toBe(true)
+    expect(isSafeAbsoluteAgyGeminiDir('/Users/alice/.gemini', 'win32')).toBe(false)
+
+    expect(() =>
+      formatAndValidateAgyOwnedSpawnArgs(
+        '/usr/local/bin/agy',
+        [
+          'acp',
+          '--process-per-session',
+          '--disable-telemetry',
+          '--gemini-dir',
+          'C:\\bad\\on\\posix',
+        ],
+        'darwin',
+        {},
+      ),
+    ).toThrow(/Unsafe Antigravity launch arguments/u)
+    expect(() =>
+      formatAndValidateAgyOwnedSpawnArgs(
+        'C:\\bin\\agy.exe',
+        [
+          'acp',
+          '--process-per-session',
+          '--disable-telemetry',
+          '--gemini-dir',
+          '/posix/on/windows',
+        ],
+        'win32',
+        {},
+      ),
+    ).toThrow(/Unsafe Antigravity launch arguments/u)
+    expect(() =>
+      formatAndValidateAgyOwnedSpawnArgs(
+        'C:\\bin\\agy.cmd',
+        ['acp', '--process-per-session', '--disable-telemetry'],
+        'win32',
+        { SystemRoot: 'C:\\Windows' },
+        {
+          lstat: () => {
+            throw new Error('simulated symlink/missing SystemRoot')
+          },
+        },
+      ),
+    ).toThrow(/Trusted Windows command interpreter could not be confirmed/u)
+
+    const crossPlatformPool = new AgyAcpConnectionPool({
+      executablePath: '/usr/local/bin/agy',
+      geminiDir: 'C:\\windows-style-on-posix',
+      processFactory: () => {
+        throw new Error('should not spawn on invalid platform geminiDir')
+      },
+    })
+    await expect(
+      crossPlatformPool.acquire({
+        cwd: projectDir,
+        permissionScope: 'standard',
+        permissionMode: 'ask',
+        sessionId: 'sess-cross-platform',
+      }),
+    ).rejects.toMatchObject({ kind: 'protocol_error' })
+    expect(crossPlatformPool.occupiedProcessSlotCount).toBe(0)
+    expect(crossPlatformPool.activeLeaseCount).toBe(0)
+    await crossPlatformPool.dispose()
   })
 })

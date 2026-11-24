@@ -1,14 +1,14 @@
-/* oxlint-disable typescript/no-unsafe-type-assertion, no-await-in-loop -- ACP protocol harness models stdio streams, JSON-RPC frames, and sequential stream-step assertions directly. */
-import type { ChildProcessWithoutNullStreams } from 'node:child_process'
-
 import Database from 'better-sqlite3'
+/* oxlint-disable typescript/no-unsafe-type-assertion, no-await-in-loop -- ACP protocol harness models stdio streams, JSON-RPC frames, and sequential stream-step assertions directly. */
+import { execFile, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
-import { mkdir, mkdtemp, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { connect as netConnect } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { PassThrough, Writable } from 'node:stream'
+import { promisify } from 'node:util'
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 
 import {
@@ -34,6 +34,8 @@ import {
 import { PactDatabase } from '@pact/persistence'
 
 import * as utilityLog from '../../diagnostics/utility-log.js'
+import { runDirectoryWorker } from '../workspace-changes/directory-worker.test-support.js'
+import { WorkspaceChanges } from '../workspace-changes/workspace-changes.js'
 import { AGY_SESSION_LIFECYCLE_RPC_TIMEOUT_MS, AgyAcpConnectionPool } from './agy-acp-connection.js'
 import {
   AgyAgentAdapter,
@@ -12831,7 +12833,9 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
     const runId = randomUUID()
     const grantId = randomUUID()
     let initInstructions = ''
+    let newSystemAppend = ''
     let promptSystemAppend = ''
+    let promptFirstBlock = ''
     let mcpName = ''
     const harness = createAcpHarness()
 
@@ -12841,6 +12845,10 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
         return
       }
       if (frame.method === 'session/new') {
+        const meta = Reflect.get(frame.params as object, '_meta') as
+          | { antigravity?: { systemPrompt?: { append?: string } } }
+          | undefined
+        newSystemAppend = meta?.antigravity?.systemPrompt?.append ?? ''
         const servers = (frame.params as { mcpServers?: Array<{ url: string; name: string }> })
           .mcpServers
         const mcpUrl = servers?.[0]?.url ?? ''
@@ -12876,6 +12884,9 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
           | { antigravity?: { systemPrompt?: { append?: string } } }
           | undefined
         promptSystemAppend = meta?.antigravity?.systemPrompt?.append ?? ''
+        promptFirstBlock =
+          (frame.params as { prompt?: Array<{ type?: string; text?: string }> }).prompt?.[0]
+            ?.text ?? ''
         harness.sendToClient({ jsonrpc: '2.0', id: frame.id, result: { stopReason: 'end_turn' } })
       }
     })
@@ -12921,7 +12932,22 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
       }
       expect(initInstructions).not.toContain('sourceReference')
       expect(initInstructions).not.toContain('native-root-v1')
+      expect(newSystemAppend).toBe(promptSystemAppend)
       expect(promptSystemAppend).toContain(initInstructions)
+      expect(promptSystemAppend).toContain('Do NOT invoke run_command')
+      expect(promptFirstBlock.startsWith('Pact host instructions for this turn:\n')).toBe(true)
+      expect(promptFirstBlock).toContain('Do NOT invoke run_command')
+      expect(promptFirstBlock).toContain(
+        `mcp_${mcpName}_submit_review({ verdict: "accepted"|"changes_requested"|"needs_user"|"incomplete"`,
+      )
+      const trailingPromptJson = JSON.parse(
+        promptFirstBlock.slice(promptFirstBlock.lastIndexOf('\n') + 1),
+      ) as Record<string, unknown>
+      expect(trailingPromptJson).toMatchObject({
+        version: 'pact-agent-prompt-v1',
+        sessionId: pactSessionId,
+        pactRunId: runId,
+      })
 
       // Validate representative payloads from each displayed signature against real @pact/contracts schemas!
       expect(
@@ -12997,6 +13023,119 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
           complete: true,
         }).success,
       ).toBe(true)
+    } finally {
+      await adapter.dispose()
+    }
+  })
+
+  it('delivers collaboration and read-only rules via session/load _meta and workflow promptBlocks[0] while preserving trailing pactRunId JSON on code_review', async () => {
+    const { cwd, appDataDir } = await createEnv()
+    const nativeSessionId = randomUUID()
+    const pactSessionId = randomUUID()
+    const runId = randomUUID()
+    const grantId = randomUUID()
+    let loadSystemAppend = ''
+    let promptSystemAppend = ''
+    let promptFirstBlock = ''
+    let mcpName = ''
+    const harness = createAcpHarness()
+
+    harness.onClientFrame((frame) => {
+      if (frame.method === 'initialize') {
+        harness.sendToClient({ jsonrpc: '2.0', id: frame.id, result: { protocolVersion: 1 } })
+        return
+      }
+      if (frame.method === 'session/load') {
+        const meta = Reflect.get(frame.params as object, '_meta') as
+          | { antigravity?: { systemPrompt?: { append?: string } } }
+          | undefined
+        loadSystemAppend = meta?.antigravity?.systemPrompt?.append ?? ''
+        const servers = (frame.params as { mcpServers?: Array<{ url: string; name: string }> })
+          .mcpServers
+        mcpName = servers?.[0]?.name ?? ''
+        harness.sendToClient({
+          jsonrpc: '2.0',
+          id: frame.id,
+          result: defaultSessionNewResult(nativeSessionId),
+        })
+        return
+      }
+      if (frame.method === 'session/set_mode' || frame.method === 'session/set_config_option') {
+        harness.sendToClient({
+          jsonrpc: '2.0',
+          id: frame.id,
+          result: {
+            configOptions: [
+              { id: 'model', currentValue: 'gemini-4-carbon' },
+              { id: 'thought_level', currentValue: 'high' },
+            ],
+          },
+        })
+        return
+      }
+      if (frame.method === 'session/prompt') {
+        const meta = Reflect.get(frame.params as object, '_meta') as
+          | { antigravity?: { systemPrompt?: { append?: string } } }
+          | undefined
+        promptSystemAppend = meta?.antigravity?.systemPrompt?.append ?? ''
+        promptFirstBlock =
+          (frame.params as { prompt?: Array<{ type?: string; text?: string }> }).prompt?.[0]
+            ?.text ?? ''
+        harness.sendToClient({ jsonrpc: '2.0', id: frame.id, result: { stopReason: 'end_turn' } })
+      }
+    })
+
+    const { task, authorization } = makeCollaborationTask(pactSessionId, runId, 'code_review')
+    const adapter = new AgyAgentAdapter({
+      appDataDir,
+      processFactory: () => harness.child,
+      storageClient: { readTrajectoryIdentity: async () => ({ status: 'no_storage_root' }) },
+    })
+    try {
+      await collectEvents(
+        adapter.run(
+          makeBaseRunInput(cwd, {
+            nativeSessionId,
+            sessionId: pactSessionId,
+            runId,
+            promptEnvelope: {
+              version: 'pact-agent-prompt-v1',
+              sessionId: pactSessionId,
+              message: { id: randomUUID(), content: 'Review the latest code changes.' },
+              comments: [],
+              sourceGrant: { runId, grant: grantId },
+              collaboration: task,
+              collaborationAuthorization: authorization,
+            },
+            readCollaborationSourcePart: () => ({
+              source: 'inputs',
+              offset: 0,
+              nextOffset: null,
+              text: 'source',
+            }),
+          }),
+          new AbortController().signal,
+        ),
+      )
+
+      expect(loadSystemAppend).toBe(promptSystemAppend)
+      expect(loadSystemAppend).toContain('Do NOT invoke run_command')
+      expect(loadSystemAppend).toContain(
+        `mcp_${mcpName}_submit_review({ verdict: "accepted"|"changes_requested"|"needs_user"|"incomplete"`,
+      )
+      expect(promptFirstBlock.startsWith('Pact host instructions for this turn:\n')).toBe(true)
+      expect(promptFirstBlock).toContain('Do NOT invoke run_command')
+      expect(promptFirstBlock).toContain(
+        `mcp_${mcpName}_submit_review({ verdict: "accepted"|"changes_requested"|"needs_user"|"incomplete"`,
+      )
+      const trailingPromptJson = JSON.parse(
+        promptFirstBlock.slice(promptFirstBlock.lastIndexOf('\n') + 1),
+      ) as Record<string, unknown>
+      expect(trailingPromptJson).toMatchObject({
+        version: 'pact-agent-prompt-v1',
+        sessionId: pactSessionId,
+        pactRunId: runId,
+      })
     } finally {
       await adapter.dispose()
     }
@@ -20736,6 +20875,768 @@ describe('AgyAgentAdapter Wave-6 audit regressions', () => {
       } finally {
         await adapter.dispose()
       }
+    }
+  })
+  it('auto-allows Phase-1 Brain Plan write_file/edit_file permission requests only when ArtifactMetadata and every target stays inside this run brain directory', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'pact-agy-brain-plan-perm-'))
+    const cwd = join(root, 'workspace')
+    const appDataDir = join(root, 'gemini', 'antigravity-cli')
+    const nativeSessionId = randomUUID()
+    const otherSessionId = randomUUID()
+    const brainPlanPath = join(appDataDir, 'brain', nativeSessionId, 'implementation_plan.md')
+    const brainMetaPath = join(
+      appDataDir,
+      'brain',
+      nativeSessionId,
+      'implementation_plan.md.metadata.json',
+    )
+    const otherBrainPlanPath = join(appDataDir, 'brain', otherSessionId, 'implementation_plan.md')
+    const workspaceFile = join(cwd, 'parse-port.mjs')
+    await mkdir(cwd, { recursive: true })
+    await mkdir(join(appDataDir, 'brain', nativeSessionId), { recursive: true })
+
+    const harness = createAcpHarness()
+    let permSeq = 0
+    const permOutcomes = new Map<string, unknown>()
+    const sendPermission = (id: string, toolCall: Record<string, unknown>) => {
+      const rpcId = `perm-${++permSeq}-${id}`
+      harness.sendToClient({
+        jsonrpc: '2.0',
+        id: rpcId,
+        method: 'session/request_permission',
+        params: {
+          sessionId: nativeSessionId,
+          toolCall,
+          options: [
+            { optionId: 'allow', name: 'Allow', kind: 'allow_once' },
+            { optionId: 'deny', name: 'Deny', kind: 'reject_once' },
+          ],
+        },
+      })
+      return rpcId
+    }
+
+    let phase: 'plan' | 'plan_review' = 'plan'
+    harness.onClientFrame((frame) => {
+      if (typeof frame.method !== 'string' && 'id' in frame && typeof frame.id === 'string') {
+        permOutcomes.set(frame.id, Reflect.get(frame, 'result'))
+        return
+      }
+      if (frame.method === 'initialize') {
+        harness.sendToClient({ jsonrpc: '2.0', id: frame.id, result: { protocolVersion: 1 } })
+      } else if (frame.method === 'session/new' || frame.method === 'session/load') {
+        harness.sendToClient({
+          jsonrpc: '2.0',
+          id: frame.id,
+          result: defaultSessionNewResult(nativeSessionId),
+        })
+      } else if (
+        frame.method === 'session/set_mode' ||
+        frame.method === 'session/set_config_option'
+      ) {
+        harness.sendToClient({
+          jsonrpc: '2.0',
+          id: frame.id,
+          result: {
+            configOptions: [
+              { id: 'model', currentValue: 'gemini-4-carbon' },
+              { id: 'thought_level', currentValue: 'high' },
+            ],
+          },
+        })
+      } else if (frame.method === 'session/prompt') {
+        if (phase === 'plan') {
+          // 1. Valid Brain Plan write_file with ArtifactMetadata -> MUST auto-allow without UI card.
+          const allowId = sendPermission('valid-brain', {
+            toolCallId: 'tc-valid-brain',
+            name: 'write_file',
+            status: 'pending',
+            args: {
+              Path: brainPlanPath,
+              Content: '# Official Plan v1\nSafe',
+              ArtifactMetadata: { Summary: 'Plan v1', UserFacing: true, RequestFeedback: true },
+            },
+            locations: [{ path: brainPlanPath }],
+            content: [{ type: 'diff', path: brainPlanPath, newText: '# Official Plan v1\nSafe' }],
+          })
+          // 2. Denied cases in Phase-1 plan mode: workspace path, missing ArtifactMetadata,
+          //    foreign session brain path, non-md metadata file, read_file, move target outside brain.
+          sendPermission('workspace-even-meta', {
+            toolCallId: 'tc-ws',
+            name: 'write_file',
+            status: 'pending',
+            args: {
+              Path: workspaceFile,
+              Content: 'evil',
+              ArtifactMetadata: { Summary: 'Fake', UserFacing: true },
+            },
+          })
+          sendPermission('missing-meta', {
+            toolCallId: 'tc-nometa',
+            name: 'write_file',
+            status: 'pending',
+            args: { Path: brainPlanPath, Content: '# Missing Meta' },
+          })
+          sendPermission('other-session', {
+            toolCallId: 'tc-other-sid',
+            name: 'write_file',
+            status: 'pending',
+            args: {
+              Path: otherBrainPlanPath,
+              Content: '# Other SID',
+              ArtifactMetadata: { Summary: 'Other', UserFacing: true },
+            },
+          })
+          sendPermission('non-md-meta', {
+            toolCallId: 'tc-non-md',
+            name: 'write_file',
+            status: 'pending',
+            args: {
+              Path: brainMetaPath,
+              Content: '{}',
+              ArtifactMetadata: { Summary: 'Meta', UserFacing: false },
+            },
+          })
+          sendPermission('read-file', {
+            toolCallId: 'tc-read',
+            name: 'read_file',
+            status: 'pending',
+            args: { Path: workspaceFile },
+          })
+          sendPermission('diff-move-outside', {
+            toolCallId: 'tc-move',
+            name: 'edit_file',
+            status: 'pending',
+            args: {
+              Path: brainPlanPath,
+              ArtifactMetadata: { Summary: 'Move', UserFacing: true },
+            },
+            content: [
+              {
+                type: 'diff',
+                path: brainPlanPath,
+                previousPath: workspaceFile,
+                newText: '# Plan',
+              },
+            ],
+          })
+
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: nativeSessionId,
+              update: {
+                sessionUpdate: 'tool_call_update',
+                toolCallId: 'tc-valid-brain',
+                name: 'write_file',
+                status: 'completed',
+                args: {
+                  Path: brainPlanPath,
+                  Content: '# Official Plan v1\nSafe',
+                  ArtifactMetadata: { Summary: 'Plan v1', UserFacing: true, RequestFeedback: true },
+                },
+                content: [
+                  { type: 'diff', path: brainPlanPath, newText: '# Official Plan v1\nSafe' },
+                ],
+              },
+            },
+          })
+
+          void allowId
+          setTimeout(() => {
+            harness.sendToClient({
+              jsonrpc: '2.0',
+              id: frame.id,
+              result: { stopReason: 'end_turn' },
+            })
+          }, 50)
+        } else {
+          // plan_review stage has planModeStage === false -> even valid Brain Plan write MUST be denied!
+          sendPermission('review-stage-brain', {
+            toolCallId: 'tc-review-brain',
+            name: 'edit_file',
+            status: 'pending',
+            args: {
+              Path: brainPlanPath,
+              ArtifactMetadata: { Summary: 'Should Deny', UserFacing: true },
+            },
+          })
+          setTimeout(() => {
+            harness.sendToClient({
+              jsonrpc: '2.0',
+              id: frame.id,
+              result: { stopReason: 'end_turn' },
+            })
+          }, 50)
+        }
+      }
+    })
+
+    const requestPermissionSpy = vi.fn<NonNullable<AgentRunInput['requestPermission']>>()
+    const capturedPlans: Array<{ nativeId: string; text: string }> = []
+    const sessionId = randomUUID()
+    const run1Id = randomUUID()
+    const { task: planTask, authorization: planAuth } = makeCollaborationTask(
+      sessionId,
+      run1Id,
+      'plan',
+    )
+
+    const adapter = new AgyAgentAdapter({
+      appDataDir,
+      processFactory: () => harness.child,
+      storageClient: {
+        readTrajectoryIdentity: async () => ({ status: 'no_storage_root' }),
+      },
+    })
+
+    try {
+      await collectEvents(
+        adapter.run(
+          makeBaseRunInput(cwd, {
+            sessionId,
+            runId: run1Id,
+            permissionMode: 'ask',
+            requestPermission: requestPermissionSpy,
+            recordWorkflowPlan: (plan) => capturedPlans.push(plan),
+            promptEnvelope: {
+              version: 'pact-agent-prompt-v1',
+              sessionId,
+              message: { id: randomUUID(), content: '/plan Create parsePort plan' },
+              comments: [],
+              sourceGrant: { runId: run1Id, grant: 'g-plan' },
+              collaboration: planTask,
+              collaborationAuthorization: planAuth,
+            },
+          }),
+          new AbortController().signal,
+        ),
+      )
+
+      expect(requestPermissionSpy).not.toHaveBeenCalled()
+      expect(capturedPlans).toEqual([
+        {
+          nativeId: `${nativeSessionId}:tc-valid-brain`,
+          text: '# Official Plan v1\nSafe',
+        },
+      ])
+      expect(permOutcomes.get('perm-1-valid-brain')).toEqual({
+        outcome: { outcome: 'selected', optionId: 'allow' },
+      })
+      for (const deniedKey of [
+        'perm-2-workspace-even-meta',
+        'perm-3-missing-meta',
+        'perm-4-other-session',
+        'perm-5-non-md-meta',
+        'perm-6-read-file',
+        'perm-7-diff-move-outside',
+      ]) {
+        expect(permOutcomes.get(deniedKey)).toEqual({
+          outcome: { outcome: 'selected', optionId: 'deny' },
+        })
+      }
+
+      // Now verify plan_review (planModeStage === false) denies Brain Plan write permission!
+      phase = 'plan_review'
+      const run2Id = randomUUID()
+      const { task: reviewTask, authorization: reviewAuth } = makeCollaborationTask(
+        sessionId,
+        run2Id,
+        'plan_review',
+      )
+      await collectEvents(
+        adapter.run(
+          makeBaseRunInput(cwd, {
+            sessionId,
+            runId: run2Id,
+            nativeSessionId,
+            bindingGeneration: 1,
+            permissionMode: 'ask',
+            requestPermission: requestPermissionSpy,
+            promptEnvelope: {
+              version: 'pact-agent-prompt-v1',
+              sessionId,
+              message: { id: randomUUID(), content: 'Review plan' },
+              comments: [],
+              sourceGrant: { runId: run2Id, grant: 'g-review' },
+              collaboration: reviewTask,
+              collaborationAuthorization: reviewAuth,
+            },
+          }),
+          new AbortController().signal,
+        ),
+      )
+
+      expect(requestPermissionSpy).not.toHaveBeenCalled()
+      expect(permOutcomes.get('perm-8-review-stage-brain')).toEqual({
+        outcome: { outcome: 'selected', optionId: 'deny' },
+      })
+    } finally {
+      await adapter.dispose()
+      await rm(root, { recursive: true, force: true }).catch(() => undefined)
+    }
+  })
+
+  it('denies pre-dispatch, missing-id, incomplete-location, symlinked/nested Brain, duplicate-call, and code_review plan permissions, allowing a single direct plan write only once', async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), 'pact-agy-plan-hardening-')))
+    const cwd = join(root, 'workspace')
+    const appDataDir = join(root, 'gemini', 'antigravity-cli')
+    const symlinkBrainAppDataDir = join(root, 'gemini-sym-brain', 'antigravity-cli')
+    const symlinkSessionAppDataDir = join(root, 'gemini-sym-session', 'antigravity-cli')
+    const nativeSessionId = randomUUID()
+    const brainSessionDir = join(appDataDir, 'brain', nativeSessionId)
+    const nestedPlanDir = join(brainSessionDir, 'sub')
+    const validPlanPath = join(brainSessionDir, 'implementation_plan.md')
+    const nestedPlanPath = join(nestedPlanDir, 'implementation_plan.md')
+    const danglingLinkPath = join(brainSessionDir, 'dangling.md')
+    const outsideEscapeDir = join(root, 'outside-brain')
+    await Promise.all([
+      mkdir(cwd, { recursive: true }),
+      mkdir(nestedPlanDir, { recursive: true }),
+      mkdir(outsideEscapeDir, { recursive: true }),
+      mkdir(symlinkBrainAppDataDir, { recursive: true }),
+      mkdir(join(symlinkSessionAppDataDir, 'brain'), { recursive: true }),
+    ])
+    await symlink(join(outsideEscapeDir, 'nonexistent.md'), danglingLinkPath)
+    await symlink(outsideEscapeDir, join(symlinkBrainAppDataDir, 'brain'))
+    await symlink(outsideEscapeDir, join(symlinkSessionAppDataDir, 'brain', nativeSessionId))
+
+    const runPermScenario = async (targetAppDataDir: string, stage: 'plan' | 'code_review') => {
+      const harness = createAcpHarness()
+      let seq = 0
+      const outcomes = new Map<string, unknown>()
+      const sendPerm = (label: string, toolCall: Record<string, unknown>) => {
+        const rpcId = `perm-${++seq}-${label}`
+        harness.sendToClient({
+          jsonrpc: '2.0',
+          id: rpcId,
+          method: 'session/request_permission',
+          params: {
+            sessionId: nativeSessionId,
+            toolCall,
+            options: [
+              { optionId: 'allow', name: 'Allow', kind: 'allow_once' },
+              { optionId: 'deny', name: 'Deny', kind: 'reject_once' },
+            ],
+          },
+        })
+        return rpcId
+      }
+
+      harness.onClientFrame((frame) => {
+        if (typeof frame.method !== 'string' && 'id' in frame && typeof frame.id === 'string') {
+          outcomes.set(frame.id, Reflect.get(frame, 'result'))
+          return
+        }
+        if (frame.method === 'initialize') {
+          harness.sendToClient({ jsonrpc: '2.0', id: frame.id, result: { protocolVersion: 1 } })
+        } else if (frame.method === 'session/new' || frame.method === 'session/load') {
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            id: frame.id,
+            result: defaultSessionNewResult(nativeSessionId),
+          })
+        } else if (
+          frame.method === 'session/set_mode' ||
+          frame.method === 'session/set_model' ||
+          frame.method === 'session/set_config_option'
+        ) {
+          if (
+            frame.method === 'session/set_mode' &&
+            targetAppDataDir === appDataDir &&
+            stage === 'plan'
+          ) {
+            // Send pre-dispatch permission request after session registration, BEFORE session/prompt dispatches!
+            sendPerm('pre-dispatch', {
+              toolCallId: 'tc-pre-dispatch',
+              name: 'write_file',
+              status: 'pending',
+              args: {
+                Path: validPlanPath,
+                Content: '# Pre-dispatch',
+                ArtifactMetadata: { Summary: 'Pre', UserFacing: true },
+              },
+            })
+          }
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            id: frame.id,
+            result: {
+              configOptions: [
+                { id: 'model', currentValue: 'gemini-4-carbon' },
+                { id: 'thought_level', currentValue: 'high' },
+              ],
+            },
+          })
+        } else if (frame.method === 'session/prompt') {
+          if (targetAppDataDir === appDataDir && stage === 'plan') {
+            sendPerm('missing-tc-id', {
+              name: 'write_file',
+              status: 'pending',
+              args: {
+                Path: validPlanPath,
+                Content: '# Missing ID',
+                ArtifactMetadata: { Summary: 'No ID', UserFacing: true },
+              },
+            })
+            sendPerm('incomplete-locations', {
+              toolCallId: 'tc-bad-locs',
+              name: 'write_file',
+              status: 'pending',
+              args: {
+                Path: validPlanPath,
+                Content: '# Bad Locs',
+                ArtifactMetadata: { Summary: 'Bad Locs', UserFacing: true },
+              },
+              locations: [{ missingPathKey: true }],
+            })
+            sendPerm('dangling-symlink', {
+              toolCallId: 'tc-dangling',
+              name: 'write_file',
+              status: 'pending',
+              args: {
+                Path: danglingLinkPath,
+                Content: '# Dangling',
+                ArtifactMetadata: { Summary: 'Dangling', UserFacing: true },
+              },
+            })
+            sendPerm('nested-subdir', {
+              toolCallId: 'tc-nested',
+              name: 'write_file',
+              status: 'pending',
+              args: {
+                Path: nestedPlanPath,
+                Content: '# Nested',
+                ArtifactMetadata: { Summary: 'Nested', UserFacing: true },
+              },
+            })
+            sendPerm('valid-first', {
+              toolCallId: 'tc-valid-once',
+              name: 'write_file',
+              status: 'pending',
+              args: {
+                Path: validPlanPath,
+                Content: '# Valid Plan',
+                ArtifactMetadata: { Summary: 'Plan', UserFacing: true },
+              },
+              locations: [{ path: validPlanPath }],
+            })
+            sendPerm('duplicate-same-tc', {
+              toolCallId: 'tc-valid-once',
+              name: 'write_file',
+              status: 'pending',
+              args: {
+                Path: validPlanPath,
+                Content: '# Duplicate',
+                ArtifactMetadata: { Summary: 'Dup', UserFacing: true },
+              },
+            })
+          } else {
+            const targetPath = join(
+              targetAppDataDir,
+              'brain',
+              nativeSessionId,
+              'implementation_plan.md',
+            )
+            sendPerm('target', {
+              toolCallId: `tc-${stage}`,
+              name: 'write_file',
+              status: 'pending',
+              args: {
+                Path: targetPath,
+                Content: '# Target',
+                ArtifactMetadata: { Summary: 'Target', UserFacing: true },
+              },
+            })
+          }
+          setTimeout(() => {
+            harness.sendToClient({
+              jsonrpc: '2.0',
+              id: frame.id,
+              result: { stopReason: 'end_turn' },
+            })
+          }, 40)
+        }
+      })
+
+      const adapter = new AgyAgentAdapter({
+        appDataDir: targetAppDataDir,
+        processFactory: () => harness.child,
+      })
+      const spyPerm = vi.fn<NonNullable<AgentRunInput['requestPermission']>>(() =>
+        Promise.resolve('agy-reject-once'),
+      )
+      try {
+        const sessionId = randomUUID()
+        const runId = randomUUID()
+        const { task, authorization } = makeCollaborationTask(sessionId, runId, stage)
+        await collectEvents(
+          adapter.run(
+            makeBaseRunInput(cwd, {
+              sessionId,
+              runId,
+              permissionMode: 'ask',
+              requestPermission: spyPerm,
+              promptEnvelope: {
+                version: 'pact-agent-prompt-v1',
+                sessionId,
+                message: { id: randomUUID(), content: 'Run planning/review stage' },
+                comments: [],
+                sourceGrant: { runId, grant: 'g-hardening' },
+                collaboration: task,
+                collaborationAuthorization: authorization,
+              },
+            }),
+            new AbortController().signal,
+          ),
+        )
+        expect(spyPerm).not.toHaveBeenCalled()
+        return outcomes
+      } finally {
+        await adapter.dispose()
+      }
+    }
+
+    try {
+      const planOutcomes = await runPermScenario(appDataDir, 'plan')
+      expect(planOutcomes.get('perm-1-pre-dispatch')).toEqual({
+        outcome: { outcome: 'selected', optionId: 'deny' },
+      })
+      for (const denied of [
+        'perm-2-missing-tc-id',
+        'perm-3-incomplete-locations',
+        'perm-4-dangling-symlink',
+        'perm-5-nested-subdir',
+        'perm-7-duplicate-same-tc',
+      ]) {
+        expect(planOutcomes.get(denied)).toEqual({
+          outcome: { outcome: 'selected', optionId: 'deny' },
+        })
+      }
+      expect(planOutcomes.get('perm-6-valid-first')).toEqual({
+        outcome: { outcome: 'selected', optionId: 'allow' },
+      })
+
+      const symBrainOutcomes = await runPermScenario(symlinkBrainAppDataDir, 'plan')
+      expect(symBrainOutcomes.get('perm-1-target')).toEqual({
+        outcome: { outcome: 'selected', optionId: 'deny' },
+      })
+
+      const symSessionOutcomes = await runPermScenario(symlinkSessionAppDataDir, 'plan')
+      expect(symSessionOutcomes.get('perm-1-target')).toEqual({
+        outcome: { outcome: 'selected', optionId: 'deny' },
+      })
+
+      const codeReviewOutcomes = await runPermScenario(appDataDir, 'code_review')
+      expect(codeReviewOutcomes.get('perm-1-target')).toEqual({
+        outcome: { outcome: 'selected', optionId: 'deny' },
+      })
+    } finally {
+      await rm(root, { recursive: true, force: true }).catch(() => undefined)
+    }
+  })
+
+  it('prevents conflicted write_file Overwrite updates or cross-Brain moves from creating undoable WorkspaceChanges entries', async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), 'pact-agy-ws-conflict-')))
+    const cwd = join(root, 'workspace')
+    const storageRoot = join(root, 'storage')
+    const appDataDir = join(root, 'gemini', 'antigravity-cli')
+    const filePath = join(root, 'pact.sqlite')
+    const migrationsFolder = resolve(
+      import.meta.dirname,
+      '../../../../../packages/persistence/drizzle',
+    )
+    const nativeSessionId = randomUUID()
+    const existingFile = join(cwd, 'existing.mjs')
+    const movedFile = join(cwd, 'cross-moved.mjs')
+    const brainPlan = join(appDataDir, 'brain', nativeSessionId, 'implementation_plan.md')
+    await Promise.all([
+      mkdir(cwd, { recursive: true }),
+      mkdir(storageRoot, { recursive: true }),
+      mkdir(join(appDataDir, 'brain', nativeSessionId), { recursive: true }),
+    ])
+    await promisify(execFile)('git', ['init', '--quiet', cwd])
+    await writeFile(existingFile, 'export const v = 1\n', 'utf8')
+    await writeFile(movedFile, 'export const moved = 1\n', 'utf8')
+
+    const db = await PactDatabase.open({ filePath, migrationsFolder })
+    const projectId = randomUUID()
+    const sessionId = randomUUID()
+    const createdAt = new Date().toISOString()
+    db.projectCatalogRepository.add({
+      id: projectId,
+      name: 'Workspace',
+      kind: 'git',
+      directoryPath: cwd,
+      createdAt,
+    })
+    db.sessionRepository.create(
+      { id: sessionId, projectId, title: 'Conflict test', createdAt },
+      {
+        primaryAgentId: 'agy',
+        secondaryAgentId: 'codex',
+        agents: {
+          claude: { model: null, effort: null },
+          codex: { model: null, effort: null },
+          agy: { model: null, effort: null },
+        },
+        maxDiscussionRounds: 6,
+        maxReviewCycles: 3,
+        maxRepairAttempts: 3,
+      },
+    )
+    const run = db.conversationRepository.beginRun({
+      sessionId,
+      clientMessageId: randomUUID(),
+      content: 'Edit workspace files',
+      expectedCommentsRevision: 0,
+      commentIds: [],
+      agentId: 'agy',
+      settingsRevision: 1,
+      model: null,
+      effort: null,
+    }).run
+
+    const wsChanges = new WorkspaceChanges(
+      db.workspaceChangesRepository,
+      db.sessionRepository,
+      db.projectCatalogRepository,
+      storageRoot,
+      runDirectoryWorker,
+      filePath,
+    )
+    await wsChanges.initialize()
+    const runAbort = new AbortController()
+    await wsChanges.start(run, runAbort.signal)
+
+    const harness = createAcpHarness()
+    harness.onClientFrame((frame) => {
+      if (frame.method === 'initialize') {
+        harness.sendToClient({ jsonrpc: '2.0', id: frame.id, result: { protocolVersion: 1 } })
+      } else if (frame.method === 'session/new') {
+        harness.sendToClient({
+          jsonrpc: '2.0',
+          id: frame.id,
+          result: defaultSessionNewResult(nativeSessionId),
+        })
+      } else if (
+        frame.method === 'session/set_mode' ||
+        frame.method === 'session/set_model' ||
+        frame.method === 'session/set_config_option'
+      ) {
+        harness.sendToClient({
+          jsonrpc: '2.0',
+          id: frame.id,
+          result: {
+            configOptions: [
+              { id: 'model', currentValue: 'gemini-4-carbon' },
+              { id: 'thought_level', currentValue: 'high' },
+            ],
+          },
+        })
+      } else if (frame.method === 'session/prompt') {
+        // Conflicted write_file: Overwrite flips false -> true across updates without oldText!
+        harness.sendToClient({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: nativeSessionId,
+            update: {
+              sessionUpdate: 'tool_call',
+              toolCallId: 'tc-conflict-write',
+              name: 'write_file',
+              status: 'pending',
+              args: { Path: existingFile, Overwrite: false },
+            },
+          },
+        })
+        harness.sendToClient({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: nativeSessionId,
+            update: {
+              sessionUpdate: 'tool_call_update',
+              toolCallId: 'tc-conflict-write',
+              name: 'write_file',
+              status: 'completed',
+              args: { Path: existingFile, Overwrite: true },
+              content: [{ type: 'diff', path: existingFile, newText: 'export const v = 2\n' }],
+            },
+          },
+        })
+        // Cross-Brain/workspace move diff.
+        harness.sendToClient({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: nativeSessionId,
+            update: {
+              sessionUpdate: 'tool_call_update',
+              toolCallId: 'tc-cross-move',
+              name: 'edit_file',
+              status: 'completed',
+              args: { Path: brainPlan },
+              content: [
+                {
+                  type: 'diff',
+                  path: brainPlan,
+                  movePath: movedFile,
+                  oldText: '# p',
+                  newText: 'export const moved = 1\n',
+                },
+              ],
+            },
+          },
+        })
+        setTimeout(() => {
+          harness.sendToClient({ jsonrpc: '2.0', id: frame.id, result: { stopReason: 'end_turn' } })
+        }, 25)
+      }
+    })
+
+    const adapter = new AgyAgentAdapter({
+      appDataDir,
+      processFactory: () => harness.child,
+    })
+    try {
+      await collectEvents(
+        adapter.run(
+          makeBaseRunInput(cwd, {
+            sessionId,
+            runId: run.id,
+            recordFileChange: async (change, sig) => {
+              await wsChanges.record(run.id, change, sig)
+            },
+            recordUncertainEffects: (reason) => {
+              wsChanges.uncertain(run.id, reason)
+            },
+            reportNativeEffects: (effect) => {
+              if (effect.state === 'unknown') {
+                wsChanges.observeUncertainEffects(run.id)
+              }
+            },
+          }),
+          runAbort.signal,
+        ),
+      )
+      const summary = await wsChanges.finish(run.id)
+      expect(summary?.state).toBe('mixed')
+      const page = wsChanges.readPage({ changeSetId: run.id })
+      const existingEntry = page.files.find((f) => f.path === 'existing.mjs')
+      expect(existingEntry).toBeDefined()
+      expect(existingEntry?.kind).not.toBe('added')
+      const movedEntry = page.files.find((f) => f.path === 'cross-moved.mjs')
+      expect(movedEntry?.kind).toBe('renamed')
+      await expect(wsChanges.undo(run.id)).rejects.toMatchObject({
+        code: 'WORKSPACE_UNDO_UNAVAILABLE',
+      })
+    } finally {
+      await adapter.dispose()
+      await wsChanges.dispose()
+      db.close()
+      await rm(root, { recursive: true, force: true }).catch(() => undefined)
     }
   })
 

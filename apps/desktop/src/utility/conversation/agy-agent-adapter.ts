@@ -2,9 +2,10 @@ import type { ChildProcessWithoutNullStreams } from 'node:child_process'
 import type { Socket as NetSocket } from 'node:net'
 
 import { createHash, randomUUID } from 'node:crypto'
+import { lstatSync, realpathSync } from 'node:fs'
 import { createServer, type Server as HttpServer, type ServerResponse } from 'node:http'
 import { homedir } from 'node:os'
-import { basename, isAbsolute, join, relative, resolve as resolvePath } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, resolve as resolvePath } from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
 
 import {
@@ -141,10 +142,12 @@ import {
 import { NativeCheckOperation } from './native-check-operation'
 import {
   AgyRoundEffectsTracker,
+  collectAgyTargetPaths,
   isAgyBrainArtifactPath,
   nativeEffectsUncertain,
   nativeFileChangesSettled,
   recordNativeChanges,
+  workspaceRelativePath,
 } from './native-file-changes'
 import { NativeForkFiles } from './native-fork-files'
 import {
@@ -212,6 +215,13 @@ const VALID_ACP_STOP_REASONS = new Set<string>([
 
 const AGY_PLAN_SUBMISSION_INSTRUCTIONS =
   'When a first or changed plan is decision complete and no necessary user choice remains, write the complete official Markdown plan once to your native artifact directory (<appDataDir>/brain/<sessionId>/implementation_plan.md) using write_file or edit_file with ArtifactMetadata, then end this turn immediately without modifying workspace files or implementing the plan. If the frozen official plan needs no change, use the explicit retention operation instead.'
+
+const AGY_READ_ONLY_STAGE_INSTRUCTIONS = [
+  'Antigravity read-only stage rules (override general terminal or build habits):',
+  '- Do NOT invoke run_command, terminal or shell commands (including git status, git diff, ls, or test runners), subagents, or exit_plan_mode. Pact denies terminal and workspace-write permissions in read-only stages (only <appDataDir>/brain/<sessionId>/*.md plan artifacts with ArtifactMetadata are permitted during active planning), and a denied permission in Antigravity immediately terminates your turn.',
+  '- Inspect workspace files and frozen Pact sources strictly via read_file and read_collaboration_source. Label any runtime or test command you could not execute in this stage as Unverified.',
+  '- Always write a non-empty natural-language response in your assistant message (never only in internal thoughts) before ending your turn so Pact has a complete visible report to settle.',
+].join('\n')
 
 export interface AgyRebuildSeedChunkRecord {
   chunk: NativeContextRebuildChunk
@@ -1196,6 +1206,158 @@ function hasValidArtifactMetadata(args: Record<string, unknown> | undefined): bo
   const meta = args.ArtifactMetadata ?? args.artifactMetadata
   if (!isPlainObject(meta)) return false
   return Object.keys(meta).length > 0
+}
+
+const SAFE_BRAIN_COMPONENT_PATTERN = /^[A-Za-z0-9._-]+$/u
+
+function isEnoentFsError(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT'
+}
+
+function verifyNonSymlinkBrainEntry(
+  targetPath: string,
+  expectedKind: 'dir' | 'file',
+): 'exists' | 'missing' | 'invalid' {
+  try {
+    const st = lstatSync(targetPath)
+    if (st.isSymbolicLink()) return 'invalid'
+    if (expectedKind === 'dir' ? !st.isDirectory() : !st.isFile()) return 'invalid'
+    if (realpathSync(targetPath) !== targetPath) return 'invalid'
+    return 'exists'
+  } catch (error) {
+    return isEnoentFsError(error) ? 'missing' : 'invalid'
+  }
+}
+
+function resolveBrainPlanThreeSegmentFileName(
+  baseRoot: string,
+  candidatePath: string,
+  nativeSessionId: string,
+): string | undefined {
+  const rel = relative(baseRoot, candidatePath).replaceAll('\\', '/')
+  if (!rel || rel.startsWith('..') || isAbsolute(rel)) return undefined
+  const parts = rel.split('/')
+  if (parts.length !== 3 || parts[0] !== 'brain' || parts[1] !== nativeSessionId) return undefined
+  const fileName = parts[2]!
+  if (
+    !fileName ||
+    !fileName.toLowerCase().endsWith('.md') ||
+    fileName === '.md' ||
+    fileName.startsWith('..') ||
+    !SAFE_BRAIN_COMPONENT_PATTERN.test(fileName)
+  ) {
+    return undefined
+  }
+  return fileName
+}
+
+function isVerifiedDirectBrainPlanWriteTarget(
+  rawPath: string,
+  cwd: string,
+  appDataDirs: readonly string[],
+  nativeSessionId: string,
+): boolean {
+  if (
+    !nativeSessionId ||
+    nativeSessionId === '.' ||
+    nativeSessionId === '..' ||
+    !SAFE_BRAIN_COMPONENT_PATTERN.test(nativeSessionId) ||
+    !rawPath ||
+    rawPath.length > 4096 ||
+    !rawPath.toLowerCase().endsWith('.md')
+  ) {
+    return false
+  }
+  for (let i = 0; i < rawPath.length; i += 1) {
+    const code = rawPath.charCodeAt(i)
+    if (code <= 0x1f || code === 0x7f) return false
+  }
+  if (rawPath.split(/[/\\]/u).some((segment) => segment === '..')) {
+    return false
+  }
+  const candidatePath = isAbsolute(rawPath) ? resolvePath(rawPath) : resolvePath(cwd, rawPath)
+  if (workspaceRelativePath(candidatePath, cwd) !== undefined) {
+    return false
+  }
+  for (const dir of appDataDirs) {
+    let dirStat: ReturnType<typeof lstatSync>
+    let canonicalAppData: string
+    try {
+      dirStat = lstatSync(dir)
+      if (!dirStat.isDirectory() || dirStat.isSymbolicLink()) continue
+      canonicalAppData = realpathSync(dir)
+    } catch {
+      continue
+    }
+    const resolvedDir = resolvePath(dir)
+    let fileName = resolveBrainPlanThreeSegmentFileName(
+      canonicalAppData,
+      candidatePath,
+      nativeSessionId,
+    )
+    if (!fileName) {
+      let resolvedDirMatches = false
+      try {
+        resolvedDirMatches = realpathSync(resolvedDir) === canonicalAppData
+      } catch {
+        resolvedDirMatches = false
+      }
+      if (resolvedDirMatches) {
+        fileName = resolveBrainPlanThreeSegmentFileName(resolvedDir, candidatePath, nativeSessionId)
+      }
+    }
+    if (!fileName) {
+      const candidateAppData = dirname(dirname(dirname(candidatePath)))
+      try {
+        const candStat = lstatSync(candidateAppData)
+        if (
+          candStat.isDirectory() &&
+          !candStat.isSymbolicLink() &&
+          realpathSync(candidateAppData) === canonicalAppData
+        ) {
+          fileName = resolveBrainPlanThreeSegmentFileName(
+            candidateAppData,
+            candidatePath,
+            nativeSessionId,
+          )
+        }
+      } catch {
+        fileName = undefined
+      }
+    }
+    if (!fileName) continue
+
+    const brainDir = join(canonicalAppData, 'brain')
+    const sessionDir = join(brainDir, nativeSessionId)
+    const leafPath = join(sessionDir, fileName)
+
+    const brainState = verifyNonSymlinkBrainEntry(brainDir, 'dir')
+    if (brainState === 'invalid') continue
+    if (brainState === 'missing') {
+      if (
+        verifyNonSymlinkBrainEntry(sessionDir, 'dir') === 'missing' &&
+        verifyNonSymlinkBrainEntry(leafPath, 'file') === 'missing'
+      ) {
+        return true
+      }
+      continue
+    }
+
+    const sessionState = verifyNonSymlinkBrainEntry(sessionDir, 'dir')
+    if (sessionState === 'invalid') continue
+    if (sessionState === 'missing') {
+      if (verifyNonSymlinkBrainEntry(leafPath, 'file') === 'missing') {
+        return true
+      }
+      continue
+    }
+
+    const leafState = verifyNonSymlinkBrainEntry(leafPath, 'file')
+    if (leafState === 'exists' || leafState === 'missing') {
+      return true
+    }
+  }
+  return false
 }
 
 function isMarkdownBrainPlanArtifact(
@@ -6089,6 +6251,11 @@ export class AgyAgentAdapter implements AgentAdapter {
     const permissionScope =
       !readOnlyStage && effectivePermissionMode === 'full' ? 'full' : 'standard'
 
+    const tools = new Map<string, AgyToolState>()
+    const approvedBrainPlanCalls = new Map<
+      string,
+      { readonly toolName: string; readonly args: Record<string, unknown> }
+    >()
     let brainPlanTouched = false
     const activeBrainPlanOpCallIds = new Set<string>()
     const hasUnresolvedBrainPlanWrite = (): boolean => activeBrainPlanOpCallIds.size > 0
@@ -6495,6 +6662,8 @@ export class AgyAgentAdapter implements AgentAdapter {
         foreignExecIdsMemoryReservation = undefined
         for (const ctrl of interactionControllers) ctrl.abort()
         interactionControllers.clear()
+        tools.clear()
+        approvedBrainPlanCalls.clear()
         if (!options.emergency && !emergencyCleanedUp) {
           await closeZeroInputSessionOnce().catch(() => undefined)
         }
@@ -6608,6 +6777,33 @@ export class AgyAgentAdapter implements AgentAdapter {
       }
 
       const mcpDescriptor = mcpServer.hasTools ? await mcpServer.start() : undefined
+
+      const systemAppendParts: string[] = []
+      if (workflow) {
+        systemAppendParts.push(
+          collaborationInstructions(workflow, authorization, mcpServer.sourceCapability),
+        )
+        if (readOnlyStage) {
+          systemAppendParts.push(AGY_READ_ONLY_STAGE_INSTRUCTIONS)
+        }
+        if (planModeStage) {
+          systemAppendParts.push(AGY_PLAN_SUBMISSION_INSTRUCTIONS)
+        }
+      } else {
+        if (mcpServer.allowedToolNames.has('request_peer_assistance')) {
+          systemAppendParts.push(PEER_ASSISTANCE_INSTRUCTIONS)
+        }
+        if (mcpServer.allowedToolNames.has('read_collaboration_source')) {
+          systemAppendParts.push(buildSourceInstructions(mcpServer.sourceCapability))
+        }
+      }
+      if (mcpServer.hasTools) {
+        systemAppendParts.push(mcpServer.formatToolUsageInstructions())
+      }
+      const systemAppend = systemAppendParts.filter(Boolean).join('\n\n')
+      const systemPromptMeta = systemAppend
+        ? { _meta: { antigravity: { systemPrompt: { append: systemAppend } } } }
+        : {}
 
       lease = await this.pool.acquire({
         cwd: input.cwd,
@@ -6852,7 +7048,16 @@ export class AgyAgentAdapter implements AgentAdapter {
             activeRun,
             getSessionId: () => resolvedSessionId,
             mcpServer,
+            tools,
+            approvedBrainPlanCalls,
+            onBrainPlanWriteApproved: (toolCallId) => {
+              brainPlanTouched = true
+              if (activeBrainPlanOpCallIds.size < 64) {
+                activeBrainPlanOpCallIds.add(toolCallId)
+              }
+            },
             readOnlyStage,
+            planModeStage,
             permissionMode: effectivePermissionMode,
             permissionWait,
             getActiveCount: () => activePermissionRequests,
@@ -6965,6 +7170,7 @@ export class AgyAgentAdapter implements AgentAdapter {
             sessionId: input.nativeSessionId,
             cwd: lease.canonicalCwd,
             mcpServers: mcpDescriptor ? [mcpDescriptor] : [],
+            ...systemPromptMeta,
           },
           {
             timeoutMs: AGY_SESSION_LIFECYCLE_RPC_TIMEOUT_MS,
@@ -7014,6 +7220,7 @@ export class AgyAgentAdapter implements AgentAdapter {
           {
             cwd: lease.canonicalCwd,
             mcpServers: mcpDescriptor ? [mcpDescriptor] : [],
+            ...systemPromptMeta,
           },
           { timeoutMs: AGY_SESSION_LIFECYCLE_RPC_TIMEOUT_MS, signal: runSignal },
         )
@@ -7242,7 +7449,9 @@ export class AgyAgentAdapter implements AgentAdapter {
         images.push(...group.images)
       }
       promptMemoryReservation = connection.reserveWorkingMemory(
-        64 * 1024 + nativeImagePreparationBytes(images),
+        64 * 1024 +
+          Buffer.byteLength(systemAppend, 'utf8') * 2 +
+          nativeImagePreparationBytes(images),
       )
       toolStateMemoryReservation = connection.reserveWorkingMemory(0)
       foregroundDedupMemoryReservation = connection.reserveWorkingMemory(0)
@@ -7260,32 +7469,17 @@ export class AgyAgentAdapter implements AgentAdapter {
           pactRunId: input.runId,
         },
       )
+      if (workflow && systemAppend && promptBlocks[0]?.type === 'text') {
+        promptBlocks[0] = {
+          type: 'text',
+          text: `Pact host instructions for this turn:\n${systemAppend}\n\n${promptBlocks[0].text}`,
+        }
+      }
       const expectedFullPromptText = promptBlocks
         .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
         .map((block) => block.text)
         .join('\n')
         .trim()
-
-      const systemAppendParts: string[] = []
-      if (workflow) {
-        systemAppendParts.push(
-          collaborationInstructions(workflow, authorization, mcpServer.sourceCapability),
-        )
-        if (planModeStage) {
-          systemAppendParts.push(AGY_PLAN_SUBMISSION_INSTRUCTIONS)
-        }
-      } else {
-        if (mcpServer.allowedToolNames.has('request_peer_assistance')) {
-          systemAppendParts.push(PEER_ASSISTANCE_INSTRUCTIONS)
-        }
-        if (mcpServer.allowedToolNames.has('read_collaboration_source')) {
-          systemAppendParts.push(buildSourceInstructions(mcpServer.sourceCapability))
-        }
-      }
-      if (mcpServer.hasTools) {
-        systemAppendParts.push(mcpServer.formatToolUsageInstructions())
-      }
-      const systemAppend = systemAppendParts.filter(Boolean).join('\n\n')
 
       const turnEpoch = this.nextTurnEpoch++
       const roundTracker = new AgyRoundEffectsTracker(
@@ -7598,9 +7792,7 @@ export class AgyAgentAdapter implements AgentAdapter {
       const promptParams: Record<string, unknown> = {
         sessionId: resolvedSessionId,
         prompt: promptBlocks,
-        ...(systemAppend
-          ? { _meta: { antigravity: { systemPrompt: { append: systemAppend } } } }
-          : {}),
+        ...systemPromptMeta,
       }
 
       await stopPrePromptDrain(true)
@@ -7694,7 +7886,6 @@ export class AgyAgentAdapter implements AgentAdapter {
       )
 
       const answer = new AgentAnswerAssembler(input.runId)
-      const tools = new Map<string, AgyToolState>()
       let totalToolStateBytes = 0
       const resizeToolStateBytes = (state: AgyToolState, nextBytes: number): void => {
         const clamped = Math.max(0, nextBytes)
@@ -7756,6 +7947,7 @@ export class AgyAgentAdapter implements AgentAdapter {
           roundTracker,
           answer,
           tools,
+          approvedBrainPlanCalls,
           resizeToolStateBytes,
           reasoningItems,
           getReasoningBytes: () => reasoningBytes,
@@ -7778,7 +7970,9 @@ export class AgyAgentAdapter implements AgentAdapter {
             // Invalidate any prior Plan candidate as soon as a subsequent Plan mutation begins so
             // deferred readback or the newer body is always obtained before publication.
             latestBrainPlanCandidate = undefined
-            if (activeBrainPlanOpCallIds.size > 0) {
+            const hasOtherActivePlanOp =
+              activeBrainPlanOpCallIds.size > (activeBrainPlanOpCallIds.has(callId) ? 1 : 0)
+            if (hasOtherActivePlanOp) {
               // Overlapping Phase-1 Plan ops MUST verify final disk body via storage readback.
               brainPlanReadbackRequired = true
             }
@@ -11680,7 +11874,14 @@ export class AgyAgentAdapter implements AgentAdapter {
     activeRun: ActiveAgyRun | undefined
     getSessionId: () => string | undefined
     mcpServer: AgyRunMcpServer
+    tools: Map<string, AgyToolState>
+    approvedBrainPlanCalls: Map<
+      string,
+      { readonly toolName: string; readonly args: Record<string, unknown> }
+    >
+    onBrainPlanWriteApproved: (toolCallId: string) => void
     readOnlyStage: boolean
+    planModeStage: boolean
     permissionMode: SessionPermissionMode
     permissionWait: NativePermissionWait
     getActiveCount: () => number
@@ -11702,7 +11903,11 @@ export class AgyAgentAdapter implements AgentAdapter {
       activeRun,
       getSessionId,
       mcpServer,
+      tools,
+      approvedBrainPlanCalls,
+      onBrainPlanWriteApproved,
       readOnlyStage,
+      planModeStage,
       permissionMode,
       permissionWait,
       getActiveCount,
@@ -11843,6 +12048,92 @@ export class AgyAgentAdapter implements AgentAdapter {
     }
     if (mayRevokeCurrentSessionMcp && isAuthorizedPactTool) {
       mcpServer.revokeDisputedTokens(validTcId, disputedTokens)
+    }
+
+    // Phase-1 native planning authorizes bounded Markdown artifact writes strictly inside
+    // `<appDataDir>/brain/<nativeSessionId>/*.md` with ArtifactMetadata, without surfacing a UI card.
+    const isBrainPlanTool =
+      !validated.explicitToolNameInvalid &&
+      (validated.explicitToolName === 'write_file' || validated.explicitToolName === 'edit_file')
+    if (
+      planModeStage &&
+      activeRun &&
+      !activeRun.promptReplyReceived &&
+      !activeRun.rootTerminal &&
+      !activeRun.cancellationPending &&
+      !activeRun.foreignTurnActiveUntilRootBound &&
+      mcpServer.isRootActive() &&
+      !signal.aborted &&
+      !hasInvalidOrContradictedPermFrame &&
+      validated.sessionAttribution === 'matching' &&
+      validTcId !== undefined &&
+      !approvedBrainPlanCalls.has(validTcId) &&
+      approvedBrainPlanCalls.size < 64 &&
+      isBrainPlanTool &&
+      validated.argsEvidence.kind === 'present' &&
+      hasValidArtifactMetadata(validated.argsEvidence.args) &&
+      isPlainObject(params.toolCall)
+    ) {
+      const existingTool = tools.get(validTcId)
+      const existingToolHealthy =
+        !existingTool ||
+        (!existingTool.toolIdentityConflicted &&
+          !existingTool.argsConflicted &&
+          !existingTool.invalidStatus &&
+          !existingTool.completedEmitted &&
+          (existingTool.explicitToolName === undefined ||
+            existingTool.explicitToolName === validated.explicitToolName) &&
+          (existingTool.mergedArgs === undefined ||
+            mergePlainArgsRecords(existingTool.mergedArgs, validated.argsEvidence.args).kind ===
+              'ok'))
+      const stepMatches =
+        validated.stepIdx === undefined ||
+        mcpServer.minStepIdx === undefined ||
+        validated.stepIdx >= mcpServer.minStepIdx
+      const trajectoryMatches =
+        validated.trajectoryId === undefined ||
+        mcpServer.pinnedTrajectory === undefined ||
+        validated.trajectoryId === mcpServer.pinnedTrajectory
+      const argPath = asString(validated.argsEvidence.args.Path ?? validated.argsEvidence.args.path)
+      const collected = collectAgyTargetPaths(params.toolCall)
+      if (
+        existingToolHealthy &&
+        stepMatches &&
+        trajectoryMatches &&
+        argPath !== undefined &&
+        isVerifiedDirectBrainPlanWriteTarget(
+          argPath,
+          cwd,
+          this.appDataDirs,
+          activeRun.nativeSessionId,
+        ) &&
+        collected.complete &&
+        !collected.hasMoveTarget &&
+        collected.paths.length > 0 &&
+        collected.paths.every((target) =>
+          isVerifiedDirectBrainPlanWriteTarget(
+            target,
+            cwd,
+            this.appDataDirs,
+            activeRun.nativeSessionId,
+          ),
+        )
+      ) {
+        const allowOnce = findAllowOnceOptionId(params.options)
+        if (!allowOnce) {
+          await denyPermission()
+          return
+        }
+        approvedBrainPlanCalls.set(validTcId, {
+          toolName: validated.explicitToolName,
+          args: validated.argsEvidence.args,
+        })
+        onBrainPlanWriteApproved(validTcId)
+        await connection
+          .respond(rpcId, { outcome: { outcome: 'selected', optionId: allowOnce } })
+          .catch(() => undefined)
+        return
+      }
     }
 
     // 3. Read-Only Ironclad Wall (`B4`): deterministically reject ALL workspace/read_file/command/other
@@ -12102,6 +12393,10 @@ export class AgyAgentAdapter implements AgentAdapter {
     roundTracker: AgyRoundEffectsTracker
     answer: AgentAnswerAssembler
     tools: Map<string, AgyToolState>
+    approvedBrainPlanCalls: Map<
+      string,
+      { readonly toolName: string; readonly args: Record<string, unknown> }
+    >
     resizeToolStateBytes: (state: AgyToolState, nextBytes: number) => void
     reasoningItems: Map<string, string>
     getReasoningBytes: () => number
@@ -12407,13 +12702,21 @@ export class AgyAgentAdapter implements AgentAdapter {
             validated.explicitToolName === undefined && !validated.explicitToolNameInvalid
               ? context.mcpServer.lookupVerifiedCallToolName(toolCallId)
               : undefined
+          const priorApproved = context.approvedBrainPlanCalls.get(toolCallId)
           const initialExplicitName = validated.explicitToolName ?? inheritedExplicitName
+          const approvedIdentityMismatch = Boolean(
+            priorApproved &&
+            initialExplicitName !== undefined &&
+            initialExplicitName !== priorApproved.toolName,
+          )
           state = {
             toolCallId,
             // Display name may fall back to `update.kind`; authorization STRICTLY uses `explicitToolName`!
             name: initialExplicitName ?? asString(update.kind)?.slice(0, 120) ?? 'tool',
             ...(initialExplicitName !== undefined ? { explicitToolName: initialExplicitName } : {}),
-            ...(validated.explicitToolNameInvalid ? { toolIdentityConflicted: true } : {}),
+            ...(validated.explicitToolNameInvalid || approvedIdentityMismatch
+              ? { toolIdentityConflicted: true }
+              : {}),
             title: (asString(update.title) ?? initialExplicitName ?? 'Tool').slice(0, 160),
             status: normalizedIncomingStatus ?? 'pending',
             ...(incomingStatusInvalid ? { invalidStatus: true } : {}),
@@ -12423,6 +12726,7 @@ export class AgyAgentAdapter implements AgentAdapter {
           }
           context.tools.set(toolCallId, state)
         } else {
+          const priorApproved = context.approvedBrainPlanCalls.get(state.toolCallId)
           if (validated.explicitToolNameInvalid) {
             context.mcpServer.revokeDisputedTokens(
               state.toolCallId,
@@ -12431,7 +12735,10 @@ export class AgyAgentAdapter implements AgentAdapter {
             state.toolIdentityConflicted = true
           } else if (validated.explicitToolName !== undefined) {
             const incomingName = validated.explicitToolName
-            if (state.explicitToolName !== undefined && incomingName !== state.explicitToolName) {
+            if (
+              (state.explicitToolName !== undefined && incomingName !== state.explicitToolName) ||
+              (priorApproved && incomingName !== priorApproved.toolName)
+            ) {
               context.mcpServer.revokeDisputedTokens(
                 state.toolCallId,
                 state.progressToken ? [...disputedTokens, state.progressToken] : disputedTokens,
@@ -12515,16 +12822,21 @@ export class AgyAgentAdapter implements AgentAdapter {
 
         let acpAdmission: AcpToolCallAdmissionResult = 'already_retired'
         if (!state.completedEmitted) {
+          const priorApproved = context.approvedBrainPlanCalls.get(state.toolCallId)
           if (frameArgsEvidence.kind === 'invalid_or_conflict') {
             state.argsConflicted = true
           } else if (frameArgsEvidence.kind === 'present') {
-            const merged = mergePlainArgsRecords(state.mergedArgs, frameArgsEvidence.args)
+            const baselineArgs = state.mergedArgs ?? priorApproved?.args
+            const merged = mergePlainArgsRecords(baselineArgs, frameArgsEvidence.args)
             if (merged.kind === 'conflict') {
               state.argsConflicted = true
             } else {
               state.mergedArgs = merged.args
               state.mergedArgsBytes = estimateJsonPayloadBytes(state.mergedArgs)
             }
+          } else if (priorApproved && state.mergedArgs === undefined) {
+            state.mergedArgs = { ...priorApproved.args }
+            state.mergedArgsBytes = estimateJsonPayloadBytes(state.mergedArgs)
           }
           if (frameArgs) {
             state.args = frameArgs
@@ -12635,7 +12947,11 @@ export class AgyAgentAdapter implements AgentAdapter {
         const isExactBrainPlanTool =
           !state.toolIdentityConflicted &&
           (state.explicitToolName === 'write_file' || state.explicitToolName === 'edit_file')
-        if (!state.completedEmitted && context.planModeStage && isExactBrainPlanTool) {
+        if (!state.completedEmitted && context.planModeStage && !isExactBrainPlanTool) {
+          if (context.approvedBrainPlanCalls.has(state.toolCallId)) {
+            context.onBrainPlanCaptureFailed(state.toolCallId)
+          }
+        } else if (!state.completedEmitted && context.planModeStage && isExactBrainPlanTool) {
           const argPath = effectiveArgs
             ? asString(effectiveArgs.Path ?? effectiveArgs.path)
             : undefined
@@ -12686,11 +13002,25 @@ export class AgyAgentAdapter implements AgentAdapter {
             } else if (state.status === 'failed' || state.status === 'cancelled') {
               context.onBrainPlanCaptureFailed(state.toolCallId)
             } else if (state.status === 'completed') {
+              const anyAppDataExistsOnDisk = this.appDataDirs.some((dir) => {
+                try {
+                  return lstatSync(dir).isDirectory()
+                } catch {
+                  return false
+                }
+              })
               if (
                 !argIsBrainPlan ||
                 !argPath ||
                 !effectiveArgs ||
-                !hasValidArtifactMetadata(effectiveArgs)
+                !hasValidArtifactMetadata(effectiveArgs) ||
+                (anyAppDataExistsOnDisk &&
+                  !isVerifiedDirectBrainPlanWriteTarget(
+                    argPath,
+                    context.cwd,
+                    this.appDataDirs,
+                    activeRun.nativeSessionId,
+                  ))
               ) {
                 context.onBrainPlanCaptureFailed(state.toolCallId)
               } else if (diffBlocks.length > 1) {
@@ -12845,23 +13175,30 @@ export class AgyAgentAdapter implements AgentAdapter {
           }
 
           // File change & round command/tool uncertainty classification (`B9` / Module 6).
+          const conflictedArgsSources = [state.mergedArgs, state.args, state.rawInput].filter(
+            isPlainObject,
+          )
+          const hasToolConflict = Boolean(state.argsConflicted || state.toolIdentityConflicted)
           const mergedItem = {
             name: state.name,
             status: state.status,
-            args: state.args,
-            rawInput: state.rawInput,
+            args: hasToolConflict ? undefined : (state.mergedArgs ?? state.args),
+            rawInput: hasToolConflict ? undefined : state.rawInput,
             rawOutput: state.rawOutput,
             content: state.content,
             locations: state.locations,
+            argsConflicted: Boolean(state.argsConflicted),
+            toolIdentityConflicted: Boolean(state.toolIdentityConflicted),
+            conflictedArgsSources,
           }
-          if (
+          const isFileTool =
             state.name === 'write_file' ||
             state.name === 'edit_file' ||
             state.name === 'delete_file' ||
             state.name === 'remove_file' ||
             state.name === 'move_file' ||
             state.name === 'rename_file'
-          ) {
+          if (state.toolIdentityConflicted || isFileTool) {
             const fileEvidence = context.roundTracker.observeFileTool(mergedItem)
             fileEvidence.changes = fileEvidence.changes.map((change, index) => ({
               ...change,
@@ -12870,7 +13207,8 @@ export class AgyAgentAdapter implements AgentAdapter {
             if (fileEvidence.changes.length > 0 || fileEvidence.uncertain) {
               context.observeFiles(fileEvidence)
             }
-          } else {
+          }
+          if (state.toolIdentityConflicted || !isFileTool) {
             const nonFile = context.roundTracker.observeNonFileTool(mergedItem)
             if (nonFile.uncertain && nonFile.reason) {
               nativeEffectsUncertain(input, nonFile.reason, nonFile.scope)

@@ -976,21 +976,6 @@ export function messageDocument(
   runId: string,
   messageId: string,
 ): CollaborationDocument | undefined {
-  const body = repo.database
-    .select({ id: conversationBodyInputs.id })
-    .from(conversationBodyInputs)
-    .where(
-      and(
-        eq(conversationBodyInputs.sessionId, sessionId),
-        eq(conversationBodyInputs.committedMessageId, messageId),
-        eq(conversationBodyInputs.sourceRunId, runId),
-        eq(conversationBodyInputs.sealed, true),
-      ),
-    )
-    .orderBy(desc(conversationBodyInputs.updatedAt), desc(conversationBodyInputs.createdAt))
-    .limit(1)
-    .get()
-  if (body) return documentReference(repo, sessionId, body.id)
   const row = repo.database
     .select({
       bytes: sql<number>`length(CAST(${conversationMessages.content} AS BLOB))`,
@@ -1009,6 +994,21 @@ export function messageDocument(
     )
     .get()
   if (!row || row.state !== 'complete') return undefined
+  const body = repo.database
+    .select({ id: conversationBodyInputs.id })
+    .from(conversationBodyInputs)
+    .where(
+      and(
+        eq(conversationBodyInputs.sessionId, sessionId),
+        eq(conversationBodyInputs.committedMessageId, messageId),
+        eq(conversationBodyInputs.sourceRunId, runId),
+        eq(conversationBodyInputs.sealed, true),
+      ),
+    )
+    .orderBy(desc(conversationBodyInputs.updatedAt), desc(conversationBodyInputs.createdAt))
+    .limit(1)
+    .get()
+  if (body) return documentReference(repo, sessionId, body.id)
   if (row.content === null)
     throw new RunOperationConflictError(
       'The complete response has not been sealed into its source document.',

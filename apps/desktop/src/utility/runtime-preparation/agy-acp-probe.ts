@@ -1,8 +1,8 @@
 import type { ChildProcessWithoutNullStreams } from 'node:child_process'
 
-import { lstatSync, realpathSync } from 'node:fs'
-import { chmod, lstat, mkdir, mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { constants, lstatSync, realpathSync } from 'node:fs'
+import { chmod, lstat, mkdir, mkdtemp, open, rm, writeFile } from 'node:fs/promises'
+import { homedir, tmpdir } from 'node:os'
 import { isAbsolute, join, win32 as win32Path } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 
@@ -146,24 +146,38 @@ export function deriveTrustedWindowsCmdPath(env?: NodeJS.ProcessEnv): string | u
   return trustedCmd
 }
 
+export interface ResolveTrustedWindowsCmdExeOptions {
+  readonly platform?: NodeJS.Platform
+  readonly lstat?: typeof lstatSync
+  readonly realpath?: typeof realpathSync
+}
+
 /**
  * Resolves `%SystemRoot%\\System32\\cmd.exe` and, on Windows, verifies non-symlink directory and
  * executable identity before returning it.
  */
-export function resolveTrustedWindowsCmdExe(env?: NodeJS.ProcessEnv): string | undefined {
+export function resolveTrustedWindowsCmdExe(
+  env?: NodeJS.ProcessEnv,
+  options?: ResolveTrustedWindowsCmdExeOptions,
+): string | undefined {
   const trustedCmd = deriveTrustedWindowsCmdPath(env)
   if (!trustedCmd) return undefined
-  if (process.platform === 'win32') {
+  const platform = options?.platform ?? process.platform
+  const verifyOnDisk =
+    platform === 'win32' && (options?.lstat !== undefined || process.platform === 'win32')
+  if (verifyOnDisk) {
+    const statFn = options?.lstat ?? lstatSync
+    const realpathFn = options?.realpath ?? realpathSync
     const system32Dir = win32Path.dirname(trustedCmd)
     const systemRootDir = win32Path.dirname(system32Dir)
     try {
-      const rootStat = lstatSync(systemRootDir)
+      const rootStat = statFn(systemRootDir)
       if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) return undefined
-      const sys32Stat = lstatSync(system32Dir)
+      const sys32Stat = statFn(system32Dir)
       if (!sys32Stat.isDirectory() || sys32Stat.isSymbolicLink()) return undefined
-      const cmdStat = lstatSync(trustedCmd)
+      const cmdStat = statFn(trustedCmd)
       if (!cmdStat.isFile() || cmdStat.isSymbolicLink()) return undefined
-      if (realpathSync(trustedCmd).toLowerCase() !== trustedCmd.toLowerCase()) return undefined
+      if (realpathFn(trustedCmd).toLowerCase() !== trustedCmd.toLowerCase()) return undefined
     } catch {
       return undefined
     }
@@ -293,6 +307,161 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
+const MAX_SOURCE_SETTINGS_BYTES = 65_536
+const MAX_MODEL_PROVIDER_LENGTH = 64
+
+function resolveAgyGeminiDirForProbe(env?: NodeJS.ProcessEnv): string | undefined {
+  const sourceEnv = env ?? process.env
+  const explicitGeminiDir = readEnvCaseInsensitive(sourceEnv, 'ANTIGRAVITY_GEMINI_DIR')?.trim()
+  if (explicitGeminiDir !== undefined && explicitGeminiDir.length > 0) {
+    return isAbsolute(explicitGeminiDir) && !hasAsciiControlChar(explicitGeminiDir)
+      ? explicitGeminiDir
+      : undefined
+  }
+  const home =
+    readEnvCaseInsensitive(sourceEnv, 'HOME')?.trim() ||
+    readEnvCaseInsensitive(sourceEnv, 'USERPROFILE')?.trim() ||
+    homedir()
+  if (!home || !isAbsolute(home) || hasAsciiControlChar(home)) return undefined
+  return join(home, '.gemini')
+}
+
+function throwIfSetupCancelledOrExpired(signal: AbortSignal | undefined, deadlineAt: number): void {
+  if (signal?.aborted) {
+    throw abortError(signal.reason)
+  }
+  if (Date.now() >= deadlineAt) {
+    throw new AgyProbeError('timeout', 'The Antigravity ACP probe timed out before initialization.')
+  }
+}
+
+async function runWithSetupBudget<T>(
+  operation: Promise<T>,
+  signal: AbortSignal | undefined,
+  deadlineAt: number,
+): Promise<T> {
+  throwIfSetupCancelledOrExpired(signal, deadlineAt)
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let onAbort: (() => void) | undefined
+  void operation.catch(() => undefined)
+  const budgetPromise = new Promise<never>((_resolve, reject) => {
+    const remainingMs = Number.isFinite(deadlineAt)
+      ? Math.max(0, deadlineAt - Date.now())
+      : undefined
+    if (remainingMs !== undefined) {
+      timer = setTimeout(() => {
+        reject(
+          new AgyProbeError(
+            'timeout',
+            'The Antigravity ACP probe timed out before initialization.',
+          ),
+        )
+      }, remainingMs)
+      timer.unref?.()
+    }
+    if (signal) {
+      onAbort = () => reject(abortError(signal.reason))
+      signal.addEventListener('abort', onAbort, { once: true })
+    }
+  })
+  try {
+    return await Promise.race([operation, budgetPromise])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+    if (signal && onAbort) signal.removeEventListener('abort', onAbort)
+  }
+}
+
+async function seedProbeModelProviderSettings(
+  probeGeminiDir: string,
+  env?: NodeJS.ProcessEnv,
+  signal?: AbortSignal,
+  deadlineAt = Infinity,
+): Promise<void> {
+  throwIfSetupCancelledOrExpired(signal, deadlineAt)
+  const baseGeminiDir = resolveAgyGeminiDirForProbe(env)
+  if (!baseGeminiDir) return
+  const sourceSettingsPath = join(baseGeminiDir, 'antigravity-cli', 'settings.json')
+  let handle: Awaited<ReturnType<typeof open>> | undefined
+  let modelProvider: string | undefined
+  try {
+    const before = await lstat(sourceSettingsPath)
+    throwIfSetupCancelledOrExpired(signal, deadlineAt)
+    if (
+      !before.isFile() ||
+      before.isSymbolicLink() ||
+      before.size < 2 ||
+      before.size > MAX_SOURCE_SETTINGS_BYTES
+    ) {
+      return
+    }
+    const openFlags =
+      constants.O_RDONLY |
+      (constants.O_NOFOLLOW ?? 0) |
+      (process.platform === 'win32' ? 0 : (constants.O_NONBLOCK ?? 0))
+    handle = await open(sourceSettingsPath, openFlags)
+    throwIfSetupCancelledOrExpired(signal, deadlineAt)
+    const opened = await handle.stat()
+    if (
+      !opened.isFile() ||
+      opened.dev !== before.dev ||
+      opened.ino !== before.ino ||
+      opened.size !== before.size ||
+      opened.size > MAX_SOURCE_SETTINGS_BYTES
+    ) {
+      return
+    }
+    const buffer = Buffer.allocUnsafe(before.size + 1)
+    let totalRead = 0
+    while (totalRead < buffer.length) {
+      throwIfSetupCancelledOrExpired(signal, deadlineAt)
+      // oxlint-disable-next-line eslint/no-await-in-loop -- Bounded positional read of <= 64 KiB settings.json.
+      const { bytesRead } = await handle.read(
+        buffer,
+        totalRead,
+        buffer.length - totalRead,
+        totalRead,
+      )
+      if (bytesRead === 0) break
+      totalRead += bytesRead
+    }
+    if (totalRead !== before.size || totalRead > MAX_SOURCE_SETTINGS_BYTES) return
+    const parsed: unknown = JSON.parse(
+      buffer
+        .subarray(0, totalRead)
+        .toString('utf8')
+        .replace(/^\uFEFF/u, ''),
+    )
+    if (!isPlainRecord(parsed) || typeof parsed.modelProvider !== 'string') return
+    const trimmed = parsed.modelProvider.trim()
+    if (
+      trimmed.length === 0 ||
+      trimmed.length > MAX_MODEL_PROVIDER_LENGTH ||
+      hasAsciiControlChar(trimmed)
+    ) {
+      return
+    }
+    modelProvider = trimmed
+  } catch (error) {
+    if (error instanceof AgyProbeError || (error instanceof Error && error.name === 'AbortError')) {
+      throw error
+    }
+    return
+  } finally {
+    await handle?.close().catch(() => undefined)
+  }
+
+  if (!modelProvider) return
+  throwIfSetupCancelledOrExpired(signal, deadlineAt)
+  const probeAppDataDir = join(probeGeminiDir, 'probe')
+  await mkdir(probeAppDataDir, { mode: 0o700 })
+  await chmod(probeAppDataDir, 0o700)
+  await writeFile(join(probeAppDataDir, 'settings.json'), JSON.stringify({ modelProvider }), {
+    mode: 0o600,
+    flag: 'wx',
+  })
+}
+
 function abortError(reason?: unknown): Error {
   const error = new Error('The Antigravity ACP probe was aborted.', { cause: reason })
   error.name = 'AbortError'
@@ -302,6 +471,14 @@ function abortError(reason?: unknown): Error {
 export async function runAgyAcpProbe<T>(request: AgyAcpProbeRequest<T>): Promise<T> {
   if (request.signal?.aborted) {
     throw abortError(request.signal.reason)
+  }
+  const initTimeoutMs = Math.max(0, request.initializeTimeoutMs ?? DEFAULT_INITIALIZE_TIMEOUT_MS)
+  let activeDeadlineAt = Math.min(
+    Date.now() + initTimeoutMs,
+    request.businessDeadlineAt ?? Infinity,
+  )
+  if (Date.now() >= activeDeadlineAt) {
+    throw new AgyProbeError('timeout', 'The Antigravity ACP probe timed out before initialization.')
   }
 
   const probeRoot = await mkdtemp(join(tmpdir(), 'pact-agy-acp-'))
@@ -323,26 +500,34 @@ export async function runAgyAcpProbe<T>(request: AgyAcpProbeRequest<T>): Promise
   let closeFailureError: AgyProbeError | undefined
 
   try {
-    await chmod(probeRoot, 0o700)
-    await mkdir(probeCwd, { mode: 0o700 })
-    await chmod(probeCwd, 0o700)
-    await mkdir(probeGeminiDir, { mode: 0o700 })
-    await chmod(probeGeminiDir, 0o700)
     request.signal?.addEventListener('abort', onCallerAbort, { once: true })
     if (request.signal?.aborted) {
       processAbort.abort(request.signal.reason)
       throw abortError(request.signal.reason)
     }
+    await runWithSetupBudget(
+      (async () => {
+        await chmod(probeRoot, 0o700)
+        await mkdir(probeCwd, { mode: 0o700 })
+        await chmod(probeCwd, 0o700)
+        await mkdir(probeGeminiDir, { mode: 0o700 })
+        await chmod(probeGeminiDir, 0o700)
+        await seedProbeModelProviderSettings(
+          probeGeminiDir,
+          request.env,
+          processAbort.signal,
+          activeDeadlineAt,
+        )
+      })(),
+      processAbort.signal,
+      activeDeadlineAt,
+    )
+    throwIfSetupCancelledOrExpired(processAbort.signal, activeDeadlineAt)
 
     probe = request.ownProbe(processAbort.signal, () => {
       if (child && !child.stdin.destroyed) child.stdin.end()
     })
 
-    const initTimeoutMs = Math.max(0, request.initializeTimeoutMs ?? DEFAULT_INITIALIZE_TIMEOUT_MS)
-    let activeDeadlineAt = Math.min(
-      Date.now() + initTimeoutMs,
-      request.businessDeadlineAt ?? Infinity,
-    )
     const runningChild = spawnAgyAcpServer(
       request.executablePath,
       probeCwd,

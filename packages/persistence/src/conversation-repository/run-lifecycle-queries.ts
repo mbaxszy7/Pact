@@ -2386,9 +2386,35 @@ export function recordWorkspaceChanges(
         }
       }
     }
-    if (previous?.summary === payload && !collaborationChanged) return
+    const shouldRetractOrOmit = parsed.fileCount === 0 && parsed.state !== 'recovery_required'
     const rawNow = new Date().toISOString()
     const now = rawNow === run.updatedAt ? new Date(Date.parse(rawNow) + 1).toISOString() : rawNow
+    if (shouldRetractOrOmit) {
+      if (previous?.summary == null) {
+        if (collaborationChanged) {
+          transaction
+            .update(agentRuns)
+            .set({ updatedAt: now })
+            .where(eq(agentRuns.id, run.id))
+            .run()
+        }
+        return
+      }
+      appendAgentEvent(transaction, {
+        sessionId: run.sessionId,
+        runId: run.id,
+        eventType: 'workspace.changes_updated',
+        payload,
+        createdAt: now,
+      })
+      transaction
+        .update(agentRuns)
+        .set({ workspaceChangesJson: null, updatedAt: now })
+        .where(eq(agentRuns.id, run.id))
+        .run()
+      return
+    }
+    if (previous?.summary === payload && !collaborationChanged) return
     if (previous?.summary === payload) {
       transaction.update(agentRuns).set({ updatedAt: now }).where(eq(agentRuns.id, run.id)).run()
       return

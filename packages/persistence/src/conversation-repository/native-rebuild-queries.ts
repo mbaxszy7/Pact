@@ -58,6 +58,7 @@ import {
   refreshNativeSessionMetadata,
 } from '../native-presence-metadata.js'
 import {
+  agentEventJournal,
   agentRuns,
   anchoredComments,
   collaborationActionReceipts,
@@ -959,10 +960,25 @@ export function settleKnownNativeEnding(
         .run()
     repo.recordSchedulingBusinessActivity(runId, completeResponse)
   })
+  const hasExplicitOutputFailure =
+    failure !== undefined ||
+    Boolean(
+      repo.database
+        .select({ sequence: agentEventJournal.sequence })
+        .from(agentEventJournal)
+        .where(
+          and(
+            eq(agentEventJournal.runId, runId),
+            eq(agentEventJournal.eventType, 'pact.output_unavailable'),
+          ),
+        )
+        .limit(1)
+        .get(),
+    )
   repo.finishCollaboration(
     runId,
-    run.nativeOutcome === 'completed' && completeResponse,
-    failure?.message,
+    run.nativeOutcome === 'completed' && (completeResponse || !hasExplicitOutputFailure),
+    failure?.message ?? run.failureMessage,
   )
   return repo.runPatch(runId)
 }

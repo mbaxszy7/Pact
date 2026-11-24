@@ -1,7 +1,9 @@
 import type { ChildProcessWithoutNullStreams } from 'node:child_process'
+import type { lstatSync, realpathSync } from 'node:fs'
 
 import { createHash, randomUUID } from 'node:crypto'
 import { realpath } from 'node:fs/promises'
+import { posix as posixPath, win32 as win32Path } from 'node:path'
 
 import type {
   ConfirmedUnsentBoundary,
@@ -20,6 +22,10 @@ import type { LogicalIpcWorkerTraffic } from '../../shared/logical-ipc-traffic'
 
 import { recordDiagnostic } from '../../diagnostics/utility-log'
 import { OwnedProcessGroup } from '../owned-process-group'
+import {
+  isUnsafeWindowsCmdPath,
+  resolveTrustedWindowsCmdExe,
+} from '../runtime-preparation/agy-acp-probe'
 import {
   AgentExecutionError,
   NativeCapacityError,
@@ -3213,10 +3219,93 @@ interface PoolCapacityWaiter {
   onAbort?: (() => void) | undefined
 }
 
+const MAX_AGY_GEMINI_DIR_BYTES = 4096
+const WINDOWS_ABSOLUTE_GEMINI_DIR_PATTERN = /^(?:[A-Za-z]:[\\/]|\\\\[^\\/]+[\\/][^\\/]+)/u
+
+function hasAsciiControlChar(text: string): boolean {
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index)
+    if (code <= 0x1f || code === 0x7f) {
+      return true
+    }
+  }
+  return false
+}
+
+export function isSafeAbsoluteAgyGeminiDir(
+  value: string,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  if (
+    value.length === 0 ||
+    Buffer.byteLength(value, 'utf8') > MAX_AGY_GEMINI_DIR_BYTES ||
+    hasAsciiControlChar(value)
+  ) {
+    return false
+  }
+  return platform === 'win32'
+    ? WINDOWS_ABSOLUTE_GEMINI_DIR_PATTERN.test(value)
+    : posixPath.isAbsolute(value)
+}
+
+function assertSafeAgyGeminiDir(
+  value: string,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  if (!isSafeAbsoluteAgyGeminiDir(value, platform)) {
+    throw new AgentExecutionError(
+      'protocol_error',
+      'Antigravity --gemini-dir override must be a safe absolute path.',
+      false,
+    )
+  }
+  return platform === 'win32' ? win32Path.resolve(value) : posixPath.resolve(value)
+}
+
+function resolveConfiguredAgyGeminiDir(
+  env: NodeJS.ProcessEnv,
+  explicitGeminiDir?: string,
+  platform: NodeJS.Platform = process.platform,
+): string | undefined {
+  if (explicitGeminiDir !== undefined) {
+    return assertSafeAgyGeminiDir(explicitGeminiDir.trim(), platform)
+  }
+  const raw = env['ANTIGRAVITY_GEMINI_DIR']?.trim()
+  if (!raw) {
+    return undefined
+  }
+  if (hasAsciiControlChar(raw) || Buffer.byteLength(raw, 'utf8') > MAX_AGY_GEMINI_DIR_BYTES) {
+    throw new AgentExecutionError(
+      'protocol_error',
+      'Antigravity --gemini-dir override must be a safe absolute path.',
+      false,
+    )
+  }
+  if (
+    !(platform === 'win32'
+      ? WINDOWS_ABSOLUTE_GEMINI_DIR_PATTERN.test(raw)
+      : posixPath.isAbsolute(raw))
+  ) {
+    return undefined
+  }
+  return assertSafeAgyGeminiDir(raw, platform)
+}
+
+function isSafeRelativeAgyAppDataDir(value: string): boolean {
+  return Boolean(
+    value &&
+    value.length <= 128 &&
+    !value.includes('..') &&
+    !/[/\\&|<>^%!"\r\n\s]/u.test(value) &&
+    /^[a-z0-9._-]+$/iu.test(value),
+  )
+}
+
 export interface AgyAcpConnectionPoolOptions {
   executablePath: string
   clientInfo?: { name: string; title?: string; version: string } | undefined
   relativeAppDataDir?: string | undefined
+  geminiDir?: string | undefined
   idleTimeoutMs?: number | undefined
   processFactory?: AgyProcessFactory | undefined
   ipcTraffic?: LogicalIpcWorkerTraffic | undefined
@@ -3229,16 +3318,15 @@ export interface AgyAcpConnectionPoolOptions {
 function buildAgySpawnArgs(
   permissionScope: AgyPermissionScope,
   relativeAppDataDir: string | undefined,
+  geminiDir?: string,
+  platform: NodeJS.Platform = process.platform,
 ): string[] {
   const args = ['acp', '--process-per-session', '--disable-telemetry']
+  if (geminiDir !== undefined) {
+    args.push('--gemini-dir', assertSafeAgyGeminiDir(geminiDir, platform))
+  }
   if (relativeAppDataDir !== undefined) {
-    if (
-      !relativeAppDataDir ||
-      relativeAppDataDir.length > 128 ||
-      relativeAppDataDir.includes('..') ||
-      /[/\\&|<>^%!"\r\n\s]/u.test(relativeAppDataDir) ||
-      !/^[a-z0-9._-]+$/iu.test(relativeAppDataDir)
-    ) {
+    if (!isSafeRelativeAgyAppDataDir(relativeAppDataDir)) {
       throw new AgentExecutionError(
         'protocol_error',
         'Antigravity --app-data-dir override must be a safe relative directory name.',
@@ -3251,6 +3339,91 @@ function buildAgySpawnArgs(
     args.push('--dangerously-skip-permissions')
   }
   return args
+}
+
+export function formatAndValidateAgyOwnedSpawnArgs(
+  executablePath: string,
+  args: readonly string[],
+  platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+  options?: { readonly lstat?: typeof lstatSync; readonly realpath?: typeof realpathSync },
+): { target: string; spawnArgs: string[]; isWindowsCommand: boolean } {
+  const isWindowsCommand = platform === 'win32' && /\.cmd$/iu.test(executablePath)
+  if (isWindowsCommand && isUnsafeWindowsCmdPath(executablePath)) {
+    throw new AgentExecutionError(
+      'runtime_incompatible',
+      'Unsafe Antigravity executable path.',
+      false,
+    )
+  }
+  if (args[0] !== 'acp') {
+    throw new AgentExecutionError('protocol_error', 'Unsafe Antigravity launch arguments.', false)
+  }
+  for (let index = 1; index < args.length; index += 1) {
+    const arg = args[index]
+    if (
+      arg === '--process-per-session' ||
+      arg === '--disable-telemetry' ||
+      arg === '--dangerously-skip-permissions'
+    ) {
+      continue
+    }
+    if (arg === '--app-data-dir') {
+      const next = args[index + 1]
+      if (!next || !isSafeRelativeAgyAppDataDir(next)) {
+        throw new AgentExecutionError(
+          'protocol_error',
+          'Unsafe Antigravity launch arguments.',
+          false,
+        )
+      }
+      index += 1
+      continue
+    }
+    if (arg === '--gemini-dir') {
+      const next = args[index + 1]
+      if (next === undefined || !isSafeAbsoluteAgyGeminiDir(next, platform)) {
+        throw new AgentExecutionError(
+          'protocol_error',
+          'Unsafe Antigravity launch arguments.',
+          false,
+        )
+      }
+      if (isWindowsCommand && isUnsafeWindowsCmdPath(next)) {
+        throw new AgentExecutionError(
+          'runtime_incompatible',
+          'Unsafe Antigravity storage path.',
+          false,
+        )
+      }
+      index += 1
+      continue
+    }
+    throw new AgentExecutionError('protocol_error', 'Unsafe Antigravity launch arguments.', false)
+  }
+  if (isWindowsCommand) {
+    const target = resolveTrustedWindowsCmdExe(env, { platform, ...options })
+    if (!target) {
+      throw new AgentExecutionError(
+        'runtime_incompatible',
+        'Trusted Windows command interpreter could not be confirmed.',
+        false,
+      )
+    }
+    const renderedArgs = args
+      .map((arg, index) => (index > 0 && args[index - 1] === '--gemini-dir' ? `"${arg}"` : arg))
+      .join(' ')
+    return {
+      target,
+      spawnArgs: ['/d', '/s', '/c', `""${executablePath}" ${renderedArgs}"`],
+      isWindowsCommand: true,
+    }
+  }
+  return {
+    target: executablePath,
+    spawnArgs: [...args],
+    isWindowsCommand: false,
+  }
 }
 
 /**
@@ -4208,8 +4381,13 @@ export class AgyAcpConnectionPool {
           'Antigravity connection pool reached its 16-directory capacity with all connections active or unconfirmed.',
         )
       }
-      const args = buildAgySpawnArgs(entry.permissionScope, this.options.relativeAppDataDir)
       const env = agyProcessEnvironment()
+      const geminiDir = resolveConfiguredAgyGeminiDir(env, this.options.geminiDir)
+      const args = buildAgySpawnArgs(
+        entry.permissionScope,
+        this.options.relativeAppDataDir,
+        geminiDir,
+      )
       owned = this.options.processFactory
         ? await this.spawnInjected(entry.canonicalCwd, args, entry.permissionScope, env)
         : this.spawnOwnedGroup(entry.canonicalCwd, args, env)
@@ -4334,21 +4512,12 @@ export class AgyAcpConnectionPool {
     env: NodeJS.ProcessEnv,
   ): OwnedAgyProcess {
     const executablePath = this.options.executablePath
-    const isWindowsCommand = process.platform === 'win32' && /\.cmd$/iu.test(executablePath)
-    if (isWindowsCommand && /[&|<>^%!"\r\n]/u.test(executablePath)) {
-      throw new AgentExecutionError(
-        'runtime_incompatible',
-        'Unsafe Antigravity executable path.',
-        false,
-      )
-    }
-    if (args.some((arg) => !/^(?:acp|--[a-z0-9-]+|[a-z0-9._-]+)$/iu.test(arg))) {
-      throw new AgentExecutionError('protocol_error', 'Unsafe Antigravity launch arguments.', false)
-    }
-    const target = isWindowsCommand ? (process.env.ComSpec ?? 'cmd.exe') : executablePath
-    const spawnArgs = isWindowsCommand
-      ? ['/d', '/s', '/c', `""${executablePath}" ${args.join(' ')}"`]
-      : [...args]
+    const { target, spawnArgs, isWindowsCommand } = formatAndValidateAgyOwnedSpawnArgs(
+      executablePath,
+      args,
+      process.platform,
+      env,
+    )
     const processGroup = new OwnedProcessGroup({ startupObservationMs: 2_000 })
     const child = processGroup.spawn(target, spawnArgs, {
       cwd: canonicalCwd,

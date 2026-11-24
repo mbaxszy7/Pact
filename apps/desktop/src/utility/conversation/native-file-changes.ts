@@ -263,7 +263,7 @@ function canonicalOrResolved(targetPath: string): string {
   }
 }
 
-function workspaceRelativePath(rawPath: string, cwd: string): string | undefined {
+export function workspaceRelativePath(rawPath: string, cwd: string): string | undefined {
   if (!rawPath || rawPath.length > 4096) return undefined
   for (const ch of rawPath) if (ch.charCodeAt(0) < 32) return undefined
   const canonicalCwd = canonicalOrResolved(cwd)
@@ -290,46 +290,131 @@ export function isAgyBrainArtifactPath(
   return Boolean(rel) && !rel.startsWith('../') && rel !== '..' && !isAbsolute(rel)
 }
 
-function collectAgyTargetPaths(item: object): { paths: string[]; complete: boolean } {
+const AGY_PRIMARY_PATH_KEYS = [
+  'Path',
+  'path',
+  'file_path',
+  'filePath',
+  'Source',
+  'source',
+  'OldPath',
+  'oldPath',
+] as const
+
+const AGY_MOVE_PATH_KEYS = [
+  'Destination',
+  'destination',
+  'TargetPath',
+  'targetPath',
+  'NewPath',
+  'newPath',
+  'movePath',
+  'move_path',
+  'previousPath',
+] as const
+
+const AGY_DIFF_MOVE_KEYS = ['movePath', 'move_path', 'previousPath'] as const
+
+function isValidTargetPathString(value: unknown): value is string {
+  if (typeof value !== 'string' || value.trim().length === 0 || value.length > 4096) return false
+  for (let index = 0; index < value.length; index += 1) {
+    if (value.charCodeAt(index) < 32 || value.charCodeAt(index) === 127) return false
+  }
+  return true
+}
+
+function collectPathsFromObjectKeys(
+  source: object,
+  keys: readonly string[],
+  found: string[],
+  markMoveTarget?: () => void,
+): boolean {
+  let valid = true
+  for (const key of keys) {
+    if (!Object.hasOwn(source, key)) continue
+    const raw = Reflect.get(source, key)
+    if (raw === undefined) continue
+    markMoveTarget?.()
+    if (isValidTargetPathString(raw)) {
+      found.push(raw)
+    } else {
+      valid = false
+    }
+  }
+  return valid
+}
+
+export function collectAgyTargetPaths(item: object): {
+  paths: string[]
+  complete: boolean
+  hasMoveTarget: boolean
+} {
   const found: string[] = []
   let complete = true
-  const args = object(Reflect.get(item, 'args'))
-    ? Reflect.get(item, 'args')!
-    : object(Reflect.get(item, 'rawInput'))
-      ? Reflect.get(item, 'rawInput')!
-      : undefined
-  if (args) {
-    for (const key of ['Path', 'path', 'file_path', 'filePath', 'Destination', 'destination']) {
-      const value = text(Reflect.get(args, key))
-      if (value) {
-        if (value.length <= 4096) found.push(value)
-        else complete = false
-      }
+  let hasMoveTarget = false
+  for (const argField of ['args', 'rawInput'] as const) {
+    if (!Object.hasOwn(item, argField)) continue
+    const container = Reflect.get(item, argField)
+    if (container === undefined) continue
+    if (!object(container)) {
+      complete = false
+      continue
+    }
+    if (!collectPathsFromObjectKeys(container, AGY_PRIMARY_PATH_KEYS, found)) {
+      complete = false
+    }
+    if (
+      !collectPathsFromObjectKeys(container, AGY_MOVE_PATH_KEYS, found, () => {
+        hasMoveTarget = true
+      })
+    ) {
+      complete = false
     }
   }
-  const locations = Reflect.get(item, 'locations')
-  if (Array.isArray(locations)) {
-    if (locations.length > MAX_NATIVE_CHANGES) complete = false
-    else {
+  if (Object.hasOwn(item, 'locations') && Reflect.get(item, 'locations') !== undefined) {
+    const locations = Reflect.get(item, 'locations')
+    if (!Array.isArray(locations) || locations.length > MAX_NATIVE_CHANGES) {
+      complete = false
+    } else {
       for (const loc of locations) {
-        const value = object(loc) ? text(Reflect.get(loc, 'path')) : undefined
-        if (value && value.length <= 4096) found.push(value)
+        const rawPath = object(loc) ? Reflect.get(loc, 'path') : undefined
+        if (object(loc) && isValidTargetPathString(rawPath)) {
+          found.push(rawPath)
+        } else {
+          complete = false
+        }
       }
     }
   }
-  const content = Reflect.get(item, 'content')
-  if (Array.isArray(content)) {
-    if (content.length > MAX_NATIVE_CHANGES) complete = false
-    else {
+  if (Object.hasOwn(item, 'content') && Reflect.get(item, 'content') !== undefined) {
+    const content = Reflect.get(item, 'content')
+    if (!Array.isArray(content) || content.length > MAX_NATIVE_CHANGES) {
+      complete = false
+    } else {
       for (const entry of content) {
-        if (!object(entry) || Reflect.get(entry, 'type') !== 'diff') continue
-        const value = text(Reflect.get(entry, 'path'))
-        if (value && value.length <= 4096) found.push(value)
+        if (!object(entry)) {
+          complete = false
+          continue
+        }
+        const hasPathField =
+          Reflect.get(entry, 'type') === 'diff' ||
+          Object.hasOwn(entry, 'path') ||
+          AGY_DIFF_MOVE_KEYS.some((moveKey) => Object.hasOwn(entry, moveKey))
+        if (!hasPathField) continue
+        const rawPath = Reflect.get(entry, 'path')
+        if (isValidTargetPathString(rawPath)) found.push(rawPath)
         else complete = false
+        if (
+          !collectPathsFromObjectKeys(entry, AGY_DIFF_MOVE_KEYS, found, () => {
+            hasMoveTarget = true
+          })
+        ) {
+          complete = false
+        }
       }
     }
   }
-  return { paths: [...new Set(found)], complete }
+  return { paths: [...new Set(found)], complete, hasMoveTarget }
 }
 
 const AGY_DELETE_OR_RENAME_TOOLS = new Set([
@@ -350,6 +435,8 @@ const AGY_READ_ONLY_TOOLS = new Set([
   'list_dir',
   'view_file_outline',
   'view_code_item',
+  'update_focus',
+  'update_steps',
 ])
 
 const PACT_READ_ONLY_OR_METADATA_MCP_TOOLS = new Set([
@@ -361,6 +448,28 @@ const PACT_READ_ONLY_OR_METADATA_MCP_TOOLS = new Set([
   'publish_plan',
   'request_peer_assistance',
 ])
+
+function collectWorkspacePathsFromSources(
+  sources: readonly unknown[],
+  extraRawPaths: readonly string[],
+  cwd: string,
+): string[] {
+  const found = new Set<string>()
+  for (const raw of extraRawPaths) {
+    const rel = workspaceRelativePath(raw, cwd)
+    if (rel) found.add(rel)
+  }
+  for (const source of sources) {
+    if (!object(source)) continue
+    for (const key of [...AGY_PRIMARY_PATH_KEYS, ...AGY_MOVE_PATH_KEYS]) {
+      const raw = Reflect.get(source, key)
+      if (!isValidTargetPathString(raw)) continue
+      const rel = workspaceRelativePath(raw, cwd)
+      if (rel) found.add(rel)
+    }
+  }
+  return [...found]
+}
 
 /**
  * Extracts NativeFileChange records strictly from completed Antigravity `write_file`/`edit_file`
@@ -375,6 +484,15 @@ export function agyFileChanges(
   const toolName = text(Reflect.get(item, 'name')) ?? ''
   const status = text(Reflect.get(item, 'status'))
   const content = Reflect.get(item, 'content')
+  const argsConflicted = Reflect.get(item, 'argsConflicted') === true
+  const toolIdentityConflicted = Reflect.get(item, 'toolIdentityConflicted') === true
+  const hasConflict = argsConflicted || toolIdentityConflicted
+  const conflictReason =
+    'The Antigravity tool call reported conflicting arguments or identity across updates.'
+  const rawConflictedArgsSources: unknown = Reflect.get(item, 'conflictedArgsSources')
+  const conflictedArgsSources: readonly unknown[] = Array.isArray(rawConflictedArgsSources)
+    ? [...rawConflictedArgsSources]
+    : []
   const hasDiffBlocks =
     Array.isArray(content) &&
     content.some((entry) => object(entry) && Reflect.get(entry, 'type') === 'diff')
@@ -382,28 +500,50 @@ export function agyFileChanges(
   if (AGY_DELETE_OR_RENAME_TOOLS.has(toolName)) {
     const reason = 'Antigravity file deletions and renames cannot be safely undone.'
     const { paths, complete } = collectAgyTargetPaths(item)
-    const workspacePaths = paths
-      .map((raw) => workspaceRelativePath(raw, cwd))
-      .filter((rel): rel is string => rel !== undefined)
+    const workspacePaths = hasConflict
+      ? collectWorkspacePathsFromSources(
+          [Reflect.get(item, 'args'), Reflect.get(item, 'rawInput'), ...conflictedArgsSources],
+          paths,
+          cwd,
+        )
+      : paths
+          .map((raw) => workspaceRelativePath(raw, cwd))
+          .filter((rel): rel is string => rel !== undefined)
     const isRename = toolName === 'move_file' || toolName === 'rename_file'
     return {
       changes: workspacePaths.map((path) => ({
         path,
         kind: isRename ? ('renamed' as const) : ('deleted' as const),
-        ...(status !== 'completed' ? { invalidateOnly: true as const } : {}),
-        ...(!isRename && status === 'completed' ? { after: null } : {}),
-        unavailableReason: reason,
+        ...(status !== 'completed' || hasConflict ? { invalidateOnly: true as const } : {}),
+        ...(!isRename && status === 'completed' && !hasConflict ? { after: null } : {}),
+        unavailableReason: hasConflict ? conflictReason : reason,
       })),
-      uncertain: reason,
-      invalidatesPriorEvidence: !complete || workspacePaths.length === 0 || status !== 'completed',
+      uncertain: hasConflict ? conflictReason : reason,
+      invalidatesPriorEvidence:
+        hasConflict || !complete || workspacePaths.length === 0 || status !== 'completed',
     }
   }
 
   if (toolName !== 'write_file' && toolName !== 'edit_file') {
-    if (hasDiffBlocks) {
+    if (hasDiffBlocks || hasConflict) {
+      const collected = collectAgyTargetPaths(item)
+      const workspacePaths = collectWorkspacePathsFromSources(
+        [Reflect.get(item, 'args'), Reflect.get(item, 'rawInput'), ...conflictedArgsSources],
+        collected.paths,
+        cwd,
+      )
       return {
-        changes: [],
-        uncertain: 'An unrecognized Antigravity tool emitted unverified diff blocks.',
+        changes: workspacePaths.map((path) => ({
+          path,
+          kind: 'modified' as const,
+          invalidateOnly: true as const,
+          unavailableReason: hasConflict
+            ? conflictReason
+            : 'An unrecognized Antigravity tool emitted unverified diff blocks.',
+        })),
+        uncertain: hasConflict
+          ? conflictReason
+          : 'An unrecognized Antigravity tool emitted unverified diff blocks.',
         invalidatesPriorEvidence: true,
       }
     }
@@ -412,6 +552,8 @@ export function agyFileChanges(
 
   const collected = collectAgyTargetPaths(item)
   if (
+    !hasConflict &&
+    !collected.hasMoveTarget &&
     collected.complete &&
     collected.paths.length > 0 &&
     collected.paths.every((raw) =>
@@ -421,11 +563,24 @@ export function agyFileChanges(
     return { changes: [] }
   }
 
+  const args = object(Reflect.get(item, 'args'))
+    ? Reflect.get(item, 'args')!
+    : object(Reflect.get(item, 'rawInput'))
+      ? Reflect.get(item, 'rawInput')!
+      : undefined
+  const conflictWorkspacePaths = hasConflict
+    ? collectWorkspacePathsFromSources([args, ...conflictedArgsSources], collected.paths, cwd)
+    : []
+
   if (status !== 'completed') {
-    const reason = 'A failed or incomplete Antigravity file operation may have left partial edits.'
-    const workspacePaths = collected.paths
-      .map((raw) => workspaceRelativePath(raw, cwd))
-      .filter((rel): rel is string => rel !== undefined)
+    const reason = hasConflict
+      ? conflictReason
+      : 'A failed or incomplete Antigravity file operation may have left partial edits.'
+    const workspacePaths = hasConflict
+      ? conflictWorkspacePaths
+      : collected.paths
+          .map((raw) => workspaceRelativePath(raw, cwd))
+          .filter((rel): rel is string => rel !== undefined)
     return {
       changes: workspacePaths.map((path) => ({
         path,
@@ -438,11 +593,6 @@ export function agyFileChanges(
     }
   }
 
-  const args = object(Reflect.get(item, 'args'))
-    ? Reflect.get(item, 'args')!
-    : object(Reflect.get(item, 'rawInput'))
-      ? Reflect.get(item, 'rawInput')!
-      : undefined
   const requestedRawPath = args
     ? text(Reflect.get(args, 'Path') ?? Reflect.get(args, 'path'))
     : undefined
@@ -451,18 +601,21 @@ export function agyFileChanges(
     : undefined
 
   if (!Array.isArray(content) || content.length === 0 || content.length > MAX_NATIVE_CHANGES) {
-    const reason = 'The completed Antigravity file operation did not provide bounded diff blocks.'
+    const reason = hasConflict
+      ? conflictReason
+      : 'The completed Antigravity file operation did not provide bounded diff blocks.'
+    const affected = hasConflict
+      ? conflictWorkspacePaths
+      : requestedRelPath
+        ? [requestedRelPath]
+        : []
     return {
-      changes: requestedRelPath
-        ? [
-            {
-              path: requestedRelPath,
-              kind: 'modified',
-              invalidateOnly: true,
-              unavailableReason: reason,
-            },
-          ]
-        : [],
+      changes: affected.map((path) => ({
+        path,
+        kind: 'modified',
+        invalidateOnly: true,
+        unavailableReason: reason,
+      })),
       uncertain: reason,
       invalidatesPriorEvidence: true,
     }
@@ -472,26 +625,29 @@ export function agyFileChanges(
     (entry): entry is object => object(entry) && Reflect.get(entry, 'type') === 'diff',
   )
   if (diffs.length === 0) {
-    const reason = 'The completed Antigravity file operation omitted its diff block.'
+    const reason = hasConflict
+      ? conflictReason
+      : 'The completed Antigravity file operation omitted its diff block.'
+    const affected = hasConflict
+      ? conflictWorkspacePaths
+      : requestedRelPath
+        ? [requestedRelPath]
+        : []
     return {
-      changes: requestedRelPath
-        ? [
-            {
-              path: requestedRelPath,
-              kind: 'modified',
-              invalidateOnly: true,
-              unavailableReason: reason,
-            },
-          ]
-        : [],
+      changes: affected.map((path) => ({
+        path,
+        kind: 'modified',
+        invalidateOnly: true,
+        unavailableReason: reason,
+      })),
       uncertain: reason,
       invalidatesPriorEvidence: true,
     }
   }
 
   const changes: NativeFileChange[] = []
-  let uncertain: string | undefined
-  let invalidatesPriorEvidence = false
+  let uncertain: string | undefined = hasConflict ? conflictReason : undefined
+  let invalidatesPriorEvidence = hasConflict
 
   for (const diff of diffs) {
     const rawDiffPath = text(Reflect.get(diff, 'path'))
@@ -502,30 +658,67 @@ export function agyFileChanges(
         invalidatesPriorEvidence: true,
       }
     }
-    if (isAgyBrainArtifactPath(rawDiffPath, cwd, options.appDataDir, options.nativeSessionId)) {
-      continue
+    const moveKeyPresent = AGY_DIFF_MOVE_KEYS.some(
+      (moveKey) => Reflect.get(diff, moveKey) !== undefined,
+    )
+    const rawMoveTarget =
+      Reflect.get(diff, 'movePath') ??
+      Reflect.get(diff, 'move_path') ??
+      Reflect.get(diff, 'previousPath')
+    const moveTarget = text(rawMoveTarget)
+    if (moveKeyPresent && (!isValidTargetPathString(moveTarget) || moveTarget === undefined)) {
+      return {
+        changes,
+        uncertain: 'An Antigravity move diff omitted a valid endpoint path.',
+        invalidatesPriorEvidence: true,
+      }
     }
+
+    const primaryBrain = isAgyBrainArtifactPath(
+      rawDiffPath,
+      cwd,
+      options.appDataDir,
+      options.nativeSessionId,
+    )
     const relPath = workspaceRelativePath(rawDiffPath, cwd)
-    if (!relPath) {
+
+    if (moveTarget !== undefined) {
+      const moveBrain = isAgyBrainArtifactPath(
+        moveTarget,
+        cwd,
+        options.appDataDir,
+        options.nativeSessionId,
+      )
+      const moveRel = workspaceRelativePath(moveTarget, cwd)
+      if (!hasConflict && primaryBrain && moveBrain) {
+        continue
+      }
+      if (relPath || moveRel) {
+        const reason = hasConflict
+          ? conflictReason
+          : 'Antigravity rename operations do not provide complete Undo metadata.'
+        changes.push({
+          path: relPath ?? moveRel!,
+          previousPath: relPath && moveRel ? moveRel : relPath ? moveTarget : rawDiffPath,
+          kind: 'renamed',
+          unavailableReason: reason,
+        })
+        uncertain ??= reason
+        invalidatesPriorEvidence = true
+        continue
+      }
       uncertain ??= 'An Antigravity file operation targeted a path outside the project workspace.'
+      invalidatesPriorEvidence = true
       continue
     }
 
-    const moveTarget = text(
-      Reflect.get(diff, 'movePath') ??
-        Reflect.get(diff, 'move_path') ??
-        Reflect.get(diff, 'previousPath'),
-    )
-    if (moveTarget !== undefined) {
-      const reason = 'Antigravity rename operations do not provide complete Undo metadata.'
-      changes.push({
-        path: relPath,
-        previousPath: workspaceRelativePath(moveTarget, cwd) ?? moveTarget,
-        kind: 'renamed',
-        unavailableReason: reason,
-      })
-      uncertain ??= reason
-      invalidatesPriorEvidence = true
+    if (!hasConflict && primaryBrain) {
+      continue
+    }
+    if (!relPath) {
+      if (!primaryBrain) {
+        uncertain ??= 'An Antigravity file operation targeted a path outside the project workspace.'
+      }
       continue
     }
 
@@ -583,14 +776,16 @@ export function agyFileChanges(
         const reason = 'The Antigravity diff original content exceeded the file byte limit.'
         return { changes, uncertain: reason, invalidatesPriorEvidence: true }
       }
-      if (!pathMismatch && !contentMismatch && oldText === newText) {
+      if (!hasConflict && !pathMismatch && !contentMismatch && oldText === newText) {
         continue
       }
-      const unavailableReason = pathMismatch
-        ? 'The Antigravity file target path differed from its diff path.'
-        : contentMismatch
-          ? 'The Antigravity write_file diff did not match its requested content.'
-          : undefined
+      const unavailableReason = hasConflict
+        ? conflictReason
+        : pathMismatch
+          ? 'The Antigravity file target path differed from its diff path.'
+          : contentMismatch
+            ? 'The Antigravity write_file diff did not match its requested content.'
+            : undefined
       changes.push({
         path: relPath,
         kind: 'modified',
@@ -608,8 +803,8 @@ export function agyFileChanges(
     if (oldText === undefined || oldText === null) {
       // New-file creation proof: `write_file` natively fails on an existing path unless
       // `Overwrite` or `Append` is true. Require explicit `args` proving neither flag was set
-      // (or an explicit `created: true` witness) and that no prior operation in the round
-      // already recorded this path.
+      // (or an explicit `created: true` witness), no argument/identity conflict, and that no prior
+      // operation in the round already recorded this path.
       const overwrite = args ? Reflect.get(args, 'Overwrite') === true : true
       const append = args ? Reflect.get(args, 'Append') === true : true
       const rawOutput = Reflect.get(item, 'rawOutput')
@@ -618,6 +813,7 @@ export function agyFileChanges(
         Reflect.get(diff, 'created') === true
       const alreadyRecorded = options.priorRecordedPaths?.has(relPath) === true
       const provenNewFile =
+        !hasConflict &&
         toolName === 'write_file' &&
         !alreadyRecorded &&
         !pathMismatch &&
@@ -632,8 +828,9 @@ export function agyFileChanges(
           after: newText,
         })
       } else {
-        const reason =
-          'The Antigravity file diff omitted original content without new-file creation proof.'
+        const reason = hasConflict
+          ? conflictReason
+          : 'The Antigravity file diff omitted original content without new-file creation proof.'
         changes.push({
           path: relPath,
           kind: 'modified',
@@ -651,6 +848,22 @@ export function agyFileChanges(
       uncertain: 'The Antigravity file diff contained an invalid oldText field.',
       invalidatesPriorEvidence: true,
     }
+  }
+
+  if (hasConflict) {
+    const represented = new Set(changes.map((c) => c.path))
+    for (const extraRel of conflictWorkspacePaths) {
+      if (!represented.has(extraRel)) {
+        changes.push({
+          path: extraRel,
+          kind: 'modified',
+          invalidateOnly: true,
+          unavailableReason: conflictReason,
+        })
+      }
+    }
+    uncertain ??= conflictReason
+    invalidatesPriorEvidence = true
   }
 
   return {
@@ -979,10 +1192,23 @@ export class AgyRoundEffectsTracker {
       nativeSessionId: this.nativeSessionId,
       priorRecordedPaths: this.recorded,
     })
+    const argsConflicted = Reflect.get(item, 'argsConflicted') === true
+    const toolIdentityConflicted = Reflect.get(item, 'toolIdentityConflicted') === true
+    const hasConflict = argsConflicted || toolIdentityConflicted
     const nextPaths = new Set<string>()
     for (const change of result.changes) {
       const rel = workspaceRelativePath(change.path, this.cwd) ?? change.path
       nextPaths.add(rel)
+      if (change.previousPath) {
+        const prevRel = workspaceRelativePath(change.previousPath, this.cwd)
+        if (prevRel) nextPaths.add(prevRel)
+      }
+    }
+    if (hasConflict) {
+      this.priorArbitraryMutator = true
+      result.uncertain ??=
+        'The Antigravity tool call reported conflicting arguments or identity across updates.'
+      result.invalidatesPriorEvidence = true
     }
     if (nextPaths.size > 0) {
       const priorOverlap =
@@ -1005,6 +1231,17 @@ export class AgyRoundEffectsTracker {
   }
 
   observeNonFileTool(item: object): AgyToolUncertaintyClassification {
+    const toolIdentityConflicted = Reflect.get(item, 'toolIdentityConflicted') === true
+    if (toolIdentityConflicted) {
+      this.priorArbitraryMutator = true
+      return {
+        uncertain: true,
+        scope: 'recorded_files',
+        reason:
+          'An Antigravity tool call reported conflicting tool identities; Undo is unavailable.',
+      }
+    }
+    const argsConflicted = Reflect.get(item, 'argsConflicted') === true
     const toolName = text(Reflect.get(item, 'name')) ?? ''
     if (
       !toolName ||
@@ -1014,10 +1251,10 @@ export class AgyRoundEffectsTracker {
     ) {
       return { uncertain: false, scope: 'unlisted' }
     }
-    if (AGY_READ_ONLY_TOOLS.has(toolName)) {
+    if (!argsConflicted && AGY_READ_ONLY_TOOLS.has(toolName)) {
       return { uncertain: false, scope: 'unlisted' }
     }
-    if (this.ownPeerServerName) {
+    if (!argsConflicted && this.ownPeerServerName) {
       const prefix = `mcp_${this.ownPeerServerName}_`
       if (toolName.startsWith(prefix)) {
         const suffix = toolName.slice(prefix.length)
@@ -1027,6 +1264,18 @@ export class AgyRoundEffectsTracker {
       }
     }
     if (toolName === 'run_command') {
+      if (argsConflicted) {
+        this.priorArbitraryMutator = true
+        if (this.priorCommands.length < MAX_ROUND_COMMANDS) {
+          this.priorCommands.push({ commandLine: undefined })
+        }
+        return {
+          uncertain: true,
+          scope: 'recorded_files',
+          reason:
+            'A native command in this round reported conflicting arguments; Undo is unavailable.',
+        }
+      }
       const args = object(Reflect.get(item, 'args'))
         ? Reflect.get(item, 'args')!
         : object(Reflect.get(item, 'rawInput'))
