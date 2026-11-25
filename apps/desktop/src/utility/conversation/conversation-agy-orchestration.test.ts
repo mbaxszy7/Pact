@@ -1,11 +1,8 @@
 import Database from 'better-sqlite3'
-import { build } from 'electron-vite'
 import { createHash, randomUUID } from 'node:crypto'
-import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
-import { createRequire } from 'node:module'
+import { mkdir, mkdtemp, realpath, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
-import { pathToFileURL } from 'node:url'
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 
 import type { AgentNativeForkWitness, AgentRunInput } from '@pact/agent-runtime'
@@ -40,12 +37,14 @@ import {
   encodeStringField,
   encodeVarintField,
 } from './agy-native-storage.js'
+import { configureAgyStorageChildScriptForTesting } from './agy-storage-runner.js'
 import {
   Conversation,
   createAgyNativeStorageClient,
   resolveEffectiveAgyAppDataDir,
 } from './conversation.js'
 import { NativeForkFiles } from './native-fork-files.js'
+import { nativeWorkerFixture } from './native-workers-fixture.test-support.js'
 
 const forkWorkerBundle = vi.hoisted(() => ({ path: '' }))
 vi.mock('node:worker_threads', async (original) => {
@@ -69,23 +68,16 @@ vi.mock('node:worker_threads', async (original) => {
   }
 })
 
-let workerBundleDir = ''
+let workerFixture: Awaited<ReturnType<typeof nativeWorkerFixture>> | undefined
 beforeAll(async () => {
-  workerBundleDir = await mkdtemp(join(tmpdir(), 'pact-m5-fork-worker-'))
-  const desktopRoot = resolve(import.meta.dirname, '../../..')
-  const require = createRequire(join(desktopRoot, 'package.json'))
-  const configFile = join(workerBundleDir, 'worker.config.mjs')
-  const betterSqliteEntry = pathToFileURL(require.resolve('better-sqlite3')).href
-  await writeFile(
-    configFile,
-    `import {externalizeDepsPlugin} from ${JSON.stringify(pathToFileURL(require.resolve('electron-vite')).href)}; export default {main:{plugins:[externalizeDepsPlugin({exclude:['@pact/contracts']})],resolve:{alias:{'better-sqlite3':${JSON.stringify(betterSqliteEntry)}}},build:{outDir:${JSON.stringify(join(workerBundleDir, 'bundle'))},rollupOptions:{external:[${JSON.stringify(betterSqliteEntry)}],input:{'native-fork-worker':${JSON.stringify(join(import.meta.dirname, 'native-fork-worker.ts'))}}}}}};`,
-  )
-  await build({ root: desktopRoot, configFile, ignoreConfigWarning: true, logLevel: 'silent' })
-  forkWorkerBundle.path = join(workerBundleDir, 'bundle', 'native-fork-worker.js')
-}, 20_000)
+  workerFixture = await nativeWorkerFixture(['native-fork-worker', 'agy-storage-child'])
+  forkWorkerBundle.path = workerFixture.paths['native-fork-worker']!
+  configureAgyStorageChildScriptForTesting(workerFixture.paths['agy-storage-child'])
+}, 30_000)
 
 afterAll(async () => {
-  if (workerBundleDir) await rm(workerBundleDir, { recursive: true, force: true })
+  configureAgyStorageChildScriptForTesting(undefined)
+  await workerFixture?.dispose()
 })
 
 const harness = vi.hoisted(() => ({

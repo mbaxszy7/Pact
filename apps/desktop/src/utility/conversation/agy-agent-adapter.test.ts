@@ -44,6 +44,7 @@ import {
   type AgyNativeStorageClient,
 } from './agy-agent-adapter.js'
 import {
+  configureAgyStorageChildScriptForTesting,
   configureDefaultAgyStorageTransport,
   NodeChildProcessAgyStorageTransport,
   type AgyStorageTransport,
@@ -93,10 +94,12 @@ vi.mock('node:worker_threads', async (original) => {
 
 let workerFixture: Awaited<ReturnType<typeof nativeWorkerFixture>>
 beforeAll(async () => {
-  workerFixture = await nativeWorkerFixture(['native-fork-worker'])
+  workerFixture = await nativeWorkerFixture(['native-fork-worker', 'agy-storage-child'])
   forkWorker.path = workerFixture.paths['native-fork-worker']!
+  configureAgyStorageChildScriptForTesting(workerFixture.paths['agy-storage-child'])
 }, 30_000)
 afterAll(async () => {
+  configureAgyStorageChildScriptForTesting(undefined)
   await workerFixture?.dispose()
 })
 
