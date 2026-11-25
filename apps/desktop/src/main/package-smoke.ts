@@ -131,22 +131,39 @@ async function verifyPackagedTerminal(
           return { ok: false, stage: 'subscribe', message: sub.error.message }
         }
         if (isWin32) {
-          const readyDeadline = Date.now() + 6000
-          while (collected.length === 0 && Date.now() < readyDeadline) {
+          const readyDeadline = Date.now() + 8000
+          while (!stripAnsi(collected).includes('>') && Date.now() < readyDeadline) {
             await new Promise((r) => setTimeout(r, 40))
           }
+          await new Promise((r) => setTimeout(r, 150))
         }
+        const streamId = crypto.randomUUID()
         const written = await bridge.writeTerminal({
           terminalId,
-          streamId: crypto.randomUUID(),
+          streamId,
           chunkSeq: 0,
           expectedEpoch: epoch,
-          data: command,
+          data: isWin32 ? command.replace(/\\r$/, '') : command,
         })
         if (!written.ok) {
           await bridge.unsubscribeTerminal({ subscriptionId }).catch(() => undefined)
           unsub()
           return { ok: false, stage: 'write', message: written.error.message }
+        }
+        if (isWin32) {
+          await new Promise((r) => setTimeout(r, 80))
+          const enterWritten = await bridge.writeTerminal({
+            terminalId,
+            streamId,
+            chunkSeq: 1,
+            expectedEpoch: epoch,
+            data: '\\r',
+          })
+          if (!enterWritten.ok) {
+            await bridge.unsubscribeTerminal({ subscriptionId }).catch(() => undefined)
+            unsub()
+            return { ok: false, stage: 'write_enter', message: enterWritten.error.message }
+          }
         }
         const deadline = Date.now() + (isWin32 ? 12000 : 8000)
         while (!stripAnsi(collected).includes('PACT_TERM_SMOKE_OK') && Date.now() < deadline) {
@@ -169,30 +186,34 @@ async function verifyPackagedTerminal(
         const closeMs = Date.now() - closeStart
         const listAfter = await bridge.listTerminals({ projectId })
         const snapText = snap.ok && snap.value.kind === 'snapshot' ? stripAnsi(snap.value.text) : ''
-        const snapHasMarker = snapText.includes('PACT_TERM_SMOKE_OK')
-        const hasMarker = stripAnsi(collected).includes('PACT_TERM_SMOKE_OK') || snapHasMarker
+        const hasMarker =
+          stripAnsi(collected).includes('PACT_TERM_SMOKE_OK') ||
+          snapText.includes('PACT_TERM_SMOKE_OK')
         const closedOk = closed.ok && closed.value.closed
+        const ok =
+          hasMarker &&
+          snap.ok &&
+          closedOk &&
+          listAfter.ok &&
+          listAfter.value.terminals.length === 0
         return {
-          ok:
-            hasMarker &&
-            snap.ok &&
-            closedOk &&
-            listAfter.ok &&
-            listAfter.value.terminals.length === 0,
+          ok,
           m: hasMarker,
           s: snap.ok,
-          sm: snapHasMarker,
           bytes: collected.length,
           seq: lastSeq,
           sb: snapText.length,
           pre: preClose?.state ?? null,
-          preSig: preClose?.exitSignal ?? null,
-          preCode: preClose?.exitCode ?? null,
-          preErr: preClose?.errorMessage?.slice(0, 140) ?? null,
+          ...(preClose?.exitSignal ? { preSig: preClose.exitSignal } : {}),
+          ...(preClose?.exitCode !== null && preClose?.exitCode !== undefined
+            ? { preCode: preClose.exitCode }
+            : {}),
+          ...(preClose?.errorMessage ? { preErr: preClose.errorMessage.slice(0, 100) } : {}),
           cOk: closedOk,
           cMs: closeMs,
-          cErr: !closed.ok ? (closed.error.code + ':' + closed.error.message).slice(0, 140) : null,
+          ...(!closed.ok ? { cErr: (closed.error.code + ':' + closed.error.message).slice(0, 100) } : {}),
           rem: listAfter.ok ? listAfter.value.terminals.length : -1,
+          ...(!ok ? { snap: snapText.replace(/\\s+/g, ' ').trim().slice(-240) } : {}),
         }
       })()
     `)
