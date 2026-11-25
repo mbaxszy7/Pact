@@ -48,6 +48,15 @@ it('reads both actual native model catalogs with idle input, shared ownership an
     db.runtimePreparationRepository.saveSelectedExecutablePath('claude', claude)
     const runtime = new RuntimePreparation(db.runtimePreparationRepository)
     const readiness = await runtime.inspectReadiness()
+    const readinessSummary = readiness.ok
+      ? readiness.value.agents.map((agent) => ({
+          agentId: agent.agentId,
+          state: agent.state,
+          detail: agent.detail ?? null,
+          hasVersion: Boolean(agent.version),
+        }))
+      : readiness.error
+    console.info(`[native readiness] ${JSON.stringify(readinessSummary)}`)
     expect(readiness).toMatchObject({
       ok: true,
       value: {

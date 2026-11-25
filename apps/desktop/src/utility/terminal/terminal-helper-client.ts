@@ -61,6 +61,7 @@ export interface TerminalHelperExit {
   exitCode: number | null
   signal: string | null
   cleanupConfirmed: boolean
+  diagnostic?: string | undefined
 }
 
 export interface TerminalHelperReady {
@@ -451,6 +452,7 @@ export class TerminalHelperClient {
   private startupTimer: ReturnType<typeof setTimeout> | undefined
   private startupReject: ((error: Error) => void) | undefined
   private pendingResize: { cols: number; rows: number } | undefined
+  private oversizedFrameLen: number | null = null
 
   constructor(private readonly callbacks: TerminalHelperCallbacks) {}
 
@@ -527,7 +529,12 @@ export class TerminalHelperClient {
           rejectReady(error)
         } else {
           this.callbacks.onError(error.message)
-          this.finishExit({ exitCode: null, signal: null, cleanupConfirmed: false })
+          this.finishExit({
+            exitCode: null,
+            signal: null,
+            cleanupConfirmed: false,
+            diagnostic: 'source=child_error',
+          })
         }
       })
 
@@ -535,6 +542,10 @@ export class TerminalHelperClient {
         if (this.startupTimer) clearTimeout(this.startupTimer)
         const remaining = this.utf8Decoder.end()
         if (remaining) this.callbacks.onOutput(remaining)
+        const diagnostic =
+          this.oversizedFrameLen !== null
+            ? `source=oversized_frame len=${this.oversizedFrameLen}`
+            : `source=child_close code=${String(code)} signal=${String(signal)} stderrLen=${this.stderrText.length}`
         if (!this.readySettled) {
           this.readySettled = true
           const detail = this.stderrText.trim()
@@ -543,7 +554,12 @@ export class TerminalHelperClient {
               detail || `Terminal helper exited before startup (${code ?? signal ?? 'closed'}).`,
             ),
           )
-          this.finishExit({ exitCode: code, signal: signal ?? null, cleanupConfirmed: false })
+          this.finishExit({
+            exitCode: code,
+            signal: signal ?? null,
+            cleanupConfirmed: false,
+            diagnostic,
+          })
           return
         }
         if (!this.exited) {
@@ -552,6 +568,7 @@ export class TerminalHelperClient {
             exitCode: code,
             signal: signal ?? null,
             cleanupConfirmed: false,
+            diagnostic,
           })
         }
       })
@@ -613,7 +630,12 @@ export class TerminalHelperClient {
   async shutdown(
     options: { force?: boolean; graceMs?: number; deadlineMs?: number } = {},
   ): Promise<TerminalHelperExit> {
-    if (this.latestExit) return this.latestExit
+    if (this.latestExit) {
+      return {
+        ...this.latestExit,
+        diagnostic: `cached(${this.latestExit.diagnostic ?? 'none'})`,
+      }
+    }
     if (!this.child) {
       this.abortedBeforeStart = true
       this.shutdownRequested = true
@@ -650,7 +672,12 @@ export class TerminalHelperClient {
         this.forceTerminateProcess()
         const idx = this.exitResolvers.indexOf(onExit)
         if (idx >= 0) this.exitResolvers.splice(idx, 1)
-        resolveShutdown({ exitCode: null, signal: 'SIGKILL', cleanupConfirmed: false })
+        resolveShutdown({
+          exitCode: null,
+          signal: 'SIGKILL',
+          cleanupConfirmed: false,
+          diagnostic: `source=shutdown_timeout waitMs=${waitMs}`,
+        })
       }, waitMs)
       const onExit = (exit: TerminalHelperExit): void => {
         clearTimeout(timer)
@@ -691,6 +718,7 @@ export class TerminalHelperClient {
       const frameType = this.rxBuffer.readUInt8(0)
       const length = this.rxBuffer.readUInt32BE(1)
       if (length > MAX_INCOMING_FRAME_BYTES) {
+        this.oversizedFrameLen = length
         this.forceTerminateProcess()
         if (!this.readySettled) {
           this.readySettled = true
@@ -774,10 +802,12 @@ export class TerminalHelperClient {
     if (frameType === FRAME_EXIT) {
       const remainingTail = this.utf8Decoder.end()
       if (remainingTail) this.callbacks.onOutput(remainingTail)
+      const diagnostic = `source=frame_exit shellExited=${String(Reflect.get(parsedValue, 'shellExited'))} jobOk=${String(Reflect.get(parsedValue, 'jobOk'))} remPids=${String(Reflect.get(parsedValue, 'remainingPids'))} closer=${String(Reflect.get(parsedValue, 'closerDone'))} drain=${String(Reflect.get(parsedValue, 'drainDone'))} inFrames=${String(Reflect.get(parsedValue, 'inputFrames'))} inBytes=${String(Reflect.get(parsedValue, 'inputBytes'))} inErr=${String(Reflect.get(parsedValue, 'inputErr'))}`
       this.finishExit({
         exitCode: readNum('exitCode'),
         signal: readStr('signal'),
         cleanupConfirmed: Reflect.get(parsedValue, 'cleanupConfirmed') === true,
+        diagnostic,
       })
       return
     }

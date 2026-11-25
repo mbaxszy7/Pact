@@ -92,7 +92,7 @@ async function verifyPackagedTerminal(
 
     const command =
       process.platform === 'win32'
-        ? `Set-Content -Path '${pidFile}' -Value $PID -NoNewline; Write-Output 'PACT_TERM_SMOKE_OK'; Start-Sleep -Seconds 30\r`
+        ? `Set-Content -Path '${pidFile}' -Value $PID -NoNewline; Write-Output ('PACT_TERM_' + 'SMOKE_OK'); Start-Sleep -Seconds 30\r`
         : `sh -c "echo $$ > '${pidFile}'; echo PACT_TERM_SMOKE_OK; sleep 30"\r`
 
     const roundtrip: unknown = await window.webContents.executeJavaScript(`
@@ -163,7 +163,10 @@ async function verifyPackagedTerminal(
         const snap = await bridge.readTerminalSnapshot({ terminalId, offset: 0 })
         await bridge.unsubscribeTerminal({ subscriptionId })
         unsub()
+        const preClose = snap.ok ? snap.value.terminal : undefined
+        const closeStart = Date.now()
         const closed = await bridge.closeTerminal({ terminalId, force: true })
+        const closeMs = Date.now() - closeStart
         const listAfter = await bridge.listTerminals({ projectId })
         const remaining = listAfter.ok ? listAfter.value.terminals[0] : undefined
         const snapText = snap.ok && snap.value.kind === 'snapshot' ? stripAnsi(snap.value.text) : ''
@@ -183,17 +186,35 @@ async function verifyPackagedTerminal(
           collectedBytes: collected.length,
           lastSeq,
           snapBytes: snapText.length,
+          collectedPreview: JSON.stringify(collected.slice(0, 240)),
+          preCloseState: preClose ? preClose.state : null,
+          preCloseExitCode: preClose ? preClose.exitCode : null,
+          preCloseExitSignal: preClose ? preClose.exitSignal : null,
+          preCloseShell: preClose ? preClose.shell : null,
+          preCloseError: preClose ? (preClose.errorMessage ?? null) : null,
+          closeMs,
           closedOk,
           closeErrorCode: !closed.ok ? closed.error.code : null,
+          closeErrorMessage: !closed.ok ? closed.error.message : null,
           remainingCount: listAfter.ok ? listAfter.value.terminals.length : -1,
           remainingState: remaining ? remaining.state : null,
           remainingExitCode: remaining ? remaining.exitCode : null,
           remainingHasActiveChild: remaining ? remaining.hasActiveChild : null,
+          remainingError: remaining ? (remaining.errorMessage ?? null) : null,
         }
       })()
     `)
     if (!roundtrip || typeof roundtrip !== 'object' || Reflect.get(roundtrip, 'ok') !== true) {
-      throw new Error(`Packaged terminal roundtrip failed: ${JSON.stringify(roundtrip)}`)
+      const failedPidText = await readFile(pidFile, 'utf8').catch(() => null)
+      const diag =
+        roundtrip && typeof roundtrip === 'object'
+          ? {
+              ...roundtrip,
+              pidFilePresent: failedPidText !== null,
+              pidFileText: failedPidText?.trim().slice(0, 32) ?? null,
+            }
+          : roundtrip
+      throw new Error(`Packaged terminal roundtrip failed: ${JSON.stringify(diag)}`)
     }
     const pidText = await readFile(pidFile, 'utf8').catch(() => '')
     const parsedPid = Number.parseInt(pidText.trim(), 10)

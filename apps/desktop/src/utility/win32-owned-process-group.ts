@@ -398,7 +398,20 @@ async function allocateReceipt(
         ++count + pendingAllocations > MAX_RECEIPTS
       )
         throw failure()
-      const info = await lstat(join(config.receiptDirectory, entry.name))
+      let info
+      try {
+        info = await lstat(join(config.receiptDirectory, entry.name))
+      } catch (error) {
+        if (
+          typeof error === 'object' &&
+          error !== null &&
+          'code' in error &&
+          error.code === 'ENOENT'
+        ) {
+          continue
+        }
+        throw error
+      }
       if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1 || info.size > 2048)
         throw failure()
     }

@@ -377,10 +377,11 @@ export class TerminalManager {
             ...(exit.exitCode !== null ? { exitCode: exit.exitCode } : {}),
           })
         } else {
+          const detail = exit.diagnostic ? ` (${exit.diagnostic})` : ''
           entry.summary = {
             ...entry.summary,
             state: 'unconfirmed',
-            errorMessage: 'Terminal process cleanup could not be confirmed.',
+            errorMessage: `Terminal process cleanup could not be confirmed.${detail}`.slice(0, 300),
             ...(exit.exitCode !== null ? { exitCode: exit.exitCode } : {}),
             ...(exit.signal !== null ? { exitSignal: exit.signal } : {}),
           }
@@ -719,7 +720,8 @@ export class TerminalManager {
         ok: false,
         error: {
           code: 'UNCERTAIN',
-          message: 'Terminal subprocess cleanup could not be confirmed yet.',
+          message:
+            entry.summary.errorMessage ?? 'Terminal subprocess cleanup could not be confirmed yet.',
         },
       }
     }
@@ -888,10 +890,14 @@ export class TerminalManager {
         ...(options.deadlineMs !== undefined ? { deadlineMs: options.deadlineMs } : {}),
       })
       if (!exit.cleanupConfirmed) {
+        const detail = exit.diagnostic ? ` (${exit.diagnostic})` : ''
         entry.summary = {
           ...entry.summary,
           state: 'unconfirmed',
-          errorMessage: 'Terminal process cleanup could not be confirmed yet.',
+          errorMessage: `Terminal process cleanup could not be confirmed yet.${detail}`.slice(
+            0,
+            300,
+          ),
         }
         this.emitStateUpsert(entry.summary)
         return false

@@ -550,6 +550,9 @@ int wmain(int argc, wchar_t** argv) {
   std::atomic<bool> ping_requested{false};
   std::atomic<uint32_t> shutdown_grace_ms{2000};
   std::atomic<bool> closer_started{false};
+  std::atomic<uint32_t> input_frames{0};
+  std::atomic<uint32_t> input_bytes{0};
+  std::atomic<DWORD> last_input_err{0};
 
   std::thread drain_thread([hPipeOutRead, hDrainDone]() {
     uint8_t buf[32768];
@@ -596,10 +599,25 @@ int wmain(int argc, wchar_t** argv) {
       if (flen > 0 && !read_exact_stdin(payload.data(), flen)) break;
 
       if (ftype == FRAME_INPUT && !closer_started.load() && flen > 0) {
+        input_frames.fetch_add(1);
         std::lock_guard<std::mutex> lock(pipe_in_mutex);
         if (!pipe_in_closed && hPipeInWrite) {
-          DWORD written = 0;
-          (void)WriteFile(hPipeInWrite, payload.data(), flen, &written, nullptr);
+          size_t off = 0;
+          while (off < flen) {
+            DWORD written = 0;
+            BOOL ok = WriteFile(
+                hPipeInWrite,
+                payload.data() + off,
+                static_cast<DWORD>(flen - off),
+                &written,
+                nullptr);
+            if (!ok || written == 0) {
+              last_input_err.store(ok ? ERROR_WRITE_FAULT : GetLastError());
+              break;
+            }
+            off += written;
+            input_bytes.fetch_add(written);
+          }
         }
       } else if (ftype == FRAME_RESIZE && flen == 4 && !closer_started.load()) {
         SHORT nc = static_cast<SHORT>((static_cast<uint16_t>(payload[0]) << 8) | payload[1]);
@@ -720,7 +738,14 @@ int wmain(int argc, wchar_t** argv) {
       FRAME_EXIT,
       "{\"exitCode\":" + (shell_exited ? std::to_string(exit_code) : std::string("null")) +
           ",\"signal\":null,\"cleanupConfirmed\":" + std::string(cleanup_confirmed ? "true" : "false") +
-          ",\"remainingPids\":" + std::to_string(final_remaining) + "}");
+          ",\"remainingPids\":" + std::to_string(final_remaining) +
+          ",\"shellExited\":" + std::string(shell_exited ? "true" : "false") +
+          ",\"jobOk\":" + std::string(final_job_ok ? "true" : "false") +
+          ",\"closerDone\":" + std::string(closer_done ? "true" : "false") +
+          ",\"drainDone\":" + std::string(drain_done ? "true" : "false") +
+          ",\"inputFrames\":" + std::to_string(input_frames.load()) +
+          ",\"inputBytes\":" + std::to_string(input_bytes.load()) +
+          ",\"inputErr\":" + std::to_string(last_input_err.load()) + "}");
 
   if (closer_done && closer_thread.joinable()) closer_thread.join();
   else if (closer_thread.joinable()) closer_thread.detach();

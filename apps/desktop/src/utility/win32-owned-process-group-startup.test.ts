@@ -1,5 +1,7 @@
 import { ChildProcess, type SpawnOptions } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import {
+  mkdir,
   mkdtemp,
   readdir,
   realpath,
@@ -27,6 +29,7 @@ const seam = vi.hoisted(() => ({
     | undefined,
   onReceiptOpen: undefined as ((handle: FileHandle, path: string) => FileHandle) | undefined,
   failReceiptOpen: undefined as (() => Error) | undefined,
+  beforeReceiptLstat: undefined as ((path: string) => Promise<void> | void) | undefined,
   unlinkCalls: 0,
 }))
 function isSpawnOptions(
@@ -56,6 +59,13 @@ vi.mock('node:fs/promises', async (original) => {
   const actual = await original<typeof import('node:fs/promises')>()
   return {
     ...actual,
+    lstat: async (...args: Parameters<typeof actual.lstat>) => {
+      const pathText = typeof args[0] === 'string' ? args[0] : String(args[0])
+      if (seam.beforeReceiptLstat && pathText.endsWith('.receipt')) {
+        await seam.beforeReceiptLstat(pathText)
+      }
+      return actual.lstat(...args)
+    },
     open: async (...args: Parameters<typeof actual.open>) => {
       const pathText = typeof args[0] === 'string' ? args[0] : String(args[0])
       if (seam.failReceiptOpen && pathText.endsWith('.receipt')) {
@@ -77,6 +87,7 @@ afterEach(() => {
   seam.spawn = undefined
   seam.onReceiptOpen = undefined
   seam.failReceiptOpen = undefined
+  seam.beforeReceiptLstat = undefined
   seam.unlinkCalls = 0
   vi.useRealTimers()
 })
@@ -1597,6 +1608,125 @@ it('tags WindowsOwnedProcess.close(deadline) timeout errors with code unconfirme
     Object.defineProperty(prepareHelper!, 'exitCode', { value: 1, configurable: true })
     prepareHelper!.emit('close', 1, null)
     await owner.whenReleased()
+    expect(memory.bytes).toBe(0)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+it('tolerates concurrent receipt retirement (ENOENT on lstat) during allocateReceipt while still rejecting non-ENOENT errors', async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'pact-windows-receipt-race-')))
+  const receiptsDir = join(root, 'receipts')
+  const memory = new NativeWorkingMemory('business')
+  await mkdir(receiptsDir, { recursive: true })
+
+  try {
+    const priorReceiptPath = join(receiptsDir, `${randomUUID()}.receipt`)
+    await writeFile(priorReceiptPath, '')
+
+    let retiredOnce = false
+    seam.beforeReceiptLstat = async (pathText) => {
+      if (!retiredOnce && pathText === priorReceiptPath) {
+        retiredOnce = true
+        await unlink(priorReceiptPath)
+      }
+    }
+
+    let prepareHelper: ChildProcess | undefined
+    const prepareStarted = Promise.withResolvers<void>()
+    seam.spawn = (_command, args) => {
+      const mode = args?.[0] ?? ''
+      const helper = new ChildProcess()
+      if (mode === 'prepare') {
+        const control = createControlPipe(() => {
+          // Hold until test drives owner.close().
+        })
+        Object.defineProperty(helper, 'pid', { value: 6410 })
+        Object.defineProperty(helper, 'stdio', {
+          value: [null, null, null, control.stream, null],
+        })
+        prepareHelper = helper
+        setImmediate(() => {
+          helper.emit('spawn')
+          prepareStarted.resolve()
+        })
+        return helper
+      }
+      if (mode === 'abort-allocated') {
+        const control = createControlPipe(() => {
+          void (async () => {
+            const entries = await readdir(receiptsDir)
+            await Promise.all(entries.map((entry) => unlink(join(receiptsDir, entry))))
+            control.pushFrame(Buffer.from([17, 1]))
+            Object.defineProperty(helper, 'exitCode', { value: 0, configurable: true })
+            helper.emit('close', 0, null)
+          })()
+        })
+        Object.defineProperty(helper, 'pid', { value: 6411 })
+        Object.defineProperty(helper, 'stdio', {
+          value: [null, null, null, control.stream, null],
+        })
+        setImmediate(() => helper.emit('spawn'))
+        return helper
+      }
+      throw new Error(`Unexpected Windows bridge mode: ${mode}`)
+    }
+
+    const owner = new WindowsOwnedProcess(
+      process.execPath,
+      [],
+      {},
+      {
+        windows: {
+          windowsBridgeExecutable: await realpath(process.execPath),
+          receiptDirectory: receiptsDir,
+        },
+        memory,
+      },
+    )
+
+    await prepareStarted.promise
+    expect(retiredOnce).toBe(true)
+
+    const closeTask = owner.close(Date.now() + 5_000)
+    Object.defineProperty(prepareHelper!, 'exitCode', { value: 1, configurable: true })
+    prepareHelper!.emit('close', 1, null)
+    await closeTask
+    await owner.whenReleased()
+    expect(memory.bytes).toBe(0)
+    expect(await readdir(receiptsDir)).toEqual([])
+
+    // Phase 2: non-ENOENT lstat failure on an existing receipt must still fail startup cleanly.
+    const existingReceipt = join(receiptsDir, `${randomUUID()}.receipt`)
+    await writeFile(existingReceipt, '')
+    seam.spawn = () => {
+      throw new Error('helper should not spawn when receipt scan throws non-ENOENT')
+    }
+    seam.beforeReceiptLstat = (pathText) => {
+      if (pathText === existingReceipt) {
+        throw Object.assign(new Error('Permission denied'), { code: 'EACCES' })
+      }
+    }
+
+    const erroredOwner = new WindowsOwnedProcess(
+      process.execPath,
+      [],
+      {},
+      {
+        windows: {
+          windowsBridgeExecutable: await realpath(process.execPath),
+          receiptDirectory: receiptsDir,
+        },
+        memory,
+      },
+    )
+    const childError = await new Promise<Error>((resolveError) => {
+      erroredOwner.child.once('error', resolveError)
+    })
+    expect(childError).toBeInstanceOf(Error)
+    await erroredOwner.close(Date.now() + 5_000)
+    await erroredOwner.whenReleased()
+    expect(erroredOwner.released).toBe(true)
     expect(memory.bytes).toBe(0)
   } finally {
     await rm(root, { recursive: true, force: true })
