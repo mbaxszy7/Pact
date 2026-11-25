@@ -453,6 +453,7 @@ export class TerminalHelperClient {
   private startupReject: ((error: Error) => void) | undefined
   private pendingResize: { cols: number; rows: number } | undefined
   private oversizedFrameLen: number | null = null
+  private oversizedFrameType: number | null = null
 
   constructor(private readonly callbacks: TerminalHelperCallbacks) {}
 
@@ -544,7 +545,7 @@ export class TerminalHelperClient {
         if (remaining) this.callbacks.onOutput(remaining)
         const diagnostic =
           this.oversizedFrameLen !== null
-            ? `source=oversized_frame len=${this.oversizedFrameLen}`
+            ? `source=oversized_frame type=0x${(this.oversizedFrameType ?? 0).toString(16).padStart(2, '0')} len=${this.oversizedFrameLen}`
             : `source=child_close code=${String(code)} signal=${String(signal)} stderrLen=${this.stderrText.length}`
         if (!this.readySettled) {
           this.readySettled = true
@@ -713,12 +714,15 @@ export class TerminalHelperClient {
     resolveReady: (info: TerminalHelperReady) => void,
     rejectReady: (error: Error) => void,
   ): void {
+    if (this.oversizedFrameLen !== null) return
     this.rxBuffer = this.rxBuffer.length > 0 ? Buffer.concat([this.rxBuffer, chunk]) : chunk
     while (this.rxBuffer.length >= 5) {
       const frameType = this.rxBuffer.readUInt8(0)
       const length = this.rxBuffer.readUInt32BE(1)
       if (length > MAX_INCOMING_FRAME_BYTES) {
+        this.oversizedFrameType = frameType
         this.oversizedFrameLen = length
+        this.rxBuffer = Buffer.alloc(0)
         this.forceTerminateProcess()
         if (!this.readySettled) {
           this.readySettled = true

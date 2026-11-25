@@ -497,6 +497,9 @@ int wmain(int argc, wchar_t** argv) {
 
   STARTUPINFOEXW si{};
   si.StartupInfo.cb = sizeof(si);
+  // Prevent Windows from duplicating this helper's redirected binary-protocol stdio pipes
+  // into the ConPTY child shell; nullptr hStd* with STARTF_USESTDHANDLES lets ConPTY bind stdio.
+  si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
   si.lpAttributeList = attr_list;
 
   std::wstring cmdline = L"\"" + shell_path + L"\"";

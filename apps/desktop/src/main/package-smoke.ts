@@ -168,7 +168,6 @@ async function verifyPackagedTerminal(
         const closed = await bridge.closeTerminal({ terminalId, force: true })
         const closeMs = Date.now() - closeStart
         const listAfter = await bridge.listTerminals({ projectId })
-        const remaining = listAfter.ok ? listAfter.value.terminals[0] : undefined
         const snapText = snap.ok && snap.value.kind === 'snapshot' ? stripAnsi(snap.value.text) : ''
         const snapHasMarker = snapText.includes('PACT_TERM_SMOKE_OK')
         const hasMarker = stripAnsi(collected).includes('PACT_TERM_SMOKE_OK') || snapHasMarker
@@ -180,27 +179,20 @@ async function verifyPackagedTerminal(
             closedOk &&
             listAfter.ok &&
             listAfter.value.terminals.length === 0,
-          hasMarker,
-          snapOk: snap.ok,
-          snapHasMarker,
-          collectedBytes: collected.length,
-          lastSeq,
-          snapBytes: snapText.length,
-          collectedPreview: JSON.stringify(collected.slice(0, 240)),
-          preCloseState: preClose ? preClose.state : null,
-          preCloseExitCode: preClose ? preClose.exitCode : null,
-          preCloseExitSignal: preClose ? preClose.exitSignal : null,
-          preCloseShell: preClose ? preClose.shell : null,
-          preCloseError: preClose ? (preClose.errorMessage ?? null) : null,
-          closeMs,
-          closedOk,
-          closeErrorCode: !closed.ok ? closed.error.code : null,
-          closeErrorMessage: !closed.ok ? closed.error.message : null,
-          remainingCount: listAfter.ok ? listAfter.value.terminals.length : -1,
-          remainingState: remaining ? remaining.state : null,
-          remainingExitCode: remaining ? remaining.exitCode : null,
-          remainingHasActiveChild: remaining ? remaining.hasActiveChild : null,
-          remainingError: remaining ? (remaining.errorMessage ?? null) : null,
+          m: hasMarker,
+          s: snap.ok,
+          sm: snapHasMarker,
+          bytes: collected.length,
+          seq: lastSeq,
+          sb: snapText.length,
+          pre: preClose?.state ?? null,
+          preSig: preClose?.exitSignal ?? null,
+          preCode: preClose?.exitCode ?? null,
+          preErr: preClose?.errorMessage?.slice(0, 140) ?? null,
+          cOk: closedOk,
+          cMs: closeMs,
+          cErr: !closed.ok ? (closed.error.code + ':' + closed.error.message).slice(0, 140) : null,
+          rem: listAfter.ok ? listAfter.value.terminals.length : -1,
         }
       })()
     `)
@@ -210,36 +202,36 @@ async function verifyPackagedTerminal(
         roundtrip && typeof roundtrip === 'object'
           ? {
               ...roundtrip,
-              pidFilePresent: failedPidText !== null,
-              pidFileText: failedPidText?.trim().slice(0, 32) ?? null,
+              pid: failedPidText !== null,
             }
           : roundtrip
       throw new Error(`Packaged terminal roundtrip failed: ${JSON.stringify(diag)}`)
     }
     const pidText = await readFile(pidFile, 'utf8').catch(() => '')
     const parsedPid = Number.parseInt(pidText.trim(), 10)
-    if (Number.isSafeInteger(parsedPid) && parsedPid > 1) {
-      childPid = parsedPid
-      const deadline = Date.now() + 1500
-      let alive = true
-      while (Date.now() < deadline) {
-        try {
-          process.kill(childPid, 0)
-          // oxlint-disable-next-line no-await-in-loop -- Bounded 1.5s poll confirming OS process release after closeTerminal.
-          await new Promise((resolveDelay) => setTimeout(resolveDelay, 40))
-        } catch {
-          alive = false
-          break
-        }
+    if (!Number.isSafeInteger(parsedPid) || parsedPid <= 1) {
+      throw new Error('Packaged terminal did not write a valid child PID.')
+    }
+    childPid = parsedPid
+    const deadline = Date.now() + 1500
+    let alive = true
+    while (Date.now() < deadline) {
+      try {
+        process.kill(childPid, 0)
+        // oxlint-disable-next-line no-await-in-loop -- Bounded 1.5s poll confirming OS process release after closeTerminal.
+        await new Promise((resolveDelay) => setTimeout(resolveDelay, 40))
+      } catch {
+        alive = false
+        break
       }
-      if (alive) {
-        try {
-          process.kill(childPid, 'SIGKILL')
-        } catch {
-          // Best-effort cleanup after failure.
-        }
-        throw new Error(`Packaged terminal child process ${childPid} remained alive after close.`)
+    }
+    if (alive) {
+      try {
+        process.kill(childPid, 'SIGKILL')
+      } catch {
+        // Best-effort cleanup after failure.
       }
+      throw new Error(`Packaged terminal child process ${childPid} remained alive after close.`)
     }
     if (projectId) {
       await utilityClient.archiveProject({ projectId }).catch(() => undefined)
