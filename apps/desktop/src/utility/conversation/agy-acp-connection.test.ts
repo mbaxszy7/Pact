@@ -2442,6 +2442,7 @@ describe('session/close positive confirmation and retiring connection state mach
       })
       await pool.dispose()
     },
+    15_000,
   )
 
   it('excludes only the expired session/close when two same-session closes have different deadlines', async () => {

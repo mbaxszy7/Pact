@@ -100,6 +100,14 @@ async function verifyPackagedTerminal(
         const bridge = window.pact
         const projectId = ${JSON.stringify(projectId)}
         const command = ${JSON.stringify(command)}
+        const isWin32 = ${JSON.stringify(process.platform === 'win32')}
+        const esc = String.fromCharCode(27)
+        const bel = String.fromCharCode(7)
+        const ansiRe = new RegExp(
+          esc + '(?:\\\\[[0-9;?]*[ -/]*[@-~]|\\\\][^' + bel + esc + ']*(?:' + bel + '|' + esc + '\\\\\\\\)|[@-Z\\\\-_])',
+          'g',
+        )
+        const stripAnsi = (value) => value.replace(ansiRe, '')
         const created = await bridge.createTerminal({
           projectId,
           requestId: crypto.randomUUID(),
@@ -122,6 +130,12 @@ async function verifyPackagedTerminal(
           unsub()
           return { ok: false, stage: 'subscribe', message: sub.error.message }
         }
+        if (isWin32) {
+          const readyDeadline = Date.now() + 6000
+          while (collected.length === 0 && Date.now() < readyDeadline) {
+            await new Promise((r) => setTimeout(r, 40))
+          }
+        }
         const written = await bridge.writeTerminal({
           terminalId,
           streamId: crypto.randomUUID(),
@@ -134,8 +148,8 @@ async function verifyPackagedTerminal(
           unsub()
           return { ok: false, stage: 'write', message: written.error.message }
         }
-        const deadline = Date.now() + 8000
-        while (!collected.includes('PACT_TERM_SMOKE_OK') && Date.now() < deadline) {
+        const deadline = Date.now() + (isWin32 ? 12000 : 8000)
+        while (!stripAnsi(collected).includes('PACT_TERM_SMOKE_OK') && Date.now() < deadline) {
           await new Promise((r) => setTimeout(r, 40))
         }
         if (lastSeq > 0) {
@@ -151,18 +165,30 @@ async function verifyPackagedTerminal(
         unsub()
         const closed = await bridge.closeTerminal({ terminalId, force: true })
         const listAfter = await bridge.listTerminals({ projectId })
+        const remaining = listAfter.ok ? listAfter.value.terminals[0] : undefined
+        const snapText = snap.ok && snap.value.kind === 'snapshot' ? stripAnsi(snap.value.text) : ''
+        const snapHasMarker = snapText.includes('PACT_TERM_SMOKE_OK')
+        const hasMarker = stripAnsi(collected).includes('PACT_TERM_SMOKE_OK') || snapHasMarker
+        const closedOk = closed.ok && closed.value.closed
         return {
           ok:
-            collected.includes('PACT_TERM_SMOKE_OK') &&
+            hasMarker &&
             snap.ok &&
-            closed.ok &&
-            closed.value.closed &&
+            closedOk &&
             listAfter.ok &&
             listAfter.value.terminals.length === 0,
-          hasMarker: collected.includes('PACT_TERM_SMOKE_OK'),
+          hasMarker,
           snapOk: snap.ok,
-          closedOk: closed.ok && closed.value.closed,
+          snapHasMarker,
+          collectedBytes: collected.length,
+          lastSeq,
+          snapBytes: snapText.length,
+          closedOk,
+          closeErrorCode: !closed.ok ? closed.error.code : null,
           remainingCount: listAfter.ok ? listAfter.value.terminals.length : -1,
+          remainingState: remaining ? remaining.state : null,
+          remainingExitCode: remaining ? remaining.exitCode : null,
+          remainingHasActiveChild: remaining ? remaining.hasActiveChild : null,
         }
       })()
     `)

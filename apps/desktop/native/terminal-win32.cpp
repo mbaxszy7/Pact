@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <algorithm>
 #include <atomic>
 #include <cwctype>
 #include <mutex>
@@ -176,7 +177,7 @@ bool should_strip_env_key_w(const std::wstring& key) {
 }
 
 std::vector<wchar_t> build_sanitized_env_block() {
-  std::vector<wchar_t> block;
+  std::vector<std::wstring> entries;
   LPWCH raw = GetEnvironmentStringsW();
   if (raw) {
     const wchar_t* p = raw;
@@ -187,8 +188,7 @@ std::vector<wchar_t> build_sanitized_env_block() {
       if (eq != std::wstring::npos && eq > 0) {
         std::wstring key = entry.substr(0, eq);
         if (!should_strip_env_key_w(key)) {
-          block.insert(block.end(), entry.begin(), entry.end());
-          block.push_back(L'\0');
+          entries.push_back(std::move(entry));
         }
       }
       p += step;
@@ -200,7 +200,24 @@ std::vector<wchar_t> build_sanitized_env_block() {
            L"COLORTERM=truecolor",
            L"TERM_PROGRAM=Pact",
        }) {
-    std::wstring line(extra);
+    entries.emplace_back(extra);
+  }
+  std::sort(entries.begin(), entries.end(), [](const std::wstring& a, const std::wstring& b) {
+    size_t ka = a.find(L'=');
+    size_t kb = b.find(L'=');
+    size_t la = (ka == std::wstring::npos) ? a.size() : ka;
+    size_t lb = (kb == std::wstring::npos) ? b.size() : kb;
+    size_t common = (la < lb) ? la : lb;
+    for (size_t i = 0; i < common; i++) {
+      wint_t ca = towlower(a[i]);
+      wint_t cb = towlower(b[i]);
+      if (ca != cb) return ca < cb;
+    }
+    if (la != lb) return la < lb;
+    return a < b;
+  });
+  std::vector<wchar_t> block;
+  for (const std::wstring& line : entries) {
     block.insert(block.end(), line.begin(), line.end());
     block.push_back(L'\0');
   }
@@ -309,17 +326,33 @@ void send_ctrl_c_via_helper(DWORD target_pid) {
   PROCESS_INFORMATION pi{};
   std::vector<wchar_t> cmd_buf(cmd.begin(), cmd.end());
   cmd_buf.push_back(L'\0');
-  if (CreateProcessW(
-          self_path,
-          cmd_buf.data(),
-          nullptr,
-          nullptr,
-          FALSE,
-          DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB,
-          nullptr,
-          nullptr,
-          &si,
-          &pi)) {
+  BOOL started = CreateProcessW(
+      self_path,
+      cmd_buf.data(),
+      nullptr,
+      nullptr,
+      FALSE,
+      DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB,
+      nullptr,
+      nullptr,
+      &si,
+      &pi);
+  if (!started && GetLastError() == ERROR_ACCESS_DENIED) {
+    std::vector<wchar_t> cmd_buf_retry(cmd.begin(), cmd.end());
+    cmd_buf_retry.push_back(L'\0');
+    started = CreateProcessW(
+        self_path,
+        cmd_buf_retry.data(),
+        nullptr,
+        nullptr,
+        FALSE,
+        DETACHED_PROCESS,
+        nullptr,
+        nullptr,
+        &si,
+        &pi);
+  }
+  if (started) {
     WaitForSingleObject(pi.hProcess, 800);
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
@@ -530,10 +563,19 @@ int wmain(int argc, wchar_t** argv) {
     if (hDrainDone) SetEvent(hDrainDone);
   });
 
+  std::mutex pipe_in_mutex;
+  bool pipe_in_closed = false;
   std::thread closer_thread;
   auto ensure_closer_started = [&]() {
     if (!closer_started.exchange(true)) {
-      CloseHandle(hPipeInWrite);
+      {
+        std::lock_guard<std::mutex> lock(pipe_in_mutex);
+        if (!pipe_in_closed && hPipeInWrite) {
+          CloseHandle(hPipeInWrite);
+          hPipeInWrite = nullptr;
+          pipe_in_closed = true;
+        }
+      }
       closer_thread = std::thread([fnClosePseudoConsole, hPC, hCloserDone]() {
         fnClosePseudoConsole(hPC);
         if (hCloserDone) SetEvent(hCloserDone);
@@ -554,8 +596,11 @@ int wmain(int argc, wchar_t** argv) {
       if (flen > 0 && !read_exact_stdin(payload.data(), flen)) break;
 
       if (ftype == FRAME_INPUT && !closer_started.load() && flen > 0) {
-        DWORD written = 0;
-        (void)WriteFile(hPipeInWrite, payload.data(), flen, &written, nullptr);
+        std::lock_guard<std::mutex> lock(pipe_in_mutex);
+        if (!pipe_in_closed && hPipeInWrite) {
+          DWORD written = 0;
+          (void)WriteFile(hPipeInWrite, payload.data(), flen, &written, nullptr);
+        }
       } else if (ftype == FRAME_RESIZE && flen == 4 && !closer_started.load()) {
         SHORT nc = static_cast<SHORT>((static_cast<uint16_t>(payload[0]) << 8) | payload[1]);
         SHORT nr = static_cast<SHORT>((static_cast<uint16_t>(payload[2]) << 8) | payload[3]);
@@ -614,8 +659,8 @@ int wmain(int argc, wchar_t** argv) {
       if (shutdown_deadline == 0) {
         if (shutdown_force.load() || shutdown_grace_ms.load() == 0) {
           force_killed = true;
-          ensure_closer_started();
           TerminateJobObject(hJob, 1);
+          ensure_closer_started();
           shutdown_deadline = GetTickCount64() + 1000;
         } else {
           if (!cooperative_sent) {
@@ -629,8 +674,9 @@ int wmain(int argc, wchar_t** argv) {
         }
       } else if (!force_killed && GetTickCount64() >= shutdown_deadline) {
         force_killed = true;
-        ensure_closer_started();
         TerminateJobObject(hJob, 1);
+        ensure_closer_started();
+        shutdown_deadline = GetTickCount64() + 1000;
       }
     }
 
@@ -653,15 +699,15 @@ int wmain(int argc, wchar_t** argv) {
     if (shell_exited && job_ok && remaining == 0) {
       break;
     }
-    if (shutdown_requested.load() && force_killed && GetTickCount64() >= shutdown_deadline + 1000) {
+    if (shutdown_requested.load() && force_killed && GetTickCount64() >= shutdown_deadline) {
       break;
     }
   }
 
   ensure_closer_started();
-  bool closer_done = !hCloserDone || (WaitForSingleObject(hCloserDone, 1000) == WAIT_OBJECT_0);
-  bool drain_done = !hDrainDone || (WaitForSingleObject(hDrainDone, 1000) == WAIT_OBJECT_0);
-  if (WaitForSingleObject(hProcess, 500) == WAIT_OBJECT_0) {
+  bool closer_done = !hCloserDone || (WaitForSingleObject(hCloserDone, 1500) == WAIT_OBJECT_0);
+  bool drain_done = !hDrainDone || (WaitForSingleObject(hDrainDone, 1500) == WAIT_OBJECT_0);
+  if (!shell_exited && WaitForSingleObject(hProcess, 500) == WAIT_OBJECT_0) {
     shell_exited = true;
     GetExitCodeProcess(hProcess, &exit_code);
   }

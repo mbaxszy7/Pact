@@ -709,8 +709,8 @@ export class TerminalManager {
     }
 
     const confirmed = await this.shutdownEntry(entry, {
-      force: false,
-      graceMs: 2_000,
+      force: Boolean(input.force),
+      graceMs: input.force ? 0 : 2_000,
       deadlineMs: 3_800,
       reason: 'closed',
     })
