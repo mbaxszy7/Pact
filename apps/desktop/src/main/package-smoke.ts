@@ -104,7 +104,7 @@ async function verifyPackagedTerminal(
         const esc = String.fromCharCode(27)
         const bel = String.fromCharCode(7)
         const ansiRe = new RegExp(
-          esc + '(?:\\\\[[0-9;?]*[ -/]*[@-~]|\\\\][^' + bel + esc + ']*(?:' + bel + '|' + esc + '\\\\\\\\)|[@-Z\\\\-_])',
+          esc + '(?:\\\\[[0-9:;<=>?]*[ -/]*[@-~]|\\\\][^' + bel + esc + ']*(?:' + bel + '|' + esc + '\\\\\\\\)|[@-Z\\\\-_])',
           'g',
         )
         const stripAnsi = (value) => value.replace(ansiRe, '')
@@ -132,7 +132,11 @@ async function verifyPackagedTerminal(
         }
         if (isWin32) {
           const readyDeadline = Date.now() + 8000
-          while (!stripAnsi(collected).includes('>') && Date.now() < readyDeadline) {
+          while (
+            (!stripAnsi(collected).includes('terminal-smoke-') ||
+              !stripAnsi(collected).includes('>')) &&
+            Date.now() < readyDeadline
+          ) {
             await new Promise((r) => setTimeout(r, 40))
           }
           await new Promise((r) => setTimeout(r, 150))
@@ -150,8 +154,22 @@ async function verifyPackagedTerminal(
           unsub()
           return { ok: false, stage: 'write', message: written.error.message }
         }
+        let echoed = false
+        let crOk = false
+        let lfOk = false
+        let crBytes = 0
+        let lfBytes = 0
         if (isWin32) {
-          await new Promise((r) => setTimeout(r, 80))
+          const echoDeadline = Date.now() + 4000
+          while (
+            !stripAnsi(collected).includes('Start-Sleep -Seconds 30') &&
+            Date.now() < echoDeadline
+          ) {
+            await new Promise((r) => setTimeout(r, 40))
+          }
+          echoed = stripAnsi(collected).includes('Start-Sleep -Seconds 30')
+          await new Promise((r) => setTimeout(r, 100))
+          const beforeCr = collected.length
           const enterWritten = await bridge.writeTerminal({
             terminalId,
             streamId,
@@ -164,10 +182,44 @@ async function verifyPackagedTerminal(
             unsub()
             return { ok: false, stage: 'write_enter', message: enterWritten.error.message }
           }
-        }
-        const deadline = Date.now() + (isWin32 ? 12000 : 8000)
-        while (!stripAnsi(collected).includes('PACT_TERM_SMOKE_OK') && Date.now() < deadline) {
-          await new Promise((r) => setTimeout(r, 40))
+          const crDeadline = Date.now() + 5000
+          while (
+            !stripAnsi(collected).includes('PACT_TERM_SMOKE_OK') &&
+            Date.now() < crDeadline
+          ) {
+            await new Promise((r) => setTimeout(r, 40))
+          }
+          crOk = stripAnsi(collected).includes('PACT_TERM_SMOKE_OK')
+          crBytes = collected.length - beforeCr
+          if (!crOk) {
+            const beforeLf = collected.length
+            const lfWritten = await bridge.writeTerminal({
+              terminalId,
+              streamId,
+              chunkSeq: 2,
+              expectedEpoch: epoch,
+              data: '\\n',
+            })
+            if (!lfWritten.ok) {
+              await bridge.unsubscribeTerminal({ subscriptionId }).catch(() => undefined)
+              unsub()
+              return { ok: false, stage: 'write_lf', message: lfWritten.error.message }
+            }
+            const lfDeadline = Date.now() + 3000
+            while (
+              !stripAnsi(collected).includes('PACT_TERM_SMOKE_OK') &&
+              Date.now() < lfDeadline
+            ) {
+              await new Promise((r) => setTimeout(r, 40))
+            }
+            lfOk = stripAnsi(collected).includes('PACT_TERM_SMOKE_OK')
+            lfBytes = collected.length - beforeLf
+          }
+        } else {
+          const deadline = Date.now() + 8000
+          while (!stripAnsi(collected).includes('PACT_TERM_SMOKE_OK') && Date.now() < deadline) {
+            await new Promise((r) => setTimeout(r, 40))
+          }
         }
         if (lastSeq > 0) {
           await bridge.ackTerminalOutput({
@@ -186,9 +238,10 @@ async function verifyPackagedTerminal(
         const closeMs = Date.now() - closeStart
         const listAfter = await bridge.listTerminals({ projectId })
         const snapText = snap.ok && snap.value.kind === 'snapshot' ? stripAnsi(snap.value.text) : ''
-        const hasMarker =
-          stripAnsi(collected).includes('PACT_TERM_SMOKE_OK') ||
-          snapText.includes('PACT_TERM_SMOKE_OK')
+        const hasMarker = isWin32
+          ? crOk
+          : stripAnsi(collected).includes('PACT_TERM_SMOKE_OK') ||
+            snapText.includes('PACT_TERM_SMOKE_OK')
         const closedOk = closed.ok && closed.value.closed
         const ok =
           hasMarker &&
@@ -213,7 +266,13 @@ async function verifyPackagedTerminal(
           cMs: closeMs,
           ...(!closed.ok ? { cErr: (closed.error.code + ':' + closed.error.message).slice(0, 100) } : {}),
           rem: listAfter.ok ? listAfter.value.terminals.length : -1,
-          ...(!ok ? { snap: snapText.replace(/\\s+/g, ' ').trim().slice(-240) } : {}),
+          ...(!ok && isWin32
+            ? {
+                w: { e: echoed, cr: crOk, lf: lfOk, cb: crBytes, lb: lfBytes },
+                rh: collected.slice(0, 60),
+                rt: collected.slice(-80),
+              }
+            : {}),
         }
       })()
     `)
