@@ -3,6 +3,7 @@ import type { ChildProcessWithoutNullStreams } from 'node:child_process'
 
 import { createHash, randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
+import { existsSync } from 'node:fs'
 import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -2369,13 +2370,15 @@ describe('session/close positive confirmation and retiring connection state mach
     async () => {
       const root = await mkdtemp(join(tmpdir(), 'pact-agy-real-group-late-'))
       tempDirs.push(root)
+      const readyFlag = join(root, 'ready-helper')
       const releaseFlag = join(root, 'release-helper')
       const script = join(root, 'stub-acp.cjs')
       await writeFile(
         script,
         [
-          "const { existsSync } = require('node:fs')",
+          "const { existsSync, writeFileSync } = require('node:fs')",
           "process.on('SIGTERM', () => {})",
+          `writeFileSync(${JSON.stringify(readyFlag)}, 'ready')`,
           'process.stdin.resume()',
           `setInterval(() => { if (existsSync(${JSON.stringify(releaseFlag)})) process.exit(0) }, 15)`,
           'setTimeout(() => process.exit(0), 15000)',
@@ -2418,6 +2421,14 @@ describe('session/close positive confirmation and retiring connection state mach
         return undefined
       })
 
+      // Wait until the real child process has registered its SIGTERM trap before capping shutdown.
+      await vi.waitFor(
+        () => {
+          expect(existsSync(readyFlag)).toBe(true)
+        },
+        { timeout: 5_000 },
+      )
+
       // Force a short shutdown deadline so the real OwnedProcessGroup close times out while the child is still alive.
       lease.connection.capShutdownDeadline(Date.now() + 60)
       await expect(lease.connection.close(new Error('short deadline'))).rejects.toThrow(/deadline/u)
@@ -2433,13 +2444,17 @@ describe('session/close positive confirmation and retiring connection state mach
       // settledAfterCloseTimeout(), sets released = true, settles physicalCompletion exactly once,
       // and clears the pool quarantine slot!
       await writeFile(releaseFlag, 'go')
+      await vi.waitFor(
+        () => {
+          lease.connection.recheckPhysicalRelease()
+          expect(realGroup.released).toBe(true)
+          expect(pool.unconfirmedClosingCount).toBe(0)
+          expect(pool.occupiedProcessSlotCount).toBe(0)
+        },
+        { interval: 25, timeout: 5_000 },
+      )
       await expect(op.physicalCompletion).resolves.toBe('connection_closed')
       expect(physicalSettled).toBe(1)
-      await vi.waitFor(() => {
-        expect(pool.unconfirmedClosingCount).toBe(0)
-        expect(pool.occupiedProcessSlotCount).toBe(0)
-        expect(realGroup.released).toBe(true)
-      })
       await pool.dispose()
     },
     15_000,

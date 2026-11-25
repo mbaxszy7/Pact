@@ -2092,6 +2092,7 @@ export class AgyAcpConnection {
         (shutdownError: unknown) => {
           this.shutdownAttemptSettled = true
           this.startWatchingLatePhysicalRelease()
+          this.recheckPhysicalRelease()
           throw shutdownError
         },
       )
