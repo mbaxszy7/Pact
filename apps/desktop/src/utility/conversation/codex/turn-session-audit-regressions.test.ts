@@ -1083,4 +1083,452 @@ describe('CodexTurnSession Astra Shard 3 audit regressions', () => {
       error: expect.objectContaining({ kind: 'response_too_large' }),
     })
   })
+
+  it('A-F1: preserves pre-ACK spawnAgent + child fileChange in arrival order and replays child interaction buffered before child turn/started', async () => {
+    const childElicAnswered = Promise.withResolvers<void>()
+    const harness = createFakeCodexProcess((request, respond, notify) => {
+      if (request.id === 'child-early-elic' && 'result' in request) {
+        childElicAnswered.resolve()
+        return
+      }
+      if (request.method === 'thread/start') {
+        respond({ id: request.id, result: defaultThreadStartResult('th-af1') })
+      } else if (request.method === 'turn/start') {
+        // Pre-ACK root spawnAgent + child thread/started + child turn/started + child fileChange
+        notify({
+          method: 'item/started',
+          params: {
+            threadId: 'th-af1',
+            turnId: 'turn-af1',
+            item: { id: 'sp-pre', type: 'collabAgentToolCall', tool: 'spawnAgent' },
+          },
+        })
+        notify({
+          method: 'thread/started',
+          params: { thread: { id: 'child-af1', parentThreadId: 'th-af1' } },
+        })
+        notify({
+          method: 'turn/started',
+          params: { threadId: 'child-af1', turn: { id: 'child-turn-af1' } },
+        })
+        notify({
+          method: 'item/completed',
+          params: {
+            threadId: 'child-af1',
+            turnId: 'child-turn-af1',
+            item: {
+              id: 'child-fc-1',
+              type: 'fileChange',
+              status: 'completed',
+              changes: [{ path: '/project/child-preack.ts', kind: { type: 'update' } }],
+            },
+          },
+        })
+        // Now root ACK arrives AFTER those 4 frames
+        respond({ id: request.id, result: { turn: { id: 'turn-af1' } } })
+
+        // Spawn a second child whose elicitation arrives BEFORE its child turn/started
+        notify({
+          method: 'thread/started',
+          params: { thread: { id: 'child-af1-b', parentThreadId: 'th-af1' } },
+        })
+        notify({
+          id: 'child-early-elic',
+          method: 'mcpServer/elicitation/request',
+          params: {
+            threadId: 'child-af1-b',
+            turnId: 'child-turn-af1-b',
+            serverName: 'docs-mcp',
+            mode: 'url',
+            elicitationId: 'elic-child-b',
+            url: 'https://example.invalid/child-b',
+            message: 'Allow child B?',
+          },
+        })
+        // Deliver child-af1-b turn/started with NO subsequent frame until elicitation is answered
+        notify({
+          method: 'turn/started',
+          params: { threadId: 'child-af1-b', turn: { id: 'child-turn-af1-b' } },
+        })
+        void childElicAnswered.promise.then(() => {
+          notify({
+            method: 'turn/completed',
+            params: { threadId: 'child-af1', turn: { id: 'child-turn-af1', status: 'completed' } },
+          })
+          notify({
+            method: 'turn/completed',
+            params: {
+              threadId: 'child-af1-b',
+              turn: { id: 'child-turn-af1-b', status: 'completed' },
+            },
+          })
+          notify({
+            method: 'item/completed',
+            params: {
+              threadId: 'th-af1',
+              turnId: 'turn-af1',
+              item: {
+                id: 'sp-pre',
+                type: 'collabAgentToolCall',
+                tool: 'spawnAgent',
+                status: 'completed',
+                senderThreadId: 'th-af1',
+                receiverThreadIds: ['child-af1', 'child-af1-b'],
+                agentsStates: {
+                  'child-af1': { status: 'completed' },
+                  'child-af1-b': { status: 'completed' },
+                },
+              },
+            },
+          })
+          notify({
+            method: 'turn/completed',
+            params: { threadId: 'th-af1', turn: { id: 'turn-af1', status: 'completed' } },
+          })
+          return undefined
+        })
+      }
+    })
+    const adapter = new CodexAgentAdapter('/fake/codex', () => harness.child)
+    openAdapters.push(adapter)
+
+    const recordedOps: string[] = []
+    const requestUserInput = vi.fn<() => Promise<{ action: 'accept' }>>(async () => ({
+      action: 'accept' as const,
+    }))
+    const input = baseRunInput({
+      host: {
+        effects: {
+          recordFileChange: async (change) => {
+            recordedOps.push(change.operationId ?? change.path)
+          },
+        },
+        interactions: { requestUserInput },
+      },
+    })
+    for await (const event of adapter.run(input, new AbortController().signal)) {
+      void event
+    }
+    await vi.waitFor(() => expect(adapter.hasActiveBackgroundWork(input.runId)).toBe(false))
+    expect(recordedOps).toEqual(['child-af1:child-fc-1:0'])
+    expect(requestUserInput).toHaveBeenCalledTimes(1)
+  })
+
+  it('A-F2: rejects turn-scoped mcpServer/elicitation/request during thread/resume before_dispatch while allowing turn-less startup elicitation', async () => {
+    const turnlessAnswered = Promise.withResolvers<void>()
+    const harness = createFakeCodexProcess((request, respond, notify) => {
+      if (request.id === 'startup-turnless-elic' && 'result' in request) {
+        turnlessAnswered.resolve()
+        return
+      }
+      if (request.method === 'thread/resume') {
+        // Stale elicitation carrying old turnId MUST NOT reach requestUserInput during before_dispatch
+        notify({
+          id: 'stale-turn-elic',
+          method: 'mcpServer/elicitation/request',
+          params: {
+            threadId: 'th-af2',
+            turnId: 'old-turn-from-prev-run',
+            serverName: 'docs-mcp',
+            mode: 'url',
+            elicitationId: 'elic-stale',
+            url: 'https://example.invalid/stale',
+            message: 'Stale turn elicitation',
+          },
+        })
+        // Legitimate turn-less startup elicitation MUST succeed
+        notify({
+          id: 'startup-turnless-elic',
+          method: 'mcpServer/elicitation/request',
+          params: {
+            threadId: 'th-af2',
+            serverName: 'docs-mcp',
+            mode: 'url',
+            elicitationId: 'elic-valid',
+            url: 'https://example.invalid/valid',
+            message: 'Valid startup elicitation',
+          },
+        })
+        void turnlessAnswered.promise.then(() => {
+          respond({ id: request.id, result: defaultThreadStartResult('th-af2') })
+          return undefined
+        })
+      } else if (request.method === 'turn/start') {
+        respond({ id: request.id, result: { turn: { id: 'turn-af2' } } })
+        notify({
+          method: 'turn/completed',
+          params: { threadId: 'th-af2', turn: { id: 'turn-af2', status: 'completed' } },
+        })
+      }
+    })
+    const adapter = new CodexAgentAdapter('/fake/codex', () => harness.child)
+    openAdapters.push(adapter)
+
+    const seenMessages: string[] = []
+    const requestUserInput = vi.fn<(req: { message?: string }) => Promise<{ action: 'accept' }>>(
+      async (req) => {
+        if (typeof req.message === 'string') seenMessages.push(req.message)
+        return { action: 'accept' as const }
+      },
+    )
+    const input = baseRunInput({
+      nativeSessionId: 'th-af2',
+      host: { interactions: { requestUserInput } },
+    })
+    for await (const event of adapter.run(input, new AbortController().signal)) {
+      void event
+    }
+    expect(requestUserInput).toHaveBeenCalledTimes(1)
+    expect(seenMessages).toEqual(['Valid startup elicitation'])
+  })
+
+  it('A-F3 & A-F4: binds exact turnId + interrupts once via userMessage echo after post-write Stop, and settles late thread/start reply without sending turn/start', async () => {
+    // Part 1 (A-F3): Post-write Stop before ACK -> userMessage echo confirms turnId, persists accepted, sends ONE turn/interrupt; late ACK sends ZERO duplicates.
+    {
+      const turnStartSeen = Promise.withResolvers<{ id: unknown; respond: Send; notify: Send }>()
+      const interruptCalls: Record<string, unknown>[] = []
+      const harness = createFakeCodexProcess((request, respond, notify) => {
+        if (request.method === 'thread/start') {
+          respond({ id: request.id, result: defaultThreadStartResult('th-af3') })
+        } else if (request.method === 'turn/start') {
+          turnStartSeen.resolve({ id: request.id, respond, notify })
+        } else if (request.method === 'turn/interrupt') {
+          interruptCalls.push(request)
+          respond({ id: request.id, result: {} })
+        }
+      })
+      const adapter = new CodexAgentAdapter('/fake/codex', () => harness.child)
+      openAdapters.push(adapter)
+
+      const dispatches: string[] = []
+      const evidence: NativeProbeResult[] = []
+      const abort = new AbortController()
+      const input = baseRunInput({
+        host: {
+          lifecycle: {
+            recordDispatch: (phase) => dispatches.push(phase),
+            recordNativeEvidence: (entry) => evidence.push(entry),
+          },
+        },
+      })
+      const runPromise = (async () => {
+        for await (const event of adapter.run(input, abort.signal)) {
+          void event
+        }
+      })()
+      const pendingTurnStart = await turnStartSeen.promise
+      abort.abort()
+      await expect(runPromise).rejects.toThrow(/confirm its final state/u)
+
+      // Withhold ACK and send exact matching userMessage echo first
+      pendingTurnStart.notify({
+        method: 'item/completed',
+        params: {
+          threadId: 'th-af3',
+          turnId: 'turn-af3-echo',
+          item: { id: 'u1', type: 'userMessage', clientId: input.runId },
+        },
+      })
+      await vi.waitFor(() => expect(interruptCalls).toHaveLength(1))
+      expect(dispatches).toContain('accepted')
+      expect(
+        evidence.some((e) => e.kind === 'running' && e.identity.nativeTurnId === 'turn-af3-echo'),
+      ).toBe(true)
+
+      // Now deliver late ACK for the same turn -> must NOT trigger a second turn/interrupt!
+      pendingTurnStart.respond({
+        id: pendingTurnStart.id,
+        result: { turn: { id: 'turn-af3-echo' } },
+      })
+      await flushMicrotasks(15)
+      expect(interruptCalls).toHaveLength(1)
+
+      pendingTurnStart.notify({
+        method: 'turn/completed',
+        params: { threadId: 'th-af3', turn: { id: 'turn-af3-echo', status: 'interrupted' } },
+      })
+      await vi.waitFor(() => expect(adapter.hasActiveBackgroundWork(input.runId)).toBe(false))
+    }
+
+    // Part 2 (A-F4): Post-write Stop during thread/start -> late thread/start reply replays startup hook, sends 0 turn/start, and releases once hook completes.
+    {
+      const threadStartSeen = Promise.withResolvers<{ id: unknown; respond: Send; notify: Send }>()
+      const harness = createFakeCodexProcess((request, respond, notify) => {
+        if (request.method === 'thread/start') {
+          notify({
+            method: 'hook/started',
+            params: { threadId: 'th-af4', run: { id: 'late-hook-1', status: 'running' } },
+          })
+          threadStartSeen.resolve({ id: request.id, respond, notify })
+        }
+      })
+      const adapter = new CodexAgentAdapter('/fake/codex', () => harness.child)
+      openAdapters.push(adapter)
+
+      const recordConfirmedUnsent = vi.fn<() => void>()
+      const abort = new AbortController()
+      const input = baseRunInput({
+        host: {
+          recovery: {
+            inputSha256: '0'.repeat(64),
+            recordEffectiveSettings: vi.fn<() => void>(),
+            recordConfirmedUnsent,
+          },
+        },
+      })
+      const runPromise = (async () => {
+        for await (const event of adapter.run(input, abort.signal)) {
+          void event
+        }
+      })()
+      const pendingThreadStart = await threadStartSeen.promise
+      abort.abort()
+      await expect(runPromise).rejects.toThrow(/interrupted/u)
+
+      // Late thread/start reply arrives after foreground already exited
+      pendingThreadStart.respond({
+        id: pendingThreadStart.id,
+        result: defaultThreadStartResult('th-af4'),
+      })
+      await flushMicrotasks(15)
+      expect(harness.sent.filter((m) => m.method === 'turn/start')).toHaveLength(0)
+      expect(recordConfirmedUnsent).not.toHaveBeenCalled()
+      // Hook is still running -> observer stays active until hook completes
+      expect(adapter.hasActiveBackgroundWork(input.runId)).toBe(true)
+      pendingThreadStart.notify({
+        method: 'hook/completed',
+        params: { threadId: 'th-af4', run: { id: 'late-hook-1', status: 'completed' } },
+      })
+      await vi.waitFor(() => expect(adapter.hasActiveBackgroundWork(input.runId)).toBe(false))
+    }
+  })
+
+  it('A-F5: hands off already-captured complete answer to recordArchivedEvent when Stop interrupts while foreground is paused on fileChange', async () => {
+    const unblockFile = Promise.withResolvers<void>()
+    const fileRecordingStarted = Promise.withResolvers<void>()
+    const terminalObserved = Promise.withResolvers<void>()
+    let notifyRef: Send | undefined
+    const harness = createFakeCodexProcess((request, respond, notify) => {
+      notifyRef = notify
+      if (request.method === 'thread/start') {
+        respond({ id: request.id, result: defaultThreadStartResult('th-af5') })
+      } else if (request.method === 'turn/start') {
+        respond({ id: request.id, result: { turn: { id: 'turn-af5' } } })
+      }
+    })
+    const adapter = new CodexAgentAdapter('/fake/codex', () => harness.child)
+    openAdapters.push(adapter)
+
+    const archived: NormalizedAgentEvent[] = []
+    const abort = new AbortController()
+    const input = baseRunInput({
+      host: {
+        lifecycle: {
+          recordNativeEvidence: (entry) => {
+            if (entry.kind === 'ended') terminalObserved.resolve()
+          },
+        },
+        effects: {
+          recordFileChange: async () => {
+            fileRecordingStarted.resolve()
+            await unblockFile.promise
+          },
+          recordArchivedEvent: (event) => {
+            archived.push(event)
+          },
+        },
+      },
+    })
+
+    const foregroundEvents: NormalizedAgentEvent[] = []
+    const runPromise = (async () => {
+      for await (const ev of adapter.run(input, abort.signal)) {
+        foregroundEvents.push(ev)
+        if (ev.type === 'turn.started') {
+          notifyRef?.({
+            method: 'item/completed',
+            params: {
+              threadId: 'th-af5',
+              turnId: 'turn-af5',
+              item: {
+                id: 'fc-block',
+                type: 'fileChange',
+                status: 'completed',
+                changes: [{ path: '/project/a.ts', kind: { type: 'update' } }],
+              },
+            },
+          })
+          notifyRef?.({
+            method: 'item/completed',
+            params: {
+              threadId: 'th-af5',
+              turnId: 'turn-af5',
+              item: { id: 'ans-af5', type: 'agentMessage', text: 'Authoritative complete answer.' },
+            },
+          })
+          notifyRef?.({
+            method: 'turn/completed',
+            params: { threadId: 'th-af5', turn: { id: 'turn-af5', status: 'completed' } },
+          })
+        }
+      }
+    })()
+
+    await fileRecordingStarted.promise
+    await terminalObserved.promise
+    // Abort while foreground is blocked awaiting fileChange recording BEFORE reading ans-af5 / turn/completed
+    abort.abort()
+    unblockFile.resolve()
+    await expect(runPromise).rejects.toThrow(/confirm its final state|interrupted/u)
+    await vi.waitFor(() => expect(adapter.hasActiveBackgroundWork(input.runId)).toBe(false))
+
+    const archivedText = archived.filter((e) => e.type === 'text.completed')
+    expect(archivedText).toHaveLength(1)
+    expect(archivedText[0]?.text).toBe('Authoritative complete answer.')
+    expect(archived.some((e) => e.type === 'turn.completed' && e.outcome === 'completed')).toBe(
+      true,
+    )
+    expect(foregroundEvents.some((e) => e.type === 'text.completed')).toBe(false)
+  })
+
+  it.each([
+    {
+      name: 'Invalid params missing threadId (-32602) does NOT map to context_resume_failed',
+      response: { error: { code: -32_602, message: 'missing threadId parameter' } },
+      expectedKind: 'protocol_error',
+    },
+    {
+      name: 'Rollout missing error naming a DIFFERENT thread ID does NOT mark saved thread missing',
+      response: {
+        error: { code: -32_600, message: 'no rollout found for thread id th-completely-other' },
+      },
+      expectedKind: 'agent_process_crash',
+    },
+    {
+      name: 'Rollout missing error naming the EXACT saved thread ID maps to context_resume_failed',
+      response: { error: { code: -32_600, message: 'no rollout found for thread id th-saved' } },
+      expectedKind: 'context_resume_failed',
+    },
+  ] as const)('A-F8: $name', async ({ response, expectedKind }) => {
+    const harness = createFakeCodexProcess((request, respond) => {
+      if (request.method === 'thread/resume') {
+        respond({ id: request.id, ...response })
+      }
+    })
+    const adapter = new CodexAgentAdapter('/fake/codex', () => harness.child)
+    openAdapters.push(adapter)
+
+    const input = baseRunInput({ nativeSessionId: 'th-saved' })
+    let caught: unknown
+    try {
+      for await (const event of adapter.run(input, new AbortController().signal)) {
+        void event
+      }
+    } catch (error) {
+      caught = error
+    }
+    expect(caught).toBeInstanceOf(AgentExecutionError)
+    expect((caught as AgentExecutionError).kind).toBe(expectedKind)
+    expect(harness.sent.filter((msg) => msg.method === 'turn/start')).toHaveLength(0)
+  })
 })

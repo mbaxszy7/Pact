@@ -368,7 +368,7 @@ export interface EarlyNativeFact {
   bytes: number
   heldBytes: number
   reservation: NativeMemoryReservation
-  rootStartupCandidate?: boolean | undefined
+  candidateKind?: 'root_turn' | 'startup_hook' | 'child' | undefined
 }
 
 export const CODEX_MAX_PENDING_RECORDINGS = 64
@@ -386,14 +386,75 @@ export function isCodexConnectionScopedNotification(method: unknown, params: obj
   return !hasThread && !hasTurn
 }
 
-/** Strict classifier for confirmed missing Codex thread/rollout on `thread/resume` (S3-F7). */
-export function isCodexMissingThreadError(rawMessage: string, rpcCode?: unknown): boolean {
-  if (rpcCode === -32_601 || /\bmethod\s+not\s+found\b/iu.test(rawMessage)) {
+const CODEX_MISSING_THREAD_STOPWORDS = new Set([
+  'id',
+  'is',
+  'was',
+  'not',
+  'does',
+  'could',
+  'cannot',
+  'cant',
+  'found',
+  'missing',
+  'unknown',
+  'for',
+  'in',
+  'on',
+  'at',
+  'to',
+  'of',
+  'the',
+  'a',
+  'an',
+  'file',
+  'path',
+  'rollout',
+  'thread',
+  'session',
+  'conversation',
+  'saved',
+  'native',
+])
+
+/** Strict classifier for confirmed missing Codex thread/rollout on `thread/resume` (S3-F7 / A-F8). */
+export function isCodexMissingThreadError(
+  rawMessage: string,
+  rpcCode?: unknown,
+  expectedThreadId?: string,
+): boolean {
+  if (
+    rpcCode === -32_601 ||
+    rpcCode === -32_602 ||
+    /\bmethod\s+not\s+found\b/iu.test(rawMessage) ||
+    /\binvalid\s+params?\b/iu.test(rawMessage) ||
+    /\bmissing\s+(?:required\s+)?(?:param(?:eter)?|field|argument|threadid)\b|\bthreadid\b[^\n]*\b(?:missing|required)\b/iu.test(
+      rawMessage,
+    )
+  ) {
     return false
   }
-  return /no rollout found|unknown thread|missing thread|thread\b[^\n]*\b(?:not found|does not exist|missing)|rollout\b[^\n]*\b(?:not found|does not exist|missing)|session\b[^\n]*\b(?:not found|does not exist)|conversation\b[^\n]*\bnot found/iu.test(
-    rawMessage,
-  )
+  if (
+    !/no rollout found|unknown thread|thread\b[^\n]*\b(?:not found|does not exist)|rollout\b[^\n]*\b(?:not found|does not exist)|saved native session[^\n]*not found|session\b[^\n]*\b(?:not found|does not exist)|conversation\b[^\n]*\bnot found/iu.test(
+      rawMessage,
+    )
+  ) {
+    return false
+  }
+  if (expectedThreadId) {
+    const idPatterns = [
+      /(?:for\s+)?(?:thread|rollout|session|conversation)(?:\s+id)?\s*[:=]?\s*["'`]?([A-Za-z0-9._:-]+)["'`]?/giu,
+      /(?:not found|does not exist)\s*[:=]\s*["'`]?([A-Za-z0-9._:-]+)["'`]?/giu,
+    ]
+    for (const pattern of idPatterns) {
+      for (const match of rawMessage.matchAll(pattern)) {
+        const candidate = match[1]?.replace(/[.,;!?]+$/u, '')
+        if (!candidate || CODEX_MISSING_THREAD_STOPWORDS.has(candidate.toLowerCase())) continue
+        if (candidate !== expectedThreadId) return false
+      }
+    }
+  }
+  return true
 }
 
 export interface NativeBackground {
@@ -1379,18 +1440,22 @@ export function classifyCodexStartupRejection(
       ),
     )
   const rawRpcMessage = extractCodexRpcErrorMessage(rpcError) ?? ''
-  if (rpcCode === -32_601 || /\bmethod\s+not\s+found\b/iu.test(rawRpcMessage)) {
+  if (
+    rpcCode === -32_601 ||
+    rpcCode === -32_602 ||
+    /\bmethod\s+not\s+found\b/iu.test(rawRpcMessage)
+  ) {
     return new AgentExecutionError(
       'protocol_error',
       formatCodexRpcErrorMessage(
         rpcError,
-        'Codex does not support thread/resume.',
+        'Codex rejected thread/resume with a protocol error.',
         'Codex thread/resume rejected: ',
       ),
       false,
     )
   }
-  if (!isCodexMissingThreadError(rawRpcMessage, rpcCode))
+  if (!isCodexMissingThreadError(rawRpcMessage, rpcCode, nativeSessionId))
     return classifyCodexRpcError(
       rpcError,
       'Codex rejected thread/resume.',
@@ -1533,5 +1598,109 @@ export function buildCodexTurnStartParams(params: {
       },
     },
     ...(serviceTier ? { serviceTierForTurn: serviceTier } : {}),
+  }
+}
+
+export function applyCodexWorkflowMcpToolCall(params: {
+  item: object
+  runId: string
+  peerServerName: string
+  peerToolServer: PactPeerToolServer
+  peerReceipt: string | undefined
+  capturePlan: (nativeId: string, text: string) => void
+  captureRetainedPlan: (nativeId: unknown) => void
+  captureInputResult: (outcome: CollaborationInputObservation) => void
+  captureReview: (verdict: CollaborationReviewObservation) => void
+}): void {
+  const {
+    item,
+    runId,
+    peerServerName,
+    peerToolServer,
+    peerReceipt,
+    capturePlan,
+    captureRetainedPlan,
+    captureInputResult,
+    captureReview,
+  } = params
+  if (
+    Reflect.get(item, 'type') !== 'mcpToolCall' ||
+    Reflect.get(item, 'server') !== peerServerName ||
+    !['submit_review', 'submit_input_result', 'retain_current_plan', 'publish_plan'].includes(
+      String(Reflect.get(item, 'tool')),
+    ) ||
+    Reflect.get(item, 'status') !== 'completed' ||
+    Reflect.get(item, 'error') !== null
+  ) {
+    return
+  }
+  const result = Reflect.get(item, 'result')
+  const structured =
+    result && typeof result === 'object' ? Reflect.get(result, 'structuredContent') : undefined
+  const inputResultCall = Reflect.get(item, 'tool') === 'submit_input_result'
+  const retentionCall = Reflect.get(item, 'tool') === 'retain_current_plan'
+  const publishPlanCall = Reflect.get(item, 'tool') === 'publish_plan'
+  const receipt =
+    structured && typeof structured === 'object'
+      ? Reflect.get(
+          structured,
+          publishPlanCall
+            ? 'pactPublishedPlan'
+            : retentionCall
+              ? 'pactPlanRetention'
+              : inputResultCall
+                ? 'pactInputResult'
+                : 'pactReview',
+        )
+      : undefined
+  if (
+    !receipt ||
+    typeof receipt !== 'object' ||
+    Reflect.get(receipt, 'receipt') !== peerToolServer.capabilityReceipt ||
+    !peerReceipt
+  ) {
+    return
+  }
+  if (publishPlanCall) {
+    if (
+      result &&
+      typeof result === 'object' &&
+      Reflect.get(result, 'isError') !== true &&
+      Reflect.get(receipt, 'final') === true
+    ) {
+      const markdown = peerToolServer.acceptPublishedPlan(peerReceipt)
+      if (markdown) capturePlan(`pact-plan-${runId}`, markdown)
+    }
+  } else if (retentionCall) {
+    if (
+      result &&
+      typeof result === 'object' &&
+      Reflect.get(result, 'isError') !== true &&
+      Reflect.get(receipt, 'accepted') === true &&
+      peerToolServer.acceptPlanRetention(Reflect.get(item, 'arguments'), peerReceipt)
+    ) {
+      captureRetainedPlan(Reflect.get(item, 'id'))
+    }
+  } else if (inputResultCall) {
+    const outcome = peerToolServer.acceptInputResult(Reflect.get(item, 'arguments'), peerReceipt)
+    if (
+      outcome &&
+      result &&
+      typeof result === 'object' &&
+      Reflect.get(result, 'isError') !== true &&
+      Reflect.get(receipt, 'outcome') === outcome.outcome &&
+      JSON.stringify(Reflect.get(receipt, 'questions')) === JSON.stringify(outcome.questions)
+    ) {
+      captureInputResult(outcome)
+    }
+  } else {
+    const verdict = peerToolServer.acceptReview(Reflect.get(item, 'arguments'), peerReceipt)
+    if (
+      verdict &&
+      Reflect.get(receipt, 'verdict') === verdict.verdict &&
+      JSON.stringify(Reflect.get(receipt, 'questions')) === JSON.stringify(verdict.questions)
+    ) {
+      captureReview(verdict)
+    }
   }
 }
