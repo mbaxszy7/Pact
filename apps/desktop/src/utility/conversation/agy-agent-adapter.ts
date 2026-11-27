@@ -150,6 +150,7 @@ export class AgyAgentAdapter implements AgentAdapter {
     const sessionModes = new Map<string, SessionModeState>()
     const nativeRebuildReceipts = new Map<string, AgyRebuildReceipt>()
     const activeRuns = this.activeRuns
+    const replayingSessions = new Map<string, number>()
     const ownedRunHandles = new Set<AgyOwnedRunHandle>()
     const skillProbeOwner = new AgySkillProbeOwner()
     const activeOwnedForkFiles = new Set<NativeForkFiles>()
@@ -167,6 +168,7 @@ export class AgyAgentAdapter implements AgentAdapter {
       sessionModes,
       nativeRebuildReceipts,
       activeRuns,
+      replayingSessions,
       ownedRunHandles,
       skillProbeOwner,
       ownedForkFiles: undefined,
@@ -658,39 +660,45 @@ export class AgyAgentAdapter implements AgentAdapter {
       this.runtime.activeRuns.clear()
       this.runtime.sessionModes.clear()
       this.runtime.nativeRebuildReceipts.clear()
-      this.runtime.nativeEvidence.clear()
-      this.runtime.evidenceCacheWork.release()
       const joinOwnedRuns = async (): Promise<void> => {
-        if (ownedRuns.length === 0) return
-        const waitMs =
-          shutdown?.flushDeadlineAt !== undefined
-            ? Math.max(0, shutdown.flushDeadlineAt - Date.now())
-            : AGY_PHYSICAL_SETTLEMENT_GRACE_MS
-        let settledInTime = false
-        let timer: ReturnType<typeof setTimeout> | undefined
         try {
-          await Promise.race([
-            Promise.allSettled(ownedRuns.map((handle) => handle.finalized)).then(() => {
-              settledInTime = true
-              return undefined
-            }),
-            new Promise<void>((resolve) => {
-              timer = setTimeout(resolve, waitMs)
-              timer.unref?.()
-            }),
-          ])
+          if (ownedRuns.length === 0) return
+          const waitMs =
+            shutdown?.flushDeadlineAt !== undefined
+              ? Math.max(0, shutdown.flushDeadlineAt - Date.now())
+              : AGY_PHYSICAL_SETTLEMENT_GRACE_MS
+          let settledInTime = false
+          let timer: ReturnType<typeof setTimeout> | undefined
+          try {
+            await Promise.race([
+              Promise.allSettled(ownedRuns.map((handle) => handle.finalized)).then(() => {
+                settledInTime = true
+                return undefined
+              }),
+              new Promise<void>((resolve) => {
+                timer = setTimeout(resolve, waitMs)
+                timer.unref?.()
+              }),
+            ])
+          } finally {
+            if (timer !== undefined) clearTimeout(timer)
+          }
+          if (!settledInTime) {
+            const lingering = ownedRuns.filter((handle) => this.runtime.ownedRunHandles.has(handle))
+            await Promise.allSettled(lingering.map((handle) => handle.forceCleanup()))
+            if (lingering.length > 0 && shutdown?.flushDeadlineAt !== undefined) {
+              throw new AgentExecutionError(
+                'agent_process_crash',
+                'Antigravity adapter disposal timed out waiting for active Run finalization.',
+                false,
+              )
+            }
+          }
         } finally {
-          if (timer !== undefined) clearTimeout(timer)
-        }
-        if (!settledInTime) {
-          const lingering = ownedRuns.filter((handle) => this.runtime.ownedRunHandles.has(handle))
-          await Promise.allSettled(lingering.map((handle) => handle.forceCleanup()))
-          if (lingering.length > 0 && shutdown?.flushDeadlineAt !== undefined) {
-            throw new AgentExecutionError(
-              'agent_process_crash',
-              'Antigravity adapter disposal timed out waiting for active Run finalization.',
-              false,
-            )
+          this.runtime.nativeEvidence.clear()
+          if (!this.evidenceCacheReleased) {
+            this.evidenceCacheReleased = true
+            this.runtime.evidenceCacheWork.release()
           }
         }
       }
@@ -763,6 +771,8 @@ export class AgyAgentAdapter implements AgentAdapter {
     }
   }
 
+  private evidenceCacheReleased = false
+
   private invalidateNonTerminalEvidence(runId: string, nativeSessionId: string | undefined): void {
     if (!nativeSessionId) return
     const key = this.evidenceKey(runId, nativeSessionId)
@@ -773,6 +783,7 @@ export class AgyAgentAdapter implements AgentAdapter {
   }
 
   private resizeEvidenceCacheWork(): void {
+    if (this.evidenceCacheReleased) return
     let totalBytes = 0
     for (const item of this.runtime.nativeEvidence.values()) {
       totalBytes += Buffer.byteLength(JSON.stringify(item), 'utf8') * 2 + 256
@@ -824,14 +835,16 @@ export class AgyAgentAdapter implements AgentAdapter {
                 source: fact.source,
               }
 
-    const key = this.evidenceKey(input.runId, nativeSessionId)
-    this.runtime.nativeEvidence.delete(key)
-    if (this.runtime.nativeEvidence.size >= AGY_EVIDENCE_CACHE_LIMIT) {
-      const oldest = this.runtime.nativeEvidence.keys().next().value
-      if (oldest !== undefined) this.runtime.nativeEvidence.delete(oldest)
+    if (!this.evidenceCacheReleased) {
+      const key = this.evidenceKey(input.runId, nativeSessionId)
+      this.runtime.nativeEvidence.delete(key)
+      if (this.runtime.nativeEvidence.size >= AGY_EVIDENCE_CACHE_LIMIT) {
+        const oldest = this.runtime.nativeEvidence.keys().next().value
+        if (oldest !== undefined) this.runtime.nativeEvidence.delete(oldest)
+      }
+      this.runtime.nativeEvidence.set(key, probeResult)
+      this.resizeEvidenceCacheWork()
     }
-    this.runtime.nativeEvidence.set(key, probeResult)
-    this.resizeEvidenceCacheWork()
     input.host?.lifecycle?.recordNativeEvidence?.(probeResult)
   }
 }

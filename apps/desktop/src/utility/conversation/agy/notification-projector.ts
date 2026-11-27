@@ -99,6 +99,9 @@ export class AgyNotificationProjector {
     getActiveCount: () => number
     adjustActiveCount: (delta: number) => void
     interactionControllers: Set<AbortController>
+    isExecutionStillOwned?: (() => boolean) | undefined
+    registerInteraction?: ((controller: AbortController) => void) | undefined
+    unregisterInteraction?: ((controller: AbortController) => void) | undefined
     pushEvent: (event: NormalizedAgentEvent) => void
     signal: AbortSignal
   }): Promise<void> {
@@ -125,6 +128,9 @@ export class AgyNotificationProjector {
       getActiveCount,
       adjustActiveCount,
       interactionControllers,
+      isExecutionStillOwned,
+      registerInteraction,
+      unregisterInteraction,
       pushEvent,
       signal,
     } = context
@@ -371,16 +377,19 @@ export class AgyNotificationProjector {
       !this.runtime.disposed &&
       !signal.aborted &&
       connection.isOpen &&
+      (isExecutionStillOwned ? isExecutionStillOwned() : true) &&
       (activeRun
-        ? !activeRun.promptReplyReceived &&
+        ? !activeRun.promptRpcCompleted &&
+          !activeRun.promptReplyReceived &&
           !activeRun.rootTerminal &&
           activeRun.turnEpoch === fenceEpoch &&
           activeRun.executorId === fenceExecutor &&
           activeRun.bindingGeneration === fenceGen &&
           !(
             validated.executionId !== undefined &&
-            activeRun.providerExecutionId !== undefined &&
-            activeRun.providerExecutionId !== validated.executionId
+            (activeRun.knownForeignExecutionIds.has(validated.executionId) ||
+              (activeRun.providerExecutionId !== undefined &&
+                activeRun.providerExecutionId !== validated.executionId))
           )
         : true)
 
@@ -396,7 +405,8 @@ export class AgyNotificationProjector {
     const endConnectionWait = connection.beginPermissionWait()
     const endLocalWait = permissionWait.begin()
     const interactionAbort = new AbortController()
-    interactionControllers.add(interactionAbort)
+    if (registerInteraction) registerInteraction(interactionAbort)
+    else interactionControllers.add(interactionAbort)
 
     try {
       if (!isFenceCurrent()) {
@@ -445,7 +455,8 @@ export class AgyNotificationProjector {
           .catch(() => undefined)
       }
     } finally {
-      interactionControllers.delete(interactionAbort)
+      if (unregisterInteraction) unregisterInteraction(interactionAbort)
+      else interactionControllers.delete(interactionAbort)
       endLocalWait()
       endConnectionWait()
       adjustActiveCount(-1)
@@ -466,6 +477,9 @@ export class AgyNotificationProjector {
     readOnlyNonInteractive: boolean
     permissionWait: NativePermissionWait
     interactionControllers: Set<AbortController>
+    isExecutionStillOwned?: (() => boolean) | undefined
+    registerInteraction?: ((controller: AbortController) => void) | undefined
+    unregisterInteraction?: ((controller: AbortController) => void) | undefined
     pushEvent: (event: NormalizedAgentEvent) => void
     signal: AbortSignal
   }): Promise<void> {
@@ -483,6 +497,9 @@ export class AgyNotificationProjector {
       readOnlyNonInteractive,
       permissionWait,
       interactionControllers,
+      isExecutionStillOwned,
+      registerInteraction,
+      unregisterInteraction,
       pushEvent,
       signal,
     } = context
@@ -534,23 +551,27 @@ export class AgyNotificationProjector {
       !this.runtime.disposed &&
       !signal.aborted &&
       connection.isOpen &&
+      (isExecutionStillOwned ? isExecutionStillOwned() : true) &&
       (activeRun
-        ? !activeRun.promptReplyReceived &&
+        ? !activeRun.promptRpcCompleted &&
+          !activeRun.promptReplyReceived &&
           !activeRun.rootTerminal &&
           activeRun.turnEpoch === fenceEpoch &&
           activeRun.executorId === fenceExecutor &&
           activeRun.bindingGeneration === fenceGen &&
           !(
             validated.executionId !== undefined &&
-            activeRun.providerExecutionId !== undefined &&
-            activeRun.providerExecutionId !== validated.executionId
+            (activeRun.knownForeignExecutionIds.has(validated.executionId) ||
+              (activeRun.providerExecutionId !== undefined &&
+                activeRun.providerExecutionId !== validated.executionId))
           )
         : true)
 
     const endConnectionWait = connection.beginPermissionWait()
     const endLocalWait = permissionWait.begin()
     const interactionAbort = new AbortController()
-    interactionControllers.add(interactionAbort)
+    if (registerInteraction) registerInteraction(interactionAbort)
+    else interactionControllers.add(interactionAbort)
 
     try {
       if (!isFenceCurrent()) {
@@ -592,7 +613,8 @@ export class AgyNotificationProjector {
         await connection.respond(rpcId, { action: 'cancel' }).catch(() => undefined)
       }
     } finally {
-      interactionControllers.delete(interactionAbort)
+      if (unregisterInteraction) unregisterInteraction(interactionAbort)
+      else interactionControllers.delete(interactionAbort)
       endLocalWait()
       endConnectionWait()
     }
@@ -638,6 +660,7 @@ export class AgyNotificationProjector {
     onObservedBackgroundTask: () => void
     onAcceptTurn: () => void
     canAdmitForegroundDelta: () => boolean
+    canAdmitWorkflowEffect?: (() => boolean) | undefined
     onForegroundDeltaDropped?: () => void
     reportUnknown: (reason: string) => void
     observeFiles: (evidence: NativeChanges) => void
@@ -836,7 +859,7 @@ export class AgyNotificationProjector {
       }
 
       if (sessionUpdate === 'agent_message_chunk') {
-        if (context.receivedAfterPromptReply) return
+        if (context.receivedAfterPromptReply || update.outOfTurn === true) return
         const content = isPlainObject(update.content) ? update.content : undefined
         const text = content && content.type === 'text' ? asString(content.text) : undefined
         if (!text) return
@@ -1276,10 +1299,15 @@ export class AgyNotificationProjector {
                   candidateText.trim().length > 0 &&
                   Buffer.byteLength(candidateText, 'utf8') <= COLLABORATION_PUBLISHED_PLAN_MAX_BYTES
                 ) {
-                  context.onBrainPlanCaptured(state.toolCallId, {
-                    nativeId: buildBoundedNativePlanId(activeRun.nativeSessionId, state.toolCallId),
-                    text: candidateText,
-                  })
+                  if (context.canAdmitWorkflowEffect ? context.canAdmitWorkflowEffect() : true) {
+                    context.onBrainPlanCaptured(state.toolCallId, {
+                      nativeId: buildBoundedNativePlanId(
+                        activeRun.nativeSessionId,
+                        state.toolCallId,
+                      ),
+                      text: candidateText,
+                    })
+                  }
                 } else if (state.explicitToolName === 'edit_file' && diffBlocks.length === 0) {
                   // `edit_file` without inline full `newText` diff block invalidates any earlier
                   // candidate so terminal cold `storageClient.inspectRun(..., { includePlan: true })`
@@ -1311,9 +1339,11 @@ export class AgyNotificationProjector {
         if (!state.completedEmitted && isTerminalToolStatus) {
           state.completedEmitted = true
 
-          // Promote staged Pact MCP tool outcomes strictly when this terminal transition was admitted.
+          // Promote staged Pact MCP tool outcomes strictly when this terminal transition was admitted
+          // and the Run lifecycle kernel still permits workflow/process-bound effects (S2-F2).
           if (
             !context.receivedAfterPromptReply &&
+            (context.canAdmitWorkflowEffect ? context.canAdmitWorkflowEffect() : true) &&
             state.status === 'completed' &&
             !state.invalidStatus &&
             !incomingStatusInvalid &&
@@ -1675,6 +1705,7 @@ export class AgyNotificationProjector {
       (spawnedTaskId ? activeRun.backgroundTaskAliases.get(spawnedTaskId) : undefined)
 
     if ((status === 'failed' || status === 'cancelled') && !spawnedTaskId) {
+      activeRun.pendingLaunchToolCallIds.delete(toolCallId)
       if (existingCanonical) {
         this.settleBackgroundTaskByAlias(activeRun, input, [toolCallId])
       }
@@ -1704,8 +1735,17 @@ export class AgyNotificationProjector {
         activeRun.backgroundTaskAliases.set(spawnedTaskId, canonicalKey)
       }
     }
-    if (status === 'completed' && activeRun.launchedCompletedToolCallIds.size < 256) {
-      activeRun.launchedCompletedToolCallIds.add(toolCallId)
+    if (status === 'completed') {
+      activeRun.pendingLaunchToolCallIds.delete(toolCallId)
+      if (activeRun.launchedCompletedToolCallIds.size < 256) {
+        activeRun.launchedCompletedToolCallIds.add(toolCallId)
+      }
+    } else if (
+      (status === 'pending' || status === 'in_progress') &&
+      !activeRun.launchedCompletedToolCallIds.has(toolCallId) &&
+      activeRun.pendingLaunchToolCallIds.size < 256
+    ) {
+      activeRun.pendingLaunchToolCallIds.add(toolCallId)
     }
     if (changed) {
       input.host?.effects?.backgroundWorkChanged?.()
@@ -1748,6 +1788,8 @@ export class AgyNotificationProjector {
     input: AgentRunInput
     activeRun: ActiveAgyRun
     observedBackgroundTask: boolean
+    onObservedBackgroundTask?: (() => void) | undefined
+    isOtherRunReplayingHistory?: (() => boolean) | undefined
     canSettleEffects: () => boolean
     isRootTerminal: () => boolean
     seenForegroundMessageIds: Set<string>
@@ -1901,22 +1943,44 @@ export class AgyNotificationProjector {
         }
       }
     } finally {
-      // Settle tracked background task completion states; AgyTurnBackgroundObserver drains
-      // any queued reports before reporting settled and releasing observer ownership/lease.
-      // Never let a non-out-of-turn replay of a completed background-task launch call settle
-      // the still-running background task (e.g., when another Run runs session/load).
-      const isReplayOfCompletedLaunchCall =
-        sessionUpdate === 'tool_call_update' &&
-        toolCallId !== undefined &&
-        activeRun.launchedCompletedToolCallIds.has(toolCallId) &&
-        !record.outOfTurn
-      const isTerminalTaskUpdate =
-        sessionUpdate === 'background_task_completed' ||
-        (sessionUpdate === 'tool_call_update' &&
-          !isReplayOfCompletedLaunchCall &&
-          (status === 'completed' || status === 'failed' || status === 'cancelled'))
-      if (isTerminalTaskUpdate) {
-        this.settleBackgroundTaskByAlias(activeRun, input, [taskId, toolCallId])
+      // S2-F5: Distinguish daemon launch ACKs (`rawOutput.taskId` / explicit daemon launch metadata)
+      // from session/load launch replays and genuine compact background task completions.
+      const isLaunchAckOrReplay =
+        sessionUpdate === 'tool_call_update' && !record.outOfTurn && record.isDaemonLaunchMetadata
+      if (isLaunchAckOrReplay) {
+        if (toolCallId !== undefined && !activeRun.launchedCompletedToolCallIds.has(toolCallId)) {
+          // First post-cutoff launch ACK: bind toolCallId <-> launchTaskId alias and keep task active
+          // (or remove if the launch itself failed without spawning a task).
+          this.trackBackgroundTaskLaunch(
+            activeRun,
+            input,
+            toolCallId,
+            record.launchTaskId ?? record.eventTaskId,
+            status ?? 'completed',
+            () => context.onObservedBackgroundTask?.(),
+            reportUnknown,
+          )
+        }
+      } else {
+        const isReplayOfCompletedLaunchCall =
+          sessionUpdate === 'tool_call_update' &&
+          !record.outOfTurn &&
+          record.eventTaskId === undefined &&
+          toolCallId !== undefined &&
+          activeRun.launchedCompletedToolCallIds.has(toolCallId) &&
+          Boolean(context.isOtherRunReplayingHistory?.())
+        const isTerminalTaskUpdate =
+          sessionUpdate === 'background_task_completed' ||
+          (sessionUpdate === 'tool_call_update' &&
+            !isReplayOfCompletedLaunchCall &&
+            (status === 'completed' || status === 'failed' || status === 'cancelled'))
+        if (isTerminalTaskUpdate) {
+          this.settleBackgroundTaskByAlias(activeRun, input, [
+            record.eventTaskId,
+            record.launchTaskId,
+            toolCallId,
+          ])
+        }
       }
     }
   }

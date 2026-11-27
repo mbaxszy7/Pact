@@ -5,7 +5,9 @@ import type {
   AgentCollaborationSourceReader,
   AgentPromptEnvelope,
   AgentPromptImage,
+  AgentRunInput,
   AgentSourceReadForm,
+  RunLifecycleKernel,
 } from '@pact/agent-runtime'
 import type {
   CollaborationTask,
@@ -13,6 +15,8 @@ import type {
   NativeInputField,
   NativePermissionRequest,
   NativeUserInputRequest,
+  NormalizedAgentEvent,
+  SessionPermissionMode,
 } from '@pact/contracts'
 
 import { agentPromptImageGroups } from '@pact/agent-runtime'
@@ -22,6 +26,9 @@ import {
   nativePermissionRequestSchema,
 } from '@pact/contracts'
 
+import type { AgyAcpConnection, AgyIngress } from '../agy-acp-connection'
+import type { NativePermissionWait } from '../native-permission-wait'
+import type { AgyAdapterRuntime } from './adapter-runtime'
 import type { AgyRunMcpServer } from './peer-mcp-server'
 
 import { AgentExecutionError } from '../agent-execution-error'
@@ -30,6 +37,7 @@ import { cutoffSourceNavigator } from '../frozen-source-reader'
 import { agyPromptInput, nativeImagePreparationBytes } from '../native-image-content'
 import { nativeApprovalDisplayFits, safeNativePermissionText } from '../native-permission-wait'
 import { PEER_ASSISTANCE_INSTRUCTIONS } from '../peer-assistance-policy'
+import { validateAgyFrame } from './frame-validator'
 import {
   AGY_PLAN_SUBMISSION_INSTRUCTIONS,
   AGY_READ_ONLY_STAGE_INSTRUCTIONS,
@@ -37,6 +45,8 @@ import {
   isPlainObject,
   type AcpConfigOptionEntry,
   type AcpSessionDescriptor,
+  type ActiveAgyRun,
+  type AgyToolState,
 } from './types'
 
 export function parseAcpSessionDescriptor(
@@ -548,4 +558,315 @@ export async function prepareAgyTurnPromptBlocks(params: {
     .join('\n')
     .trim()
   return { promptBlocks, expectedFullPromptText }
+}
+
+export interface AgyTurnInteractionRouterHost {
+  readonly runtime: AgyAdapterRuntime
+  readonly kernel: RunLifecycleKernel
+  readonly input: AgentRunInput
+  readonly mcpServer: AgyRunMcpServer
+  readonly tools: Map<string, AgyToolState>
+  readonly approvedBrainPlanCalls: Map<
+    string,
+    { readonly toolName: string; readonly args: Record<string, unknown> }
+  >
+  readonly onBrainPlanWriteApproved: (toolCallId: string) => void
+  readonly readOnlyStage: boolean
+  readonly planModeStage: boolean
+  readonly askOnlyStage: boolean
+  readonly readOnlyNonInteractive: boolean
+  readonly permissionMode: SessionPermissionMode
+  readonly signal: AbortSignal
+  readonly getActiveRun: () => ActiveAgyRun | undefined
+  readonly getResolvedSessionId: () => string | undefined
+  readonly getActiveExecutorId: () => string
+  readonly isRootFirstByteWritten: () => boolean
+  readonly isRootTerminal: () => boolean
+  readonly isReplayingHistory: () => boolean
+  readonly getPromptCutoffSeq: () => number | undefined
+  readonly pushPendingEvent: (event: NormalizedAgentEvent) => void
+}
+
+/**
+ * Deep module owning ordered ACP server-request validation, permission & elicitation
+ * routing, and dynamic foreign-execution revocation for pending interactions (S2-F2/S2-F3).
+ */
+export class AgyTurnInteractionRouter {
+  readonly interactionControllers = new Set<AbortController>()
+  private readonly trackedInteractions = new Map<
+    AbortController,
+    { readonly executionId?: string | undefined; readonly arrivedUnscoped: boolean }
+  >()
+  private activePermissionRequests = 0
+
+  constructor(private readonly host: AgyTurnInteractionRouterHost) {}
+
+  isExecutionOwned(meta: {
+    readonly executionId?: string | undefined
+    readonly arrivedUnscoped: boolean
+  }): boolean {
+    const activeRun = this.host.getActiveRun()
+    if (!activeRun) return true
+    if (meta.executionId !== undefined) {
+      if (activeRun.knownForeignExecutionIds.has(meta.executionId)) return false
+      if (
+        activeRun.providerExecutionId !== undefined &&
+        activeRun.providerExecutionId !== meta.executionId
+      ) {
+        return false
+      }
+    }
+    if (
+      meta.arrivedUnscoped &&
+      activeRun.providerExecutionId === undefined &&
+      activeRun.foreignTurnActiveUntilRootBound
+    ) {
+      return false
+    }
+    return true
+  }
+
+  cancelDisowned(): void {
+    for (const [ctrl, meta] of this.trackedInteractions) {
+      if (!this.isExecutionOwned(meta)) {
+        ctrl.abort()
+      }
+    }
+  }
+
+  abortAll(): void {
+    for (const ctrl of this.interactionControllers) {
+      ctrl.abort()
+    }
+    this.interactionControllers.clear()
+    this.trackedInteractions.clear()
+  }
+
+  handleOrderedServerRequest(params: {
+    readonly connection: AgyAcpConnection
+    readonly canonicalCwd: string
+    readonly permissionWait: NativePermissionWait
+    readonly req: Extract<AgyIngress, { kind: 'server_request' }>
+  }): boolean {
+    const { connection, canonicalCwd, permissionWait, req } = params
+    const { method, rpcId, message } = req
+    if (method !== 'session/request_permission' && method !== 'elicitation/create') {
+      void connection
+        .respondError(rpcId, 'Unsupported Antigravity ACP server request.', -32_601)
+        .catch(() => undefined)
+      return false
+    }
+    const rawParams = Reflect.get(message, 'params')
+    const paramsObjectValid = isPlainObject(rawParams)
+    const reqParams = paramsObjectValid ? rawParams : {}
+    const activeRun = this.host.getActiveRun()
+    const promptCutoffSeq = this.host.getPromptCutoffSeq()
+
+    if (
+      activeRun?.promptRpcCompleted ||
+      activeRun?.promptReplyReceived ||
+      (promptCutoffSeq !== undefined && req.seq > promptCutoffSeq)
+    ) {
+      if (method === 'session/request_permission') {
+        const rejectOnce = findRejectOnceOptionId(reqParams.options)
+        void connection
+          .respond(
+            rpcId,
+            rejectOnce
+              ? { outcome: { outcome: 'selected', optionId: rejectOnce } }
+              : { outcome: { outcome: 'cancelled' } },
+          )
+          .catch(() => undefined)
+      } else {
+        void connection.respond(rpcId, { action: 'cancel' }).catch(() => undefined)
+      }
+      return true
+    }
+
+    const resolvedSessionId = this.host.getResolvedSessionId()
+    const validated = validateAgyFrame(
+      req,
+      resolvedSessionId,
+      this.host.mcpServer.pinnedTrajectory,
+      this.host.mcpServer.minStepIdx,
+    )
+    const unscopedForeign = Boolean(
+      activeRun &&
+      activeRun.providerExecutionId === undefined &&
+      activeRun.foreignTurnActiveUntilRootBound &&
+      validated.executionId === undefined,
+    )
+    const identityContradicted =
+      validated.hasForeignOrInvalidSessionMeta ||
+      validated.executionIdInvalid ||
+      validated.rootEvidenceContradicted ||
+      unscopedForeign ||
+      (validated.executionId !== undefined &&
+        activeRun?.providerExecutionId !== undefined &&
+        validated.executionId !== activeRun.providerExecutionId) ||
+      (validated.executionId !== undefined &&
+        Boolean(activeRun?.knownForeignExecutionIds.has(validated.executionId)))
+
+    const permRequestInvalid =
+      method === 'session/request_permission' &&
+      (!paramsObjectValid ||
+        identityContradicted ||
+        validated.tokens.hasInvalidToken ||
+        validated.tokens.hasConflictingTokens ||
+        validated.toolCallIdInvalid ||
+        validated.argsEvidence.kind === 'invalid_or_conflict' ||
+        (validated.statusPresent &&
+          (validated.statusInvalid ||
+            validated.status === 'completed' ||
+            validated.status === 'failed' ||
+            validated.status === 'cancelled')))
+    const elicitRequestInvalid =
+      method === 'elicitation/create' &&
+      (!paramsObjectValid ||
+        identityContradicted ||
+        validated.tokens.hasInvalidToken ||
+        validated.tokens.hasConflictingTokens)
+
+    let preBuiltPermissionCard: ReturnType<typeof buildAgyPermissionCard> | undefined
+    let permissionCardValid = false
+    if (method === 'session/request_permission' && !permRequestInvalid) {
+      try {
+        preBuiltPermissionCard = buildAgyPermissionCard(reqParams, canonicalCwd)
+        permissionCardValid = true
+      } catch {
+        permissionCardValid = false
+      }
+    }
+
+    let preParsedElicitationRequest: NativeUserInputRequest | undefined
+    let elicitationPayloadValid = false
+    let elicitationParseErrorMessage: string | undefined
+    if (method === 'elicitation/create' && !elicitRequestInvalid) {
+      try {
+        preParsedElicitationRequest = agyElicitationRequest(reqParams)
+        elicitationPayloadValid = true
+      } catch (error) {
+        elicitationPayloadValid = false
+        elicitationParseErrorMessage =
+          error instanceof Error ? error.message : 'Unsupported Antigravity elicitation schema.'
+      }
+    }
+
+    const requestValidForAcceptance =
+      method === 'session/request_permission'
+        ? !permRequestInvalid && permissionCardValid
+        : !elicitRequestInvalid && elicitationPayloadValid
+
+    if (
+      requestValidForAcceptance &&
+      activeRun &&
+      this.host.isRootFirstByteWritten() &&
+      !activeRun.turnAccepted &&
+      !activeRun.promptReplyReceived &&
+      !this.host.isRootTerminal() &&
+      !this.host.isReplayingHistory()
+    ) {
+      const executorId = this.host.getActiveExecutorId()
+      activeRun.turnAccepted = true
+      this.host.kernel.recordDispatch('accepted', activeRun.nativeSessionId, executorId)
+      this.host.runtime.recordEvidence(
+        this.host.input,
+        activeRun.nativeSessionId,
+        executorId,
+        { kind: 'running', source: 'live_runtime' },
+        activeRun.nativeTurnId,
+      )
+      this.host.pushPendingEvent({
+        agentId: 'agy',
+        type: 'turn.started',
+        turnId: this.host.input.runId,
+      })
+    }
+
+    const interactionMeta = {
+      executionId: validated.executionId,
+      arrivedUnscoped: validated.executionId === undefined,
+    }
+    const registerInteraction = (ctrl: AbortController): void => {
+      this.interactionControllers.add(ctrl)
+      this.trackedInteractions.set(ctrl, interactionMeta)
+    }
+    const unregisterInteraction = (ctrl: AbortController): void => {
+      this.interactionControllers.delete(ctrl)
+      this.trackedInteractions.delete(ctrl)
+    }
+    const isExecutionStillOwned = (): boolean => this.isExecutionOwned(interactionMeta)
+
+    if (method === 'session/request_permission') {
+      this.host.runtime.projector
+        .handlePermissionRequest({
+          connection,
+          validated,
+          rpcId,
+          params: reqParams,
+          paramsObjectValid,
+          unscopedDuringForeignTurn: unscopedForeign,
+          preBuiltCard: preBuiltPermissionCard,
+          cwd: canonicalCwd,
+          input: this.host.input,
+          activeRun,
+          getSessionId: this.host.getResolvedSessionId,
+          mcpServer: this.host.mcpServer,
+          tools: this.host.tools,
+          approvedBrainPlanCalls: this.host.approvedBrainPlanCalls,
+          onBrainPlanWriteApproved: this.host.onBrainPlanWriteApproved,
+          readOnlyStage: this.host.readOnlyStage,
+          planModeStage: this.host.planModeStage,
+          permissionMode: this.host.permissionMode,
+          permissionWait,
+          getActiveCount: () => this.activePermissionRequests,
+          adjustActiveCount: (delta) => {
+            this.activePermissionRequests += delta
+          },
+          interactionControllers: this.interactionControllers,
+          isExecutionStillOwned,
+          registerInteraction,
+          unregisterInteraction,
+          pushEvent: this.host.pushPendingEvent,
+          signal: this.host.signal,
+        })
+        .catch(() => undefined)
+      return true
+    }
+
+    if (!elicitRequestInvalid && !elicitationPayloadValid) {
+      void connection
+        .respondError(
+          rpcId,
+          elicitationParseErrorMessage ?? 'Unsupported Antigravity elicitation schema.',
+          -32_602,
+        )
+        .catch(() => undefined)
+      return true
+    }
+
+    this.host.runtime.projector
+      .handleElicitationRequest({
+        connection,
+        validated,
+        rpcId,
+        params: reqParams,
+        paramsObjectValid,
+        unscopedDuringForeignTurn: unscopedForeign,
+        preParsedRequest: preParsedElicitationRequest,
+        input: this.host.input,
+        activeRun,
+        askOnlyStage: this.host.askOnlyStage,
+        readOnlyNonInteractive: this.host.readOnlyNonInteractive,
+        permissionWait,
+        interactionControllers: this.interactionControllers,
+        isExecutionStillOwned,
+        registerInteraction,
+        unregisterInteraction,
+        pushEvent: this.host.pushPendingEvent,
+        signal: this.host.signal,
+      })
+      .catch(() => undefined)
+    return true
+  }
 }

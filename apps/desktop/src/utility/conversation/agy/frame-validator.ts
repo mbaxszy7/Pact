@@ -1239,6 +1239,9 @@ export interface CompactPostCutoffBackgroundRecord {
   readonly status?: string | undefined
   readonly outOfTurn: boolean
   readonly taskId?: string | undefined
+  readonly eventTaskId?: string | undefined
+  readonly launchTaskId?: string | undefined
+  readonly isDaemonLaunchMetadata: boolean
   readonly toolCallId?: string | undefined
   readonly explicitMsgId?: string | undefined
   readonly rawText?: string | undefined
@@ -1253,9 +1256,21 @@ export function buildCompactPostCutoffBackgroundRecord(
   const status = asString(update.status)
   const outOfTurn = update.outOfTurn === true
   const rawOutput = isPlainObject(update.rawOutput) ? update.rawOutput : undefined
-  const taskId =
-    asString(update.taskId ?? update.backgroundTaskId) ??
-    (rawOutput ? asString(rawOutput.taskId ?? rawOutput.backgroundTaskId) : undefined)
+  const rawArgs = isPlainObject(update.args)
+    ? update.args
+    : isPlainObject(update.rawInput)
+      ? update.rawInput
+      : undefined
+  const toolName = asString(update.name ?? update.toolName)
+  const eventTaskId = asString(update.taskId ?? update.backgroundTaskId)
+  const launchTaskId = rawOutput
+    ? asString(rawOutput.taskId ?? rawOutput.backgroundTaskId)
+    : undefined
+  const taskId = eventTaskId ?? launchTaskId
+  const isDaemonLaunchMetadata =
+    launchTaskId !== undefined ||
+    (toolName === 'run_command' && rawArgs?.IsDaemon === true) ||
+    toolName === 'schedule'
   const toolCallId = asString(update.toolCallId ?? update.id)
   const explicitMsgId = asString(update.messageId ?? update.stepId)
   const isOutOfTurnCompletion =
@@ -1277,6 +1292,9 @@ export function buildCompactPostCutoffBackgroundRecord(
     ...(status !== undefined ? { status } : {}),
     outOfTurn,
     ...(taskId !== undefined ? { taskId } : {}),
+    ...(eventTaskId !== undefined ? { eventTaskId } : {}),
+    ...(launchTaskId !== undefined ? { launchTaskId } : {}),
+    isDaemonLaunchMetadata,
     ...(toolCallId !== undefined ? { toolCallId } : {}),
     ...(explicitMsgId !== undefined ? { explicitMsgId } : {}),
     ...(rawText !== undefined ? { rawText } : {}),

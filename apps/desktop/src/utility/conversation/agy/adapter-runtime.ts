@@ -60,6 +60,7 @@ export interface AgyAdapterRuntime {
   readonly sessionModes: Map<string, SessionModeState>
   readonly nativeRebuildReceipts: Map<string, AgyRebuildReceipt>
   readonly activeRuns: Map<string, ActiveAgyRun>
+  readonly replayingSessions: Map<string, number>
   readonly ownedRunHandles: Set<AgyOwnedRunHandle>
   readonly skillProbeOwner: AgySkillProbeOwner
   ownedForkFiles: NativeForkFiles | undefined

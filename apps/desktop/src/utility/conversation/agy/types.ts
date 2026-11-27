@@ -423,7 +423,9 @@ export interface ActiveAgyRun {
   readonly connection: AgyAcpConnection
   readonly turnEpoch: number
   turnAccepted: boolean
+  promptRpcCompleted: boolean
   promptReplyReceived: boolean
+  replayingHistory: boolean
   foregroundReleased: boolean
   rootReleasing: boolean
   rootTerminal: boolean
@@ -434,8 +436,10 @@ export interface ActiveAgyRun {
   readonly rootExecutionWaiters: Set<() => void>
   readonly activeBackgroundTasks: Set<string>
   readonly backgroundTaskAliases: Map<string, string>
+  readonly pendingLaunchToolCallIds: Set<string>
   readonly launchedCompletedToolCallIds: Set<string>
   backgroundUnconfirmed: boolean
+  reportUnknown?: ((reason: string) => void) | undefined
   readonly observation: AbortController
   readonly retireSourceReader: (() => void) | undefined
   isSteerLeaseOpen: () => boolean

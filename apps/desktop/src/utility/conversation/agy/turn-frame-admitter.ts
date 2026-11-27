@@ -10,28 +10,176 @@ import { recheckValidatedFrameAgainstRootBoundary } from './frame-validator'
 import {
   AGY_MAX_FOREIGN_EXECUTION_IDS,
   AGY_MAX_FOREIGN_EXECUTION_ID_BYTES,
+  AGY_MAX_PENDING_EVENTS,
+  AGY_MAX_PENDING_EVENT_BYTES,
+  AGY_MAX_PRE_PROMPT_REPLAY_TOOL_IDS,
   AGY_MAX_STAGED_PRE_BIND_BYTES,
   AGY_MAX_STAGED_PRE_BIND_FRAMES,
   asString,
   estimateJsonPayloadBytes,
+  estimateNormalizedEventBytes,
   extractUserChunkPactIdentity,
   isPlainObject,
   type ActiveAgyRun,
   type ValidatedAgyFrame,
 } from './types'
 
+const ORDER_SENSITIVE_UPDATES = new Set<string>([
+  'agent_message_chunk',
+  'agent_thought_chunk',
+  'tool_call',
+  'tool_call_update',
+  'background_task_completed',
+])
+
+/** Bounded foreground event queue with backpressure & control-drain discard mode. */
+export class AgyPendingEventQueue {
+  private readonly entries: Array<{
+    readonly event: NormalizedAgentEvent
+    readonly bytes: number
+  }> = []
+  private bytes = 0
+  private discardAllFlag = false
+  wakeEventLoop: (() => void) | undefined
+  wakePumpForBackpressure: (() => void) | undefined
+
+  constructor(private readonly getReservation: () => NativeMemoryReservation | undefined) {}
+
+  get length(): number {
+    return this.entries.length
+  }
+
+  get discarding(): boolean {
+    return this.discardAllFlag
+  }
+
+  enableDiscardMode(): void {
+    this.discardAllFlag = true
+    this.clear()
+  }
+
+  notifyEventLoop(): void {
+    const wake = this.wakeEventLoop
+    this.wakeEventLoop = undefined
+    wake?.()
+  }
+
+  notifyPumpForBackpressure(): void {
+    const wake = this.wakePumpForBackpressure
+    this.wakePumpForBackpressure = undefined
+    wake?.()
+  }
+
+  isAtSoftCap(): boolean {
+    if (this.discardAllFlag) return false
+    return (
+      this.entries.length >= AGY_MAX_PENDING_EVENTS || this.bytes >= AGY_MAX_PENDING_EVENT_BYTES
+    )
+  }
+
+  push(ev: NormalizedAgentEvent): void {
+    if (this.discardAllFlag) return
+    const evBytes = estimateNormalizedEventBytes(ev)
+    const nextBytes = this.bytes + evBytes
+    if (
+      this.entries.length >= AGY_MAX_PENDING_EVENTS * 2 ||
+      nextBytes > AGY_MAX_PENDING_EVENT_BYTES * 2
+    ) {
+      throw new AgentExecutionError(
+        'response_too_large',
+        'Antigravity pending event queue exceeded working-memory budget.',
+        false,
+      )
+    }
+    this.getReservation()?.resize(nextBytes)
+    this.bytes = nextBytes
+    this.entries.push({ event: ev, bytes: evBytes })
+    this.notifyEventLoop()
+  }
+
+  shift(): NormalizedAgentEvent | undefined {
+    const entry = this.entries.shift()
+    if (!entry) return undefined
+    this.bytes = Math.max(0, this.bytes - entry.bytes)
+    this.getReservation()?.resize(this.bytes)
+    if (!this.isAtSoftCap()) {
+      this.notifyPumpForBackpressure()
+    }
+    return entry.event
+  }
+
+  clear(): void {
+    this.entries.length = 0
+    this.bytes = 0
+    this.getReservation()?.resize(0)
+    this.notifyPumpForBackpressure()
+  }
+}
+
+/** Tracks pre-prompt `session/load` replayed tool IDs with fail-closed overflow latching (S2-F9). */
+export class AgyPrePromptReplayTracker {
+  private readonly replayedToolCallIds = new Set<string>()
+  private coverageIncomplete = false
+
+  get isIncomplete(): boolean {
+    return this.coverageIncomplete
+  }
+
+  has(toolCallId: string): boolean {
+    return this.replayedToolCallIds.has(toolCallId)
+  }
+
+  observeNotification(
+    note: object,
+    targetSessionId: string,
+    observeTitle: (note: object, targetSessionId: string) => void,
+  ): void {
+    observeTitle(note, targetSessionId)
+    if (!isPlainObject(note) || asString(Reflect.get(note, 'method')) !== 'session/update') {
+      return
+    }
+    const params = Reflect.get(note, 'params')
+    if (!isPlainObject(params)) return
+    const sid = asString(params.sessionId ?? params.session_id)
+    if (sid !== undefined && sid !== targetSessionId) return
+    const update = params.update
+    if (!isPlainObject(update)) return
+    const sessionUpdate = asString(update.sessionUpdate)
+    if (sessionUpdate !== 'tool_call' && sessionUpdate !== 'tool_call_update') return
+    const toolCallId = asString(update.toolCallId ?? update.id)
+    if (!toolCallId || toolCallId.length > 1024) return
+    if (!this.replayedToolCallIds.has(toolCallId)) {
+      if (this.replayedToolCallIds.size >= AGY_MAX_PRE_PROMPT_REPLAY_TOOL_IDS) {
+        this.coverageIncomplete = true
+        const oldest = this.replayedToolCallIds.values().next().value
+        if (oldest !== undefined) this.replayedToolCallIds.delete(oldest)
+      }
+      this.replayedToolCallIds.add(toolCallId)
+    }
+  }
+
+  clear(): void {
+    this.replayedToolCallIds.clear()
+  }
+}
+
 export interface AgyTurnFrameAdmitterHost {
   readonly runtime: AgyAdapterRuntime
   readonly input: AgentRunInput
   readonly activeRun: ActiveAgyRun
   readonly mcpServer: AgyRunMcpServer
-  readonly prePromptReplayedToolCallIds: ReadonlySet<string>
+  readonly prePromptReplay: AgyPrePromptReplayTracker
+  readonly hasCurrentRunTool: (toolCallId: string) => boolean
   readonly expectedFullPromptText: string
   readonly expectedPromptContent: string
   readonly getStagedPreBindReservation: () => NativeMemoryReservation | undefined
   readonly releaseStagedPreBindReservation: () => void
   readonly getForeignExecIdsReservation: () => NativeMemoryReservation | undefined
   readonly releaseForeignExecIdsReservation: () => void
+  readonly onExecutionOwnershipChanged?: (() => void) | undefined
+  readonly onOwnedOutOfTurnUpdate?:
+    | ((params: Record<string, unknown>, update: Record<string, unknown>) => void)
+    | undefined
   readonly projectValidatedFrame: (validated: ValidatedAgyFrame) => Generator<NormalizedAgentEvent>
 }
 
@@ -65,6 +213,7 @@ export class AgyTurnFrameAdmitter {
     this.host.getForeignExecIdsReservation()?.resize(nextBytes)
     this.foreignExecIdsBytes = nextBytes
     activeRun.knownForeignExecutionIds.add(execId)
+    this.host.onExecutionOwnershipChanged?.()
   }
 
   clearStagedPreBindNotifications(): void {
@@ -77,18 +226,48 @@ export class AgyTurnFrameAdmitter {
 
   /**
    * Idempotent teardown shared by normal iterator exit and emergency forceCleanup:
-   * empties staged queues and releases both working-memory reservations at most once.
+   * empties staged queues and releases staged reservation; optionally preserves
+   * `foreignExecIdsMemoryReservation` while retained background observation still reads
+   * `activeRun.knownForeignExecutionIds` (released in `cleanupRetained`).
    */
-  close(): void {
+  close(options?: { readonly keepForeignExecReservation?: boolean | undefined }): void {
     if (this.closedFlag) return
     this.closedFlag = true
     this.host.activeRun.stagedPreBindNotifications.length = 0
     this.stagedPreBindBytes = 0
-    this.foreignExecIdsBytes = 0
     try {
       this.host.releaseStagedPreBindReservation()
     } finally {
-      this.host.releaseForeignExecIdsReservation()
+      if (!options?.keepForeignExecReservation) {
+        this.foreignExecIdsBytes = 0
+        this.host.releaseForeignExecIdsReservation()
+      }
+    }
+  }
+
+  private *drainResolvedPreBindPrefix(): Generator<NormalizedAgentEvent> {
+    if (this.closedFlag) return
+    const { activeRun, mcpServer, projectValidatedFrame } = this.host
+    while (!this.closedFlag && activeRun.stagedPreBindNotifications.length > 0) {
+      const head = activeRun.stagedPreBindNotifications[0]!
+      const headExecId = head.frame.executionId
+      if (headExecId !== undefined) {
+        if (!activeRun.knownForeignExecutionIds.has(headExecId)) break
+        activeRun.stagedPreBindNotifications.shift()
+        this.stagedPreBindBytes = Math.max(0, this.stagedPreBindBytes - head.bytes)
+        this.host.getStagedPreBindReservation()?.resize(this.stagedPreBindBytes)
+        continue
+      }
+      activeRun.stagedPreBindNotifications.shift()
+      this.stagedPreBindBytes = Math.max(0, this.stagedPreBindBytes - head.bytes)
+      this.host.getStagedPreBindReservation()?.resize(this.stagedPreBindBytes)
+      if (head.arrivedDuringForeignTurn) continue
+      const rechecked = recheckValidatedFrameAgainstRootBoundary(
+        head.frame,
+        mcpServer.pinnedTrajectory,
+        mcpServer.minStepIdx,
+      )
+      yield* projectValidatedFrame(rechecked)
     }
   }
 
@@ -96,15 +275,24 @@ export class AgyTurnFrameAdmitter {
     if (this.closedFlag) return
     const { activeRun, mcpServer, projectValidatedFrame } = this.host
     const boundExecId = activeRun.providerExecutionId
-    if (!boundExecId || activeRun.stagedPreBindNotifications.length === 0) return
+    if (!boundExecId) {
+      yield* this.drainResolvedPreBindPrefix()
+      return
+    }
+    if (activeRun.stagedPreBindNotifications.length === 0) return
     while (!this.closedFlag && activeRun.stagedPreBindNotifications.length > 0) {
       const staged = activeRun.stagedPreBindNotifications.shift()!
       this.stagedPreBindBytes = Math.max(0, this.stagedPreBindBytes - staged.bytes)
       this.host.getStagedPreBindReservation()?.resize(this.stagedPreBindBytes)
-      // Retain arrival-time attribution: execution-less frames observed while a foreign turn
-      // was active, or frames carrying a different execution_id, never replay into this root.
-      if (staged.frame.executionId !== boundExecId) continue
-      if (staged.arrivedDuringForeignTurn && staged.frame.executionId === undefined) continue
+      // Retain arrival-time attribution while preserving ACP seq order across mixed IDs (S2-F8):
+      // frames carrying a different execution_id or unattributed frames observed during a foreign
+      // turn never replay into this root; matching execution_id and clean unattributed frames replay in seq order.
+      if (staged.frame.executionId !== undefined && staged.frame.executionId !== boundExecId) {
+        continue
+      }
+      if (staged.frame.executionId === undefined && staged.arrivedDuringForeignTurn) {
+        continue
+      }
       const rechecked = recheckValidatedFrameAgainstRootBoundary(
         staged.frame,
         mcpServer.pinnedTrajectory,
@@ -123,15 +311,52 @@ export class AgyTurnFrameAdmitter {
       const execId = staged.frame.executionId
       if (execId !== undefined && activeRun.knownForeignExecutionIds.has(execId)) return false
       if (staged.arrivedDuringForeignTurn) return false
-      const kind = staged.frame.sessionUpdate
       return (
-        kind === 'agent_message_chunk' ||
-        kind === 'agent_thought_chunk' ||
-        kind === 'tool_call' ||
-        kind === 'tool_call_update' ||
-        kind === 'background_task_completed'
+        staged.frame.sessionUpdate !== undefined &&
+        ORDER_SENSITIVE_UPDATES.has(staged.frame.sessionUpdate)
       )
     })
+  }
+
+  private handleOutOfTurnForegroundFrame(
+    validated: ValidatedAgyFrame,
+    update: Record<string, unknown>,
+  ): void {
+    const { activeRun, runtime } = this.host
+    const rawParams = Reflect.get(validated.message, 'params')
+    const rawOutput = isPlainObject(update.rawOutput) ? update.rawOutput : undefined
+    const taskId =
+      asString(update.taskId ?? update.backgroundTaskId) ??
+      (rawOutput ? asString(rawOutput.taskId ?? rawOutput.backgroundTaskId) : undefined)
+    const toolCallId = validated.toolCallIdInvalid ? undefined : validated.toolCallId
+    const explicitlyOwnedByCurrentRun =
+      (taskId !== undefined &&
+        (activeRun.backgroundTaskAliases.has(taskId) ||
+          activeRun.activeBackgroundTasks.has(taskId))) ||
+      (toolCallId !== undefined &&
+        (activeRun.backgroundTaskAliases.has(toolCallId) ||
+          activeRun.activeBackgroundTasks.has(toolCallId))) ||
+      (validated.executionId !== undefined &&
+        activeRun.providerExecutionId !== undefined &&
+        validated.executionId === activeRun.providerExecutionId)
+    if (explicitlyOwnedByCurrentRun && isPlainObject(rawParams)) {
+      this.host.onOwnedOutOfTurnUpdate?.(rawParams, update)
+      return
+    }
+    // Unattributable outOfTurn frame cannot enter this foreground root answer; mark any
+    // retained background runs on the same session unconfirmed because attribution was lost.
+    for (const other of runtime.activeRuns.values()) {
+      if (
+        other !== activeRun &&
+        other.nativeSessionId === activeRun.nativeSessionId &&
+        other.activeBackgroundTasks.size > 0
+      ) {
+        other.backgroundUnconfirmed = true
+        other.reportUnknown?.(
+          'Antigravity received an unattributable out-of-turn background update while another Run was active on the same session.',
+        )
+      }
+    }
   }
 
   *admitAndProject(validated: ValidatedAgyFrame): Generator<NormalizedAgentEvent> {
@@ -141,19 +366,26 @@ export class AgyTurnFrameAdmitter {
       input,
       activeRun,
       mcpServer,
-      prePromptReplayedToolCallIds,
+      prePromptReplay,
+      hasCurrentRunTool,
       expectedFullPromptText,
       expectedPromptContent,
       projectValidatedFrame,
     } = this.host
 
-    if (activeRun.providerExecutionId && activeRun.stagedPreBindNotifications.length > 0) {
+    if (activeRun.stagedPreBindNotifications.length > 0) {
       yield* this.drainStagedPreBindNotes()
     }
     if (validated.method !== 'session/update') return
     const update = validated.payload
     const sessionUpdate = validated.sessionUpdate
     if (!update || !sessionUpdate) return
+
+    // Explicit outOfTurn frames are background reports/task completions, NEVER foreground root answers (S2-F4).
+    if (update.outOfTurn === true) {
+      this.handleOutOfTurnForegroundFrame(validated, update)
+      return
+    }
 
     const updateExecId = validated.executionId
     // Run contradiction guard BEFORE any execution binding, foreign-ID insertion,
@@ -184,10 +416,24 @@ export class AgyTurnFrameAdmitter {
       activeRun.resumedExistingSession &&
       (sessionUpdate === 'tool_call' || sessionUpdate === 'tool_call_update') &&
       !validated.toolCallIdInvalid &&
-      validated.toolCallId !== undefined &&
-      prePromptReplayedToolCallIds.has(validated.toolCallId)
+      validated.toolCallId !== undefined
     ) {
-      return
+      if (prePromptReplay.has(validated.toolCallId)) {
+        return
+      }
+      // S2-F9: When pre-prompt replay history exceeded 4,096 distinct tool IDs, evicted historical
+      // split completions without verified current-Run identity cannot mutate current WorkspaceChanges.
+      if (prePromptReplay.isIncomplete && sessionUpdate === 'tool_call_update') {
+        const hasVerifiedCurrentIdentity =
+          updateExecId !== undefined ||
+          (validated.stepIdx !== undefined &&
+            mcpServer.minStepIdx !== undefined &&
+            validated.stepIdx >= mcpServer.minStepIdx) ||
+          hasCurrentRunTool(validated.toolCallId)
+        if (!hasVerifiedCurrentIdentity) {
+          return
+        }
+      }
     }
 
     const updateMeta = Reflect.get(update, '_meta')
@@ -242,6 +488,7 @@ export class AgyTurnFrameAdmitter {
         activeRun.foreignTurnActiveUntilRootBound = false
         if (updateExecId && (hasExactHostRunReceipt || hasExactFullPromptProof)) {
           runtime.projector.bindRootExecutionId(activeRun, input, updateExecId)
+          this.host.onExecutionOwnershipChanged?.()
           yield* this.drainStagedPreBindNotes()
         }
         yield* projectValidatedFrame(validated)
@@ -251,6 +498,10 @@ export class AgyTurnFrameAdmitter {
         this.addKnownForeignExecutionId(updateExecId)
       }
       activeRun.foreignTurnActiveUntilRootBound = true
+      this.host.onExecutionOwnershipChanged?.()
+      if (activeRun.stagedPreBindNotifications.length > 0) {
+        yield* this.drainResolvedPreBindPrefix()
+      }
       return
     }
 
@@ -264,6 +515,7 @@ export class AgyTurnFrameAdmitter {
 
     if (canBindFromInitialUpdate) {
       runtime.projector.bindRootExecutionId(activeRun, input, updateExecId)
+      this.host.onExecutionOwnershipChanged?.()
       yield* this.drainStagedPreBindNotes()
       yield* projectValidatedFrame(validated)
       return
@@ -271,7 +523,11 @@ export class AgyTurnFrameAdmitter {
 
     if (activeRun.foreignTurnActiveUntilRootBound && updateExecId === undefined) return
 
-    if (updateExecId !== undefined) {
+    // S2-F8: Stage both candidate execution_id frames AND subsequent order-sensitive frames
+    // behind any pending staged frame so mixed-ID chunks strictly preserve ACP seq order.
+    const mustStageToPreserveOrder =
+      activeRun.stagedPreBindNotifications.length > 0 && ORDER_SENSITIVE_UPDATES.has(sessionUpdate)
+    if (updateExecId !== undefined || mustStageToPreserveOrder) {
       const frameBytes = estimateJsonPayloadBytes(validated.message, AGY_MAX_STAGED_PRE_BIND_BYTES)
       const nextStagedBytes = this.stagedPreBindBytes + frameBytes
       if (

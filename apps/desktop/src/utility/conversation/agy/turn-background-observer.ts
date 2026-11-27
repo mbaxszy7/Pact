@@ -5,7 +5,6 @@ import type { NativeMemoryReservation } from '../native-working-memory'
 import type { AgyAdapterRuntime } from './adapter-runtime'
 import type { AgyRunMcpServer } from './peer-mcp-server'
 
-import { nativeFileChangesSettled } from '../native-file-changes'
 import {
   buildCompactPostCutoffBackgroundRecord,
   estimateCompactBackgroundRecordBytes,
@@ -43,6 +42,7 @@ export interface AgyTurnBackgroundObserverHost {
   readonly getResolvedSessionId: () => string | undefined
   readonly canSettleEffects: () => boolean
   readonly isRootTerminal: () => boolean
+  readonly reportSettled: () => void
   readonly reportUnknown: (reason: string) => void
   readonly getForegroundDedupReservation: () => NativeMemoryReservation | undefined
   readonly getPostCutoffBgReservation: () => NativeMemoryReservation | undefined
@@ -75,6 +75,10 @@ export class AgyTurnBackgroundObserver {
 
   markObservedBackgroundTask(): void {
     this.observedBackgroundTaskFlag = true
+  }
+
+  hasObservedBackgroundTask(): boolean {
+    return this.observedBackgroundTaskFlag
   }
 
   recordSeenForegroundMessageId(msgIdentity: string, trustedStepIdx?: number): void {
@@ -164,6 +168,9 @@ export class AgyTurnBackgroundObserver {
           input: this.host.input,
           activeRun,
           observedBackgroundTask: this.observedBackgroundTaskFlag,
+          onObservedBackgroundTask: () => this.markObservedBackgroundTask(),
+          isOtherRunReplayingHistory: () =>
+            (this.host.runtime.replayingSessions.get(activeRun.nativeSessionId) ?? 0) > 0,
           canSettleEffects: () => this.host.canSettleEffects(),
           isRootTerminal: () => this.host.isRootTerminal(),
           seenForegroundMessageIds: this.seenForegroundMessageIds,
@@ -218,10 +225,14 @@ export class AgyTurnBackgroundObserver {
       if (this.retainedCleaned) return
       this.retainedCleaned = true
       if (activeRun && this.host.isRootTerminal()) {
-        if (options.reason === 'tasks_drained' && activeRun.activeBackgroundTasks.size === 0) {
-          if (!activeRun.backgroundUnconfirmed && this.host.canSettleEffects()) {
-            nativeFileChangesSettled(this.host.input, 'settled', 'native_work_drained')
-          }
+        // Settle strictly from final facts AFTER all already-admitted background reports have drained,
+        // regardless of whether tasks_drained, transport_closed, or disposal triggered teardown.
+        if (
+          activeRun.activeBackgroundTasks.size === 0 &&
+          !activeRun.backgroundUnconfirmed &&
+          this.host.canSettleEffects()
+        ) {
+          this.host.reportSettled()
         } else if (activeRun.activeBackgroundTasks.size > 0 || activeRun.backgroundUnconfirmed) {
           this.host.reportUnknown(
             options.reason === 'transport_closed'
@@ -286,30 +297,43 @@ export class AgyTurnBackgroundObserver {
       if (!ownership.valid) return false
 
       let hasCompetingSessionOwner = params.connection.hasActiveSessionConsumer(trackedSessionId)
-      if (!hasCompetingSessionOwner) {
-        for (const other of this.host.runtime.activeRuns.values()) {
-          if (
-            other !== trackedRun &&
-            other.nativeSessionId === trackedSessionId &&
-            !other.rootTerminal
-          ) {
-            hasCompetingSessionOwner = true
-            break
-          }
+      const otherRunReplayingHistory =
+        (this.host.runtime.replayingSessions.get(trackedSessionId) ?? 0) > 0
+      for (const other of this.host.runtime.activeRuns.values()) {
+        if (other === trackedRun || other.nativeSessionId !== trackedSessionId) continue
+        if (
+          !other.rootTerminal ||
+          other.activeBackgroundTasks.size > 0 ||
+          other.backgroundUnconfirmed
+        ) {
+          hasCompetingSessionOwner = true
         }
       }
       if (hasCompetingSessionOwner) {
         const rawOutput = isPlainObject(update.rawOutput) ? update.rawOutput : undefined
-        const taskId =
-          asString(update.taskId ?? update.backgroundTaskId) ??
-          (rawOutput ? asString(rawOutput.taskId ?? rawOutput.backgroundTaskId) : undefined)
+        const rawArgs = isPlainObject(update.args)
+          ? update.args
+          : isPlainObject(update.rawInput)
+            ? update.rawInput
+            : undefined
+        const toolName = asString(update.name ?? update.toolName)
+        const eventTaskId = asString(update.taskId ?? update.backgroundTaskId)
+        const launchTaskId = rawOutput
+          ? asString(rawOutput.taskId ?? rawOutput.backgroundTaskId)
+          : undefined
+        const taskId = eventTaskId ?? launchTaskId
+        const isDaemonLaunchMetadata =
+          launchTaskId !== undefined ||
+          (toolName === 'run_command' && rawArgs?.IsDaemon === true) ||
+          toolName === 'schedule'
         const toolCallId = asString(update.toolCallId ?? update.id)
         // Do not intercept another Run's session/load replay of this Run's already-completed launch call.
         if (
           sessionUpdate === 'tool_call_update' &&
           update.outOfTurn !== true &&
           toolCallId !== undefined &&
-          trackedRun.launchedCompletedToolCallIds.has(toolCallId)
+          trackedRun.launchedCompletedToolCallIds.has(toolCallId) &&
+          (isDaemonLaunchMetadata || otherRunReplayingHistory)
         ) {
           return false
         }
