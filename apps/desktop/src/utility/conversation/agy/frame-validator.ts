@@ -1312,7 +1312,14 @@ export function estimateCompactBackgroundRecordBytes(
   charge(record.ownership.trajectoryId)
   charge(record.sessionUpdate)
   charge(record.status)
-  charge(record.taskId)
+  // B-F12: Charge every distinct retained task identity string once (eventTaskId, launchTaskId, taskId).
+  charge(record.eventTaskId)
+  if (record.launchTaskId !== record.eventTaskId) {
+    charge(record.launchTaskId)
+  }
+  if (record.taskId !== record.eventTaskId && record.taskId !== record.launchTaskId) {
+    charge(record.taskId)
+  }
   charge(record.toolCallId)
   charge(record.explicitMsgId)
   charge(record.rawText)

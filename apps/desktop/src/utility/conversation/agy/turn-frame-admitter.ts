@@ -21,6 +21,7 @@ import {
   extractUserChunkPactIdentity,
   isPlainObject,
   type ActiveAgyRun,
+  type StagedPreBindFrame,
   type ValidatedAgyFrame,
 } from './types'
 
@@ -245,9 +246,44 @@ export class AgyTurnFrameAdmitter {
     }
   }
 
+  private *replayStagedFrame(staged: StagedPreBindFrame): Generator<NormalizedAgentEvent> {
+    const { activeRun, mcpServer, prePromptReplay, hasCurrentRunTool, projectValidatedFrame } =
+      this.host
+    const frame = staged.frame
+    const update = frame.payload
+    const sessionUpdate = frame.sessionUpdate
+    if (update?.outOfTurn === true) {
+      this.handleOutOfTurnForegroundFrame(frame, update)
+      return
+    }
+    if (
+      activeRun.resumedExistingSession &&
+      (sessionUpdate === 'tool_call' || sessionUpdate === 'tool_call_update') &&
+      !frame.toolCallIdInvalid &&
+      frame.toolCallId !== undefined
+    ) {
+      if (prePromptReplay.has(frame.toolCallId)) return
+      if (prePromptReplay.isIncomplete && sessionUpdate === 'tool_call_update') {
+        const hasVerifiedCurrentIdentity =
+          frame.executionId !== undefined ||
+          (frame.stepIdx !== undefined &&
+            mcpServer.minStepIdx !== undefined &&
+            frame.stepIdx >= mcpServer.minStepIdx) ||
+          hasCurrentRunTool(frame.toolCallId)
+        if (!hasVerifiedCurrentIdentity) return
+      }
+    }
+    const rechecked = recheckValidatedFrameAgainstRootBoundary(
+      frame,
+      mcpServer.pinnedTrajectory,
+      mcpServer.minStepIdx,
+    )
+    yield* projectValidatedFrame(rechecked)
+  }
+
   private *drainResolvedPreBindPrefix(): Generator<NormalizedAgentEvent> {
     if (this.closedFlag) return
-    const { activeRun, mcpServer, projectValidatedFrame } = this.host
+    const { activeRun } = this.host
     while (!this.closedFlag && activeRun.stagedPreBindNotifications.length > 0) {
       const head = activeRun.stagedPreBindNotifications[0]!
       const headExecId = head.frame.executionId
@@ -262,18 +298,13 @@ export class AgyTurnFrameAdmitter {
       this.stagedPreBindBytes = Math.max(0, this.stagedPreBindBytes - head.bytes)
       this.host.getStagedPreBindReservation()?.resize(this.stagedPreBindBytes)
       if (head.arrivedDuringForeignTurn) continue
-      const rechecked = recheckValidatedFrameAgainstRootBoundary(
-        head.frame,
-        mcpServer.pinnedTrajectory,
-        mcpServer.minStepIdx,
-      )
-      yield* projectValidatedFrame(rechecked)
+      yield* this.replayStagedFrame(head)
     }
   }
 
   *drainStagedPreBindNotes(): Generator<NormalizedAgentEvent> {
     if (this.closedFlag) return
-    const { activeRun, mcpServer, projectValidatedFrame } = this.host
+    const { activeRun } = this.host
     const boundExecId = activeRun.providerExecutionId
     if (!boundExecId) {
       yield* this.drainResolvedPreBindPrefix()
@@ -293,12 +324,7 @@ export class AgyTurnFrameAdmitter {
       if (staged.frame.executionId === undefined && staged.arrivedDuringForeignTurn) {
         continue
       }
-      const rechecked = recheckValidatedFrameAgainstRootBoundary(
-        staged.frame,
-        mcpServer.pinnedTrajectory,
-        mcpServer.minStepIdx,
-      )
-      yield* projectValidatedFrame(rechecked)
+      yield* this.replayStagedFrame(staged)
     }
   }
 
@@ -381,24 +407,15 @@ export class AgyTurnFrameAdmitter {
     const sessionUpdate = validated.sessionUpdate
     if (!update || !sessionUpdate) return
 
-    // Explicit outOfTurn frames are background reports/task completions, NEVER foreground root answers (S2-F4).
-    if (update.outOfTurn === true) {
-      this.handleOutOfTurnForegroundFrame(validated, update)
-      return
-    }
-
     const updateExecId = validated.executionId
-    // Run contradiction guard BEFORE any execution binding, foreign-ID insertion,
-    // staged-frame drain, or projection. Retain ONLY negative MCP revocation for disputed frames.
-    const frameRootContradictsPinned =
+    // B-F1: Check structural/session contradictions FIRST (before outOfTurn or foreign-execution
+    // handling) so self-contradictory metadata can never mutate any Run's background state.
+    const frameStructurallyContradicted =
       validated.hasForeignOrInvalidSessionMeta ||
       validated.executionIdInvalid ||
       validated.rootEvidenceContradicted ||
-      (updateExecId !== undefined &&
-        activeRun.providerExecutionId !== undefined &&
-        updateExecId !== activeRun.providerExecutionId) ||
-      (updateExecId !== undefined && activeRun.knownForeignExecutionIds.has(updateExecId))
-    if (frameRootContradictsPinned || !validated.isAttributableToCurrentSession) {
+      !validated.isAttributableToCurrentSession
+    if (frameStructurallyContradicted) {
       if (
         validated.sessionAttribution !== 'pure_foreign' &&
         (sessionUpdate === 'tool_call' || sessionUpdate === 'tool_call_update')
@@ -412,6 +429,71 @@ export class AgyTurnFrameAdmitter {
       return
     }
 
+    const isKnownOrPinnedForeignExecution =
+      updateExecId !== undefined &&
+      ((activeRun.providerExecutionId !== undefined &&
+        updateExecId !== activeRun.providerExecutionId) ||
+        activeRun.knownForeignExecutionIds.has(updateExecId))
+    if (isKnownOrPinnedForeignExecution) {
+      if (sessionUpdate === 'tool_call' || sessionUpdate === 'tool_call_update') {
+        const disputedTokens = validated.tokens.allCanonicalTokens
+        const tcId = validated.toolCallIdInvalid ? undefined : validated.toolCallId
+        if (tcId !== undefined || disputedTokens.length > 0) {
+          mcpServer.revokeDisputedTokens(tcId, disputedTokens)
+        }
+      }
+      // B-F1: Structurally valid user_message_chunk from a pre-known foreign execution MUST
+      // still enter foreign-turn isolation so subsequent unscoped frames cannot leak into this Run.
+      if (
+        sessionUpdate === 'user_message_chunk' &&
+        update.outOfTurn !== true &&
+        activeRun.providerExecutionId === undefined
+      ) {
+        activeRun.foreignTurnActiveUntilRootBound = true
+        this.host.onExecutionOwnershipChanged?.()
+        if (activeRun.stagedPreBindNotifications.length > 0) {
+          yield* this.drainResolvedPreBindPrefix()
+        }
+      }
+      return
+    }
+
+    const stagePreBindFrame = (frame: ValidatedAgyFrame): void => {
+      const frameBytes = estimateJsonPayloadBytes(frame.message, AGY_MAX_STAGED_PRE_BIND_BYTES)
+      const nextStagedBytes = this.stagedPreBindBytes + frameBytes
+      if (
+        activeRun.stagedPreBindNotifications.length >= AGY_MAX_STAGED_PRE_BIND_FRAMES ||
+        nextStagedBytes > AGY_MAX_STAGED_PRE_BIND_BYTES
+      ) {
+        throw new AgentExecutionError(
+          'response_too_large',
+          'Antigravity pre-bind staged updates exceeded working-memory budget.',
+          false,
+        )
+      }
+      this.host.getStagedPreBindReservation()?.resize(nextStagedBytes)
+      this.stagedPreBindBytes = nextStagedBytes
+      activeRun.stagedPreBindNotifications.push({
+        frame,
+        bytes: frameBytes,
+        arrivedDuringForeignTurn: activeRun.foreignTurnActiveUntilRootBound,
+      })
+    }
+
+    // Explicit outOfTurn frames are background reports/task completions, NEVER foreground root answers (S2-F4).
+    // B-F10: When pre-bind frames are staged, preserve order so a staged tool_call registers aliases first.
+    if (update.outOfTurn === true) {
+      if (
+        activeRun.providerExecutionId === undefined &&
+        activeRun.stagedPreBindNotifications.length > 0
+      ) {
+        stagePreBindFrame(validated)
+        return
+      }
+      this.handleOutOfTurnForegroundFrame(validated, update)
+      return
+    }
+
     if (
       activeRun.resumedExistingSession &&
       (sessionUpdate === 'tool_call' || sessionUpdate === 'tool_call_update') &&
@@ -421,8 +503,10 @@ export class AgyTurnFrameAdmitter {
       if (prePromptReplay.has(validated.toolCallId)) {
         return
       }
-      // S2-F9: When pre-prompt replay history exceeded 4,096 distinct tool IDs, evicted historical
-      // split completions without verified current-Run identity cannot mutate current WorkspaceChanges.
+      // S2-F9 & B-F10: When pre-prompt replay history exceeded 4,096 distinct tool IDs, evicted
+      // historical split completions without verified current-Run identity cannot mutate WorkspaceChanges.
+      // If pre-bind frames are still staged (e.g. a new tool_call with executionId waiting for bind),
+      // stage this dependent tool_call_update and re-evaluate hasCurrentRunTool after staged frames replay.
       if (prePromptReplay.isIncomplete && sessionUpdate === 'tool_call_update') {
         const hasVerifiedCurrentIdentity =
           updateExecId !== undefined ||
@@ -431,6 +515,12 @@ export class AgyTurnFrameAdmitter {
             validated.stepIdx >= mcpServer.minStepIdx) ||
           hasCurrentRunTool(validated.toolCallId)
         if (!hasVerifiedCurrentIdentity) {
+          if (
+            activeRun.providerExecutionId === undefined &&
+            activeRun.stagedPreBindNotifications.length > 0
+          ) {
+            stagePreBindFrame(validated)
+          }
           return
         }
       }
@@ -528,25 +618,7 @@ export class AgyTurnFrameAdmitter {
     const mustStageToPreserveOrder =
       activeRun.stagedPreBindNotifications.length > 0 && ORDER_SENSITIVE_UPDATES.has(sessionUpdate)
     if (updateExecId !== undefined || mustStageToPreserveOrder) {
-      const frameBytes = estimateJsonPayloadBytes(validated.message, AGY_MAX_STAGED_PRE_BIND_BYTES)
-      const nextStagedBytes = this.stagedPreBindBytes + frameBytes
-      if (
-        activeRun.stagedPreBindNotifications.length >= AGY_MAX_STAGED_PRE_BIND_FRAMES ||
-        nextStagedBytes > AGY_MAX_STAGED_PRE_BIND_BYTES
-      ) {
-        throw new AgentExecutionError(
-          'response_too_large',
-          'Antigravity pre-bind staged updates exceeded working-memory budget.',
-          false,
-        )
-      }
-      this.host.getStagedPreBindReservation()?.resize(nextStagedBytes)
-      this.stagedPreBindBytes = nextStagedBytes
-      activeRun.stagedPreBindNotifications.push({
-        frame: validated,
-        bytes: frameBytes,
-        arrivedDuringForeignTurn: activeRun.foreignTurnActiveUntilRootBound,
-      })
+      stagePreBindFrame(validated)
       return
     }
 

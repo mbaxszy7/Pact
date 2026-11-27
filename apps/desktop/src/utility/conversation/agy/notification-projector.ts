@@ -35,6 +35,7 @@ import {
   nativeEffectsUncertain,
   type NativeChanges,
 } from '../native-file-changes'
+import { NativeFrameWriteError } from '../native-frame-writer'
 import { NativePermissionWait } from '../native-permission-wait'
 import {
   hasValidArtifactMetadata,
@@ -218,9 +219,33 @@ export class AgyNotificationProjector {
       return
     }
 
+    const fenceEpoch = activeRun?.turnEpoch
+    const fenceExecutor = activeRun?.executorId
+    const fenceGen = activeRun?.bindingGeneration
+    const isFenceCurrent = (): boolean =>
+      !this.runtime.disposed &&
+      !signal.aborted &&
+      connection.isOpen &&
+      (isExecutionStillOwned ? isExecutionStillOwned() : true) &&
+      (activeRun
+        ? !activeRun.promptRpcCompleted &&
+          !activeRun.promptReplyReceived &&
+          !activeRun.rootTerminal &&
+          activeRun.turnEpoch === fenceEpoch &&
+          activeRun.executorId === fenceExecutor &&
+          activeRun.bindingGeneration === fenceGen &&
+          !(
+            validated.executionId !== undefined &&
+            (activeRun.knownForeignExecutionIds.has(validated.executionId) ||
+              (activeRun.providerExecutionId !== undefined &&
+                activeRun.providerExecutionId !== validated.executionId))
+          )
+        : true)
+
     // Auto-allow ONLY verified current-root Pact MCP tools matching this Run's active allowed list.
     if (
       activeRun &&
+      !activeRun.promptRpcCompleted &&
       !activeRun.promptReplyReceived &&
       mcpServer.isRootActive() &&
       !signal.aborted &&
@@ -259,9 +284,19 @@ export class AgyNotificationProjector {
       } else if (resolvedPt?.structured && !resolvedPt.structured.hasLeadingZeros) {
         mcpServer.pinRootTrajectoryId(resolvedPt.structured.trajectoryId)
       }
-      await connection
-        .respond(rpcId, { outcome: { outcome: 'selected', optionId: allowOnce } })
-        .catch(() => undefined)
+      try {
+        await connection.respond(
+          rpcId,
+          { outcome: { outcome: 'selected', optionId: allowOnce } },
+          { signal, canDispatch: isFenceCurrent },
+        )
+      } catch (err) {
+        if (connection.isOpen && !(err instanceof NativeFrameWriteError && err.possiblyWritten)) {
+          await connection
+            .respond(rpcId, { outcome: { outcome: 'cancelled' } })
+            .catch(() => undefined)
+        }
+      }
       return
     }
     if (mayRevokeCurrentSessionMcp && isAuthorizedPactTool) {
@@ -276,6 +311,7 @@ export class AgyNotificationProjector {
     if (
       planModeStage &&
       activeRun &&
+      !activeRun.promptRpcCompleted &&
       !activeRun.promptReplyReceived &&
       !activeRun.rootTerminal &&
       !activeRun.cancellationPending &&
@@ -347,9 +383,19 @@ export class AgyNotificationProjector {
           args: validated.argsEvidence.args,
         })
         onBrainPlanWriteApproved(validTcId)
-        await connection
-          .respond(rpcId, { outcome: { outcome: 'selected', optionId: allowOnce } })
-          .catch(() => undefined)
+        try {
+          await connection.respond(
+            rpcId,
+            { outcome: { outcome: 'selected', optionId: allowOnce } },
+            { signal, canDispatch: isFenceCurrent },
+          )
+        } catch (err) {
+          if (connection.isOpen && !(err instanceof NativeFrameWriteError && err.possiblyWritten)) {
+            await connection
+              .respond(rpcId, { outcome: { outcome: 'cancelled' } })
+              .catch(() => undefined)
+          }
+        }
         return
       }
     }
@@ -369,29 +415,6 @@ export class AgyNotificationProjector {
       await denyPermission()
       return
     }
-
-    const fenceEpoch = activeRun?.turnEpoch
-    const fenceExecutor = activeRun?.executorId
-    const fenceGen = activeRun?.bindingGeneration
-    const isFenceCurrent = (): boolean =>
-      !this.runtime.disposed &&
-      !signal.aborted &&
-      connection.isOpen &&
-      (isExecutionStillOwned ? isExecutionStillOwned() : true) &&
-      (activeRun
-        ? !activeRun.promptRpcCompleted &&
-          !activeRun.promptReplyReceived &&
-          !activeRun.rootTerminal &&
-          activeRun.turnEpoch === fenceEpoch &&
-          activeRun.executorId === fenceExecutor &&
-          activeRun.bindingGeneration === fenceGen &&
-          !(
-            validated.executionId !== undefined &&
-            (activeRun.knownForeignExecutionIds.has(validated.executionId) ||
-              (activeRun.providerExecutionId !== undefined &&
-                activeRun.providerExecutionId !== validated.executionId))
-          )
-        : true)
 
     let card: ReturnType<typeof buildAgyPermissionCard>
     try {
@@ -439,17 +462,25 @@ export class AgyNotificationProjector {
       const mappedResponse = card.responses.get(decisionId) ?? {
         outcome: { outcome: 'cancelled' },
       }
-      await connection.respond(rpcId, mappedResponse)
+      // B-F2: Enforce ownership fence at physical outbound write boundary, not just JS enqueue.
+      await connection.respond(rpcId, mappedResponse, {
+        signal: combinedSignal,
+        canDispatch: isFenceCurrent,
+      })
       if (decisionId === 'agy-cancel') {
         const cancelSessionId = activeRun?.nativeSessionId ?? getSessionId()
         if (cancelSessionId) {
           await connection
-            .notify('session/cancel', { sessionId: cancelSessionId }, {})
+            .notify(
+              'session/cancel',
+              { sessionId: cancelSessionId },
+              { signal: combinedSignal, canDispatch: isFenceCurrent },
+            )
             .catch(() => undefined)
         }
       }
-    } catch {
-      if (connection.isOpen) {
+    } catch (err) {
+      if (connection.isOpen && !(err instanceof NativeFrameWriteError && err.possiblyWritten)) {
         await connection
           .respond(rpcId, { outcome: { outcome: 'cancelled' } })
           .catch(() => undefined)
@@ -604,12 +635,17 @@ export class AgyNotificationProjector {
           uiRequest.kind === 'url'
             ? { action: 'accept' }
             : { action: 'accept', content: decision.values ?? {} },
+          { signal: combinedSignal, canDispatch: isFenceCurrent },
         )
       } else {
-        await connection.respond(rpcId, { action: decision.action })
+        await connection.respond(
+          rpcId,
+          { action: decision.action },
+          { signal: combinedSignal, canDispatch: isFenceCurrent },
+        )
       }
-    } catch {
-      if (connection.isOpen) {
+    } catch (err) {
+      if (connection.isOpen && !(err instanceof NativeFrameWriteError && err.possiblyWritten)) {
         await connection.respond(rpcId, { action: 'cancel' }).catch(() => undefined)
       }
     } finally {
@@ -1789,6 +1825,8 @@ export class AgyNotificationProjector {
     activeRun: ActiveAgyRun
     observedBackgroundTask: boolean
     onObservedBackgroundTask?: (() => void) | undefined
+    arrivedDuringOtherRunReplay?: boolean | undefined
+    ensureCompactEndedCommitted?: (() => boolean) | undefined
     isOtherRunReplayingHistory?: (() => boolean) | undefined
     canSettleEffects: () => boolean
     isRootTerminal: () => boolean
@@ -1902,12 +1940,23 @@ export class AgyNotificationProjector {
 
               if (reportedBackgroundMessageIds.size >= 64) {
                 activeRun.backgroundUnconfirmed = true
-                input.host?.effects?.recordBackgroundReportUnavailable?.(identity)
+                if (!context.ensureCompactEndedCommitted || context.ensureCompactEndedCommitted()) {
+                  input.host?.effects?.recordBackgroundReportUnavailable?.(identity)
+                }
                 reportUnknown(
                   'Antigravity background report tracking reached the 64-report per-run cap; coverage is incomplete.',
                 )
+              } else if (
+                context.ensureCompactEndedCommitted &&
+                !context.ensureCompactEndedCommitted()
+              ) {
+                // B-F8: Compact ended(completed) could not be committed before persisting report;
+                // do not mark dedup complete and latch uncertainty so report is not silently dropped.
+                activeRun.backgroundUnconfirmed = true
+                reportUnknown(
+                  'Antigravity root terminal receipt could not be persisted before background report delivery.',
+                )
               } else {
-                reportedBackgroundMessageIds.add(nativeMessageId)
                 let reservation: NativeMemoryReservation | undefined
                 try {
                   const byteLength = Buffer.byteLength(rawText, 'utf8')
@@ -1918,9 +1967,15 @@ export class AgyNotificationProjector {
                     ...identity,
                     text: rawText,
                   })
+                  reportedBackgroundMessageIds.add(nativeMessageId)
                 } catch (error) {
                   if (input.host?.effects?.recordBackgroundReportUnavailable) {
-                    input.host?.effects?.recordBackgroundReportUnavailable(identity)
+                    try {
+                      input.host.effects.recordBackgroundReportUnavailable(identity)
+                      reportedBackgroundMessageIds.add(nativeMessageId)
+                    } catch {
+                      activeRun.backgroundUnconfirmed = true
+                    }
                   } else {
                     recordDiagnostic({
                       operation: 'native_check',
@@ -1943,23 +1998,39 @@ export class AgyNotificationProjector {
         }
       }
     } finally {
-      // S2-F5: Distinguish daemon launch ACKs (`rawOutput.taskId` / explicit daemon launch metadata)
+      // S2-F5 & B-F9: Distinguish daemon launch ACKs (`rawOutput.taskId` / explicit daemon launch metadata)
       // from session/load launch replays and genuine compact background task completions.
       const isLaunchAckOrReplay =
         sessionUpdate === 'tool_call_update' && !record.outOfTurn && record.isDaemonLaunchMetadata
       if (isLaunchAckOrReplay) {
-        if (toolCallId !== undefined && !activeRun.launchedCompletedToolCallIds.has(toolCallId)) {
-          // First post-cutoff launch ACK: bind toolCallId <-> launchTaskId alias and keep task active
-          // (or remove if the launch itself failed without spawning a task).
-          this.trackBackgroundTaskLaunch(
-            activeRun,
-            input,
-            toolCallId,
-            record.launchTaskId ?? record.eventTaskId,
-            status ?? 'completed',
-            () => context.onObservedBackgroundTask?.(),
-            reportUnknown,
-          )
+        if (toolCallId !== undefined) {
+          if (!activeRun.launchedCompletedToolCallIds.has(toolCallId)) {
+            this.trackBackgroundTaskLaunch(
+              activeRun,
+              input,
+              toolCallId,
+              record.launchTaskId ?? record.eventTaskId,
+              status ?? 'completed',
+              () => context.onObservedBackgroundTask?.(),
+              reportUnknown,
+            )
+          } else if (
+            record.launchTaskId !== undefined &&
+            !context.arrivedDuringOtherRunReplay &&
+            activeRun.backgroundTaskAliases.has(toolCallId)
+          ) {
+            // B-F9: Idempotently register a delayed `rawOutput.taskId` alias for a still-active
+            // launched task without reopening already-settled tasks.
+            const canonicalKey = activeRun.backgroundTaskAliases.get(toolCallId)
+            if (
+              canonicalKey &&
+              activeRun.activeBackgroundTasks.has(canonicalKey) &&
+              !activeRun.backgroundTaskAliases.has(record.launchTaskId) &&
+              activeRun.backgroundTaskAliases.size < 256
+            ) {
+              activeRun.backgroundTaskAliases.set(record.launchTaskId, canonicalKey)
+            }
+          }
         }
       } else {
         const isReplayOfCompletedLaunchCall =
@@ -1968,7 +2039,7 @@ export class AgyNotificationProjector {
           record.eventTaskId === undefined &&
           toolCallId !== undefined &&
           activeRun.launchedCompletedToolCallIds.has(toolCallId) &&
-          Boolean(context.isOtherRunReplayingHistory?.())
+          Boolean(context.arrivedDuringOtherRunReplay || context.isOtherRunReplayingHistory?.())
         const isTerminalTaskUpdate =
           sessionUpdate === 'background_task_completed' ||
           (sessionUpdate === 'tool_call_update' &&

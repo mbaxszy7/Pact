@@ -42,6 +42,10 @@ export interface AgyTurnBackgroundObserverHost {
   readonly getResolvedSessionId: () => string | undefined
   readonly canSettleEffects: () => boolean
   readonly isRootTerminal: () => boolean
+  readonly hasVerifiedRootOutcome?: (() => boolean) | undefined
+  readonly ensureCompactEndedCommitted?: (() => boolean) | undefined
+  readonly awaitRecordings?: (() => Promise<void>) | undefined
+  readonly hasPendingRecordings?: (() => boolean) | undefined
   readonly reportSettled: () => void
   readonly reportUnknown: (reason: string) => void
   readonly getForegroundDedupReservation: () => NativeMemoryReservation | undefined
@@ -64,6 +68,13 @@ export class AgyTurnBackgroundObserver {
   private postCutoffBackgroundTail = Promise.resolve()
   private postCutoffBgQueuedCount = 0
   private postCutoffBgQueuedBytes = 0
+  private readonly pendingPreTerminalEntries: Array<{
+    params: Record<string, unknown>
+    update: Record<string, unknown>
+    ownership: ValidatedBackgroundOwnership
+    arrivedDuringOtherRunReplay: boolean
+    bytes: number
+  }> = []
   private admittingBackground = true
   private unsubscribeBackground: (() => void) | undefined
   private unsubscribeConnectionClose: (() => void) | undefined
@@ -118,10 +129,42 @@ export class AgyTurnBackgroundObserver {
     }
   }
 
+  hasPendingWork(): boolean {
+    return (
+      this.postCutoffBgQueuedCount > 0 ||
+      this.pendingPreTerminalEntries.length > 0 ||
+      Boolean(this.host.hasPendingRecordings?.())
+    )
+  }
+
+  onRecordingsSettled(): void {
+    const activeRun = this.host.getActiveRun()
+    if (activeRun) this.maybeFinishRetainedBackground(activeRun)
+  }
+
+  flushPreTerminalEntries(): void {
+    if (!this.pendingPreTerminalEntries.length) return
+    const items = this.pendingPreTerminalEntries.splice(0)
+    for (const entry of items) {
+      this.postCutoffBgQueuedCount = Math.max(0, this.postCutoffBgQueuedCount - 1)
+      this.postCutoffBgQueuedBytes = Math.max(0, this.postCutoffBgQueuedBytes - entry.bytes)
+      if (!this.retainedCleaned) {
+        this.host.getPostCutoffBgReservation()?.resize(this.postCutoffBgQueuedBytes)
+      }
+      this.enqueuePostCutoffBackgroundUpdate(
+        entry.params,
+        entry.update,
+        entry.ownership,
+        entry.arrivedDuringOtherRunReplay,
+      )
+    }
+  }
+
   enqueuePostCutoffBackgroundUpdate(
     params: Record<string, unknown>,
     update: Record<string, unknown>,
     preValidatedOwnership?: ValidatedBackgroundOwnership,
+    arrivedDuringOtherRunReplayOverride?: boolean,
   ): void {
     if (!this.admittingBackground) return
     const activeRun = this.host.getActiveRun()
@@ -159,6 +202,43 @@ export class AgyTurnBackgroundObserver {
       )
       return
     }
+    // B-F9: Capture replay state at exact frame arrival boundary instead of asynchronously reading later state.
+    const arrivedDuringOtherRunReplay =
+      arrivedDuringOtherRunReplayOverride ??
+      (this.host.runtime.replayingSessions.get(activeRun.nativeSessionId) ?? 0) > 0
+    // B-F8: Buffer owned out-of-turn background reports arriving before root reaches a verified
+    // terminal outcome, then flush them in order once compact `ended(completed)` can be committed.
+    const rootOutcomeReady = this.host.hasVerifiedRootOutcome?.() ?? this.host.isRootTerminal()
+    if (
+      !rootOutcomeReady &&
+      record.rawText &&
+      ((record.sessionUpdate === 'agent_message_chunk' && record.outOfTurn) ||
+        record.sessionUpdate === 'background_task_completed' ||
+        (record.sessionUpdate === 'tool_call_update' &&
+          record.status === 'completed' &&
+          record.outOfTurn))
+    ) {
+      if (this.pendingPreTerminalEntries.length >= 16) {
+        if (!this.retainedCleaned) {
+          this.host.getPostCutoffBgReservation()?.resize(this.postCutoffBgQueuedBytes)
+        }
+        activeRun.backgroundUnconfirmed = true
+        this.host.reportUnknown(
+          'Antigravity pre-terminal background report buffer exceeded capacity; coverage is incomplete.',
+        )
+        return
+      }
+      this.postCutoffBgQueuedCount += 1
+      this.postCutoffBgQueuedBytes = nextBytes
+      this.pendingPreTerminalEntries.push({
+        params,
+        update,
+        ownership,
+        arrivedDuringOtherRunReplay,
+        bytes: recordBytes,
+      })
+      return
+    }
     this.postCutoffBgQueuedCount += 1
     this.postCutoffBgQueuedBytes = nextBytes
     this.postCutoffBackgroundTail = this.postCutoffBackgroundTail
@@ -169,7 +249,10 @@ export class AgyTurnBackgroundObserver {
           activeRun,
           observedBackgroundTask: this.observedBackgroundTaskFlag,
           onObservedBackgroundTask: () => this.markObservedBackgroundTask(),
+          arrivedDuringOtherRunReplay,
+          ensureCompactEndedCommitted: this.host.ensureCompactEndedCommitted,
           isOtherRunReplayingHistory: () =>
+            arrivedDuringOtherRunReplay ||
             (this.host.runtime.replayingSessions.get(activeRun.nativeSessionId) ?? 0) > 0,
           canSettleEffects: () => this.host.canSettleEffects(),
           isRootTerminal: () => this.host.isRootTerminal(),
@@ -197,20 +280,12 @@ export class AgyTurnBackgroundObserver {
   private maybeFinishRetainedBackground(activeRun: ActiveAgyRun): void {
     if (!this.retainedCleanup || this.retainedSettling || this.retainedCleaned) return
     if (!this.host.isRootTerminal() || activeRun.activeBackgroundTasks.size > 0) return
-    // Wait until EVERY already-admitted background report has drained before revoking
+    // Wait until EVERY already-admitted background report AND file recording has drained before revoking
     // ownership, reporting settled, or releasing postCutoffBgMemoryReservation!
-    if (this.postCutoffBgQueuedCount > 0) return
+    if (this.hasPendingWork()) return
     this.closeRetainedBackground({ reason: 'tasks_drained' })
   }
 
-  /**
-   * Unified background teardown entry for task-count-zero, ACP EOF/transport close,
-   * and adapter disposal:
-   * 1. Stop admitting new frames immediately.
-   * 2. Drain all already-admitted background records before revoking host ownership.
-   * 3. Report settled (if tasks drained cleanly) or unknown (if tasks remain unconfirmed).
-   * 4. Invoke retained cleanup (release reservations, retire reader, delete activeRuns, release lease).
-   */
   closeRetainedBackground(options: {
     readonly reason: 'tasks_drained' | 'transport_closed' | 'disposed'
     readonly emergency?: boolean | undefined
@@ -224,16 +299,26 @@ export class AgyTurnBackgroundObserver {
     const finalize = (): void => {
       if (this.retainedCleaned) return
       this.retainedCleaned = true
+      if (this.pendingPreTerminalEntries.length > 0) {
+        this.pendingPreTerminalEntries.length = 0
+        this.postCutoffBgQueuedCount = 0
+        this.postCutoffBgQueuedBytes = 0
+      }
       if (activeRun && this.host.isRootTerminal()) {
-        // Settle strictly from final facts AFTER all already-admitted background reports have drained,
-        // regardless of whether tasks_drained, transport_closed, or disposal triggered teardown.
+        // B-F7: Settle strictly from final facts AFTER both background reports AND file recordings
+        // have drained, regardless of whether tasks_drained, transport_closed, or disposal triggered teardown.
         if (
           activeRun.activeBackgroundTasks.size === 0 &&
           !activeRun.backgroundUnconfirmed &&
+          !this.host.hasPendingRecordings?.() &&
           this.host.canSettleEffects()
         ) {
           this.host.reportSettled()
-        } else if (activeRun.activeBackgroundTasks.size > 0 || activeRun.backgroundUnconfirmed) {
+        } else if (
+          activeRun.activeBackgroundTasks.size > 0 ||
+          activeRun.backgroundUnconfirmed ||
+          this.host.hasPendingRecordings?.()
+        ) {
           this.host.reportUnknown(
             options.reason === 'transport_closed'
               ? 'Antigravity ACP connection closed before background tasks settled.'
@@ -250,7 +335,11 @@ export class AgyTurnBackgroundObserver {
       finalize()
       return
     }
-    void this.postCutoffBackgroundTail.finally(finalize)
+    const waitTasks: Promise<unknown>[] = [this.postCutoffBackgroundTail]
+    if (this.host.awaitRecordings) {
+      waitTasks.push(this.host.awaitRecordings().catch(() => undefined))
+    }
+    void Promise.allSettled(waitTasks).finally(finalize)
   }
 
   /**
@@ -327,13 +416,20 @@ export class AgyTurnBackgroundObserver {
           (toolName === 'run_command' && rawArgs?.IsDaemon === true) ||
           toolName === 'schedule'
         const toolCallId = asString(update.toolCallId ?? update.id)
-        // Do not intercept another Run's session/load replay of this Run's already-completed launch call.
+        // Do not intercept another Run's session/load replay of this Run's already-completed launch call,
+        // UNLESS it carries a delayed new rawOutput.taskId alias for an active task (B-F9).
         if (
           sessionUpdate === 'tool_call_update' &&
           update.outOfTurn !== true &&
           toolCallId !== undefined &&
           trackedRun.launchedCompletedToolCallIds.has(toolCallId) &&
-          (isDaemonLaunchMetadata || otherRunReplayingHistory)
+          (otherRunReplayingHistory ||
+            (isDaemonLaunchMetadata &&
+              !(
+                launchTaskId !== undefined &&
+                trackedRun.backgroundTaskAliases.has(toolCallId) &&
+                !trackedRun.backgroundTaskAliases.has(launchTaskId)
+              )))
         ) {
           return false
         }
@@ -350,7 +446,7 @@ export class AgyTurnBackgroundObserver {
             execId === trackedRun.providerExecutionId)
         if (!explicitlyOwnedByOldRun) return false
       }
-      this.enqueuePostCutoffBackgroundUpdate(msgParams, update, ownership)
+      this.enqueuePostCutoffBackgroundUpdate(msgParams, update, ownership, otherRunReplayingHistory)
       return true
     })
 

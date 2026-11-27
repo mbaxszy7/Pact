@@ -67,6 +67,7 @@ import {
   AgyTurnFrameAdmitter,
 } from './turn-frame-admitter'
 import {
+  AGY_CONTROL_DRAIN_HANDOFF_MS,
   AGY_MAX_TOOL_STATE_BYTES,
   AGY_PHYSICAL_SETTLEMENT_GRACE_MS,
   AGY_SESSION_METADATA_UPDATES,
@@ -206,6 +207,7 @@ export class AgyTurnSession {
     const observation = new AbortController()
     const runFinalizer = Promise.withResolvers<void>()
     let stopStreamPump: (() => void) | undefined
+    let drainBufferedPostCutoff: (() => void) | undefined
     let stopPrePromptDrain: ((drainRemaining?: boolean) => Promise<void>) | undefined
     let handoffOrderedStreamToBackground: ((onRetainedCleanup: () => void) => void) | undefined
     let cleanupForegroundResources:
@@ -215,31 +217,30 @@ export class AgyTurnSession {
     let finalTerminalEvidenceCommitted = false
     let compactTerminalCommitError: unknown
     let liveTerminalOutcome: 'completed' | 'interrupted' | 'failed' | undefined
-    const commitMinimalLiveTerminalFallback = (): void => {
-      if (
-        compactTerminalCommitted ||
-        finalTerminalEvidenceCommitted ||
-        !liveTerminalOutcome ||
-        !activeRun ||
-        !resolvedSessionId
-      ) {
-        return
-      }
+    let controlDrainTimer: ReturnType<typeof setTimeout> | undefined
+    let releaseReplayMarker: (() => void) | undefined
+    let settlePromptFromResponseRef: ((res: object) => void) | undefined
+    let promptRpcResolvedResponseRef: object | undefined
+    const ensureCompactEndedCommitted = (): boolean => {
+      if (compactTerminalCommitted || finalTerminalEvidenceCommitted) return true
+      if (!liveTerminalOutcome || !activeRun || !resolvedSessionId) return false
       rootTerminal = true
       activeRun.rootTerminal = true
       this.kernel.recordTerminal(liveTerminalOutcome)
-      this.runtime.recordEvidence(
-        input,
-        resolvedSessionId,
-        activeExecutorId,
-        {
-          kind: 'ended',
-          source: 'live_terminal',
-          outcome: liveTerminalOutcome,
-        },
-        activeRun.nativeTurnId,
-      )
-      compactTerminalCommitted = true
+      try {
+        this.runtime.recordEvidence(
+          input,
+          resolvedSessionId,
+          activeExecutorId,
+          { kind: 'ended', source: 'live_terminal', outcome: liveTerminalOutcome },
+          activeRun.nativeTurnId,
+        )
+        compactTerminalCommitted = true
+        return true
+      } catch (err) {
+        compactTerminalCommitError ??= err
+        return false
+      }
     }
 
     const loadHostTrajectoryIdentity = (loadSignal: AbortSignal) =>
@@ -278,6 +279,7 @@ export class AgyTurnSession {
       isRootCurrent: () =>
         !this.runtime.disposed &&
         rootFirstByteWritten &&
+        !promptRpcCompleted &&
         !promptReplyReceived &&
         !rootTerminal &&
         !rootReleasing &&
@@ -286,6 +288,7 @@ export class AgyTurnSession {
       isSourceCurrent: () =>
         !this.runtime.disposed &&
         rootFirstByteWritten &&
+        !promptRpcCompleted &&
         !promptReplyReceived &&
         !rootTerminal &&
         !sourceRetired &&
@@ -440,23 +443,53 @@ export class AgyTurnSession {
             clearTimeout(cancelGraceTimer)
             cancelGraceTimer = undefined
           }
+          if (controlDrainTimer !== undefined) {
+            clearTimeout(controlDrainTimer)
+            controlDrainTimer = undefined
+          }
+          runIsolated(() => releaseReplayMarker?.())
+          // B-F5: If transport already received a verified root reply while consumer paused at soft cap,
+          // unblock backpressure and settle that reply BEFORE stopping the stream pump and closing stream.
+          if (promptRpcResolvedResponseRef !== undefined && !promptSettled) {
+            runIsolated(() => enableEventDiscardMode?.())
+            runIsolated(() => settlePromptFromResponseRef?.(promptRpcResolvedResponseRef!))
+          }
           promptRpcAbort.abort()
           await stopPrePromptDrain?.(false).catch(() => undefined)
           runIsolated(() => stopStreamPump?.())
-          runIsolated(() => commitMinimalLiveTerminalFallback())
+          if (!options.emergency && !emergencyCleanedUp) {
+            runIsolated(() => drainBufferedPostCutoff?.())
+          }
+          runIsolated(() => ensureCompactEndedCommitted())
           foregroundReleased = true
+          controlDrainActive = false
           const isEmergency = options.emergency || emergencyCleanedUp
           if (isEmergency || !rootTerminal) {
             rootTerminal = true
           }
           if (activeRun) {
             activeRun.foregroundReleased = true
+            if (activeRun.controlDrainActive) {
+              activeRun.controlDrainActive = false
+              runIsolated(() => input.host?.effects?.backgroundWorkChanged?.())
+            }
             if (isEmergency || rootTerminal) {
               activeRun.rootTerminal = true
             }
             runIsolated(() => this.runtime.projector.notifyRootExecutionWaiters(activeRun!))
           }
-          if (
+          const fullyDrainedBeforeEmergency =
+            isEmergency &&
+            Boolean(activeRun) &&
+            finalTerminalEvidenceCommitted &&
+            !unknownEffectsReported &&
+            !activeRun!.backgroundUnconfirmed &&
+            activeRun!.activeBackgroundTasks.size === 0 &&
+            recordings.size === 0 &&
+            !(backgroundObserver?.hasPendingWork() ?? false)
+          if (fullyDrainedBeforeEmergency) {
+            runIsolated(() => reportSettled())
+          } else if (
             (isEmergency || (!compactTerminalCommitted && !finalTerminalEvidenceCommitted)) &&
             !unknownEffectsReported &&
             !isConfirmedZeroBytesSent()
@@ -669,8 +702,16 @@ export class AgyTurnSession {
         controlDrainActive = true
         foregroundReleased = true
         activeRun.foregroundReleased = true
+        activeRun.controlDrainActive = true
+        input.host?.effects?.backgroundWorkChanged?.()
         enableEventDiscardMode?.()
         abortOutstandingInteractions()
+        controlDrainTimer = setTimeout(() => {
+          if (!controlDrainActive) return
+          reportUnknown('Antigravity control-drain handoff exceeded its bounded timeout.')
+          void completeFinalTeardown({ emergency: true }).catch(() => undefined)
+        }, AGY_CONTROL_DRAIN_HANDOFF_MS)
+        controlDrainTimer.unref?.()
         onControlSettled = () => {
           if (!controlDrainActive) return
           void completeFinalTeardown({
@@ -712,6 +753,7 @@ export class AgyTurnSession {
         }
         if (
           rootFirstByteWritten &&
+          !promptRpcCompleted &&
           !promptSettled &&
           !rootTerminal &&
           resolvedSessionId &&
@@ -781,7 +823,14 @@ export class AgyTurnSession {
 
       const permissionWait = new NativePermissionWait()
       const releaseWaitObserver = permissionWait.subscribe(() => {
-        if (activeRun?.turnAccepted && !rootTerminal && resolvedSessionId) {
+        if (
+          activeRun?.turnAccepted &&
+          !rootTerminal &&
+          !compactTerminalCommitted &&
+          !finalTerminalEvidenceCommitted &&
+          !promptRpcCompleted &&
+          resolvedSessionId
+        ) {
           this.runtime.recordEvidence(
             input,
             resolvedSessionId,
@@ -850,6 +899,14 @@ export class AgyTurnSession {
           replaySid,
           (this.runtime.replayingSessions.get(replaySid) ?? 0) + 1,
         )
+        let replayMarkerReleased = false
+        releaseReplayMarker = () => {
+          if (replayMarkerReleased) return
+          replayMarkerReleased = true
+          const remainingReplays = (this.runtime.replayingSessions.get(replaySid) ?? 1) - 1
+          if (remainingReplays <= 0) this.runtime.replayingSessions.delete(replaySid)
+          else this.runtime.replayingSessions.set(replaySid, remainingReplays)
+        }
         try {
           sessionStream = connection.openSessionStream(input.nativeSessionId, { ordered: true })
           let replayConfigOptions: AcpConfigOptionEntry[] | undefined
@@ -907,9 +964,6 @@ export class AgyTurnSession {
           }
         } finally {
           replayingHistory = false
-          const remainingReplays = (this.runtime.replayingSessions.get(replaySid) ?? 1) - 1
-          if (remainingReplays <= 0) this.runtime.replayingSessions.delete(replaySid)
-          else this.runtime.replayingSessions.set(replaySid, remainingReplays)
         }
       } else {
         const newReq = connection.request(
@@ -1322,6 +1376,10 @@ export class AgyTurnSession {
         getResolvedSessionId: () => resolvedSessionId,
         canSettleEffects: () => !unknownEffectsReported,
         isRootTerminal: () => rootTerminal,
+        hasVerifiedRootOutcome: () => liveTerminalOutcome !== undefined || rootTerminal,
+        ensureCompactEndedCommitted,
+        awaitRecordings: () => recordingTail,
+        hasPendingRecordings: () => recordings.size > 0,
         reportSettled,
         reportUnknown,
         getForegroundDedupReservation: () => foregroundDedupMemoryReservation,
@@ -1371,6 +1429,7 @@ export class AgyTurnSession {
       }
 
       await stopPrePromptDrain(true)
+      releaseReplayMarker?.()
       await throwIfPrePromptStreamClosed()
 
       promptEnteredTransport = true
@@ -1459,33 +1518,14 @@ export class AgyTurnSession {
                     : 'failed'
               liveTerminalOutcome = earlyOutcome
               this.kernel.recordTerminal(earlyOutcome)
-              // S1-F3 + S2-F1: When background work is active (or foreground body consumer already exited),
-              // persist compact `ended` receipt immediately on verified ordered reply BEFORE opening
-              // post-cutoff background report admission so SQLite accepts immediate post-cutoff reports.
               if (
-                !compactTerminalCommitted &&
-                resolvedSessionId &&
-                (controlDrainActive ||
-                  activeRun.activeBackgroundTasks.size > 0 ||
-                  observer.hasObservedBackgroundTask())
+                controlDrainActive ||
+                activeRun.activeBackgroundTasks.size > 0 ||
+                observer.hasObservedBackgroundTask()
               ) {
-                try {
-                  this.runtime.recordEvidence(
-                    input,
-                    resolvedSessionId,
-                    activeExecutorId,
-                    {
-                      kind: 'ended',
-                      source: 'live_terminal',
-                      outcome: earlyOutcome,
-                    },
-                    activeRun.nativeTurnId,
-                  )
-                  compactTerminalCommitted = true
-                } catch (err) {
-                  compactTerminalCommitError ??= err
-                }
+                ensureCompactEndedCommitted()
               }
+              observer.flushPreTerminalEntries()
             }
           }
           this.runtime.projector.notifyRootExecutionWaiters(activeRun)
@@ -1499,14 +1539,36 @@ export class AgyTurnSession {
           onControlSettled?.()
         }
       }
+      settlePromptFromResponseRef = settlePromptFromResponse
+
+      const failPromptControl = (err: Error, abortPump = false): void => {
+        promptError ??= err
+        promptSettled = true
+        promptRpcCompleted = true
+        promptReplyReceived = true
+        mcpServer.notifyRootStateChanged()
+        abortOutstandingInteractions()
+        if (activeRun) {
+          activeRun.promptRpcCompleted = true
+          activeRun.promptReplyReceived = true
+          this.runtime.projector.notifyRootExecutionWaiters(activeRun)
+        }
+        if (cancelGraceTimer !== undefined) {
+          clearTimeout(cancelGraceTimer)
+          cancelGraceTimer = undefined
+        }
+        if (abortPump) pumpAbort.abort()
+        else promptRpcAbort.abort()
+        notifyEventLoop()
+        if (controlDrainActive) onControlSettled?.()
+      }
 
       void promptOp.result.then(
         (res) => {
           promptRpcResolvedResponse = res
-          // S2-F2: Close Steer lease, cancel outbound sends, and withdraw pending interactions
-          // immediately when the root prompt RPC resolves on the wire while keeping `reply.seq`
-          // as the ordered foreground projection cutoff.
+          promptRpcResolvedResponseRef = res
           promptRpcCompleted = true
+          mcpServer.notifyRootStateChanged()
           if (activeRun) {
             activeRun.promptRpcCompleted = true
             this.runtime.projector.notifyRootExecutionWaiters(activeRun)
@@ -1523,25 +1585,7 @@ export class AgyTurnSession {
           return undefined
         },
         (err: unknown) => {
-          promptError ??= err instanceof Error ? err : new Error(String(err))
-          promptSettled = true
-          promptRpcCompleted = true
-          promptReplyReceived = true
-          abortOutstandingInteractions()
-          if (activeRun) {
-            activeRun.promptRpcCompleted = true
-            activeRun.promptReplyReceived = true
-            this.runtime.projector.notifyRootExecutionWaiters(activeRun)
-          }
-          if (cancelGraceTimer !== undefined) {
-            clearTimeout(cancelGraceTimer)
-            cancelGraceTimer = undefined
-          }
-          pumpAbort.abort()
-          notifyEventLoop()
-          if (controlDrainActive) {
-            onControlSettled?.()
-          }
+          failPromptControl(err instanceof Error ? err : new Error(String(err)), true)
           return undefined
         },
       )
@@ -1590,7 +1634,10 @@ export class AgyTurnSession {
         )
         recordingTail = task
         recordings.add(task)
-        void task.finally(() => recordings.delete(task))
+        void task.finally(() => {
+          recordings.delete(task)
+          observer.onRecordingsSettled()
+        })
       }
 
       const projectValidatedFrame = (
@@ -1800,6 +1847,14 @@ export class AgyTurnSession {
         if (sid !== resolvedSessionId || !isPlainObject(params.update)) return
         observer.enqueuePostCutoffBackgroundUpdate(params, params.update)
       }
+      drainBufferedPostCutoff = (): void => {
+        if (promptCutoffSeq === undefined || !sessionStream) return
+        while (true) {
+          const buffered = sessionStream.shift()
+          if (!buffered) break
+          if (buffered.seq > promptCutoffSeq) routePostCutoffIngress(buffered)
+        }
+      }
 
       const dispatchOrderedIngress = (item: AgyIngress): void => {
         if (item.kind === 'end') {
@@ -1813,25 +1868,13 @@ export class AgyTurnSession {
                   .notify('session/cancel', { sessionId: resolvedSessionId! }, {})
                   .catch(() => undefined)
               }
-              promptError ??= new AgentExecutionError(
-                item.cause === 'deadline' ? 'transient_transport' : 'agent_process_crash',
-                item.detail ?? 'Antigravity session stream ended before prompt settlement.',
-                item.cause === 'deadline',
+              failPromptControl(
+                new AgentExecutionError(
+                  item.cause === 'deadline' ? 'transient_transport' : 'agent_process_crash',
+                  item.detail ?? 'Antigravity session stream ended before prompt settlement.',
+                  item.cause === 'deadline',
+                ),
               )
-              promptSettled = true
-              promptRpcCompleted = true
-              promptReplyReceived = true
-              abortOutstandingInteractions()
-              if (activeRun) {
-                activeRun.promptRpcCompleted = true
-                activeRun.promptReplyReceived = true
-                this.runtime.projector.notifyRootExecutionWaiters(activeRun)
-              }
-              promptRpcAbort.abort()
-              notifyEventLoop()
-              if (controlDrainActive) {
-                onControlSettled?.()
-              }
             }
           }
           return
@@ -1943,21 +1986,7 @@ export class AgyTurnSession {
                     .notify('session/cancel', { sessionId: resolvedSessionId }, {})
                     .catch(() => undefined)
                 }
-                promptError ??= err
-                promptSettled = true
-                promptRpcCompleted = true
-                promptReplyReceived = true
-                abortOutstandingInteractions()
-                if (activeRun) {
-                  activeRun.promptRpcCompleted = true
-                  activeRun.promptReplyReceived = true
-                  this.runtime.projector.notifyRootExecutionWaiters(activeRun)
-                }
-                promptRpcAbort.abort()
-                notifyEventLoop()
-                if (controlDrainActive) {
-                  onControlSettled?.()
-                }
+                failPromptControl(err)
               }
               break
             }
@@ -1965,21 +1994,7 @@ export class AgyTurnSession {
           }
         } catch (err) {
           pumpError ??= err instanceof Error ? err : new Error(String(err))
-          promptError ??= pumpError
-          promptSettled = true
-          promptRpcCompleted = true
-          promptReplyReceived = true
-          abortOutstandingInteractions()
-          if (activeRun) {
-            activeRun.promptRpcCompleted = true
-            activeRun.promptReplyReceived = true
-            this.runtime.projector.notifyRootExecutionWaiters(activeRun)
-          }
-          promptRpcAbort.abort()
-          notifyEventLoop()
-          if (controlDrainActive) {
-            onControlSettled?.()
-          }
+          failPromptControl(pumpError)
         }
       })()
 
@@ -2218,6 +2233,7 @@ export class AgyTurnSession {
 
         await recordingTail
         await input.host?.lifecycle?.waitForRootOutput?.()
+        drainBufferedPostCutoff?.()
         await observer.awaitTail()
 
         const incompleteVisiblePrefix = unresolvedPreBindOutput || foregroundDeltaDropped
@@ -2264,14 +2280,10 @@ export class AgyTurnSession {
             : {}),
         }
 
-        // S2-F1: Persist the verified native terminal receipt BEFORE yielding `text.completed`
-        // (for non-truncated runs) so pausing at `text.completed` followed by `dispose()` already
-        // has the verified `ended` receipt durably committed without duplicating normal receipts.
-        if (
-          !finalTerminalEvidenceCommitted &&
-          !foregroundReleased &&
-          !(incompleteVisiblePrefix && outcome === 'completed')
-        ) {
+        // S2-F1 & B-F6: Persist verified native terminal receipt BEFORE yielding `text.completed`
+        // or truncated `turn.completed(failed)` so SQLite monotonically retains `nativeOutcome=completed`
+        // even if the consumer exits or restarts at that yield point.
+        if (!finalTerminalEvidenceCommitted && !foregroundReleased) {
           this.runtime.recordEvidence(
             input,
             resolvedSessionId,
@@ -2369,26 +2381,11 @@ export class AgyTurnSession {
 
         if (!foregroundReleased) {
           if (incompleteVisiblePrefix && outcome === 'completed') {
-            // When unresolved substantive pre-bind frames or Stop-frozen foreground deltas remain
-            // after emitting a visible prefix, emit `turn.completed { outcome: 'failed' }` (without
-            // `text.completed`) so SQLite marks the truncated prefix `incomplete`, then record the
-            // independently verified native outcome with `completeness: 'partial'`.
             yield {
               agentId: 'agy',
               type: 'turn.completed',
               turnId: input.runId,
               outcome: 'failed',
-            }
-            if (!finalTerminalEvidenceCommitted) {
-              this.runtime.recordEvidence(
-                input,
-                resolvedSessionId,
-                activeExecutorId,
-                terminalEvidence,
-                activeRun.nativeTurnId,
-              )
-              finalTerminalEvidenceCommitted = true
-              compactTerminalCommitted = true
             }
             if (
               !unknownEffectsReported &&
@@ -2415,7 +2412,7 @@ export class AgyTurnSession {
           }
         }
       } finally {
-        commitMinimalLiveTerminalFallback()
+        ensureCompactEndedCommitted()
         if (
           promptSettled ||
           rootTerminal ||

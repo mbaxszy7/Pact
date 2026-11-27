@@ -699,7 +699,11 @@ export class AgyAcpConnection {
     )
   }
 
-  async respond(id: string | number, result: object): Promise<void> {
+  async respond(
+    id: string | number,
+    result: object,
+    options: { signal?: AbortSignal | undefined; canDispatch?: (() => boolean) | undefined } = {},
+  ): Promise<void> {
     if (
       (typeof id === 'string' && id.length > 1024) ||
       (typeof id === 'number' && !Number.isSafeInteger(id))
@@ -710,7 +714,10 @@ export class AgyAcpConnection {
         false,
       )
     }
-    await this.outbound.enqueue({ jsonrpc: '2.0', id, result }, {})
+    await this.outbound.enqueue(
+      { jsonrpc: '2.0', id, result },
+      { canDispatch: options.canDispatch, cancelBeforeWriteSignal: options.signal },
+    )
   }
 
   async respondError(id: string | number, message: string, code = -32_601): Promise<void> {

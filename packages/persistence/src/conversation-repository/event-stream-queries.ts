@@ -1327,11 +1327,25 @@ function applyEventWithinTransaction(
       .from(sessions)
       .where(eq(sessions.id, sessionId))
       .get()?.status
+    const existingRunOutcome = transaction
+      .select({ dispatchPhase: agentRuns.dispatchPhase, nativeOutcome: agentRuns.nativeOutcome })
+      .from(agentRuns)
+      .where(eq(agentRuns.id, runId))
+      .get()
+    // B-F6: Preserve an already-verified native `completed` outcome monotonically so a
+    // truncated-visible-body `turn.completed { outcome: 'failed' }` keeps the assistant
+    // message `incomplete` without downgrading verified `nativeOutcome` or breaking
+    // subsequent background report ownership.
+    const nextNativeOutcome =
+      existingRunOutcome?.dispatchPhase === 'ended' &&
+      existingRunOutcome.nativeOutcome === 'completed'
+        ? 'completed'
+        : event.outcome
     transaction
       .update(agentRuns)
       .set({
         status: event.outcome,
-        nativeOutcome: event.outcome,
+        nativeOutcome: nextNativeOutcome,
         dispatchPhase: 'ended',
         failureKind: null,
         failureMessage: null,

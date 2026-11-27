@@ -48,6 +48,7 @@ import { AgySessionBootstrapper } from './agy/session-bootstrap'
 import { AgyTurnSession } from './agy/turn-session'
 import {
   AGY_EVIDENCE_CACHE_LIMIT,
+  AGY_EVIDENCE_CACHE_MAX_BYTES,
   AGY_MAX_STEERING_INPUTS,
   AGY_PHYSICAL_SETTLEMENT_GRACE_MS,
   asString,
@@ -284,10 +285,19 @@ export class AgyAgentAdapter implements AgentAdapter {
     if (runId !== undefined) {
       const run = this.runtime.activeRuns.get(runId)
       if (!run) return false
-      return run.backgroundUnconfirmed || run.activeBackgroundTasks.size > 0
+      return (
+        run.backgroundUnconfirmed ||
+        run.activeBackgroundTasks.size > 0 ||
+        run.controlDrainActive === true
+      )
     }
     for (const run of this.runtime.activeRuns.values()) {
-      if (run.backgroundUnconfirmed || run.activeBackgroundTasks.size > 0) return true
+      if (
+        run.backgroundUnconfirmed ||
+        run.activeBackgroundTasks.size > 0 ||
+        run.controlDrainActive === true
+      )
+        return true
     }
     return false
   }
@@ -295,7 +305,7 @@ export class AgyAgentAdapter implements AgentAdapter {
   backgroundWork(runId: string, executorId: string): 'working' | 'stoppable' | undefined {
     const run = this.runtime.activeRuns.get(runId)
     if (!run || run.executorId !== executorId) return undefined
-    if (run.backgroundUnconfirmed) return 'working'
+    if (run.backgroundUnconfirmed || run.controlDrainActive === true) return 'working'
     if (run.activeBackgroundTasks.size > 0) return 'stoppable'
     return undefined
   }
@@ -782,13 +792,21 @@ export class AgyAgentAdapter implements AgentAdapter {
     this.resizeEvidenceCacheWork()
   }
 
+  private static estimateEvidenceBytes(item: NativeProbeResult): number {
+    return Buffer.byteLength(JSON.stringify(item), 'utf8') * 2 + 256
+  }
+
   private resizeEvidenceCacheWork(): void {
     if (this.evidenceCacheReleased) return
     let totalBytes = 0
     for (const item of this.runtime.nativeEvidence.values()) {
-      totalBytes += Buffer.byteLength(JSON.stringify(item), 'utf8') * 2 + 256
+      totalBytes += AgyAgentAdapter.estimateEvidenceBytes(item)
     }
-    this.runtime.evidenceCacheWork.resize(totalBytes)
+    try {
+      this.runtime.evidenceCacheWork.resize(totalBytes)
+    } catch {
+      // Best-effort shrink/resize on eviction; never block authoritative teardown.
+    }
   }
 
   private recordEvidence(
@@ -835,15 +853,47 @@ export class AgyAgentAdapter implements AgentAdapter {
                 source: fact.source,
               }
 
+    // B-F11: Pre-compute bytes and enforce BOTH 8-item count AND 16 MiB byte cap BEFORE inserting
+    // into the evictable cache; if candidate exceeds budget or shared working memory refuses resize,
+    // skip caching it so authoritative host persistence and final answer delivery are never blocked.
     if (!this.evidenceCacheReleased) {
       const key = this.evidenceKey(input.runId, nativeSessionId)
       this.runtime.nativeEvidence.delete(key)
-      if (this.runtime.nativeEvidence.size >= AGY_EVIDENCE_CACHE_LIMIT) {
-        const oldest = this.runtime.nativeEvidence.keys().next().value
-        if (oldest !== undefined) this.runtime.nativeEvidence.delete(oldest)
+      const candidateBytes = AgyAgentAdapter.estimateEvidenceBytes(probeResult)
+      let currentBytes = 0
+      for (const item of this.runtime.nativeEvidence.values()) {
+        currentBytes += AgyAgentAdapter.estimateEvidenceBytes(item)
       }
-      this.runtime.nativeEvidence.set(key, probeResult)
-      this.resizeEvidenceCacheWork()
+      if (candidateBytes <= AGY_EVIDENCE_CACHE_MAX_BYTES) {
+        while (
+          this.runtime.nativeEvidence.size >= AGY_EVIDENCE_CACHE_LIMIT ||
+          (this.runtime.nativeEvidence.size > 0 &&
+            currentBytes + candidateBytes > AGY_EVIDENCE_CACHE_MAX_BYTES)
+        ) {
+          const oldest = this.runtime.nativeEvidence.keys().next().value
+          if (oldest === undefined) break
+          const removed = this.runtime.nativeEvidence.get(oldest)
+          this.runtime.nativeEvidence.delete(oldest)
+          if (removed) {
+            currentBytes = Math.max(
+              0,
+              currentBytes - AgyAgentAdapter.estimateEvidenceBytes(removed),
+            )
+          }
+        }
+        try {
+          this.runtime.evidenceCacheWork.resize(currentBytes + candidateBytes)
+          this.runtime.nativeEvidence.set(key, probeResult)
+        } catch {
+          try {
+            this.runtime.evidenceCacheWork.resize(currentBytes)
+          } catch {
+            // Leave cache clean without failing authoritative host evidence delivery.
+          }
+        }
+      } else {
+        this.resizeEvidenceCacheWork()
+      }
     }
     input.host?.lifecycle?.recordNativeEvidence?.(probeResult)
   }

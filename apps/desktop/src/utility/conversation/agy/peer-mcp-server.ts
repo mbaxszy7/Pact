@@ -202,6 +202,10 @@ export class AgyRunMcpServer {
     this.correlator.clearPendingTransferredPlanBytes()
   }
 
+  notifyRootStateChanged(): void {
+    this.correlator.notifyWaiters()
+  }
+
   revokeRun(): void {
     this.correlator.revokeRun()
   }

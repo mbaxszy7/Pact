@@ -2080,6 +2080,10 @@ export class McpCallCorrelator {
     this.wakeAllWaiters()
   }
 
+  notifyWaiters(): void {
+    this.wakeAllWaiters()
+  }
+
   revokeRun(): void {
     this.revoked = true
     this.pendingTitleOwner = undefined

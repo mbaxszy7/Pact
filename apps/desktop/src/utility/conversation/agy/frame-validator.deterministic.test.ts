@@ -2,8 +2,10 @@ import { describe, expect, it } from 'vitest'
 
 import {
   buildCompactArgsFingerprint,
+  buildCompactPostCutoffBackgroundRecord,
   canonicalizeProgressToken,
   compareArgsFingerprints,
+  estimateCompactBackgroundRecordBytes,
   mergeArgsFingerprints,
   parseAgyPromptTerminalReply,
   parseRootProgressToken,
@@ -134,5 +136,45 @@ describe('agy/frame-validator (zero-I/O deterministic suite)', () => {
         10,
       ),
     ).toEqual({ valid: true, executionId: 'exec-root', trajectoryId: 'traj-1', stepIdx: 12 })
+  })
+
+  it('B-F12: charges every distinct retained task ID (eventTaskId + launchTaskId) once in compact background byte estimates', () => {
+    const ownership = { valid: true as const, executionId: 'exec-1' }
+    const idA = 'a'.repeat(500)
+    const idB = 'b'.repeat(700)
+
+    const single = buildCompactPostCutoffBackgroundRecord(
+      { sessionUpdate: 'tool_call_update', status: 'completed', taskId: idA },
+      ownership,
+    )
+    const duplicate = buildCompactPostCutoffBackgroundRecord(
+      {
+        sessionUpdate: 'tool_call_update',
+        status: 'completed',
+        taskId: idA,
+        rawOutput: { taskId: idA },
+      },
+      ownership,
+    )
+    const distinct = buildCompactPostCutoffBackgroundRecord(
+      {
+        sessionUpdate: 'tool_call_update',
+        status: 'completed',
+        taskId: idA,
+        rawOutput: { taskId: idB },
+      },
+      ownership,
+    )
+
+    expect(single).toBeDefined()
+    expect(duplicate).toBeDefined()
+    expect(distinct).toBeDefined()
+
+    const singleBytes = estimateCompactBackgroundRecordBytes(single!)
+    const duplicateBytes = estimateCompactBackgroundRecordBytes(duplicate!)
+    const distinctBytes = estimateCompactBackgroundRecordBytes(distinct!)
+
+    expect(duplicateBytes).toBe(singleBytes)
+    expect(distinctBytes).toBe(singleBytes + Buffer.byteLength(idB, 'utf8') * 2 + 16)
   })
 })

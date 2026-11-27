@@ -427,6 +427,7 @@ export interface ActiveAgyRun {
   promptReplyReceived: boolean
   replayingHistory: boolean
   foregroundReleased: boolean
+  controlDrainActive?: boolean | undefined
   rootReleasing: boolean
   rootTerminal: boolean
   cancellationPending: boolean
@@ -488,6 +489,8 @@ export const AGY_MAX_STAGED_PRE_BIND_BYTES = 2 * 1024 * 1024
 export const AGY_MAX_FOREIGN_EXECUTION_IDS = 256
 export const AGY_MAX_FOREIGN_EXECUTION_ID_BYTES = 64 * 1024
 export const AGY_MAX_POST_CUTOFF_BG_PENDING = 128
+export const AGY_EVIDENCE_CACHE_MAX_BYTES = 16 * 1024 * 1024
+export const AGY_CONTROL_DRAIN_HANDOFF_MS = 120_000
 export const AGY_MAX_POST_CUTOFF_BG_BYTES = 2 * 1024 * 1024
 export const AGY_MCP_MAX_CONCURRENT_SOCKETS = 32
 export const AGY_MCP_HEADERS_TIMEOUT_MS = 5_000
