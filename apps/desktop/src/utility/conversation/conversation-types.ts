@@ -200,6 +200,7 @@ export interface NativeObservation {
   archiver: RunOutputArchiver
   foregroundExited: boolean
   observationController: AbortController
+  backgroundReportTasks?: Set<Promise<void>> | undefined
   release?: (() => void) | undefined
   backgroundStop?:
     | {

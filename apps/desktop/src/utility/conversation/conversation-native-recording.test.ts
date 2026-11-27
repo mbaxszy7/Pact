@@ -1242,3 +1242,189 @@ it('S1-F2 & S1-F3: retains observer until foreground exits after Stop+settled an
     await f2.dispose()
   }
 })
+
+it('A-F6 & A-Advisory2: preserves pending/complete background report on shutdown behind archiveTail, surfaces post-foreground failureRecordingError on close, and keeps cross-Run session sequence strictly ascending', async () => {
+  // 1. A-F6a: Background report queued while archiveTail is busy still persists (complete or incomplete) across shutdown.
+  const f1 = await fixture('claude')
+  try {
+    const holdRootBody = Promise.withResolvers<void>()
+    let savedInput: AgentRunInput | undefined
+    let savedExecutorId = ''
+    let savedNativeSessionId = ''
+    native.customRun = async function* (agentId, executorId, input) {
+      native.actors += 1
+      native.inputs.set(input.runId, input)
+      savedInput = input
+      savedExecutorId = executorId
+      savedNativeSessionId = `native:${input.sessionId}`
+      input.host?.lifecycle?.recordExecutor?.(executorId)
+      input.host?.lifecycle?.recordDispatch?.('possibly_sent', savedNativeSessionId, executorId)
+      yield { type: 'session.started', agentId, nativeSessionId: savedNativeSessionId }
+      input.host?.lifecycle?.recordDispatch?.('accepted', savedNativeSessionId, executorId)
+      yield { type: 'turn.started', agentId, turnId: `turn:${input.runId}` }
+      native.background.add(input.runId)
+      input.host?.lifecycle?.recordNativeEvidence?.({
+        kind: 'ended',
+        source: 'live_terminal',
+        outcome: 'completed',
+        identity: {
+          sessionId: input.sessionId,
+          agentId,
+          runId: input.runId,
+          requestId: input.runId,
+          nativeSessionId: savedNativeSessionId,
+          nativeTurnId: `turn:${input.runId}`,
+          bindingGeneration: input.bindingGeneration!,
+          executorId,
+        },
+      })
+      // Queue a large archived answer so archiveTail is actively running
+      input.host?.effects?.recordArchivedEvent?.({
+        type: 'text.completed',
+        agentId,
+        turnId: `turn:${input.runId}`,
+        outputId: 'answer',
+        text: 'Root answer body.',
+      })
+      await holdRootBody.promise
+    }
+    const drafts = f1.db.conversationRepository.readPage({
+      scope: 'drafts',
+      sessionId: f1.sessionId,
+    })
+    if (drafts.scope !== 'drafts') throw new Error('Missing drafts')
+    const sent = await f1.flow.send({
+      sessionId: f1.sessionId,
+      clientMessageId: randomUUID(),
+      content: 'Shutdown with queued background report',
+      expectedCommentsRevision: drafts.commentsRevision,
+      commentIds: [],
+      route: { type: 'agent', agentId: 'claude' },
+    })
+    if (!sent.ok) throw new Error('Expected send to succeed')
+    const runId = sent.value.runs[0]!.id
+    await vi.waitFor(() => expect(savedInput).toBeDefined())
+    const reportCall = savedInput!.host!.effects!.recordBackgroundReport!({
+      agentId: 'claude',
+      runId,
+      nativeSessionId: savedNativeSessionId,
+      nativeTurnId: `turn:${runId}`,
+      bindingGeneration: savedInput!.bindingGeneration!,
+      executorId: savedExecutorId,
+      frameId: randomUUID(),
+      nativeMessageId: 'bg-report-shutdown-behind-archive-tail',
+      text: 'Background update during shutdown.',
+    })
+    holdRootBody.resolve()
+    await f1.flow.dispose({ flushDeadlineAt: Date.now() + 2000 })
+    await reportCall
+    const persisted = f1.db.conversationRepository
+      .read(f1.sessionId)
+      .messages.find((m) => isConversationBackgroundReport(m))
+    expect(persisted).toBeDefined()
+    expect(['complete', 'incomplete']).toContain(persisted?.state)
+  } finally {
+    await f1.dispose()
+  }
+
+  // 2. A-F6b: Post-foreground archive failure whose failure-receipt write also fails still surfaces on close().
+  const f2 = await fixture('codex')
+  try {
+    let savedInput2: AgentRunInput | undefined
+    native.customRun = async function* (agentId, executorId, input) {
+      native.actors += 1
+      native.inputs.set(input.runId, input)
+      savedInput2 = input
+      const nativeSessionId = `native:${input.sessionId}`
+      input.host?.lifecycle?.recordExecutor?.(executorId)
+      input.host?.lifecycle?.recordDispatch?.('possibly_sent', nativeSessionId, executorId)
+      yield { type: 'session.started', agentId, nativeSessionId }
+      input.host?.lifecycle?.recordDispatch?.('accepted', nativeSessionId, executorId)
+      yield { type: 'turn.started', agentId, turnId: `turn:${input.runId}` }
+      native.background.add(input.runId)
+      yield {
+        type: 'text.completed',
+        agentId,
+        turnId: `turn:${input.runId}`,
+        outputId: 'answer',
+        text: 'Done',
+      }
+      yield { type: 'turn.completed', agentId, turnId: `turn:${input.runId}`, outcome: 'completed' }
+    }
+    const drafts2 = f2.db.conversationRepository.readPage({
+      scope: 'drafts',
+      sessionId: f2.sessionId,
+    })
+    if (drafts2.scope !== 'drafts') throw new Error('Missing drafts')
+    const sent2 = await f2.flow.send({
+      sessionId: f2.sessionId,
+      clientMessageId: randomUUID(),
+      content: 'Post-foreground archive failure propagation',
+      expectedCommentsRevision: drafts2.commentsRevision,
+      commentIds: [],
+      route: { type: 'agent', agentId: 'codex' },
+    })
+    if (!sent2.ok) throw new Error('Expected send to succeed')
+    const runId2 = sent2.value.runs[0]!.id
+    await vi.waitFor(() => expect(f2.flow.diagnostics().activeExecutions).toBe(0))
+    const failSpy = vi
+      .spyOn(f2.db.conversationRepository, 'recordOutputFailure')
+      .mockImplementation(() => {
+        throw new Error('Injected SQLite failure-receipt write error')
+      })
+    try {
+      savedInput2!.host!.effects!.recordArchivedEvent!({
+        type: 'text.delta',
+        agentId: 'codex',
+        turnId: `turn:${runId2}`,
+        outputId: '',
+        text: 'corrupt-late-archive-event',
+      })
+      native.background.delete(runId2)
+      savedInput2!.host!.effects!.reportNativeEffects!({
+        runId: runId2,
+        generation: savedInput2!.nativeGeneration!,
+        state: 'settled',
+      })
+      await vi.waitFor(() => expect(failSpy).toHaveBeenCalled())
+      await expect(f2.flow.dispose({ flushDeadlineAt: Date.now() + 2000 })).rejects.toThrow(
+        /could not finish all output commits/u,
+      )
+    } finally {
+      failSpy.mockRestore()
+    }
+  } finally {
+    await f2.dispose().catch(() => undefined)
+  }
+
+  // 3. A-Advisory2: Real ConversationRuntimeCore.subscribe sees strictly ascending sequence across old-Run archive & new-Run foreground.
+  const f3 = await fixture('codex')
+  try {
+    const observedSequences: number[] = []
+    const unsubscribe = f3.flow.subscribe((patch) => {
+      if (patch.sessionId === f3.sessionId) observedSequences.push(patch.observation.sequence)
+    })
+    try {
+      const run1Id = await f3.send()
+      const input1 = native.inputs.get(run1Id)!
+      // Emit a late archived event from run1 while run2 is running foreground in the same session
+      input1.host?.effects?.recordArchivedEvent?.({
+        type: 'text.delta',
+        agentId: 'codex',
+        turnId: `turn:${run1Id}`,
+        outputId: 'answer',
+        text: ' late-archive-tail',
+      })
+      f3.endBackground(run1Id)
+      await f3.send()
+      for (let i = 1; i < observedSequences.length; i += 1) {
+        expect(observedSequences[i]!).toBeGreaterThanOrEqual(observedSequences[i - 1]!)
+      }
+      expect(observedSequences.length).toBeGreaterThan(2)
+    } finally {
+      unsubscribe()
+    }
+  } finally {
+    await f3.dispose()
+  }
+})

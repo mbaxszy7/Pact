@@ -706,10 +706,20 @@ export class ArchiveAndQuitCoordinator {
           outcome: unresolved ? 'unresolved' : failures.has(task.sessionId) ? 'failed' : 'stopped',
         })
       }
+      const scopeArchiveFailure =
+        [...this.core.unrecordedArchiveFailures.values()].some((entry) =>
+          scopeSessionIds.has(entry.sessionId),
+        ) ||
+        [...this.core.nativeObservations.values()].some(
+          (owner) =>
+            scopeSessionIds.has(owner.archiver.sessionId) &&
+            owner.archiver.failureRecordingError !== undefined,
+        )
       if (
         this.core.disposed ||
         performance.now() >= deadline ||
         failures.size ||
+        scopeArchiveFailure ||
         this.core.conversations.archives.hasNativeWork(scope) ||
         this.archiveWork(scope).tasks.length
       )
@@ -1063,17 +1073,43 @@ export class ArchiveAndQuitCoordinator {
     this.core.adapters.clear()
     const agyPoolEntries = [...this.core.agyConnectionPools.entries()]
     const agyForkFiles = this.core.agyForkFiles
+    const pendingBackgroundReports: Promise<void>[] = []
+    for (const owner of this.core.nativeObservations.values()) {
+      if (owner.backgroundReportTasks) {
+        for (const task of owner.backgroundReportTasks) pendingBackgroundReports.push(task)
+      }
+    }
+    if (pendingBackgroundReports.length > 0 && flushDeadlineAt !== undefined) {
+      const remainingMs = Math.max(0, flushDeadlineAt - Date.now())
+      if (remainingMs > 0) {
+        let reportTimer: ReturnType<typeof setTimeout> | undefined
+        try {
+          await Promise.race([
+            Promise.allSettled(pendingBackgroundReports),
+            new Promise<void>((resolve) => {
+              reportTimer = setTimeout(resolve, remainingMs)
+            }),
+          ])
+        } finally {
+          clearTimeout(reportTimer)
+        }
+      }
+    }
     for (const owner of this.core.nativeObservations.values()) {
       owner.sourceReader?.retire()
       this.core.recovery.clearBackgroundStop(owner)
       owner.observationController.abort()
       owner.archiver.archiveController.abort()
     }
-    await Promise.allSettled(
-      [...this.core.nativeObservations.values()].flatMap((owner) =>
-        owner.archiver.archiveTail ? [owner.archiver.archiveTail] : [],
-      ),
-    )
+    const observationDrains: Promise<unknown>[] = []
+    for (const owner of this.core.nativeObservations.values()) {
+      if (owner.archiver.archiveTail) observationDrains.push(owner.archiver.archiveTail)
+      if (owner.backgroundReportTasks) {
+        for (const task of owner.backgroundReportTasks) observationDrains.push(task)
+      }
+    }
+    await Promise.allSettled(observationDrains)
+    if (this.core.unrecordedArchiveFailures.size > 0) flushed = false
     for (const owner of this.core.nativeObservations.values()) {
       try {
         if (owner.archiver.failureRecordingError !== undefined) flushed = false
@@ -1157,6 +1193,7 @@ export class ArchiveAndQuitCoordinator {
     if (shutdownOwners.some((owner) => owner.shutdown?.failed)) flushed = false
     for (const owner of shutdownOwners) delete owner.shutdown
     this.core.nativeObservations.clear()
+    this.core.unrecordedArchiveFailures.clear()
     this.core.activeExecutions.clear()
     this.core.preparingSends.clear()
     this.core.preparingContinuations.clear()

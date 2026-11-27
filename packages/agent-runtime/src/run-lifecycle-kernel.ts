@@ -142,19 +142,24 @@ export function classifyBindingRejection(input: {
 
 export const NATIVE_TERMINAL_FAILURE_MAX_CHARS = 240
 
+const HEADER_LINE_SECRET_PATTERNS: readonly RegExp[] = [
+  /(?:^|[\r\n])\s*["']?(?:set-cookie|cookie|(?:proxy-)?authorization)["']?\s*[:=]\s*[^\r\n]+/giu,
+  /["']?(?:set-cookie|cookie|(?:proxy-)?authorization)["']?\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\r\n}\]]+)/giu,
+]
+
 const REDACT_SECRET_PATTERNS: readonly RegExp[] = [
-  /["']?(?:proxy-)?authorization["']?\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\r\n,;}\]]+)/giu,
-  /\b(?:Bearer|Basic|Digest|ApiKey)\s+[A-Za-z0-9._~+/=-]{4,}/giu,
+  /\b(?:Bearer|Basic|Digest|ApiKey)\s+[A-Za-z0-9._~+/=-]{4,}(?:\s*,\s*[A-Za-z0-9._-]+=(?:"[^"]*"|[^\s,;}\]]+))*/giu,
   /\bToken\s+(?=[A-Za-z0-9._~+/=-]*[0-9._+/=-])[A-Za-z0-9._~+/=-]{8,}/gu,
   /\bsk-[A-Za-z0-9_-]{12,}/gu,
   /\bAIza[0-9A-Za-z_-]{20,}/gu,
-  /["']?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|client[_-]?secret|x-api-key|set-cookie|cookie|password|passwd|pwd|secret|token)["']?\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s"',;}\]]+)/giu,
+  /["']?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|client[_-]?secret|x-api-key|password|passwd|pwd|secret|token)["']?\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s"',;}\]]+)/giu,
 ]
 
 /**
  * Single authoritative sanitizer for provider terminal failure detail (Rule A5):
- * strips ASCII control characters, collapses whitespace, redacts obvious credentials,
- * and caps the output at 240 characters.
+ * strips full sensitive header values before flattening whitespace (preserving line
+ * boundaries for multi-member Cookie/Set-Cookie/Authorization headers), redacts
+ * structured/standalone credentials, and caps the output at 240 characters.
  */
 export function sanitizeNativeTerminalFailure(
   raw: unknown,
@@ -174,12 +179,21 @@ export function sanitizeNativeTerminalFailure(
           : typeof raw === 'number' || typeof raw === 'boolean' || typeof raw === 'bigint'
             ? String(raw)
             : ''
-  let cleaned = ''
+  let linePreserving = ''
   for (const ch of source) {
     const code = ch.charCodeAt(0)
-    cleaned += code < 32 || code === 127 ? ' ' : ch
+    if (ch === '\n' || ch === '\r') {
+      linePreserving += ch
+    } else {
+      linePreserving += code < 32 || code === 127 ? ' ' : ch
+    }
   }
-  cleaned = cleaned.replaceAll(/\s+/gu, ' ').trim()
+  for (const pattern of HEADER_LINE_SECRET_PATTERNS) {
+    linePreserving = linePreserving.replace(pattern, (match) =>
+      match.startsWith('\n') || match.startsWith('\r') ? `${match[0]}[redacted]` : '[redacted]',
+    )
+  }
+  let cleaned = linePreserving.replaceAll(/\s+/gu, ' ').trim()
   for (const pattern of REDACT_SECRET_PATTERNS) {
     cleaned = cleaned.replace(pattern, '[redacted]')
   }
@@ -631,6 +645,10 @@ export class RunLifecycleKernel<TMeta = undefined> {
         this.ledger.recordings.queuedCount > 0
       ) {
         return this.reportNativeEffects('unknown', 'native_recording_drain_incomplete')
+      }
+      if (this.ledger.tasks.hasActiveTasks) {
+        // Active provisional or confirmed tasks remain tracked; stay pending until settled.
+        return false
       }
       this.effectsStateValue = 'settled'
       this.callbacks.onReportNativeEffects?.({

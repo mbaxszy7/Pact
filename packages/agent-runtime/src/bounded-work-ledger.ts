@@ -152,12 +152,28 @@ export class BoundedBackgroundTaskTable<TMeta = undefined> {
       return false
     }
 
+    const existingMapped =
+      provisionalLaunchId !== undefined
+        ? this.provisionalToConfirmed.get(provisionalLaunchId)
+        : undefined
+    const conflictingConfirmedAlias =
+      existingMapped !== undefined && existingMapped !== confirmedTaskId
+    if (conflictingConfirmedAlias) {
+      // Two contradictory confirmed IDs claimed the same provisional launch ID:
+      // preserve the already-mapped confirmed task and latch observation uncertainty.
+      this.latchOverflow(
+        `Conflicting confirmed task identities for provisional launch ${provisionalLaunchId}.`,
+      )
+    }
+
     const hadProvisional =
       provisionalLaunchId !== undefined ? this.provisional.delete(provisionalLaunchId) : false
 
     const completedByConfirmed = this.earlyCompletedIds.has(confirmedTaskId)
     const completedByProvisional =
-      provisionalLaunchId !== undefined && this.earlyCompletedIds.has(provisionalLaunchId)
+      provisionalLaunchId !== undefined &&
+      !conflictingConfirmedAlias &&
+      this.earlyCompletedIds.has(provisionalLaunchId)
     if (completedByConfirmed || completedByProvisional) {
       let removed = hadProvisional
       if (this.confirmed.delete(confirmedTaskId)) removed = true
@@ -166,17 +182,7 @@ export class BoundedBackgroundTaskTable<TMeta = undefined> {
         if (this.provisional.delete(launchId)) removed = true
         this.recordCompletedId(launchId)
       }
-      if (provisionalLaunchId !== undefined) {
-        const mapped = this.provisionalToConfirmed.get(provisionalLaunchId)
-        if (mapped !== undefined && mapped !== confirmedTaskId) {
-          if (this.confirmed.delete(mapped)) removed = true
-          const mappedLinked = this.unlinkConfirmedAliases(mapped)
-          for (const launchId of mappedLinked) {
-            if (this.provisional.delete(launchId)) removed = true
-            this.recordCompletedId(launchId)
-          }
-          this.recordCompletedId(mapped)
-        }
+      if (provisionalLaunchId !== undefined && !conflictingConfirmedAlias) {
         this.unlinkProvisionalAlias(provisionalLaunchId)
         this.recordCompletedId(provisionalLaunchId)
       }
@@ -186,11 +192,13 @@ export class BoundedBackgroundTaskTable<TMeta = undefined> {
     }
 
     if (this.confirmed.has(confirmedTaskId)) {
-      if (provisionalLaunchId) {
+      if (provisionalLaunchId && !conflictingConfirmedAlias) {
         this.linkAlias(provisionalLaunchId, confirmedTaskId)
       }
       this.confirmed.set(confirmedTaskId, {
-        ...(provisionalLaunchId ? { provisionalId: provisionalLaunchId } : {}),
+        ...(provisionalLaunchId && !conflictingConfirmedAlias
+          ? { provisionalId: provisionalLaunchId }
+          : {}),
         confirmedTaskId,
         stage: 'confirmed',
         meta,
@@ -204,11 +212,13 @@ export class BoundedBackgroundTaskTable<TMeta = undefined> {
       return false
     }
 
-    if (provisionalLaunchId) {
+    if (provisionalLaunchId && !conflictingConfirmedAlias) {
       this.linkAlias(provisionalLaunchId, confirmedTaskId)
     }
     this.confirmed.set(confirmedTaskId, {
-      ...(provisionalLaunchId ? { provisionalId: provisionalLaunchId } : {}),
+      ...(provisionalLaunchId && !conflictingConfirmedAlias
+        ? { provisionalId: provisionalLaunchId }
+        : {}),
       confirmedTaskId,
       stage: 'confirmed',
       meta,

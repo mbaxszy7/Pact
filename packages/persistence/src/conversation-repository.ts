@@ -2371,6 +2371,10 @@ export class ConversationRepository {
     return eventStreamQueries.completeAnswer(this.host, runId, metadata, source, signal, options)
   }
 
+  admitBackgroundReportPending(report: BackgroundReportIdentity): ConversationPatch | undefined {
+    return eventStreamQueries.admitBackgroundReportPending(this.host, report)
+  }
+
   async recordBackgroundReport(
     report: NativeBackgroundReport,
     source: (physicalSignal: AbortSignal) => AsyncIterable<string>,

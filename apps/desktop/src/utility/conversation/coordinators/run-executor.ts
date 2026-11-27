@@ -148,7 +148,10 @@ export class RunExecutor {
           }
           if (owner) {
             owner.foregroundExited = true
-            if (!owner.adapter.hasActiveBackgroundWork?.(execution.run.id)) {
+            if (
+              !owner.adapter.hasActiveBackgroundWork?.(execution.run.id) &&
+              !(owner.backgroundReportTasks?.size ?? 0)
+            ) {
               if (execution.streamBuffer && !execution.streamBuffer.flush()) {
                 drainError ??= new Error('The last foreground output could not be committed.')
               }
@@ -160,6 +163,13 @@ export class RunExecutor {
               }
               owner.release?.()
               if (this.core.nativeObservations.get(execution.run.id) === owner) {
+                if (owner.archiver.failureRecordingError !== undefined) {
+                  this.core.recordUnrecordedArchiveFailure(
+                    execution.run.id,
+                    run.sessionId,
+                    owner.archiver.failureRecordingError,
+                  )
+                }
                 owner.observationController.abort()
                 this.settleOrphanedPendingEffects(
                   execution.run.id,
@@ -690,6 +700,7 @@ export class RunExecutor {
       archiver,
       foregroundExited: false,
       observationController: new AbortController(),
+      backgroundReportTasks: new Set(),
     }
     ownerRef = owner
     this.core.nativeObservations.set(run.id, owner)
@@ -728,7 +739,12 @@ export class RunExecutor {
     let runDeliveryPossible = false
 
     const release = (): void => {
-      if (!stillOwned() || !owner.foregroundExited || adapter.hasActiveBackgroundWork?.(run.id))
+      if (
+        !stillOwned() ||
+        !owner.foregroundExited ||
+        adapter.hasActiveBackgroundWork?.(run.id) ||
+        (owner.backgroundReportTasks?.size ?? 0) > 0
+      )
         return
       if (archiver.archiveTail) {
         void archiver.archiveTail.then(release, release)
@@ -747,6 +763,11 @@ export class RunExecutor {
         this.core.workspaceChanges?.observeUncertainEffects(run.id)
       }
       if (archiver.failureRecordingError !== undefined) {
+        this.core.recordUnrecordedArchiveFailure(
+          run.id,
+          run.sessionId,
+          archiver.failureRecordingError,
+        )
         recordDiagnostic({
           operation: 'native_check',
           phase: 'failed',
@@ -1136,32 +1157,45 @@ export class RunExecutor {
             ) {
               return
             }
-            try {
-              if (archiver.archiveTail) {
-                await archiver.archiveTail.catch(() => undefined)
+            const task = (async () => {
+              try {
+                // A-F6: Validate full repository identity and durably admit the pending/incomplete
+                // report row BEFORE awaiting `archiveTail`, so shutdown during archiveTail wait
+                // always leaves at least an incomplete record (or completes within quit deadline).
+                this.core.conversations.admitBackgroundReportPending(report)
+                if (archiver.archiveTail) {
+                  await archiver.archiveTail.catch(() => undefined)
+                }
+                if (owner.observationController.signal.aborted) return
+                const patch = await this.core.conversations.recordBackgroundReport(
+                  report,
+                  (bodySignal) => RunOutputArchiver.answerParts(report.text, bodySignal),
+                  owner.observationController.signal,
+                )
+                if (patch && stillOwned()) this.core.publish(patch)
+              } catch (error) {
+                if (!stillOwned() || owner.observationController.signal.aborted) return
+                const patch = this.core.conversations.recordBackgroundReportUnavailable(report)
+                if (patch) this.core.publish(patch)
+                recordDiagnostic({
+                  operation: 'native_check',
+                  phase: 'failed',
+                  level: 'warn',
+                  scope: 'run',
+                  sessionId: run.sessionId,
+                  runId: run.id,
+                  agentId: run.agentId,
+                  runtimeBoundary: 'archive',
+                  code: classifyAgentError(error).kind,
+                })
               }
-              if (!stillOwned() || owner.observationController.signal.aborted) return
-              const patch = await this.core.conversations.recordBackgroundReport(
-                report,
-                (bodySignal) => RunOutputArchiver.answerParts(report.text, bodySignal),
-                owner.observationController.signal,
-              )
-              if (patch && stillOwned()) this.core.publish(patch)
-            } catch (error) {
-              if (!stillOwned() || owner.observationController.signal.aborted) return
-              const patch = this.core.conversations.recordBackgroundReportUnavailable(report)
-              if (patch) this.core.publish(patch)
-              recordDiagnostic({
-                operation: 'native_check',
-                phase: 'failed',
-                level: 'warn',
-                scope: 'run',
-                sessionId: run.sessionId,
-                runId: run.id,
-                agentId: run.agentId,
-                runtimeBoundary: 'archive',
-                code: classifyAgentError(error).kind,
-              })
+            })()
+            owner.backgroundReportTasks?.add(task)
+            try {
+              await task
+            } finally {
+              owner.backgroundReportTasks?.delete(task)
+              if (owner.foregroundExited) owner.release?.()
             }
           },
           anchorFileBeforeEdit: async (path, ioSignal) => {

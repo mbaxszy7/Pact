@@ -185,6 +185,7 @@ export class ConversationRuntimeCore {
   readonly adapters = new Map<string, CachedAdapter>()
   skillDocumentOwner: SkillDocumentOwner | undefined
   readonly nativeObservations = new Map<string, NativeObservation>()
+  readonly unrecordedArchiveFailures = new Map<string, { sessionId: string; error: unknown }>()
   readonly nativeChecks = new Map<string, ActiveNativeCheck>()
   adapterSlotTail: Promise<void> = Promise.resolve()
   pendingContinuationScheduled = false
@@ -1584,6 +1585,14 @@ export class ConversationRuntimeCore {
       preparingExecutions: this.preparingSends.size + this.preparingContinuations.size,
       adapterSlots: this.adapters.size,
     }
+  }
+
+  recordUnrecordedArchiveFailure(runId: string, sessionId: string, error: unknown): void {
+    if (this.unrecordedArchiveFailures.size >= 64 && !this.unrecordedArchiveFailures.has(runId)) {
+      const oldest = this.unrecordedArchiveFailures.keys().next().value
+      if (oldest !== undefined) this.unrecordedArchiveFailures.delete(oldest)
+    }
+    this.unrecordedArchiveFailures.set(runId, { sessionId, error })
   }
 
   subscribe(listener: (patch: ConversationPatch, progress: boolean) => void): () => void {

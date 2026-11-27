@@ -113,6 +113,31 @@ export async function completeAnswer(
   )
 }
 
+export function admitBackgroundReportPending(
+  repo: ConversationRepositoryHost,
+  report: BackgroundReportIdentity,
+): ConversationPatch | undefined {
+  const id = backgroundReportId(report)
+  const existingInput = repo.database
+    .select({ committed: conversationBodyInputs.committedMessageId })
+    .from(conversationBodyInputs)
+    .where(eq(conversationBodyInputs.id, id))
+    .get()
+  if (existingInput) return undefined
+  const existingMessage = repo.database
+    .select({
+      state: conversationMessages.state,
+      revision: conversationMessages.contentRevision,
+    })
+    .from(conversationMessages)
+    .where(eq(conversationMessages.id, id))
+    .get()
+  if (existingMessage && (existingMessage.state === 'complete' || existingMessage.revision > 0)) {
+    return undefined
+  }
+  return commitBackgroundReport(repo, report, id, undefined, 'pending')
+}
+
 export async function recordBackgroundReport(
   repo: ConversationRepositoryHost,
   report: NativeBackgroundReport,
@@ -141,16 +166,21 @@ export async function recordBackgroundReport(
       throw new RunOperationConflictError('A background update repeated with a different source.')
     return undefined
   }
-  // A prior unavailable admission is already durable. Never re-seal a replay
-  // after its uncommitted body was discarded on cancellation or cold startup.
-  if (
-    repo.database
-      .select({ id: conversationMessages.id })
-      .from(conversationMessages)
-      .where(eq(conversationMessages.id, id))
-      .get()
-  )
+  // A prior complete or unavailable admission is already durable. Never re-seal a replay
+  // after its uncommitted body was discarded on cancellation or cold startup. An in-flight
+  // pre-admitted `pending` placeholder (state='incomplete', contentRevision=0) proceeds to seal.
+  const existingMessage = repo.database
+    .select({
+      id: conversationMessages.id,
+      state: conversationMessages.state,
+      revision: conversationMessages.contentRevision,
+    })
+    .from(conversationMessages)
+    .where(eq(conversationMessages.id, id))
+    .get()
+  if (existingMessage && (existingMessage.state === 'complete' || existingMessage.revision > 0)) {
     return undefined
+  }
   commitBackgroundReport(repo, report, id, undefined, 'pending')
   return sealAnswerBody(repo, run, id, report.nativeMessageId, source, signal, (body) => {
     if (body.sha256 !== digest)

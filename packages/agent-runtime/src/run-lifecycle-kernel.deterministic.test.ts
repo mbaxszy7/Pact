@@ -674,5 +674,59 @@ describe('Shared runtime validators, binding taxonomy, sanitizer, and Disposable
     expect(table2.activeCount).toBe(0)
     expect(table2.aliasCount).toBe(0)
     expect(table2.hasActiveTasks).toBe(false)
+
+    // A-F7: Multi-member Cookie / Set-Cookie and comma-separated Digest Authorization headers are stripped in full.
+    const cookieHeader = [
+      'HTTP 401',
+      `${['Coo', 'kie'].join('')}: first=alpha1; sid=sentinel_two_987; theme=dark`,
+      `${['Authoriz', 'ation'].join('')}: Digest username="u1", realm="r1", response="sentinel_digest_val"`,
+      'Retry-After: 5',
+    ].join('\n')
+    const sanitizedMulti = sanitizeNativeTerminalFailure(cookieHeader)
+    expect(sanitizedMulti).not.toContain('alpha1')
+    expect(sanitizedMulti).not.toContain('sentinel_two_987')
+    expect(sanitizedMulti).not.toContain('theme=dark')
+    expect(sanitizedMulti).not.toContain('sentinel_digest_val')
+    expect(sanitizedMulti).toContain('HTTP 401')
+    expect(sanitizedMulti).toContain('Retry-After: 5')
+
+    // A-F9: Explicit reportNativeEffects('settled') stays pending while confirmed/provisional tasks are active.
+    const taskEffectsLog: string[] = []
+    const kTask = new RunLifecycleKernel({
+      agentId: 'agy',
+      runId: 'run-active-task-gate',
+      sessionId: 's-task',
+      nativeGeneration: 'gen-task',
+      callbacks: {
+        onReportNativeEffects: (report) => taskEffectsLog.push(report.state),
+      },
+    })
+    kTask.bindExecutor('exec-task')
+    kTask.reportNativeEffects('pending')
+    expect(kTask.ledger.tasks.confirmTask('daemon-active-1', undefined)).toBe(true)
+    // Ambient tasks remain excluded, while active confirmed tasks block settled
+    kTask.ledger.tasks.markAmbient('ambient-ignored')
+    expect(kTask.reportNativeEffects('settled')).toBe(false)
+    expect(kTask.effectsState).toBe('pending')
+    expect(taskEffectsLog).toEqual(['pending'])
+    await kTask.settle({ retainBackgroundObservation: true })
+    expect(kTask.effectsState).toBe('pending')
+    expect(taskEffectsLog).not.toContain('settled')
+    expect(kTask.ledger.tasks.completeTask('daemon-active-1')).toBe(true)
+    expect(kTask.reportNativeEffects('settled')).toBe(true)
+    expect(kTask.effectsState).toBe('settled')
+
+    // A-Advisory1: Conflicting confirmed IDs for one provisional launch preserve the original confirmed task and latch uncertainty.
+    const conflictTable = new BoundedBackgroundTaskTable<{ kind: string }>()
+    expect(conflictTable.registerProvisional('prov-conflict', { kind: 'bg' })).toBe(true)
+    expect(conflictTable.confirmTask('conf-a', { kind: 'bg' }, 'prov-conflict')).toBe(true)
+    expect(conflictTable.completeTask('conf-b')).toBe(false)
+    expect(conflictTable.confirmTask('conf-b', { kind: 'bg' }, 'prov-conflict')).toBe(true)
+    expect(conflictTable.overflowed).toBe(true)
+    // conf-a MUST still remain active until its own completion arrives!
+    expect(conflictTable.hasActiveTasks).toBe(true)
+    expect(conflictTable.confirmedCount).toBe(1)
+    expect(conflictTable.completeTask('conf-a')).toBe(true)
+    expect(conflictTable.hasActiveTasks).toBe(false)
   })
 })
