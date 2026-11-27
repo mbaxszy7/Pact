@@ -24,6 +24,10 @@ import type {
   SessionPermissionMode,
 } from '@pact/contracts'
 
+import {
+  NATIVE_TERMINAL_FAILURE_MAX_CHARS,
+  sanitizeNativeTerminalFailure,
+} from '@pact/agent-runtime'
 import { peerRequestToolInputSchema, type NativePermissionRequest } from '@pact/contracts'
 
 import type { LogicalIpcWorkerTraffic } from '../../../shared/logical-ipc-traffic'
@@ -38,7 +42,13 @@ import type { PactPeerToolServer } from '../pact-peer-tool-server'
 
 import { AgentActivityDetail } from '../agent-activity-detail'
 import { AgentAnswerAssembler } from '../agent-answer-assembler'
-import { AgentExecutionError } from '../agent-execution-error'
+import { AgentExecutionError, classifyAgentError } from '../agent-execution-error'
+
+export interface CodexSettingsBarrier {
+  readonly executorId: string
+  readonly threadId: string
+  readonly done: Promise<void>
+}
 
 export interface CodexRelayPermissionInput {
   readonly host?: never
@@ -89,6 +99,7 @@ export interface CodexAdapterRuntime {
   readonly peerToolServer: PactPeerToolServer
   peerServerName: string
   readonly nativeBackground: Set<NativeBackground>
+  readonly pendingSettingsBarriers: Map<string, CodexSettingsBarrier>
   readonly retiredNativeTurns: Set<string>
   readonly retiredNativeChildren: Set<string>
   idleTimer: ReturnType<typeof setTimeout> | undefined
@@ -207,13 +218,80 @@ export interface CodexConnectionManagerPort {
     close: (deadlineAt?: number) => Promise<void>
     physicalWitness: (ownerId: string) => Promise<import('@pact/contracts').DecisionPhysicalWitness>
   }>
+  awaitSettingsBarrier(
+    connection: CodexAppServerConnection,
+    threadId: string,
+    signal: AbortSignal,
+  ): Promise<boolean>
   applyPermissionSettings(
     connection: CodexAppServerConnection,
     threadId: string,
     policy: object | undefined,
     signal: AbortSignal,
     baselineMessage?: object,
+    background?: NativeBackground,
+    onBarrierSettled?: () => void,
   ): Promise<object>
+}
+
+export function extractCodexRpcErrorMessage(error: unknown): string | undefined {
+  if (typeof error === 'string') return error
+  if (!error || typeof error !== 'object' || Array.isArray(error)) return undefined
+  const message = Reflect.get(error, 'message')
+  return typeof message === 'string' ? message : undefined
+}
+
+export function formatCodexRpcErrorMessage(error: unknown, fallback: string, prefix = ''): string {
+  const rawMessage = extractCodexRpcErrorMessage(error)
+  let detail = rawMessage ? sanitizeNativeTerminalFailure(rawMessage) : ''
+  if (!detail && error && typeof error === 'object' && !Array.isArray(error)) {
+    const code = Reflect.get(error, 'code')
+    if (typeof code === 'number' && Number.isSafeInteger(code)) {
+      detail = `RPC error ${code}`
+    }
+  }
+  const body = detail || sanitizeNativeTerminalFailure(fallback) || 'Codex request failed.'
+  if (!prefix) return body
+  return sanitizeNativeTerminalFailure(`${prefix}${body}`, NATIVE_TERMINAL_FAILURE_MAX_CHARS)
+}
+
+export function classifyCodexRpcError(
+  error: unknown,
+  fallback: string,
+  prefix = '',
+): AgentExecutionError {
+  const rawMessage = extractCodexRpcErrorMessage(error)
+  const sanitized = formatCodexRpcErrorMessage(error, fallback, prefix)
+  const classified = classifyAgentError(new Error(rawMessage ?? sanitized))
+  if (classified.kind !== 'agent_process_crash') {
+    return new AgentExecutionError(classified.kind, sanitized, classified.retryable)
+  }
+  if (error && typeof error === 'object' && !Array.isArray(error)) {
+    const info = Reflect.get(error, 'codexErrorInfo')
+    const infoText =
+      typeof info === 'string'
+        ? info
+        : info && typeof info === 'object' && !Array.isArray(info)
+          ? Object.keys(info).join(' ')
+          : ''
+    if (infoText) {
+      const lower = infoText.toLowerCase()
+      if (lower.includes('contextwindow') || lower.includes('context_window')) {
+        return new AgentExecutionError('context_limit', sanitized, false)
+      }
+      if (
+        lower.includes('usagelimit') ||
+        lower.includes('usage_limit') ||
+        lower.includes('ratelimit')
+      ) {
+        return new AgentExecutionError('quota_or_rate_limit', sanitized, false)
+      }
+      if (lower.includes('unauth')) {
+        return new AgentExecutionError('authentication_required', sanitized, false)
+      }
+    }
+  }
+  return new AgentExecutionError(classified.kind, sanitized, classified.retryable)
 }
 
 export interface CodexLifecycleCoordinatorPort {

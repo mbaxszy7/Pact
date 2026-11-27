@@ -329,6 +329,15 @@ export class RunLifecycleKernel<TMeta = undefined> {
   private sessionGenValue: number
   private connectionGenValue: number
   private ownerGenValue: number
+  private settlePromiseValue:
+    | Promise<{
+        readonly cleanupErrors: readonly unknown[]
+        readonly recordingsDrained: boolean
+        readonly recordingsFailedCount: number
+        readonly recordingsDroppedCount: number
+        readonly disposalsDeferred: boolean
+      }>
+    | undefined
 
   constructor(options: RunLifecycleKernelOptions) {
     this.agentId = options.agentId
@@ -465,13 +474,12 @@ export class RunLifecycleKernel<TMeta = undefined> {
     nativeSessionId?: string,
     executorId?: string,
   ): boolean {
-    if (nativeSessionId) this.nativeSessionIdValue = nativeSessionId
-    if (executorId && !this.executorIdValue) this.executorIdValue = executorId
-
     if (this.phaseValue === 'Settled') return false
 
     if (phase === 'possibly_sent') {
       if (this.dispatchPhaseValue !== 'none') return false
+      if (nativeSessionId) this.nativeSessionIdValue = nativeSessionId
+      if (executorId && !this.executorIdValue) this.executorIdValue = executorId
       if (this.phaseValue === 'BootstrappingSession') this.transition('ReadyToDispatch')
       if (this.phaseValue === 'ReadyToDispatch') this.transition('DispatchedStreaming')
       this.dispatchPhaseValue = 'possibly_sent'
@@ -487,6 +495,8 @@ export class RunLifecycleKernel<TMeta = undefined> {
       if (this.dispatchPhaseValue === 'accepted' || this.dispatchPhaseValue === 'rejected') {
         return false
       }
+      if (nativeSessionId) this.nativeSessionIdValue = nativeSessionId
+      if (executorId && !this.executorIdValue) this.executorIdValue = executorId
       if (this.phaseValue === 'BootstrappingSession') this.transition('ReadyToDispatch')
       if (this.phaseValue === 'ReadyToDispatch') this.transition('DispatchedStreaming')
       this.dispatchPhaseValue = 'accepted'
@@ -498,6 +508,8 @@ export class RunLifecycleKernel<TMeta = undefined> {
     if (this.dispatchPhaseValue === 'accepted' || this.dispatchPhaseValue === 'rejected') {
       return false
     }
+    if (nativeSessionId) this.nativeSessionIdValue = nativeSessionId
+    if (executorId && !this.executorIdValue) this.executorIdValue = executorId
     this.dispatchPhaseValue = 'rejected'
     this.callbacks.onDispatchPhase?.('rejected', this.nativeSessionIdValue, this.executorIdValue)
     return true
@@ -630,8 +642,11 @@ export class RunLifecycleKernel<TMeta = undefined> {
   /**
    * Transitions into `DrainingEffects`, drains the bounded recording queue, runs LIFO
    * disposables, finalizes native effects reporting, and enters `Settled`.
+   *
+   * Concurrent calls share a single in-flight settlement promise and resolve together
+   * with the exact same final result.
    */
-  async settle(
+  settle(
     options: {
       readonly drainSignal?: AbortSignal | undefined
       readonly beforeDispose?: (() => Promise<void> | void) | undefined
@@ -640,21 +655,87 @@ export class RunLifecycleKernel<TMeta = undefined> {
   ): Promise<{
     readonly cleanupErrors: readonly unknown[]
     readonly recordingsDrained: boolean
+    readonly recordingsFailedCount: number
+    readonly recordingsDroppedCount: number
+    readonly disposalsDeferred: boolean
   }> {
-    if (this.phaseValue === 'Settled') {
-      return { cleanupErrors: [], recordingsDrained: true }
+    if (this.settlePromiseValue) {
+      return this.settlePromiseValue
     }
     this.foregroundOutputFrozenFlag = true
-    if (this.phaseValue !== 'DrainingEffects') {
+    if (this.phaseValue !== 'DrainingEffects' && this.phaseValue !== 'Settled') {
       this.transition('DrainingEffects')
     }
+    this.settlePromiseValue = this.executeSettle(options)
+    return this.settlePromiseValue
+  }
 
+  private async executeSettle(options: {
+    readonly drainSignal?: AbortSignal | undefined
+    readonly beforeDispose?: (() => Promise<void> | void) | undefined
+    readonly retainBackgroundObservation?: boolean | undefined
+  }): Promise<{
+    readonly cleanupErrors: readonly unknown[]
+    readonly recordingsDrained: boolean
+    readonly recordingsFailedCount: number
+    readonly recordingsDroppedCount: number
+    readonly disposalsDeferred: boolean
+  }> {
     const drainResult = await this.ledger.recordings.drain(options.drainSignal)
-    if (!drainResult.drained || drainResult.overflowed) {
-      this.reportNativeEffects('unknown', 'native_recording_drain_incomplete')
+    const recordingsUncertain =
+      !drainResult.drained ||
+      drainResult.overflowed ||
+      drainResult.failedCount > 0 ||
+      drainResult.droppedCount > 0
+
+    if (recordingsUncertain) {
+      const reason =
+        !drainResult.drained || drainResult.droppedCount > 0
+          ? 'native_recording_drain_incomplete'
+          : drainResult.overflowed
+            ? 'native_recording_overflow'
+            : 'native_recording_failed'
+      this.reportNativeEffects('unknown', reason)
+    }
+
+    if (!drainResult.drained) {
+      // Request worker cancellation before touching disposables so active workers never
+      // lose dependent resources while still executing.
+      this.ledger.recordings.abortAll()
     }
 
     const cleanupErrors: unknown[] = []
+    const workersStillActive = this.ledger.recordings.activeCount > 0
+    if (workersStillActive) {
+      if (!options.retainBackgroundObservation) {
+        this.reportNativeEffects('unknown', 'native_work_unconfirmed')
+      }
+      void this.ledger.recordings.whenWorkersIdle().then(async () => {
+        if (options.beforeDispose) {
+          try {
+            await options.beforeDispose()
+          } catch {
+            // Best-effort deferred cleanup once timed-out workers physically exit.
+          }
+        }
+        await this.disposables.disposeAll()
+        if (!options.retainBackgroundObservation) {
+          this.ledger.tasks.clear()
+        }
+        return undefined
+      })
+      if (this.phaseValue !== 'Settled') {
+        this.transition('Settled')
+      }
+      return {
+        cleanupErrors,
+        recordingsDrained: false,
+        recordingsFailedCount: drainResult.failedCount,
+        recordingsDroppedCount: drainResult.droppedCount,
+        disposalsDeferred: true,
+      }
+    }
+
     if (options.beforeDispose) {
       try {
         await options.beforeDispose()
@@ -667,7 +748,7 @@ export class RunLifecycleKernel<TMeta = undefined> {
     cleanupErrors.push(...scopeErrors)
 
     if (!options.retainBackgroundObservation) {
-      if (this.ledger.hasPendingWork || this.ledger.hasUncertainOverflow) {
+      if (this.ledger.hasPendingWork || this.ledger.hasUncertainOverflow || recordingsUncertain) {
         this.reportNativeEffects('unknown', 'native_work_unconfirmed')
       } else if (this.effectsStateValue === 'pending') {
         this.reportNativeEffects('settled')
@@ -675,16 +756,21 @@ export class RunLifecycleKernel<TMeta = undefined> {
       this.ledger.dispose()
     } else if (this.ledger.hasPendingWork) {
       this.reportNativeEffects('pending')
-    } else if (this.ledger.hasUncertainOverflow) {
+    } else if (this.ledger.hasUncertainOverflow || recordingsUncertain) {
       this.reportNativeEffects('unknown', 'native_work_overflow')
     } else if (this.effectsStateValue === 'pending') {
       this.reportNativeEffects('settled')
     }
 
-    this.transition('Settled')
+    if (this.phaseValue !== 'Settled') {
+      this.transition('Settled')
+    }
     return {
       cleanupErrors,
       recordingsDrained: drainResult.drained,
+      recordingsFailedCount: drainResult.failedCount,
+      recordingsDroppedCount: drainResult.droppedCount,
+      disposalsDeferred: false,
     }
   }
 

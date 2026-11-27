@@ -485,4 +485,113 @@ describe('Shared runtime validators, binding taxonomy, sanitizer, and Disposable
     expect(errors).toHaveLength(1)
     expect(await scope.disposeAll()).toEqual([])
   })
+
+  it('Wave 6A Shard 1 regressions: shares concurrent settle(), prevents false settled on recording failure/drop, defers disposeAll on timeout, avoids rejected recordDispatch mutation, and cleans aliases in both ambient orders', async () => {
+    // 1. Rejected recordDispatch does not mutate executorId or nativeSessionId.
+    const kernelRejected = new RunLifecycleKernel({
+      agentId: 'codex',
+      runId: 'run-reject-no-mutate',
+      sessionId: 's-1',
+      nativeGeneration: 'gen-1',
+    })
+    kernelRejected.bindExecutor('exec-real')
+    expect(kernelRejected.recordDispatch('accepted', 'native-real', 'exec-real')).toBe(true)
+    expect(kernelRejected.recordDispatch('possibly_sent', 'native-foreign', 'exec-foreign')).toBe(
+      false,
+    )
+    expect(kernelRejected.recordDispatch('rejected', 'native-foreign', 'exec-foreign')).toBe(false)
+    expect(kernelRejected.nativeSessionId).toBe('native-real')
+    expect(kernelRejected.executorId).toBe('exec-real')
+
+    // 2. Concurrent settle() shares one settlement promise and fails closed when a recording throws.
+    const effectsLog: string[] = []
+    const kernelConcurrent = new RunLifecycleKernel({
+      agentId: 'agy',
+      runId: 'run-concurrent-settle',
+      sessionId: 's-2',
+      nativeGeneration: 'gen-2',
+      callbacks: {
+        onReportNativeEffects: (report) => effectsLog.push(report.state),
+      },
+    })
+    kernelConcurrent.bindExecutor('exec-2')
+    kernelConcurrent.reportNativeEffects('pending')
+    const recordingGate = Promise.withResolvers<void>()
+    kernelConcurrent.ledger.recordings.enqueue(async () => {
+      await recordingGate.promise
+      throw new Error('sqlite-disk-full')
+    })
+    const settleA = kernelConcurrent.settle()
+    const settleB = kernelConcurrent.settle()
+    expect(settleA).toBe(settleB)
+    expect(kernelConcurrent.phase).toBe('DrainingEffects')
+    // New admissions during drain are rejected and tracked as dropped.
+    expect(kernelConcurrent.ledger.recordings.enqueue(async () => {})).toBe(false)
+    recordingGate.resolve()
+    const [resA, resB] = await Promise.all([settleA, settleB])
+    expect(resA).toEqual(resB)
+    expect(resA.recordingsFailedCount).toBe(1)
+    expect(resA.recordingsDroppedCount).toBe(1)
+    expect(kernelConcurrent.phase).toBe('Settled')
+    expect(kernelConcurrent.effectsState).toBe('unknown')
+    expect(effectsLog).not.toContain('settled')
+
+    // 3. Timed-out settle() aborts workers BEFORE deferred disposeAll() and runs disposeAll() once workers exit.
+    const events: string[] = []
+    const kernelTimeout = new RunLifecycleKernel({
+      agentId: 'claude',
+      runId: 'run-timeout-defer',
+      sessionId: 's-3',
+      nativeGeneration: 'gen-3',
+    })
+    kernelTimeout.bindExecutor('exec-3')
+    kernelTimeout.reportNativeEffects('pending')
+    const hungWorkerGate = Promise.withResolvers<void>()
+    kernelTimeout.disposables.register(() => {
+      events.push('disposed')
+    })
+    kernelTimeout.ledger.recordings.enqueue(async (workerSignal) => {
+      workerSignal.addEventListener('abort', () => {
+        events.push('worker-aborted')
+      })
+      await hungWorkerGate.promise
+      events.push('worker-exited')
+    })
+    const drainAbort = new AbortController()
+    drainAbort.abort()
+    const timeoutRes = await kernelTimeout.settle({ drainSignal: drainAbort.signal })
+    expect(timeoutRes.recordingsDrained).toBe(false)
+    expect(timeoutRes.disposalsDeferred).toBe(true)
+    expect(events).toEqual(['worker-aborted'])
+    expect(kernelTimeout.effectsState).toBe('unknown')
+    hungWorkerGate.resolve()
+    await kernelTimeout.ledger.recordings.whenWorkersIdle()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(events).toEqual(['worker-aborted', 'worker-exited', 'disposed'])
+
+    // 4. BoundedBackgroundTaskTable cleans aliases in BOTH ambient orders and on completeTask.
+    const table = new BoundedBackgroundTaskTable<{ kind: string }>()
+    // Order A: registerProvisional -> markAmbient(provisional) -> confirmTask(confirmed, provisional)
+    expect(table.registerProvisional('prov-a', { kind: 'bg' })).toBe(true)
+    table.markAmbient('prov-a')
+    expect(table.confirmTask('conf-a', { kind: 'bg' }, 'prov-a')).toBe(false)
+    expect(table.aliasCount).toBe(0)
+    expect(table.hasActiveTasks).toBe(false)
+
+    // Order B: registerProvisional -> confirmTask(confirmed, provisional) -> markAmbient(confirmed)
+    expect(table.registerProvisional('prov-b', { kind: 'bg' })).toBe(true)
+    expect(table.confirmTask('conf-b', { kind: 'bg' }, 'prov-b')).toBe(true)
+    expect(table.aliasCount).toBe(1)
+    table.markAmbient('conf-b')
+    expect(table.aliasCount).toBe(0)
+    expect(table.hasActiveTasks).toBe(false)
+
+    // Order C: normal confirmTask -> completeTask cleans reverse alias
+    expect(table.registerProvisional('prov-c', { kind: 'bg' })).toBe(true)
+    expect(table.confirmTask('conf-c', { kind: 'bg' }, 'prov-c')).toBe(true)
+    expect(table.aliasCount).toBe(1)
+    expect(table.completeTask('conf-c')).toBe(true)
+    expect(table.aliasCount).toBe(0)
+  })
 })

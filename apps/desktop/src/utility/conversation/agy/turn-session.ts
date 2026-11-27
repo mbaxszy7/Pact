@@ -60,11 +60,12 @@ import {
   recordNativeChanges,
 } from '../native-file-changes'
 import { agyPromptInput, nativeImagePreparationBytes } from '../native-image-content'
-import { NativePermissionWait, safeNativePermissionText } from '../native-permission-wait'
+import { NativePermissionWait } from '../native-permission-wait'
 import { bindAgySkillSelections } from '../native-skill-catalog'
 import { PEER_ASSISTANCE_INSTRUCTIONS } from '../peer-assistance-policy'
 import {
   computeRetainedPlanTextBytes,
+  formatAgyRpcErrorMessage,
   parseAgyPromptTerminalReply,
   validateAgyFrame,
   type ParsedAgyPromptTerminalReply,
@@ -119,6 +120,7 @@ export class AgyTurnSession {
       nativeGeneration: input.nativeGeneration,
       hasSourceReader: Boolean(input.host?.workflow?.sourceReader),
       sourceGrant: input.promptEnvelope.sourceGrant,
+      readerIdentity: input.host?.workflow?.sourceReader?.identity,
     })
     if (!grantCheck.ok) {
       throw new AgentExecutionError(
@@ -219,7 +221,28 @@ export class AgyTurnSession {
     const runFinalizer = Promise.withResolvers<void>()
     let stopStreamPump: (() => void) | undefined
     let stopPrePromptDrain: ((drainRemaining?: boolean) => Promise<void>) | undefined
-    let handoffOrderedStreamToBackground: (() => void) | undefined
+    let handoffOrderedStreamToBackground: ((onRetainedCleanup: () => void) => void) | undefined
+    let cleanupForegroundResources: (() => void) | undefined
+    let liveTerminalCommitted = false
+    let liveTerminalOutcome: 'completed' | 'interrupted' | 'failed' | undefined
+    const commitMinimalLiveTerminalFallback = (): void => {
+      if (liveTerminalCommitted || !liveTerminalOutcome || !activeRun || !resolvedSessionId) return
+      liveTerminalCommitted = true
+      rootTerminal = true
+      activeRun.rootTerminal = true
+      this.kernel.recordTerminal(liveTerminalOutcome)
+      this.runtime.recordEvidence(
+        input,
+        resolvedSessionId,
+        activeExecutorId,
+        {
+          kind: 'ended',
+          source: 'live_terminal',
+          outcome: liveTerminalOutcome,
+        },
+        activeRun.nativeTurnId,
+      )
+    }
 
     const loadHostTrajectoryIdentity = (loadSignal: AbortSignal) =>
       this.runtime.bootstrap.loadHostTrajectoryIdentity({
@@ -375,6 +398,7 @@ export class AgyTurnSession {
         promptRpcAbort.abort()
         await stopPrePromptDrain?.(false).catch(() => undefined)
         stopStreamPump?.()
+        commitMinimalLiveTerminalFallback()
         foregroundReleased = true
         if (options.emergency || emergencyCleanedUp) {
           rootTerminal = true
@@ -399,6 +423,7 @@ export class AgyTurnSession {
         // Root Turn has ended: unconditionally revoke and close MCP server synchronously before releasing its reservation.
         mcpServer.revokeRun()
         await mcpServer.close().catch(() => undefined)
+        cleanupForegroundResources?.()
         mcpCorrelationMemoryReservation?.release()
         mcpCorrelationMemoryReservation = undefined
         publishedPlanMemoryReservation?.release()
@@ -429,10 +454,6 @@ export class AgyTurnSession {
           activeRun &&
           activeRun.activeBackgroundTasks.size > 0
         ) {
-          handoffOrderedStreamToBackground?.()
-          sessionStream?.close()
-          sessionStream = undefined
-          // Keep background listener & lease until active background tasks settle or pool disposes.
           const retainedRun = activeRun
           const retainedLease = lease
           lease = undefined
@@ -446,23 +467,43 @@ export class AgyTurnSession {
             postCutoffBgMemoryReservation?.release()
             postCutoffBgMemoryReservation = undefined
             retireSourceReader()
+            observation.abort()
             this.runtime.activeRuns.delete(input.runId)
             retainedLease?.release()
           }
+          handoffOrderedStreamToBackground?.(cleanupRetained)
+          sessionStream?.close()
+          sessionStream = undefined
           if (
             retainedRun.observation.signal.aborted ||
             this.runtime.disposed ||
             emergencyCleanedUp
           ) {
+            backgroundObserver?.closeRetainedBackground({
+              reason: 'disposed',
+              emergency: emergencyCleanedUp || this.runtime.disposed,
+            })
             cleanupRetained()
           } else {
-            retainedRun.observation.signal.addEventListener('abort', cleanupRetained, {
-              once: true,
-            })
+            retainedRun.observation.signal.addEventListener(
+              'abort',
+              () => {
+                backgroundObserver?.closeRetainedBackground({
+                  reason: 'disposed',
+                  emergency: true,
+                })
+                cleanupRetained()
+              },
+              { once: true },
+            )
           }
         } else {
           sessionStream?.close()
           sessionStream = undefined
+          backgroundObserver?.closeRetainedBackground({
+            reason: 'disposed',
+            emergency: options.emergency || emergencyCleanedUp,
+          })
           backgroundObserver?.unsubscribe()
           foregroundDedupMemoryReservation?.release()
           foregroundDedupMemoryReservation = undefined
@@ -972,7 +1013,10 @@ export class AgyTurnSession {
           throw new AgentExecutionError(
             'context_resume_failed',
             loadError
-              ? safeNativePermissionText(JSON.stringify(loadError), 240)
+              ? formatAgyRpcErrorMessage(
+                  loadError,
+                  'Antigravity could not load the saved native session.',
+                )
               : 'Antigravity could not load the saved native session.',
             false,
           )
@@ -1007,7 +1051,10 @@ export class AgyTurnSession {
           throw new AgentExecutionError(
             'protocol_error',
             newError
-              ? safeNativePermissionText(JSON.stringify(newError), 240)
+              ? formatAgyRpcErrorMessage(
+                  newError,
+                  'Antigravity ACP server did not create a session.',
+                )
               : 'Antigravity ACP server did not create a session.',
             false,
           )
@@ -1196,7 +1243,8 @@ export class AgyTurnSession {
 
       // Prepare prompt content with Cutoff serialization & verified ACP images.
       const images: AgentPromptImage[] = []
-      const currentEnvelope = input.currentPromptEnvelope?.() ?? input.promptEnvelope
+      const currentEnvelope =
+        input.host?.lifecycle?.currentPromptEnvelope?.() ?? input.promptEnvelope
       const sourceForm: AgentSourceReadForm | undefined = mcpServer.sourceCapability.sourceReference
         ? 'sourceReference'
         : mcpServer.sourceCapability.nativeRoot
@@ -1477,10 +1525,10 @@ export class AgyTurnSession {
           return true
         },
         onDispatch: () => {
+          this.kernel.recordDispatch('possibly_sent', resolvedSessionId, activeExecutorId)
           rootFirstByteWritten = true
           promptMemoryReservation?.release()
           promptMemoryReservation = undefined
-          this.kernel.recordDispatch('possibly_sent', resolvedSessionId, activeExecutorId)
         },
       })
 
@@ -1495,6 +1543,15 @@ export class AgyTurnSession {
         pumpAbort.abort()
       }
 
+      const acceptRootTurn = (): boolean => {
+        if (!activeRun || activeRun.turnAccepted) return false
+        activeRun.turnAccepted = true
+        this.kernel.recordDispatch('accepted', resolvedSessionId, activeExecutorId)
+        return true
+      }
+
+      let drainStagedPreBindIntoQueue: (() => void) | undefined
+
       const settlePromptFromResponse = (res: object): void => {
         promptResponse = res
         parsedPromptTerminalReply = parseAgyPromptTerminalReply(res, resolvedSessionId)
@@ -1503,17 +1560,33 @@ export class AgyTurnSession {
         abortOutstandingInteractions()
         if (activeRun) {
           activeRun.promptReplyReceived = true
-          if (
-            parsedPromptTerminalReply.ok &&
-            parsedPromptTerminalReply.executionId &&
-            !activeRun.providerExecutionId &&
-            !activeRun.knownForeignExecutionIds.has(parsedPromptTerminalReply.executionId)
-          ) {
-            this.runtime.projector.bindRootExecutionId(
-              activeRun,
-              input,
-              parsedPromptTerminalReply.executionId,
+          if (parsedPromptTerminalReply.ok) {
+            const respExecId = parsedPromptTerminalReply.executionId
+            const hasExecConflict = Boolean(
+              respExecId &&
+              (activeRun.knownForeignExecutionIds.has(respExecId) ||
+                (activeRun.providerExecutionId && activeRun.providerExecutionId !== respExecId)),
             )
+            if (!hasExecConflict) {
+              if (respExecId && !activeRun.providerExecutionId) {
+                this.runtime.projector.bindRootExecutionId(activeRun, input, respExecId)
+              }
+              // Drain staged pre-bind frames synchronously BEFORE opening post-cutoff background
+              // routing so task aliases and foreground dedup IDs exist before any background frame.
+              drainStagedPreBindIntoQueue?.()
+              if (acceptRootTurn()) {
+                pushPendingEvent({ agentId: 'agy', type: 'turn.started', turnId: input.runId })
+              }
+              const earlyOutcome: 'completed' | 'interrupted' | 'failed' =
+                parsedPromptTerminalReply.stopReason === 'cancelled'
+                  ? 'interrupted'
+                  : parsedPromptTerminalReply.stopReason === 'end_turn' ||
+                      parsedPromptTerminalReply.stopReason === 'stop_sequence'
+                    ? 'completed'
+                    : 'failed'
+              liveTerminalOutcome = earlyOutcome
+              this.kernel.recordTerminal(earlyOutcome)
+            }
           }
           this.runtime.projector.notifyRootExecutionWaiters(activeRun)
         }
@@ -1724,6 +1797,10 @@ export class AgyTurnSession {
           onObservedBackgroundTask: () => {
             observer.markObservedBackgroundTask()
           },
+          onAcceptTurn: () => {
+            acceptRootTurn()
+          },
+          canAdmitForegroundDelta: () => this.kernel.canAdmitEffect('stream_delta'),
           reportUnknown,
           observeFiles,
           signal,
@@ -1738,10 +1815,53 @@ export class AgyTurnSession {
         prePromptReplayedToolCallIds,
         expectedFullPromptText,
         expectedPromptContent: currentEnvelope.message.content.trim(),
-        stagedPreBindReservation: stagedPreBindMemoryReservation,
-        foreignExecIdsReservation: foreignExecIdsMemoryReservation,
+        getStagedPreBindReservation: () => stagedPreBindMemoryReservation,
+        releaseStagedPreBindReservation: () => {
+          stagedPreBindMemoryReservation?.release()
+          stagedPreBindMemoryReservation = undefined
+        },
+        getForeignExecIdsReservation: () => foreignExecIdsMemoryReservation,
+        releaseForeignExecIdsReservation: () => {
+          foreignExecIdsMemoryReservation?.release()
+          foreignExecIdsMemoryReservation = undefined
+        },
         projectValidatedFrame,
       })
+
+      drainStagedPreBindIntoQueue = (): void => {
+        if (
+          !activeRun ||
+          !activeRun.providerExecutionId ||
+          activeRun.stagedPreBindNotifications.length === 0
+        ) {
+          return
+        }
+        for (const ev of frameAdmitter.drainStagedPreBindNotes()) {
+          pushPendingEvent(ev)
+        }
+      }
+
+      let foregroundResourcesCleaned = false
+      cleanupForegroundResources = (): void => {
+        if (foregroundResourcesCleaned) return
+        foregroundResourcesCleaned = true
+        try {
+          clearPendingEvents()
+        } catch {
+          // Isolate cleanup errors so later reservations and answer always dispose.
+        }
+        try {
+          frameAdmitter.close()
+        } catch {
+          // Isolate cleanup errors so answer.dispose() always runs.
+        }
+        prePromptReplayedToolCallIds.clear()
+        try {
+          answer.dispose()
+        } catch {
+          // Isolate answer disposal errors.
+        }
+      }
 
       const routePostCutoffIngress = (item: AgyIngress): void => {
         if (item.kind === 'server_request') {
@@ -1790,8 +1910,8 @@ export class AgyTurnSession {
 
         if (item.kind === 'reply') {
           if (item.requestId === promptOp.requestId && promptCutoffSeq === undefined) {
-            promptCutoffSeq = item.seq
             settlePromptFromResponse(item.message)
+            promptCutoffSeq = item.seq
           }
           return
         }
@@ -1840,7 +1960,7 @@ export class AgyTurnSession {
         }
       }
 
-      handoffOrderedStreamToBackground = (): void => {
+      handoffOrderedStreamToBackground = (onRetainedCleanup: () => void): void => {
         observer.handoffOrderedStreamToBackground({
           connection,
           sessionStream,
@@ -1849,6 +1969,7 @@ export class AgyTurnSession {
           onStreamClosed: () => {
             sessionStream = undefined
           },
+          onRetainedCleanup,
         })
       }
 
@@ -1967,8 +2088,9 @@ export class AgyTurnSession {
         if (promptError) {
           promptRpcAbort.abort()
           const physical = await awaitPhysicalCompletionBounded(promptOp.physicalOutcome)
-          if (physical === 'not_sent' && !rootFirstByteWritten) {
+          if (physical === 'not_sent') {
             rootConfirmedNotSent = true
+            rootFirstByteWritten = false
             this.kernel.recordDispatch('rejected', resolvedSessionId, activeExecutorId)
             if (input.host?.recovery && appliedSettings) {
               const unsent = createAgyRootFrameNotWrittenProof({
@@ -2167,11 +2289,12 @@ export class AgyTurnSession {
         // Preserve verified native `stopReason` (`end_turn` -> `completed`) even if Stop (`signal.aborted`)
         // arrived late while draining foreground output!
         const outcome: 'completed' | 'interrupted' | 'failed' =
-          stopReason === 'cancelled'
+          liveTerminalOutcome ??
+          (stopReason === 'cancelled'
             ? 'interrupted'
             : stopReason === 'end_turn' || stopReason === 'stop_sequence'
               ? 'completed'
-              : 'failed'
+              : 'failed')
 
         // Record negative plan unavailability OUTSIDE `!unknownEffectsReported` so recovery is never
         // suppressed when an open-mode final `publish_plan` was acknowledged without confirmed ACP promotion
@@ -2289,6 +2412,7 @@ export class AgyTurnSession {
             turnId: input.runId,
             outcome: 'failed',
           }
+          liveTerminalCommitted = true
           this.runtime.recordEvidence(
             input,
             resolvedSessionId,
@@ -2297,6 +2421,7 @@ export class AgyTurnSession {
             activeRun.nativeTurnId,
           )
         } else {
+          liveTerminalCommitted = true
           this.runtime.recordEvidence(
             input,
             resolvedSessionId,
@@ -2322,10 +2447,8 @@ export class AgyTurnSession {
           }
         }
       } finally {
-        clearPendingEvents()
-        frameAdmitter.clearStagedPreBindNotifications()
-        prePromptReplayedToolCallIds.clear()
-        answer.dispose()
+        commitMinimalLiveTerminalFallback()
+        cleanupForegroundResources()
       }
     } catch (error) {
       rootTerminal = true

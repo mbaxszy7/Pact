@@ -9,6 +9,8 @@ import type {
   RuntimeAgentId,
 } from '@pact/contracts'
 
+import { sanitizeNativeTerminalFailure } from '@pact/agent-runtime'
+
 import type { AgyIngress } from '../agy-acp-connection'
 
 import { isValidAgyTrajectoryId } from '../agy-native-storage'
@@ -946,6 +948,33 @@ export type ParsedAgyPromptTerminalReply =
 
 export const AGY_MAX_EXECUTION_ID_BYTES = 256
 
+/**
+ * Extracts ONLY the public string `message` or bounded numeric `code` from a JSON-RPC
+ * error object (discarding `data`, `headers`, and nested objects), then runs both
+ * terminal failure sanitization and native permission text redaction.
+ */
+export function formatAgyRpcErrorMessage(rpcError: unknown, fallback: string): string {
+  let rawText = ''
+  if (typeof rpcError === 'string') {
+    rawText = rpcError
+  } else if (isPlainObject(rpcError)) {
+    const msg = asString(rpcError.message)?.trim()
+    const code = rpcError.code
+    if (msg) {
+      rawText = msg
+    } else if (typeof code === 'number' && Number.isFinite(code)) {
+      rawText = `Antigravity RPC error (${code}).`
+    } else if (typeof code === 'string' && code.trim()) {
+      rawText = `Antigravity RPC error (${code.trim().slice(0, 64)}).`
+    }
+  }
+  const sanitized = safeNativePermissionText(
+    sanitizeNativeTerminalFailure(rawText, 240),
+    240,
+  ).trim()
+  return sanitized || fallback
+}
+
 export function parseAgyPromptTerminalReply(
   res: object | undefined,
   expectedSessionId: string | undefined,
@@ -957,7 +986,7 @@ export function parseAgyPromptTerminalReply(
       ok: false,
       reason: 'Antigravity returned an invalid session/prompt response.',
       message: rpcError
-        ? safeNativePermissionText(JSON.stringify(rpcError), 240)
+        ? formatAgyRpcErrorMessage(rpcError, 'Antigravity returned a session/prompt error.')
         : 'Antigravity returned an invalid session/prompt result.',
     }
   }

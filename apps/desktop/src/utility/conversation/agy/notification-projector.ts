@@ -33,7 +33,6 @@ import {
   AgyRoundEffectsTracker,
   collectAgyTargetPaths,
   nativeEffectsUncertain,
-  nativeFileChangesSettled,
   type NativeChanges,
 } from '../native-file-changes'
 import { NativePermissionWait } from '../native-permission-wait'
@@ -637,6 +636,8 @@ export class AgyNotificationProjector {
     recordSeenForegroundMessageId: (msgIdentity: string, trustedStepIdx?: number) => void
     recordForegroundStepIdx: (stepIdx: number) => void
     onObservedBackgroundTask: () => void
+    onAcceptTurn: () => void
+    canAdmitForegroundDelta: () => boolean
     reportUnknown: (reason: string) => void
     observeFiles: (evidence: NativeChanges) => void
     signal: AbortSignal
@@ -785,14 +786,9 @@ export class AgyNotificationProjector {
         return
       }
 
-      // First substantive model/tool activity confirms Turn acceptance.
+      // First substantive model/tool activity confirms Turn acceptance via the session FSM.
       if (!activeRun.turnAccepted) {
-        activeRun.turnAccepted = true
-        input.host?.lifecycle?.recordDispatch?.(
-          'accepted',
-          activeRun.nativeSessionId,
-          activeRun.executorId,
-        )
+        context.onAcceptTurn()
         this.runtime.recordEvidence(
           input,
           activeRun.nativeSessionId,
@@ -807,6 +803,7 @@ export class AgyNotificationProjector {
       }
 
       if (sessionUpdate === 'agent_thought_chunk') {
+        if (!context.canAdmitForegroundDelta()) return
         const content = isPlainObject(update.content) ? update.content : undefined
         const delta = content && content.type === 'text' ? asString(content.text) : undefined
         if (!delta) return
@@ -838,7 +835,7 @@ export class AgyNotificationProjector {
       }
 
       if (sessionUpdate === 'agent_message_chunk') {
-        if (context.receivedAfterPromptReply) return
+        if (context.receivedAfterPromptReply || !context.canAdmitForegroundDelta()) return
         const content = isPlainObject(update.content) ? update.content : undefined
         const text = content && content.type === 'text' ? asString(content.text) : undefined
         if (!text) return
@@ -1759,8 +1756,6 @@ export class AgyNotificationProjector {
       input,
       activeRun,
       observedBackgroundTask,
-      canSettleEffects,
-      isRootTerminal,
       seenForegroundMessageIds,
       isForegroundDedupIncomplete,
       hasOmittedForegroundIdWithoutStep,
@@ -1898,19 +1893,14 @@ export class AgyNotificationProjector {
         }
       }
     } finally {
-      // Settle tracked background task completion states and release observer/lease immediately when all settle!
+      // Settle tracked background task completion states; AgyTurnBackgroundObserver drains
+      // any queued reports before reporting settled and releasing observer ownership/lease.
       const isTerminalTaskUpdate =
         sessionUpdate === 'background_task_completed' ||
         (sessionUpdate === 'tool_call_update' &&
           (status === 'completed' || status === 'failed' || status === 'cancelled'))
       if (isTerminalTaskUpdate) {
-        const settledAny = this.settleBackgroundTaskByAlias(activeRun, input, [taskId, toolCallId])
-        if (settledAny && activeRun.activeBackgroundTasks.size === 0 && isRootTerminal()) {
-          if (!activeRun.backgroundUnconfirmed && canSettleEffects()) {
-            nativeFileChangesSettled(input, 'settled', 'native_work_drained')
-          }
-          activeRun.observation.abort()
-        }
+        this.settleBackgroundTaskByAlias(activeRun, input, [taskId, toolCallId])
       }
     }
   }

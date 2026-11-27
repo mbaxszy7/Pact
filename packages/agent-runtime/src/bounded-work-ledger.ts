@@ -37,6 +37,7 @@ export class BoundedBackgroundTaskTable<TMeta = undefined> {
   private readonly provisional = new Map<string, BackgroundTaskRecord<TMeta>>()
   private readonly confirmed = new Map<string, BackgroundTaskRecord<TMeta>>()
   private readonly provisionalToConfirmed = new Map<string, string>()
+  private readonly confirmedToProvisional = new Map<string, Set<string>>()
   private readonly ambientIds = new Set<string>()
   private readonly earlyCompletedIds = new Set<string>()
   private overflowedFlag = false
@@ -60,6 +61,10 @@ export class BoundedBackgroundTaskTable<TMeta = undefined> {
     return this.confirmed.size
   }
 
+  get aliasCount(): number {
+    return this.provisionalToConfirmed.size
+  }
+
   get hasActiveTasks(): boolean {
     return this.activeCount > 0
   }
@@ -70,14 +75,30 @@ export class BoundedBackgroundTaskTable<TMeta = undefined> {
 
   markAmbient(taskId: string): void {
     if (!taskId) return
-    if (this.ambientIds.size >= this.maxEarlyTombstones && !this.ambientIds.has(taskId)) {
-      const oldest = this.ambientIds.values().next().value
-      if (oldest !== undefined) this.ambientIds.delete(oldest)
+    let removed = false
+    this.addBoundedId(this.ambientIds, taskId)
+
+    const mappedConfirmed = this.provisionalToConfirmed.get(taskId)
+    if (mappedConfirmed !== undefined) {
+      this.addBoundedId(this.ambientIds, mappedConfirmed)
+      if (this.confirmed.delete(mappedConfirmed)) removed = true
+      const linked = this.unlinkConfirmedAliases(mappedConfirmed)
+      for (const launchId of linked) {
+        this.addBoundedId(this.ambientIds, launchId)
+        if (this.provisional.delete(launchId)) removed = true
+      }
     }
-    this.ambientIds.add(taskId)
-    const removedConfirmed = this.confirmed.delete(taskId)
-    const removedProvisional = this.provisional.delete(taskId)
-    if (removedConfirmed || removedProvisional) {
+
+    const linkedProvisionals = this.unlinkConfirmedAliases(taskId)
+    for (const launchId of linkedProvisionals) {
+      this.addBoundedId(this.ambientIds, launchId)
+      if (this.provisional.delete(launchId)) removed = true
+    }
+
+    if (this.confirmed.delete(taskId)) removed = true
+    if (this.provisional.delete(taskId)) removed = true
+    this.earlyCompletedIds.delete(taskId)
+    if (removed) {
       this.onChange?.()
     }
   }
@@ -109,21 +130,44 @@ export class BoundedBackgroundTaskTable<TMeta = undefined> {
   }
 
   confirmTask(confirmedTaskId: string, meta: TMeta, provisionalLaunchId?: string): boolean {
-    if (!confirmedTaskId || this.ambientIds.has(confirmedTaskId)) return false
-    if (provisionalLaunchId && this.ambientIds.has(provisionalLaunchId)) return false
+    if (!confirmedTaskId) return false
+    if (
+      this.ambientIds.has(confirmedTaskId) ||
+      (provisionalLaunchId !== undefined && this.ambientIds.has(provisionalLaunchId))
+    ) {
+      let removed = false
+      this.addBoundedId(this.ambientIds, confirmedTaskId)
+      if (provisionalLaunchId !== undefined) {
+        this.addBoundedId(this.ambientIds, provisionalLaunchId)
+        if (this.provisional.delete(provisionalLaunchId)) removed = true
+        this.unlinkProvisionalAlias(provisionalLaunchId)
+      }
+      if (this.confirmed.delete(confirmedTaskId)) removed = true
+      const linked = this.unlinkConfirmedAliases(confirmedTaskId)
+      for (const launchId of linked) {
+        this.addBoundedId(this.ambientIds, launchId)
+        if (this.provisional.delete(launchId)) removed = true
+      }
+      if (removed) this.onChange?.()
+      return false
+    }
 
     const hadProvisional =
       provisionalLaunchId !== undefined ? this.provisional.delete(provisionalLaunchId) : false
 
-    if (this.earlyCompletedIds.delete(confirmedTaskId)) {
-      if (provisionalLaunchId) this.provisionalToConfirmed.delete(provisionalLaunchId)
+    const earlyByConfirmed = this.earlyCompletedIds.delete(confirmedTaskId)
+    const earlyByProvisional =
+      provisionalLaunchId !== undefined && this.earlyCompletedIds.delete(provisionalLaunchId)
+    if (earlyByConfirmed || earlyByProvisional) {
+      if (provisionalLaunchId !== undefined) this.unlinkProvisionalAlias(provisionalLaunchId)
+      this.unlinkConfirmedAliases(confirmedTaskId)
       if (hadProvisional) this.onChange?.()
       return true
     }
 
     if (this.confirmed.has(confirmedTaskId)) {
       if (provisionalLaunchId) {
-        this.provisionalToConfirmed.set(provisionalLaunchId, confirmedTaskId)
+        this.linkAlias(provisionalLaunchId, confirmedTaskId)
       }
       this.confirmed.set(confirmedTaskId, {
         ...(provisionalLaunchId ? { provisionalId: provisionalLaunchId } : {}),
@@ -141,7 +185,7 @@ export class BoundedBackgroundTaskTable<TMeta = undefined> {
     }
 
     if (provisionalLaunchId) {
-      this.provisionalToConfirmed.set(provisionalLaunchId, confirmedTaskId)
+      this.linkAlias(provisionalLaunchId, confirmedTaskId)
     }
     this.confirmed.set(confirmedTaskId, {
       ...(provisionalLaunchId ? { provisionalId: provisionalLaunchId } : {}),
@@ -158,10 +202,9 @@ export class BoundedBackgroundTaskTable<TMeta = undefined> {
     let removed = false
     if (this.confirmed.delete(id)) {
       removed = true
-      for (const [launchId, confirmedId] of this.provisionalToConfirmed) {
-        if (confirmedId === id) {
-          this.provisionalToConfirmed.delete(launchId)
-        }
+      const linked = this.unlinkConfirmedAliases(id)
+      for (const launchId of linked) {
+        if (this.provisional.delete(launchId)) removed = true
       }
     }
     if (this.provisional.delete(id)) {
@@ -169,21 +212,21 @@ export class BoundedBackgroundTaskTable<TMeta = undefined> {
     }
     const mappedConfirmed = this.provisionalToConfirmed.get(id)
     if (mappedConfirmed !== undefined) {
-      this.provisionalToConfirmed.delete(id)
       if (this.confirmed.delete(mappedConfirmed)) {
         removed = true
       }
+      const linked = this.unlinkConfirmedAliases(mappedConfirmed)
+      for (const launchId of linked) {
+        if (this.provisional.delete(launchId)) removed = true
+      }
+      this.unlinkProvisionalAlias(id)
     }
     if (removed) {
       this.onChange?.()
       return true
     }
     // Out-of-order completion before confirmation: retain bounded tombstone.
-    if (this.earlyCompletedIds.size >= this.maxEarlyTombstones) {
-      const oldest = this.earlyCompletedIds.values().next().value
-      if (oldest !== undefined) this.earlyCompletedIds.delete(oldest)
-    }
-    this.earlyCompletedIds.add(id)
+    this.addBoundedId(this.earlyCompletedIds, id)
     return false
   }
 
@@ -216,9 +259,66 @@ export class BoundedBackgroundTaskTable<TMeta = undefined> {
     this.provisional.clear()
     this.confirmed.clear()
     this.provisionalToConfirmed.clear()
+    this.confirmedToProvisional.clear()
     this.earlyCompletedIds.clear()
     this.ambientIds.clear()
     if (hadAny) this.onChange?.()
+  }
+
+  private addBoundedId(target: Set<string>, id: string): void {
+    if (target.size >= this.maxEarlyTombstones && !target.has(id)) {
+      const oldest = target.values().next().value
+      if (oldest !== undefined) target.delete(oldest)
+    }
+    target.add(id)
+  }
+
+  private linkAlias(provisionalId: string, confirmedId: string): void {
+    const previousConfirmed = this.provisionalToConfirmed.get(provisionalId)
+    if (previousConfirmed !== undefined && previousConfirmed !== confirmedId) {
+      this.unlinkProvisionalAlias(provisionalId)
+    }
+    const maxAliases = Math.max(this.maxTasks * 2, this.maxEarlyTombstones)
+    if (
+      !this.provisionalToConfirmed.has(provisionalId) &&
+      this.provisionalToConfirmed.size >= maxAliases
+    ) {
+      const oldestProvisional = this.provisionalToConfirmed.keys().next().value
+      if (oldestProvisional !== undefined) {
+        this.unlinkProvisionalAlias(oldestProvisional)
+      }
+    }
+    this.provisionalToConfirmed.set(provisionalId, confirmedId)
+    let set = this.confirmedToProvisional.get(confirmedId)
+    if (!set) {
+      set = new Set<string>()
+      this.confirmedToProvisional.set(confirmedId, set)
+    }
+    set.add(provisionalId)
+  }
+
+  private unlinkProvisionalAlias(provisionalId: string): void {
+    const confirmedId = this.provisionalToConfirmed.get(provisionalId)
+    if (confirmedId === undefined) return
+    this.provisionalToConfirmed.delete(provisionalId)
+    const set = this.confirmedToProvisional.get(confirmedId)
+    if (set) {
+      set.delete(provisionalId)
+      if (set.size === 0) this.confirmedToProvisional.delete(confirmedId)
+    }
+  }
+
+  private unlinkConfirmedAliases(confirmedId: string): readonly string[] {
+    const set = this.confirmedToProvisional.get(confirmedId)
+    if (!set) return []
+    const linked = [...set]
+    this.confirmedToProvisional.delete(confirmedId)
+    for (const launchId of linked) {
+      if (this.provisionalToConfirmed.get(launchId) === confirmedId) {
+        this.provisionalToConfirmed.delete(launchId)
+      }
+    }
+    return linked
   }
 
   private latchOverflow(reason: string): void {
@@ -239,6 +339,7 @@ export interface RecordingDrainResult {
   readonly drained: boolean
   readonly completedCount: number
   readonly failedCount: number
+  readonly droppedCount: number
   readonly overflowed: boolean
   readonly aborted: boolean
 }
@@ -266,8 +367,10 @@ export class BoundedRecordingQueue {
   private activeCountValue = 0
   private completedCountValue = 0
   private failedCountValue = 0
+  private droppedCountValue = 0
   private overflowedFlag = false
-  private closedFlag = false
+  private admittingFlag = true
+  private abortedFlag = false
   private idleWaiters: Array<() => void> = []
 
   constructor(options: BoundedRecordingQueueOptions = {}) {
@@ -285,16 +388,30 @@ export class BoundedRecordingQueue {
     return this.queue.length - this.head
   }
 
+  get failedCount(): number {
+    return this.failedCountValue
+  }
+
+  get droppedCount(): number {
+    return this.droppedCountValue
+  }
+
   get overflowed(): boolean {
     return this.overflowedFlag
   }
 
   get closed(): boolean {
-    return this.closedFlag
+    return !this.admittingFlag
+  }
+
+  /** Stops accepting new work while allowing already-accepted queued entries to finish. */
+  closeAdmission(): void {
+    this.admittingFlag = false
   }
 
   enqueue(work: (signal: AbortSignal) => Promise<void>): boolean {
-    if (this.closedFlag || this.controller.signal.aborted) {
+    if (!this.admittingFlag || this.abortedFlag || this.controller.signal.aborted) {
+      this.droppedCountValue += 1
       return false
     }
     if (this.activeCountValue < this.maxConcurrency && this.queuedCount === 0) {
@@ -318,6 +435,7 @@ export class BoundedRecordingQueue {
    * or early if `deadlineSignal` aborts.
    */
   async drain(deadlineSignal?: AbortSignal): Promise<RecordingDrainResult> {
+    this.closeAdmission()
     if (this.activeCountValue === 0 && this.queuedCount === 0) {
       return this.snapshotResult(true, Boolean(deadlineSignal?.aborted))
     }
@@ -350,11 +468,24 @@ export class BoundedRecordingQueue {
     return this.snapshotResult(drained, !drained && Boolean(deadlineSignal?.aborted))
   }
 
+  /** Resolves once all currently active workers have physically finished. */
+  async whenWorkersIdle(): Promise<void> {
+    if (this.activeCountValue === 0 && this.queuedCount === 0) return
+    await new Promise<void>((resolve) => {
+      this.idleWaiters.push(resolve)
+    })
+  }
+
   /**
    * Aborts all in-flight work, drops unstarted queued entries, and prevents future enqueues.
    */
   abortAll(): void {
-    this.closedFlag = true
+    this.admittingFlag = false
+    this.abortedFlag = true
+    const remaining = this.queuedCount
+    if (remaining > 0) {
+      this.droppedCountValue += remaining
+    }
     this.queue.length = 0
     this.head = 0
     if (!this.controller.signal.aborted) {
@@ -365,7 +496,7 @@ export class BoundedRecordingQueue {
 
   private pump(): void {
     while (
-      !this.closedFlag &&
+      !this.abortedFlag &&
       !this.controller.signal.aborted &&
       this.activeCountValue < this.maxConcurrency &&
       this.head < this.queue.length
@@ -419,6 +550,7 @@ export class BoundedRecordingQueue {
       drained,
       completedCount: this.completedCountValue,
       failedCount: this.failedCountValue,
+      droppedCount: this.droppedCountValue,
       overflowed: this.overflowedFlag,
       aborted,
     }

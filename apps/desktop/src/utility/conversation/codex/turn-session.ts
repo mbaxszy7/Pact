@@ -11,7 +11,11 @@ import type {
   RuntimeAgentId,
 } from '@pact/contracts'
 
-import { RunLifecycleKernel, validateSourceGrant } from '@pact/agent-runtime'
+import {
+  RunLifecycleKernel,
+  sanitizeNativeTerminalFailure,
+  validateSourceGrant,
+} from '@pact/agent-runtime'
 import {
   collaborationInputOutcomeAllowed,
   collaborationOpenPlanPublishAllowed,
@@ -50,7 +54,6 @@ import {
 } from '../native-file-changes'
 import { codexPromptInput } from '../native-image-content'
 import { freezeNativeJsonFrame } from '../native-json-encoder'
-import { safeNativePermissionText } from '../native-permission-wait'
 import { NativeWorkingMemory } from '../native-working-memory'
 import {
   CODEX_STOP_COMMANDS,
@@ -59,9 +62,12 @@ import {
   CODEX_TURN_ACCEPT_TIMEOUT_MS,
   acceptsCodexReroute,
   cacheApprovalItem,
+  classifyCodexRpcError,
   cleanTitle,
   confirmPermissionMode,
   describeTool,
+  extractCodexRpcErrorMessage,
+  formatCodexRpcErrorMessage,
   isPeerTool,
   observeThreadTitle,
   peerProposal,
@@ -97,20 +103,6 @@ export class CodexTurnSession {
     private readonly input: AgentRunInput,
     private readonly signal: AbortSignal,
   ) {
-    const hasSourceReader = Boolean(input.host?.workflow?.sourceReader)
-    const grantCheck = validateSourceGrant({
-      runId: input.runId,
-      nativeGeneration: input.nativeGeneration,
-      hasSourceReader,
-      sourceGrant: input.promptEnvelope.sourceGrant,
-    })
-    if (!grantCheck.ok) {
-      throw new AgentExecutionError(
-        'protocol_error',
-        grantCheck.reason ?? 'The source reader has no exact root owner.',
-        false,
-      )
-    }
     this.kernel = new RunLifecycleKernel({
       agentId: 'codex',
       runId: input.runId,
@@ -127,27 +119,38 @@ export class CodexTurnSession {
   async *run(): AsyncIterable<NormalizedAgentEvent> {
     const input = this.input
     const signal = this.signal
+    const rejectBeforeStart = async (error: Error): Promise<never> => {
+      await this.kernel.settle()
+      throw error
+    }
     if (this.runtime.disposed || this.runtime.disposal)
-      throw new AgentExecutionError('agent_process_crash', 'Codex is shutting down.', false)
+      await rejectBeforeStart(
+        new AgentExecutionError('agent_process_crash', 'Codex is shutting down.', false),
+      )
     if (this.runtime.peerToolServer.hasSourceGrant())
-      throw new NativeCapacityError(
-        'The previous native root still owns its frozen sources. No new task was submitted.',
+      await rejectBeforeStart(
+        new NativeCapacityError(
+          'The previous native root still owns its frozen sources. No new task was submitted.',
+        ),
       )
-    const hasSourceReader = Boolean(input.host?.workflow?.sourceReader)
-    const sourceGrant = input.promptEnvelope.sourceGrant
-      ? { ...input.promptEnvelope.sourceGrant }
-      : undefined
-    if (
-      hasSourceReader &&
-      (!sourceGrant ||
-        sourceGrant.runId !== input.runId ||
-        (input.nativeGeneration && sourceGrant.grant !== input.nativeGeneration))
-    )
-      throw new AgentExecutionError(
-        'protocol_error',
-        'The source reader has no exact root owner.',
-        false,
+    const sourceReader = input.host?.workflow?.sourceReader
+    const hasSourceReader = Boolean(sourceReader)
+    const grantCheck = validateSourceGrant({
+      runId: input.runId,
+      nativeGeneration: input.nativeGeneration,
+      hasSourceReader,
+      sourceGrant: input.promptEnvelope.sourceGrant,
+      readerIdentity: sourceReader?.identity,
+    })
+    if (!grantCheck.ok)
+      await rejectBeforeStart(
+        new AgentExecutionError(
+          'protocol_error',
+          grantCheck.reason ?? 'The source reader has no exact root owner.',
+          false,
+        ),
       )
+    const sourceGrant = grantCheck.grant ? { ...grantCheck.grant } : undefined
     if (
       this.runtime.nativeBackground.size +
         this.runtime.nativeForkOwners.size +
@@ -155,21 +158,29 @@ export class CodexTurnSession {
           .length >=
       8
     )
-      throw new NativeCapacityError(
-        'Codex has too many owned native background contexts. Wait for one to settle; no new task was submitted.',
+      await rejectBeforeStart(
+        new NativeCapacityError(
+          'Codex has too many owned native background contexts. Wait for one to settle; no new task was submitted.',
+        ),
       )
     if (this.runtime.running) {
-      throw new AgentExecutionError(
-        'protocol_error',
-        'This Codex connection already has an active Run.',
-        false,
+      await rejectBeforeStart(
+        new AgentExecutionError(
+          'protocol_error',
+          'This Codex connection already has an active Run.',
+          false,
+        ),
       )
     }
     if (this.runtime.disposed) {
-      throw new AgentExecutionError('agent_process_crash', 'Codex is shutting down.', false)
+      await rejectBeforeStart(
+        new AgentExecutionError('agent_process_crash', 'Codex is shutting down.', false),
+      )
     }
     if (signal.aborted) {
-      throw new AgentExecutionError('agent_process_crash', 'Codex was interrupted.', false)
+      await rejectBeforeStart(
+        new AgentExecutionError('agent_process_crash', 'Codex was interrupted.', false),
+      )
     }
 
     const workflow = input.promptEnvelope.collaboration
@@ -234,8 +245,11 @@ export class CodexTurnSession {
     signal.addEventListener('abort', freezeForegroundCommands, { once: true })
     const handledRequests = new Set<string>()
     const approvalItems = new Map<string, ApprovalItem>()
+    const fileChangeRecordings = new WeakMap<object, Promise<void>>()
     let provisionalThreadId: string | undefined
-    let nativeStartupDispatched = false
+    let threadStartupDispatched = false
+    let threadStartupCompleted = false
+    let rootTurnRequested = false
     let releaseNativeRequests: (() => void) | undefined
     let releaseApprovalMetadata: (() => void) | undefined
     const answer = new AgentAnswerAssembler(input.runId)
@@ -390,6 +404,19 @@ export class CodexTurnSession {
       submittedPlan = undefined
       retainedPlan = undefined
       planMemory.release()
+      if (background.unknown) {
+        this.kernel.reportNativeEffects('unknown', 'native_observation_released')
+      } else {
+        this.kernel.reportNativeEffects(
+          'settled',
+          background.rootInputWithheld
+            ? 'workflow_input_withheld'
+            : background.rootNotStarted
+              ? 'native_turn_not_started'
+              : 'native_work_drained',
+        )
+      }
+      void this.kernel.settle()
     }
     const reasoningSummaryStates = new Map<string, { pendingPrefix: string; emitted: boolean }>()
     const observed = new WeakSet<object>()
@@ -440,7 +467,7 @@ export class CodexTurnSession {
       if (
         !background.spawns.size &&
         !(
-          nativeStartupDispatched &&
+          threadStartupDispatched &&
           !background.primaryThreadId &&
           ['hook/started', 'hook/completed'].includes(String(Reflect.get(event, 'method')))
         ) &&
@@ -594,6 +621,9 @@ export class CodexTurnSession {
         ? eventTurnId === background.primaryTurnId
         : typeof eventTurnId === 'string' &&
           background.turnIds.has(JSON.stringify([eventThread, eventTurnId]))
+      if (root && typeof eventTurnId === 'string' && eventTurnId !== background.primaryTurnId) {
+        return false
+      }
       if (
         root &&
         ownedTurn &&
@@ -708,7 +738,21 @@ export class CodexTurnSession {
         maybeSettle()
         return true
       }
-      if (observed.has(event)) return !root || background.foregroundReleased
+      const matchedDetachedLegacyRootRequest =
+        root &&
+        !ownedTurn &&
+        eventTurnId == null &&
+        Object.hasOwn(event, 'id') &&
+        typeof eventMethod === 'string' &&
+        (background.foregroundReleased || detachedRoot) &&
+        (() => {
+          const callId = Reflect.get(eventParams, 'itemId') ?? Reflect.get(eventParams, 'callId')
+          if (typeof callId !== 'string' || !callId || !background.primaryTurnId) return false
+          const opKey = JSON.stringify([eventThread, background.primaryTurnId, callId])
+          return background.operations.has(opKey) || approvalItems.has(opKey)
+        })()
+      if (root && !ownedTurn && !matchedDetachedLegacyRootRequest) return false
+      if (observed.has(event)) return !root || background.foregroundReleased || detachedRoot
       observed.add(event)
       if (
         root &&
@@ -1083,6 +1127,38 @@ export class CodexTurnSession {
       }
       if (eventMethod === 'item/completed') {
         const item = Reflect.get(eventParams, 'item')
+        if (item && typeof item === 'object' && Reflect.get(item, 'type') === 'fileChange') {
+          if (background.recordings.size >= 8) {
+            fileChangeRecordings.set(item, Promise.resolve())
+            reportUnknown(
+              'Native background evidence exceeded its bounded recording queue.',
+              'recorded_files',
+            )
+          } else {
+            const evidence = codexFileChanges(item, input.cwd)
+            const nativeId = Reflect.get(item, 'id')
+            evidence.changes = evidence.changes.map((change, index) => ({
+              ...change,
+              ...(typeof nativeId === 'string'
+                ? {
+                    operationId: root
+                      ? `${nativeId}:${index}`
+                      : `${eventThread}:${nativeId}:${index}`,
+                  }
+                : { unavailableReason: 'The native operation identity was unavailable.' }),
+            }))
+            const recording = background.recordingTail.then(() =>
+              recordNativeChanges(input, evidence, background.observation.signal),
+            )
+            background.recordingTail = recording.catch(() => undefined)
+            background.recordings.add(recording)
+            fileChangeRecordings.set(item, recording)
+            void recording.finally(() => {
+              background.recordings.delete(recording)
+              maybeSettle()
+            })
+          }
+        }
         if (item && typeof item === 'object')
           this.runtime.trackNativeBackground(
             background,
@@ -1091,37 +1167,6 @@ export class CodexTurnSession {
             typeof eventTurnId === 'string' ? eventTurnId : undefined,
           )
         replayEarly()
-        if (
-          item &&
-          typeof item === 'object' &&
-          Reflect.get(item, 'type') === 'fileChange' &&
-          (!root || background.foregroundReleased || detachedRoot)
-        ) {
-          if (background.recordings.size >= 8)
-            reportUnknown(
-              'Native background evidence exceeded its bounded recording queue.',
-              'recorded_files',
-            )
-          else {
-            const evidence = codexFileChanges(item, input.cwd)
-            const nativeId = Reflect.get(item, 'id')
-            evidence.changes = evidence.changes.map((change, index) => ({
-              ...change,
-              ...(typeof nativeId === 'string'
-                ? { operationId: `${eventThread}:${nativeId}:${index}` }
-                : { unavailableReason: 'The native operation identity was unavailable.' }),
-            }))
-            const recording = background.recordingTail.then(() =>
-              recordNativeChanges(input, evidence, background.observation.signal),
-            )
-            background.recordingTail = recording
-            background.recordings.add(recording)
-            void recording.finally(() => {
-              background.recordings.delete(recording)
-              maybeSettle()
-            })
-          }
-        }
       }
       maybeSettle()
       if (!root)
@@ -1216,6 +1261,13 @@ export class CodexTurnSession {
         // Settings ACK belongs to the current next-task update, not an older Run.
         if (Reflect.get(event, 'method') === 'thread/settings/updated') return false
         if (handleOwnedNativeEvent(event)) return true
+        if (
+          background.closed ||
+          background.foregroundReleased ||
+          background.rootTerminal ||
+          background.rootNotStarted
+        )
+          return false
         const params = Reflect.get(event, 'params')
         if (
           !params ||
@@ -1243,7 +1295,11 @@ export class CodexTurnSession {
         const nativeThread =
           Reflect.get(params, 'threadId') ?? Reflect.get(params, 'conversationId')
         if (
-          !nativeStartupDispatched ||
+          !threadStartupDispatched ||
+          background.closed ||
+          background.foregroundReleased ||
+          background.rootTerminal ||
+          background.rootNotStarted ||
           (delivery.phase === 'before_dispatch' && method !== 'mcpServer/elicitation/request') ||
           typeof nativeThread !== 'string' ||
           !nativeThread ||
@@ -1303,7 +1359,14 @@ export class CodexTurnSession {
 
       // Native resume preserves the installed stable capability for a loaded Thread.
       {
-        nativeStartupDispatched = true
+        if (input.nativeSessionId) {
+          await this.runtime.connections.awaitSettingsBarrier(
+            connection,
+            input.nativeSessionId,
+            signal,
+          )
+        }
+        threadStartupDispatched = true
         const message = await connection.request(
           input.nativeSessionId ? 'thread/resume' : 'thread/start',
           input.nativeSessionId
@@ -1326,6 +1389,7 @@ export class CodexTurnSession {
               },
           { timeoutMs: CODEX_THREAD_RPC_TIMEOUT_MS, signal },
         )
+        threadStartupCompleted = true
         const rpcError = Reflect.get(message, 'error')
         if (rpcError) {
           // An explicit startup rejection proves no Turn was submitted. This is
@@ -1341,22 +1405,36 @@ export class CodexTurnSession {
                 `thread ${input.nativeSessionId} already has an active writer`
             )
               throw new NativeThreadOccupiedError()
-            const detail = safeNativePermissionText(JSON.stringify(rpcError), 1024)
             if (isCodexArchivedSessionRejection(rpcError, input.nativeSessionId))
-              throw new NativeThreadArchivedError(`Codex thread/resume rejected: ${detail}`)
+              throw new NativeThreadArchivedError(
+                formatCodexRpcErrorMessage(
+                  rpcError,
+                  `thread ${input.nativeSessionId} is archived`,
+                  'Codex thread/resume rejected: ',
+                ),
+              )
+            const rawRpcMessage = extractCodexRpcErrorMessage(rpcError) ?? ''
             if (
               !/not found|does not exist|unknown thread|missing thread|no rollout found/iu.test(
-                detail,
+                rawRpcMessage,
               )
             )
-              throw classifyAgentError(new Error(`Codex thread/resume rejected: ${detail}`))
+              throw classifyCodexRpcError(
+                rpcError,
+                'Codex rejected thread/resume.',
+                'Codex thread/resume rejected: ',
+              )
             throw new AgentExecutionError(
               'context_resume_failed',
-              `Codex thread/resume could not find the saved native session: ${detail}`,
+              formatCodexRpcErrorMessage(
+                rpcError,
+                'Saved native session was not found.',
+                'Codex thread/resume could not find the saved native session: ',
+              ),
               false,
             )
           }
-          throw classifyAgentError(new Error(JSON.stringify(rpcError)))
+          throw classifyCodexRpcError(rpcError, 'Codex rejected thread/start.')
         }
         const result = Reflect.get(message, 'result')
         const thread = result && typeof result === 'object' ? Reflect.get(result, 'thread') : null
@@ -1399,6 +1477,8 @@ export class CodexTurnSession {
               phasePolicy,
               signal,
               message,
+              background,
+              maybeSettle,
             )
           else {
             confirmPermissionMode(message, input.permissionMode)
@@ -1533,6 +1613,8 @@ export class CodexTurnSession {
         throw new NativeInputWithheldError(
           'The native execution settings could not be confirmed unchanged. The replacement input was withheld.',
         )
+      await this.runtime.connections.awaitSettingsBarrier(connection, threadId, signal)
+      rootTurnRequested = true
       const rootOperation = connection.requestOwned(
         'turn/start',
         {
@@ -1614,7 +1696,7 @@ export class CodexTurnSession {
           },
         },
       )
-      if (input.host?.recovery && rootOperation.requestId !== null) {
+      {
         const recovery = input.host?.recovery
         const identity = { executorId: connection.executorId, nativeSessionId: threadId }
         const requestId = rootOperation.requestId
@@ -1624,10 +1706,13 @@ export class CodexTurnSession {
           .then((completion) => {
             if (completion === 'not_sent') {
               background.rootNotStarted = true
-              recovery.recordConfirmedUnsent(
-                { kind: 'codex_root_frame_not_written', requestId },
-                identity,
-              )
+              this.kernel.recordDispatch('rejected', threadId, identity.executorId)
+              if (recovery && requestId !== null) {
+                recovery.recordConfirmedUnsent(
+                  { kind: 'codex_root_frame_not_written', requestId },
+                  identity,
+                )
+              }
               maybeSettle()
             }
             return undefined
@@ -1640,7 +1725,7 @@ export class CodexTurnSession {
         delivery.phase = 'before_dispatch'
         background.rootNotStarted = true
         this.kernel.recordDispatch('rejected', threadId, connection.executorId)
-        throw classifyAgentError(new Error(JSON.stringify(turnRpcError)))
+        throw classifyCodexRpcError(turnRpcError, 'Codex rejected turn/start.')
       }
       const turnResult = Reflect.get(turnResponse, 'result')
       const turn =
@@ -1670,6 +1755,14 @@ export class CodexTurnSession {
             !signal.aborted,
         )
       delivery.phase = 'accepted'
+      this.kernel.recordDispatch('accepted', threadId, connection.executorId)
+      if (!background.rootTerminal) {
+        input.host?.lifecycle?.recordNativeEvidence?.({
+          kind: 'running',
+          source: 'live_runtime',
+          identity: this.runtime.runIdentity(input, threadId, turnId),
+        })
+      }
       yield {
         agentId: 'codex',
         type: 'run.speed.resolved',
@@ -1677,12 +1770,6 @@ export class CodexTurnSession {
         ...(speed.serviceTier === 'default' ? { speed: 'standard' as const } : {}),
         ...(speed.detail ? { detail: speed.detail } : {}),
       }
-      this.kernel.recordDispatch('accepted', threadId, connection.executorId)
-      input.host?.lifecycle?.recordNativeEvidence?.({
-        kind: 'running',
-        source: 'live_runtime',
-        identity: this.runtime.runIdentity(input, threadId, turnId),
-      })
       yield { agentId: 'codex', type: 'turn.started', turnId }
 
       let streamObserver = input.host?.lifecycle?.observeNativeDelta
@@ -1981,16 +2068,22 @@ export class CodexTurnSession {
             }
           } else {
             if (Reflect.get(item, 'type') === 'fileChange') {
-              const evidence = codexFileChanges(item, input.cwd)
-              const nativeId = Reflect.get(item, 'id')
-              evidence.changes = evidence.changes.map((change, index) => ({
-                ...change,
-                ...(typeof nativeId === 'string'
-                  ? { operationId: `${nativeId}:${index}` }
-                  : { unavailableReason: 'The native operation identity was unavailable.' }),
-              }))
-              // oxlint-disable-next-line no-await-in-loop -- Preserve applied native operation order.
-              await recordNativeChanges(input, evidence, background.observation.signal)
+              const pendingRecording = fileChangeRecordings.get(item)
+              if (pendingRecording) {
+                // oxlint-disable-next-line no-await-in-loop -- Preserve applied native operation order.
+                await pendingRecording
+              } else {
+                const evidence = codexFileChanges(item, input.cwd)
+                const nativeId = Reflect.get(item, 'id')
+                evidence.changes = evidence.changes.map((change, index) => ({
+                  ...change,
+                  ...(typeof nativeId === 'string'
+                    ? { operationId: `${nativeId}:${index}` }
+                    : { unavailableReason: 'The native operation identity was unavailable.' }),
+                }))
+                // oxlint-disable-next-line no-await-in-loop -- Preserve applied native operation order.
+                await recordNativeChanges(input, evidence, background.observation.signal)
+              }
             } else if (
               [
                 'commandExecution',
@@ -2034,7 +2127,7 @@ export class CodexTurnSession {
           if (projectionFailure) throw projectionFailure
           if (status === 'failed') {
             const error = Reflect.get(completedTurn, 'error')
-            throw classifyAgentError(new Error(JSON.stringify(error ?? 'Codex Run failed.')))
+            throw classifyCodexRpcError(error, 'Codex Run failed.')
           }
           const finalText = answer.finalize() ?? (submittedPlan && !answer.text ? '' : undefined)
           if (finalText !== undefined)
@@ -2075,7 +2168,12 @@ export class CodexTurnSession {
               'Invalid owned native error notification.',
               false,
             )
-          const failure = classifyAgentError(new Error(safeNativePermissionText(rawMessage, 1024)))
+          const classified = classifyAgentError(new Error(rawMessage))
+          const failure = new AgentExecutionError(
+            classified.kind,
+            sanitizeNativeTerminalFailure(rawMessage) || 'Codex reported a native error.',
+            classified.retryable,
+          )
           if (willRetry) {
             retryNotifications = Math.min(Number.MAX_SAFE_INTEGER, retryNotifications + 1)
             if (retryNotifications === 1)
@@ -2159,9 +2257,13 @@ export class CodexTurnSession {
             error instanceof Error ? error.name : 'other',
           ).data ?? 'other',
       })
-      if (!nativeStartupDispatched) {
+      if (!threadStartupDispatched || (threadStartupCompleted && !rootTurnRequested)) {
         background.rootNotStarted = true
-        this.kernel.recordDispatch('rejected', input.nativeSessionId, connection?.executorId)
+        this.kernel.recordDispatch(
+          'rejected',
+          threadId ?? input.nativeSessionId,
+          connection?.executorId,
+        )
       }
       if (!background.rootTerminal && !background.rootNotStarted && threadId)
         input.host?.lifecycle?.recordNativeEvidence?.({
@@ -2215,24 +2317,41 @@ export class CodexTurnSession {
           count: retryNotifications + foreignErrorNotifications,
         })
       if (signal.aborted && connection && threadId && turnId && connection.isOpen) {
-        try {
-          await this.runtime.connections.interruptForegroundCommands(
-            background,
-            connection,
-            threadId,
-            turnId,
-            stoppedCommands ?? new Map(),
-          )
-        } catch {
-          reportUnknown(
-            'Codex interruption could not be confirmed. Native observation remains active.',
-          )
+        const remainingCommands = new Map<string, string | undefined>()
+        for (const [id, handle] of stoppedCommands ?? []) {
+          if (background.operations.has(JSON.stringify([threadId, turnId, id]))) {
+            remainingCommands.set(id, handle)
+          }
+        }
+        if (!background.rootTerminal || remainingCommands.size > 0) {
+          try {
+            await this.runtime.connections.interruptForegroundCommands(
+              background,
+              connection,
+              threadId,
+              turnId,
+              remainingCommands,
+              undefined,
+              background.rootTerminal,
+            )
+          } catch {
+            reportUnknown(
+              'Codex interruption could not be confirmed. Native observation remains active.',
+            )
+          }
         }
       }
       stoppedCommands?.clear()
       background.cancellationPending = false
       this.runtime.running = false
-      if (!nativeStartupDispatched) background.rootNotStarted = true
+      if (!threadStartupDispatched || (threadStartupCompleted && !rootTurnRequested)) {
+        background.rootNotStarted = true
+        this.kernel.recordDispatch(
+          'rejected',
+          threadId ?? input.nativeSessionId,
+          connection?.executorId,
+        )
+      }
       if (!connection?.isOpen) {
         if (!background.rootNotStarted) background.unknown = true
         await Promise.allSettled(background.recordings)
@@ -2247,6 +2366,9 @@ export class CodexTurnSession {
             'awaiting_terminal',
           )
         maybeSettle()
+      }
+      if (background.closed) {
+        await this.kernel.settle()
       }
       this.runtime.connections.scheduleIdleDisconnect()
     }

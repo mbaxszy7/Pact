@@ -57,6 +57,7 @@ import {
   type CodexNativeForkOwner,
   type CodexProcessFactory,
   type CodexRunConfiguration,
+  type CodexSettingsBarrier,
   type NativeBackground,
   type NativeRebuildReceipt,
 } from './codex/types'
@@ -110,6 +111,7 @@ export class CodexAgentAdapter implements AgentAdapter {
     const loadedThreadConfigurations = new Map<string, CodexRunConfiguration>()
     const peerToolServer = new PactPeerToolServer()
     const nativeBackground = new Set<NativeBackground>()
+    const pendingSettingsBarriers = new Map<string, CodexSettingsBarrier>()
     const retiredNativeTurns = new Set<string>()
     const retiredNativeChildren = new Set<string>()
     const nativeForkOwners = new Map<string, CodexNativeForkOwner>()
@@ -160,6 +162,7 @@ export class CodexAgentAdapter implements AgentAdapter {
       peerToolServer,
       peerServerName: `pact_peer_${randomUUID().replaceAll('-', '')}`,
       nativeBackground,
+      pendingSettingsBarriers,
       retiredNativeTurns,
       retiredNativeChildren,
       idleTimer: undefined,
@@ -578,7 +581,8 @@ export class CodexAgentAdapter implements AgentAdapter {
       (!runId &&
         (this.runtime.nativeCheck.active ||
           this.runtime.nativeInspection !== undefined ||
-          this.runtime.nativeForkFiles.active)) ||
+          this.runtime.nativeForkFiles.active ||
+          this.runtime.pendingSettingsBarriers.size > 0)) ||
       [...this.runtime.nativeForkOwners].some(([id]) => !runId || id === runId) ||
       [...this.runtime.nativeBackground].some(
         (background) => !runId || background.input.runId === runId,

@@ -68,6 +68,7 @@ export class AgyAcpConnection {
   private readonly pendingRequests = new Map<number, PendingRequest>()
   private readonly unconfirmedCloseRequestIds = new Set<number>()
   private readonly backgroundListeners = new Set<(message: object) => boolean>()
+  private readonly closeListeners = new Set<() => void>()
   private readonly serverRequestListeners = new Set<(message: object) => boolean>()
   private readonly serverRequestOwners = new Map<string, RegisteredServerRequestOwner>()
   private readonly permissionWait = new NativePermissionWait()
@@ -747,6 +748,25 @@ export class AgyAcpConnection {
         this.notifyPhysicalWorkIdleIfSettled()
       }
     }
+  }
+
+  onClose(listener: () => void): () => void {
+    if (!this.isOpen) {
+      try {
+        listener()
+      } catch {
+        // Ignore close observer failures.
+      }
+      return () => undefined
+    }
+    this.closeListeners.add(listener)
+    return () => {
+      this.closeListeners.delete(listener)
+    }
+  }
+
+  hasActiveSessionConsumer(sessionId: string): boolean {
+    return Boolean(this.streams.getActiveConsumer(sessionId))
   }
 
   subscribeServerRequests(listener: (message: object) => boolean): () => void {
@@ -1686,11 +1706,20 @@ export class AgyAcpConnection {
     this.backgroundListeners.clear()
     this.serverRequestListeners.clear()
     this.serverRequestOwners.clear()
+    const closeObservers = [...this.closeListeners]
+    this.closeListeners.clear()
     this.frameChunks = []
     this.frameBytes = 0
     if (this.stdoutPaused) this.child.stdout.resume()
     this.stdoutPaused = false
     exitDrainDeferred?.resolve()
+    for (const notifyClose of closeObservers) {
+      try {
+        notifyClose()
+      } catch {
+        // Isolate close listener errors from connection teardown.
+      }
+    }
     this.onClosed?.()
   }
 

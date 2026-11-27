@@ -143,21 +143,11 @@ export class RunExecutor {
             ) {
               throw new Error('The late native output could not be committed.')
             }
+            this.settleOrphanedPendingEffects(execution.run.id, execution.deliveryPossible)
             this.core.retireStreamTrace(owner, execution.streamBuffer)
             owner.sourceReader?.retire()
             this.core.recovery.clearBackgroundStop(owner)
             this.core.nativeObservations.delete(execution.run.id)
-            if (
-              this.core.conversations.findRun(execution.run.id)?.nativeEffectsState === 'pending'
-            ) {
-              this.core.publish(
-                this.core.conversations.recordNativeEffects(
-                  execution.run.id,
-                  'unknown',
-                  'observer_ended_without_settlement',
-                ),
-              )
-            }
           }
           await this.finalizeWorkspaceChanges(execution.run.id)
           const settled = this.core.conversations.reconcileCompletedCollaboration(execution.run.id)
@@ -235,14 +225,41 @@ export class RunExecutor {
     return failure
   }
 
+  private settleOrphanedPendingEffects(runId: string, deliveryPossible: boolean): void {
+    const saved = this.core.conversations.findRun(runId)
+    if (saved?.nativeEffectsState !== 'pending') return
+    if (
+      !deliveryPossible &&
+      saved.dispatchPhase === 'not_sent' &&
+      !saved.nativeTurnId &&
+      !saved.nativeOutcome
+    ) {
+      this.core.publish(
+        this.core.conversations.recordNativeEffects(
+          runId,
+          'not_dispatched',
+          'stopped_before_native_dispatch',
+        ),
+      )
+      return
+    }
+    this.core.publish(
+      this.core.conversations.recordNativeEffects(
+        runId,
+        'unknown',
+        'observer_ended_without_settlement',
+      ),
+    )
+  }
+
   async finalizeWorkspaceChanges(runId: string): Promise<void> {
     if (this.core.disposed) return
     const run = this.core.conversations.findRun(runId)
     if (!run || ['starting', 'running', 'recovering'].includes(run.status)) return
-    if (
-      this.core.nativeObservations.get(runId)?.adapter.hasActiveBackgroundWork?.(runId) ||
-      run.nativeEffectsState === 'pending'
-    ) {
+    const activeAdapter =
+      this.core.nativeObservations.get(runId)?.adapter ??
+      this.core.adapters.get(`${run.sessionId}:${run.agentId}`)?.adapter
+    if (activeAdapter?.hasActiveBackgroundWork?.(runId)) {
       const recorded = this.core.workspaceChanges?.summary(runId)
       if (run.dispatchPhase === 'ended' && recorded && recorded.fileCount > 0) {
         this.core.publish(this.core.conversations.recordWorkspaceChanges(recorded))
@@ -375,15 +392,18 @@ export class RunExecutor {
   ownsFrozenSourceRoot(run: AgentRun): boolean {
     const saved = this.core.conversations.findRun(run.id)
     const binding = this.core.conversations.nativeContext(run.sessionId, run.agentId)
-    if (!saved || saved.controlDisposition === 'abandoned') return false
-    if (
-      binding &&
-      (binding.bindingGeneration !== (run.bindingGeneration ?? 1) ||
-        (saved.nativeSessionId && binding.nativeSessionId !== saved.nativeSessionId))
-    ) {
-      return false
-    }
-    return this.core.conversations.ownsNativeControl(run.id)
+    // A merely prepared/failed replacement candidate is not committed source
+    // ownership loss. Its previous live root keeps only its original grant.
+    return Boolean(
+      saved &&
+      !saved.forkSourceRunId &&
+      saved.controlDisposition !== 'abandoned' &&
+      saved.dispatchPhase !== 'ended' &&
+      this.core.conversations.latestAgentRun(run.sessionId, run.agentId)?.id === run.id &&
+      (!binding ||
+        (binding.bindingGeneration === (run.bindingGeneration ?? 1) &&
+          (!saved.nativeSessionId || binding.nativeSessionId === saved.nativeSessionId))),
+    )
   }
 
   retireChangedSourceGrants(sessionId: string, agentId: RuntimeAgentId): void {
@@ -515,6 +535,15 @@ export class RunExecutor {
     const ownsCurrentNativeRun = (): boolean =>
       this.core.activeExecutions.get(run.sessionId) === execution &&
       this.core.conversations.ownsNativeControl(run.id)
+    const ownsForegroundOutput = (): boolean => {
+      if (!this.ownsExecution(execution, run.id)) return false
+      const saved = this.core.conversations.findRun(run.id)
+      return Boolean(
+        saved &&
+        ['starting', 'running', 'recovering'].includes(saved.status) &&
+        this.core.conversations.ownsNativeControl(run.id),
+      )
+    }
     const currentControl = (): boolean => !this.core.disposed && ownsCurrentNativeRun()
 
     // Construct the single-writer RunOutputArchiver first, then bind it to NativeObservation.
@@ -527,7 +556,7 @@ export class RunExecutor {
       peerAssistanceAllowed,
       isOwned: stillOwned,
       isDisposed: () => this.core.disposed,
-      ownsCurrentControl: ownsCurrentNativeRun,
+      ownsCurrentControl: ownsForegroundOutput,
       isRunEnded: () => this.core.conversations.findRun(run.id)?.dispatchPhase === 'ended',
       applyStreamBatch: (events, archive) =>
         archive
@@ -623,6 +652,8 @@ export class RunExecutor {
         : undefined
     }
 
+    let enteredNativeAdapter = false
+
     const release = (): void => {
       if (!stillOwned() || adapter.hasActiveBackgroundWork?.(run.id)) return
       if (archiver.archiveTail) {
@@ -639,6 +670,7 @@ export class RunExecutor {
       archiver.flush()
       archiver.dispose()
       if (archiver.outputFailure) this.core.workspaceChanges?.observeUncertainEffects(run.id)
+      this.settleOrphanedPendingEffects(run.id, enteredNativeAdapter || execution.deliveryPossible)
       this.core.retireStreamTrace(owner, archiver.foregroundBuffer)
       owner.sourceReader?.retire()
       this.core.recovery.clearBackgroundStop(owner)
@@ -669,7 +701,6 @@ export class RunExecutor {
         )
       }
       this.core.publish(this.core.conversations.updateAttempt(run.id, 1, false))
-      this.core.publish(this.core.conversations.recordNativeEffects(run.id, 'pending'))
       const frozenWorkflow = this.core.conversations.collaboration(run.sessionId, run.id, false)
       promptEnvelope.collaboration = frozenWorkflow
         ? this.core.conversations.collaborationPromptState(frozenWorkflow)
@@ -984,6 +1015,7 @@ export class RunExecutor {
             const pending = archiver.archiveTail
             if (pending) await pending
           },
+          currentPromptEnvelope: () => execution.promptEnvelope ?? promptEnvelope,
         },
         effects: {
           recordArchivedEvent: (event) => {
@@ -1202,11 +1234,14 @@ export class RunExecutor {
         peerAssistanceAllowed,
         cwd,
         promptEnvelope,
-        currentPromptEnvelope: () => execution.promptEnvelope ?? promptEnvelope,
         model: settings.agents[run.agentId].model,
         effort: settings.agents[run.agentId].effort,
         speed: run.speed ?? 'native',
       }
+
+      if (!this.ownsExecution(execution, run.id)) return
+      this.core.publish(this.core.conversations.recordNativeEffects(run.id, 'pending'))
+      enteredNativeAdapter = true
 
       for await (const event of adapter.run(runInput, signal)) {
         if (this.core.disposed) return
@@ -1285,6 +1320,18 @@ export class RunExecutor {
         durationMs: Date.now() - diagnosticStartedAt,
       })
       const saved = this.core.conversations.findRun(run.id)
+      if (!enteredNativeAdapter && (execution.cancelledByUser || saved?.status === 'interrupted')) {
+        if (saved?.nativeEffectsState === 'pending') {
+          this.core.publish(
+            this.core.conversations.recordNativeEffects(
+              run.id,
+              'not_dispatched',
+              'stopped_before_native_dispatch',
+            ),
+          )
+        }
+        return
+      }
       if (saved?.dispatchPhase === 'ended') {
         this.core.publish(this.core.conversations.settleKnownNativeEnding(run.id, failure))
         const completedReceipt = archiver.completedNativeReceipt

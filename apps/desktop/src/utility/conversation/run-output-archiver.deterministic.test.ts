@@ -238,7 +238,18 @@ async function runArchiverInterleavingSeed(seed: number): Promise<void> {
     }
   }
 
-  await archiver.drain()
+  let drainError: unknown
+  try {
+    await archiver.drain()
+  } catch (error: unknown) {
+    drainError = error
+  }
+  const hasInjectedFault = injectCommitFault !== undefined || injectPublishFault !== undefined
+  const drainErrorMessage = drainError instanceof Error ? drainError.message : ''
+  expect(
+    drainError === undefined ||
+      (hasInjectedFault && /injected-(?:commit|publish)-fault-/u.test(drainErrorMessage)),
+  ).toBe(true)
   archiver.dispose()
 
   // Invariant 1: Working memory ALWAYS returns to 0 bytes after drain + dispose.
@@ -336,5 +347,77 @@ describe('RunOutputArchiver deterministic single-writer invariants', () => {
       '3:settle-known-ending',
     ])
     expect(harness.publishedLabels).toEqual(harness.committedLabels)
+  })
+
+  it('Wave 6A Shard 1 #4/#5 regressions: synchronously quarantines small archive body failure before same-tick turn.completed, surfaces failure-recording errors via drain()/dispose(), and publishes foreground+archive patches in strict observation.sequence order', async () => {
+    // 1. Small archive text.completed failure quarantines synchronously before a same-tick turn.completed.
+    const syncFaultHarness = createHarness({ seed: 20_001, failOnCommitSeq: 1 })
+    syncFaultHarness.setControl(false)
+    syncFaultHarness.archiver.admitArchiveEventSync({
+      agentId: 'codex',
+      type: 'text.completed',
+      turnId: 'turn-1',
+      outputId: 'out-sync',
+      text: 'small body fails commit',
+    })
+    // Same-tick turn.completed MUST be dropped because outputFailure is already synchronously latched.
+    syncFaultHarness.archiver.admitArchiveEventSync({
+      agentId: 'codex',
+      type: 'turn.completed',
+      turnId: 'turn-1',
+      outcome: 'completed',
+    })
+    expect(syncFaultHarness.archiver.outputFailure).toBeDefined()
+    await syncFaultHarness.archiver.drain()
+    syncFaultHarness.archiver.dispose()
+    expect(syncFaultHarness.committedLabels).toEqual(['2:output-failure'])
+
+    // 2. recordOutputFailure throwing inside markAborted surfaces through drain() and dispose() without unhandled rejections.
+    const recordFailHarness = createHarness({ seed: 20_002, failOnCommitSeq: 1 })
+    recordFailHarness.archiver.markAborted(new Error('body failed'))
+    await expect(recordFailHarness.archiver.drain()).rejects.toThrow(/injected-commit-fault-1/u)
+    expect(recordFailHarness.archiver.dispose()).toBe(false)
+
+    // 3. Interleaved foreground + archive buffered progress patches publish in strict ascending observation.sequence order.
+    const orderHarness = createHarness({ seed: 20_003 })
+    await orderHarness.archiver.admitEvent(
+      {
+        agentId: 'codex',
+        type: 'text.delta',
+        turnId: 'turn-1',
+        outputId: 'out-order',
+        text: 'fg-1',
+      },
+      'foreground',
+    )
+    orderHarness.setControl(false)
+    orderHarness.archiver.admitArchiveEventSync({
+      agentId: 'codex',
+      type: 'text.delta',
+      turnId: 'turn-1',
+      outputId: 'out-order',
+      text: 'arch-2',
+    })
+    orderHarness.archiver.admitTerminalReceipt({
+      kind: 'ended',
+      identity: {
+        agentId: 'codex',
+        sessionId: 'session-1',
+        runId: 'run-20003',
+        requestId: 'run-20003',
+        nativeSessionId: 'native-1',
+        nativeTurnId: 'turn-1',
+        executorId: 'exec-1',
+        bindingGeneration: 1,
+      },
+      source: 'live_terminal',
+      outcome: 'completed',
+      output: { outputId: 'out-order', text: 'fg-1arch-2', completeness: 'complete' },
+    })
+    await orderHarness.archiver.drain()
+    orderHarness.archiver.dispose()
+    expect(orderHarness.publishedLabels).toEqual(orderHarness.committedLabels)
+    const seqs = orderHarness.publishedLabels.map((l) => Number(l.split(':')[0]))
+    expect(seqs).toEqual([...seqs].toSorted((a, b) => a - b))
   })
 })

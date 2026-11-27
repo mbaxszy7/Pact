@@ -9,11 +9,7 @@ import type { RuntimeAgentId, SessionPermissionMode } from '@pact/contracts'
 import { nativePermissionRequestSchema } from '@pact/contracts'
 
 import { OwnedProcessGroup } from '../../owned-process-group'
-import {
-  AgentExecutionError,
-  classifyAgentError,
-  PermissionModeRejectedError,
-} from '../agent-execution-error'
+import { AgentExecutionError, PermissionModeRejectedError } from '../agent-execution-error'
 import {
   CodexAppServerConnection,
   type CodexConnectionDiagnostics,
@@ -39,6 +35,7 @@ import {
   IDLE_CONNECTION_TIMEOUT_MS,
   MAX_LOADED_THREAD_BYTES,
   MAX_LOADED_THREADS,
+  classifyCodexRpcError,
   codexApprovalActions,
   codexCapabilityError,
   interruptArgs,
@@ -51,6 +48,7 @@ import {
   type CodexConnectionManagerPort,
   type CodexRelayPermissionInput,
   type CodexRunConfiguration,
+  type CodexSettingsBarrier,
   type NativeBackground,
 } from './types'
 
@@ -1275,12 +1273,52 @@ export class CodexConnectionManager implements CodexConnectionManagerPort {
     }
   }
 
+  async awaitSettingsBarrier(
+    connection: CodexAppServerConnection,
+    threadId: string,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    let waited = false
+    for (;;) {
+      const barrierKey = `${connection.executorId}:${threadId}`
+      const barrier = this.runtime.pendingSettingsBarriers.get(barrierKey)
+      if (!barrier) return waited
+      waited = true
+      if (signal.aborted) {
+        throw new AgentExecutionError(
+          'user_stopped',
+          'A previous permission update for this native Thread has not finished yet. No task was submitted.',
+          false,
+        )
+      }
+      // oxlint-disable-next-line no-await-in-loop -- Re-check barrier map after awaiting so sequential updates stay serialized.
+      await new Promise<void>((resolve, reject) => {
+        const onAbort = (): void => {
+          reject(
+            new AgentExecutionError(
+              'user_stopped',
+              'A previous permission update for this native Thread has not finished yet. No task was submitted.',
+              false,
+            ),
+          )
+        }
+        signal.addEventListener('abort', onAbort, { once: true })
+        void barrier.done.finally(() => {
+          signal.removeEventListener('abort', onAbort)
+          resolve()
+        })
+      })
+    }
+  }
+
   async applyPermissionSettings(
     connection: CodexAppServerConnection,
     threadId: string,
     policy: object | undefined,
     signal: AbortSignal,
     resumed?: object,
+    background?: NativeBackground,
+    onBarrierSettled?: () => void,
   ): Promise<object> {
     if (signal.aborted)
       throw new AgentExecutionError(
@@ -1288,6 +1326,7 @@ export class CodexConnectionManager implements CodexConnectionManagerPort {
         'Permission update was cancelled. No task was submitted.',
         false,
       )
+    const waitedPriorBarrier = await this.awaitSettingsBarrier(connection, threadId, signal)
     if (!policy && process.platform === 'win32')
       policy = await this.runtime.lifecycle.readWindowsDefaultPermissionSettings(
         connection,
@@ -1298,7 +1337,7 @@ export class CodexConnectionManager implements CodexConnectionManagerPort {
       throw new PermissionModeRejectedError(
         'Native permission configuration is incomplete. Choose Ask for approval or configure a native permissions profile; no task was submitted.',
       )
-    const current = resumed && Reflect.get(resumed, 'result')
+    const current = !waitedPriorBarrier && resumed ? Reflect.get(resumed, 'result') : undefined
     const currentThread =
       current && typeof current === 'object' ? Reflect.get(current, 'thread') : undefined
     if (
@@ -1321,7 +1360,7 @@ export class CodexConnectionManager implements CodexConnectionManagerPort {
     )
       // This fresh native readback already proves the requested policy is in
       // force. Codex does not emit a settings notification for a no-op update.
-      return permissionReadback(resumed)
+      return permissionReadback(resumed!)
     const controller = new AbortController()
     const observedSignal = AbortSignal.any([signal, controller.signal])
     let settle!: (settings: object | undefined) => void
@@ -1346,13 +1385,42 @@ export class CodexConnectionManager implements CodexConnectionManagerPort {
         settle(Reflect.get(params, 'threadSettings'))
         return true
       })
-      const response = await connection.request(
+      const operation = connection.requestOwned(
         'thread/settings/update',
         { threadId, ...policy },
         { timeoutMs: CODEX_THREAD_RPC_TIMEOUT_MS, signal: observedSignal },
       )
+      const barrierKey = `${connection.executorId}:${threadId}`
+      const barrierDone = operation.physicalCompletion.then(
+        () => undefined,
+        () => undefined,
+      )
+      const barrierEntry: CodexSettingsBarrier = {
+        executorId: connection.executorId,
+        threadId,
+        done: barrierDone,
+      }
+      this.runtime.pendingSettingsBarriers.set(barrierKey, barrierEntry)
+      void barrierDone.finally(() => {
+        if (this.runtime.pendingSettingsBarriers.get(barrierKey) === barrierEntry) {
+          this.runtime.pendingSettingsBarriers.delete(barrierKey)
+        }
+        this.scheduleIdleDisconnect()
+      })
+      if (background) {
+        background.interactions.add(barrierDone)
+        void barrierDone.finally(() => {
+          background.interactions.delete(barrierDone)
+          onBarrierSettled?.()
+        })
+      }
+      const response = await operation.result
+      await barrierDone
       if (Reflect.get(response, 'error'))
-        throw classifyAgentError(new Error(JSON.stringify(Reflect.get(response, 'error'))))
+        throw classifyCodexRpcError(
+          Reflect.get(response, 'error'),
+          'Codex rejected the permission update.',
+        )
       const actual = await observed
       if (observedSignal.aborted || !samePermissionPolicy(actual, policy))
         throw new PermissionModeRejectedError(

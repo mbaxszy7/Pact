@@ -5,6 +5,7 @@ import type { NativeMemoryReservation } from '../native-working-memory'
 import type { AgyAdapterRuntime } from './adapter-runtime'
 import type { AgyRunMcpServer } from './peer-mcp-server'
 
+import { nativeFileChangesSettled } from '../native-file-changes'
 import {
   buildCompactPostCutoffBackgroundRecord,
   estimateCompactBackgroundRecordBytes,
@@ -21,6 +22,18 @@ import {
   isPlainObject,
   type ActiveAgyRun,
 } from './types'
+
+/**
+ * Only these `session/update` kinds represent background task settlement or post-turn
+ * background reports. Session control/config/replay metadata must NEVER be monopolized
+ * by a retained background observer.
+ */
+const AGY_BACKGROUND_OBSERVER_UPDATES = new Set<string>([
+  'agent_message_chunk',
+  'tool_call',
+  'tool_call_update',
+  'background_task_completed',
+])
 
 export interface AgyTurnBackgroundObserverHost {
   readonly runtime: AgyAdapterRuntime
@@ -51,7 +64,12 @@ export class AgyTurnBackgroundObserver {
   private postCutoffBackgroundTail = Promise.resolve()
   private postCutoffBgQueuedCount = 0
   private postCutoffBgQueuedBytes = 0
+  private admittingBackground = true
   private unsubscribeBackground: (() => void) | undefined
+  private unsubscribeConnectionClose: (() => void) | undefined
+  private retainedCleanup: (() => void) | undefined
+  private retainedSettling = false
+  private retainedCleaned = false
 
   constructor(private readonly host: AgyTurnBackgroundObserverHost) {}
 
@@ -101,6 +119,7 @@ export class AgyTurnBackgroundObserver {
     update: Record<string, unknown>,
     preValidatedOwnership?: ValidatedBackgroundOwnership,
   ): void {
+    if (!this.admittingBackground) return
     const activeRun = this.host.getActiveRun()
     if (!activeRun) return
     const ownership =
@@ -161,13 +180,71 @@ export class AgyTurnBackgroundObserver {
       .finally(() => {
         this.postCutoffBgQueuedCount = Math.max(0, this.postCutoffBgQueuedCount - 1)
         this.postCutoffBgQueuedBytes = Math.max(0, this.postCutoffBgQueuedBytes - recordBytes)
-        this.host.getPostCutoffBgReservation()?.resize(this.postCutoffBgQueuedBytes)
+        if (!this.retainedCleaned) {
+          this.host.getPostCutoffBgReservation()?.resize(this.postCutoffBgQueuedBytes)
+        }
+        this.maybeFinishRetainedBackground(activeRun)
       })
+  }
+
+  private maybeFinishRetainedBackground(activeRun: ActiveAgyRun): void {
+    if (!this.retainedCleanup || this.retainedSettling || this.retainedCleaned) return
+    if (!this.host.isRootTerminal() || activeRun.activeBackgroundTasks.size > 0) return
+    // Wait until EVERY already-admitted background report has drained before revoking
+    // ownership, reporting settled, or releasing postCutoffBgMemoryReservation!
+    if (this.postCutoffBgQueuedCount > 0) return
+    this.closeRetainedBackground({ reason: 'tasks_drained' })
+  }
+
+  /**
+   * Unified background teardown entry for task-count-zero, ACP EOF/transport close,
+   * and adapter disposal:
+   * 1. Stop admitting new frames immediately.
+   * 2. Drain all already-admitted background records before revoking host ownership.
+   * 3. Report settled (if tasks drained cleanly) or unknown (if tasks remain unconfirmed).
+   * 4. Invoke retained cleanup (release reservations, retire reader, delete activeRuns, release lease).
+   */
+  closeRetainedBackground(options: {
+    readonly reason: 'tasks_drained' | 'transport_closed' | 'disposed'
+    readonly emergency?: boolean | undefined
+  }): void {
+    if (this.retainedSettling || this.retainedCleaned) return
+    this.retainedSettling = true
+    this.admittingBackground = false
+    this.unsubscribe()
+    const activeRun = this.host.getActiveRun()
+
+    const finalize = (): void => {
+      if (this.retainedCleaned) return
+      this.retainedCleaned = true
+      if (activeRun && this.host.isRootTerminal()) {
+        if (options.reason === 'tasks_drained' && activeRun.activeBackgroundTasks.size === 0) {
+          if (!activeRun.backgroundUnconfirmed && this.host.canSettleEffects()) {
+            nativeFileChangesSettled(this.host.input, 'settled', 'native_work_drained')
+          }
+        } else if (activeRun.activeBackgroundTasks.size > 0 || activeRun.backgroundUnconfirmed) {
+          this.host.reportUnknown(
+            options.reason === 'transport_closed'
+              ? 'Antigravity ACP connection closed before background tasks settled.'
+              : 'Antigravity background observation ended before tasks could be confirmed.',
+          )
+        }
+      }
+      const cleanup = this.retainedCleanup
+      this.retainedCleanup = undefined
+      cleanup?.()
+    }
+
+    if (options.emergency) {
+      finalize()
+      return
+    }
+    void this.postCutoffBackgroundTail.finally(finalize)
   }
 
   /**
    * Zero-gap handoff from `orderedStream` to `subscribeBackground` when retaining background tasks:
-   * 1. Arm `subscribeBackground` FIRST (so no subsequent stdout frame can slip through).
+   * 1. Arm `subscribeBackground` and connection close observer FIRST.
    * 2. Synchronously drain all buffered post-cutoff frames from `sessionStream.shift()`.
    * 3. Close `sessionStream`.
    */
@@ -177,13 +254,18 @@ export class AgyTurnBackgroundObserver {
     promptCutoffSeq: number | undefined
     routePostCutoffIngress: (item: AgyIngress) => void
     onStreamClosed: () => void
+    onRetainedCleanup?: (() => void) | undefined
   }): void {
     const activeRun = this.host.getActiveRun()
     const resolvedSessionId = this.host.getResolvedSessionId()
     if (!activeRun || !resolvedSessionId || this.unsubscribeBackground) return
     const trackedRun = activeRun
     const trackedSessionId = resolvedSessionId
+    if (params.onRetainedCleanup) {
+      this.retainedCleanup = params.onRetainedCleanup
+    }
     this.unsubscribeBackground = params.connection.subscribeBackground((message) => {
+      if (!this.admittingBackground) return false
       if (asString(Reflect.get(message, 'method')) !== 'session/update') return false
       const msgParams = Reflect.get(message, 'params')
       if (!isPlainObject(msgParams)) return false
@@ -191,6 +273,8 @@ export class AgyTurnBackgroundObserver {
       if (sid !== trackedSessionId) return false
       const update = msgParams.update
       if (!isPlainObject(update)) return false
+      const sessionUpdate = asString(update.sessionUpdate)
+      if (!sessionUpdate || !AGY_BACKGROUND_OBSERVER_UPDATES.has(sessionUpdate)) return false
 
       const ownership = validateBackgroundUpdateForRun(
         msgParams,
@@ -201,18 +285,20 @@ export class AgyTurnBackgroundObserver {
       )
       if (!ownership.valid) return false
 
-      let hasNewerActiveRun = false
-      for (const other of this.host.runtime.activeRuns.values()) {
-        if (
-          other !== trackedRun &&
-          other.nativeSessionId === trackedSessionId &&
-          !other.rootTerminal
-        ) {
-          hasNewerActiveRun = true
-          break
+      let hasCompetingSessionOwner = params.connection.hasActiveSessionConsumer(trackedSessionId)
+      if (!hasCompetingSessionOwner) {
+        for (const other of this.host.runtime.activeRuns.values()) {
+          if (
+            other !== trackedRun &&
+            other.nativeSessionId === trackedSessionId &&
+            !other.rootTerminal
+          ) {
+            hasCompetingSessionOwner = true
+            break
+          }
         }
       }
-      if (hasNewerActiveRun) {
+      if (hasCompetingSessionOwner) {
         const rawOutput = isPlainObject(update.rawOutput) ? update.rawOutput : undefined
         const taskId =
           asString(update.taskId ?? update.backgroundTaskId) ??
@@ -247,6 +333,11 @@ export class AgyTurnBackgroundObserver {
       params.sessionStream.close()
       params.onStreamClosed()
     }
+
+    this.unsubscribeConnectionClose = params.connection.onClose(() => {
+      this.closeRetainedBackground({ reason: 'transport_closed' })
+    })
+    this.maybeFinishRetainedBackground(trackedRun)
   }
 
   awaitTail(): Promise<void> {
@@ -256,5 +347,7 @@ export class AgyTurnBackgroundObserver {
   unsubscribe(): void {
     this.unsubscribeBackground?.()
     this.unsubscribeBackground = undefined
+    this.unsubscribeConnectionClose?.()
+    this.unsubscribeConnectionClose = undefined
   }
 }

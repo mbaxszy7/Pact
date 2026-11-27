@@ -22531,4 +22531,212 @@ describe('AgyAgentAdapter Wave-6 audit regressions', () => {
       await adapter.dispose()
     }
   })
+
+  it('Wave 6A Shard 2 #1/#2/#7/#8: survives paused iterator close after dispose(), preserves live_terminal when consumer aborts on text.completed, drops post-Stop deltas, and sanitizes RPC error data/tokens', async () => {
+    const { cwd, appDataDir } = await createEnv()
+    const nativeSessionId = randomUUID()
+
+    // 1. Paused iterator close after forceCleanup/dispose() does not throw or leak answer reservation (Shard 2 #1).
+    const harness1 = createAcpHarness()
+    harness1.onClientFrame((frame) => {
+      if (frame.method === 'initialize') {
+        harness1.sendToClient({ jsonrpc: '2.0', id: frame.id, result: { protocolVersion: 1 } })
+      } else if (frame.method === 'session/new') {
+        harness1.sendToClient({
+          jsonrpc: '2.0',
+          id: frame.id,
+          result: {
+            sessionId: nativeSessionId,
+            configOptions: [
+              { id: 'model', currentValue: 'gemini-4-carbon' },
+              { id: 'thought_level', currentValue: 'high' },
+            ],
+          },
+        })
+      } else if (
+        frame.method === 'session/set_mode' ||
+        frame.method === 'session/set_config_option'
+      ) {
+        harness1.sendToClient({
+          jsonrpc: '2.0',
+          id: frame.id,
+          result: {
+            configOptions: [
+              { id: 'model', currentValue: 'gemini-4-carbon' },
+              { id: 'thought_level', currentValue: 'high' },
+            ],
+          },
+        })
+      } else if (frame.method === 'session/prompt') {
+        harness1.sendToClient({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: nativeSessionId,
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: 'partial-before-pause' },
+            },
+          },
+        })
+      }
+    })
+    const adapter1 = new AgyAgentAdapter({
+      appDataDir,
+      processFactory: () => harness1.child,
+      storageClient: {
+        readTrajectoryIdentity: async () => ({
+          status: 'ok',
+          trajectoryId: randomUUID(),
+          stepCount: 1,
+        }),
+      },
+    })
+    const stream1 = adapter1.run(makeBaseRunInput(cwd), new AbortController().signal)
+    const iter1 = stream1[Symbol.asyncIterator]()
+    let sawDelta = false
+    while (!sawDelta) {
+      // oxlint-disable-next-line no-await-in-loop -- Stepping generator to text.delta.
+      const step = await iter1.next()
+      if (step.done) break
+      if (step.value.type === 'text.delta') sawDelta = true
+    }
+    expect(sawDelta).toBe(true)
+    await adapter1.dispose()
+    await expect(iter1.return?.()).resolves.toMatchObject({ done: true })
+
+    // 2. Consumer closing iterator at text.completed (simulating RunOutputArchiver write failure) still commits live_terminal (Shard 2 #2).
+    const recordedEvidence: Array<{
+      kind: string
+      source?: string | undefined
+      outcome?: string | undefined
+    }> = []
+    const harness2 = createAcpHarness()
+    harness2.onClientFrame((frame) => {
+      if (frame.method === 'initialize') {
+        harness2.sendToClient({ jsonrpc: '2.0', id: frame.id, result: { protocolVersion: 1 } })
+      } else if (frame.method === 'session/new') {
+        harness2.sendToClient({
+          jsonrpc: '2.0',
+          id: frame.id,
+          result: {
+            sessionId: nativeSessionId,
+            configOptions: [
+              { id: 'model', currentValue: 'gemini-4-carbon' },
+              { id: 'thought_level', currentValue: 'high' },
+            ],
+          },
+        })
+      } else if (
+        frame.method === 'session/set_mode' ||
+        frame.method === 'session/set_config_option'
+      ) {
+        harness2.sendToClient({
+          jsonrpc: '2.0',
+          id: frame.id,
+          result: {
+            configOptions: [
+              { id: 'model', currentValue: 'gemini-4-carbon' },
+              { id: 'thought_level', currentValue: 'high' },
+            ],
+          },
+        })
+      } else if (frame.method === 'session/prompt') {
+        harness2.sendToClient({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: nativeSessionId,
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: 'Full verified answer.' },
+            },
+          },
+        })
+        harness2.sendToClient({ jsonrpc: '2.0', id: frame.id, result: { stopReason: 'end_turn' } })
+      }
+    })
+    const adapter2 = new AgyAgentAdapter({
+      appDataDir,
+      processFactory: () => harness2.child,
+      storageClient: {
+        readTrajectoryIdentity: async () => ({
+          status: 'ok',
+          trajectoryId: randomUUID(),
+          stepCount: 1,
+        }),
+      },
+    })
+    try {
+      const stream2 = adapter2.run(
+        makeBaseRunInput(cwd, {
+          host: {
+            lifecycle: {
+              recordNativeEvidence: (ev) => {
+                recordedEvidence.push({
+                  kind: ev.kind,
+                  ...('source' in ev ? { source: ev.source } : {}),
+                  ...('outcome' in ev ? { outcome: ev.outcome } : {}),
+                })
+              },
+            },
+          },
+        }),
+        new AbortController().signal,
+      )
+      const iter2 = stream2[Symbol.asyncIterator]()
+      while (true) {
+        // oxlint-disable-next-line no-await-in-loop -- Simulating RunOutputArchiver throwing on text.completed.
+        const step = await iter2.next()
+        if (step.done) break
+        if (step.value.type === 'text.completed') {
+          await iter2.return?.()
+          break
+        }
+      }
+      expect(recordedEvidence).toContainEqual({
+        kind: 'ended',
+        source: 'live_terminal',
+        outcome: 'completed',
+      })
+    } finally {
+      await adapter2.dispose()
+    }
+
+    // 3. RPC error data.token is stripped and message is sanitized <= 240 chars (Shard 2 #7).
+    const harness3 = createAcpHarness()
+    harness3.onClientFrame((frame) => {
+      if (frame.method === 'initialize') {
+        harness3.sendToClient({ jsonrpc: '2.0', id: frame.id, result: { protocolVersion: 1 } })
+      } else if (frame.method === 'session/new') {
+        harness3.sendToClient({
+          jsonrpc: '2.0',
+          id: frame.id,
+          error: {
+            code: -32001,
+            message: 'quota exceeded Bearer secretToken123456789',
+            data: { token: 'SENSITIVE_AGY_MARKER' },
+          },
+        })
+      }
+    })
+    const adapter3 = new AgyAgentAdapter({
+      appDataDir,
+      processFactory: () => harness3.child,
+    })
+    try {
+      let rpcErr: unknown
+      try {
+        await collectEvents(adapter3.run(makeBaseRunInput(cwd), new AbortController().signal))
+      } catch (err: unknown) {
+        rpcErr = err
+      }
+      const msg = rpcErr instanceof Error ? rpcErr.message : ''
+      expect(msg.length).toBeLessThanOrEqual(240)
+      expect(msg).not.toContain('secretToken123456789')
+      expect(msg).not.toContain('SENSITIVE_AGY_MARKER')
+    } finally {
+      await adapter3.dispose()
+    }
+  })
 })

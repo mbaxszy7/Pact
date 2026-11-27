@@ -6005,3 +6005,598 @@ it('replaces an idle loaded-thread connection when the Session active peer swaps
     await adapter.dispose()
   }
 })
+
+describe('Wave 6A Codex TurnSession adversarial regressions', () => {
+  it('Shard 3 #1/#3: records accepted/running before run.speed.resolved, skips turn/interrupt after rootTerminal, and persists paused root fileChange before settling', async () => {
+    const dispatched: string[] = []
+    const evidenceKinds: string[] = []
+    const settledReports: Array<{ state: string; reason?: string | undefined }> = []
+    const recordedFileChanges: string[] = []
+    let releaseRecordFileChange!: () => void
+    const recordStarted = Promise.withResolvers<void>()
+    let interruptSent = false
+    let pushNotify!: (message: object) => void
+
+    const adapter = new CodexAgentAdapter('/fake/codex', () => {
+      const child = fakeCodexProcess(
+        (request, respond, notify) => {
+          pushNotify = notify
+          const id = Reflect.get(request, 'id')
+          const method = String(Reflect.get(request, 'method'))
+          if (method === 'initialize') {
+            respond({ id, result: { userAgent: 'codex_cli_rs/0.163.0' } })
+          } else if (method === 'turn/start') {
+            respond({ id, result: { turn: { id: 'turn-wave6a-1' } } })
+          }
+        },
+        (request, respond, notify) => {
+          pushNotify = notify
+          const id = Reflect.get(request, 'id')
+          const method = String(Reflect.get(request, 'method'))
+          if (method === 'thread/start') {
+            respond({
+              id,
+              result: {
+                model: 'gpt-5.4',
+                reasoningEffort: 'high',
+                approvalPolicy: 'on-request',
+                approvalsReviewer: 'user',
+                sandbox: { type: 'workspaceWrite', writableRoots: [] },
+                thread: { id: 'th-wave6a-1' },
+              },
+            })
+            return true
+          }
+          if (method === 'turn/interrupt') {
+            interruptSent = true
+            respond({ id, error: { code: -32600, message: 'turn already ended' } })
+            return true
+          }
+          return false
+        },
+      )
+      return {
+        child,
+        close: async () => {
+          child.emit('exit', 0, null)
+          child.emit('close', 0, null)
+        },
+      }
+    })
+
+    try {
+      const abortController = new AbortController()
+      const stream = adapter.run(
+        {
+          runId: randomUUID(),
+          sessionId: randomUUID(),
+          cwd: '/project',
+          model: 'gpt-5.4',
+          effort: 'high',
+          promptEnvelope: {
+            version: 'pact-agent-prompt-v1',
+            sessionId: randomUUID(),
+            message: { id: randomUUID(), content: 'Edit file' },
+            comments: [],
+          },
+          host: {
+            lifecycle: {
+              recordDispatch: (phase) => dispatched.push(phase),
+              recordNativeEvidence: (ev) => evidenceKinds.push(ev.kind),
+            },
+            effects: {
+              recordFileChange: async (change) => {
+                recordedFileChanges.push(change.path)
+                recordStarted.resolve()
+                await new Promise<void>((resolve) => {
+                  releaseRecordFileChange = resolve
+                })
+              },
+              reportNativeEffects: (report) => {
+                settledReports.push({ state: report.state, reason: report.reason })
+              },
+            },
+          },
+        },
+        abortController.signal,
+      )
+      const iter = stream[Symbol.asyncIterator]()
+      let sawSpeedResolved = false
+      while (!sawSpeedResolved) {
+        // oxlint-disable-next-line no-await-in-loop -- Deliberately stepping generator to run.speed.resolved.
+        const step = await iter.next()
+        if (step.done) break
+        if (step.value.type === 'run.speed.resolved') sawSpeedResolved = true
+      }
+      expect(sawSpeedResolved).toBe(true)
+      // accepted + running MUST already be recorded BEFORE yielding run.speed.resolved.
+      expect(dispatched).toEqual(['possibly_sent', 'accepted'])
+      expect(evidenceKinds).toEqual(['running'])
+
+      // While foreground is paused, deliver root fileChange + turn/completed, then Stop and close iterator.
+      pushNotify({
+        method: 'item/started',
+        params: {
+          threadId: 'th-wave6a-1',
+          turnId: 'turn-wave6a-1',
+          item: {
+            id: 'fc-1',
+            type: 'fileChange',
+            changes: [{ path: '/project/a.ts', kind: { type: 'update' } }],
+          },
+        },
+      })
+      pushNotify({
+        method: 'item/completed',
+        params: {
+          threadId: 'th-wave6a-1',
+          turnId: 'turn-wave6a-1',
+          item: {
+            id: 'fc-1',
+            type: 'fileChange',
+            status: 'completed',
+            changes: [{ path: '/project/a.ts', kind: { type: 'update' }, diff: '+ok' }],
+          },
+        },
+      })
+      pushNotify({
+        method: 'turn/completed',
+        params: { threadId: 'th-wave6a-1', turn: { id: 'turn-wave6a-1', status: 'completed' } },
+      })
+      await recordStarted.promise
+      await vi.waitFor(() => {
+        expect(evidenceKinds).toContain('ended')
+      })
+
+      abortController.abort()
+      await iter.return?.()
+
+      // Must NOT send turn/interrupt to an already-ended turn, and must NOT settle before recordFileChange finishes.
+      expect(interruptSent).toBe(false)
+      expect(recordedFileChanges).toEqual(['/project/a.ts'])
+      expect(settledReports.some((r) => r.state === 'settled')).toBe(false)
+
+      releaseRecordFileChange()
+      await vi.waitFor(() => {
+        expect(settledReports).toContainEqual({ state: 'settled', reason: 'native_work_drained' })
+      })
+      expect(recordedFileChanges).toEqual(['/project/a.ts'])
+    } finally {
+      await adapter.dispose()
+    }
+  })
+
+  it('Shard 3 #2: keeps detached Run A hook owner from stealing Run B elicitation, reroute, or error on the same Thread', async () => {
+    let turnCounter = 0
+    let pushNotify!: (message: object) => void
+    const elicitationResponded = Promise.withResolvers<object>()
+    let runAUserInputs = 0
+    let runBUserInputs = 0
+
+    const adapter = new CodexAgentAdapter('/fake/codex', () => {
+      const child = fakeCodexProcess(
+        (request, respond, notify) => {
+          pushNotify = notify
+          const id = Reflect.get(request, 'id')
+          const method = String(Reflect.get(request, 'method'))
+          if (method === 'initialize') {
+            respond({ id, result: { userAgent: 'codex_cli_rs/0.163.0' } })
+          } else if (method === 'turn/start') {
+            turnCounter += 1
+            const turnId = `turn-shared-${turnCounter}`
+            respond({ id, result: { turn: { id: turnId } } })
+            if (turnCounter === 1) {
+              notify({
+                method: 'hook/started',
+                params: { threadId: 'th-shared-hook', run: { id: 'hook-run-a' } },
+              })
+              notify({
+                method: 'turn/completed',
+                params: { threadId: 'th-shared-hook', turn: { id: turnId, status: 'completed' } },
+              })
+            } else {
+              notify({
+                method: 'model/rerouted',
+                params: { threadId: 'th-shared-hook', turnId, toModel: 'gpt-5.4-mini' },
+              })
+              notify({
+                method: 'turn/completed',
+                params: { threadId: 'th-shared-hook', turn: { id: turnId, status: 'completed' } },
+              })
+            }
+          }
+        },
+        (request, respond, notify) => {
+          pushNotify = notify
+          const id = Reflect.get(request, 'id')
+          const method = Reflect.get(request, 'method')
+          if (id === 'elic-run-b') {
+            elicitationResponded.resolve(request)
+            return true
+          }
+          if (method === 'thread/start') {
+            respond({
+              id,
+              result: {
+                model: 'gpt-5.4',
+                reasoningEffort: 'high',
+                approvalPolicy: 'on-request',
+                approvalsReviewer: 'user',
+                sandbox: { type: 'workspaceWrite', writableRoots: [] },
+                thread: { id: 'th-shared-hook' },
+              },
+            })
+            return true
+          }
+          if (method === 'thread/resume') {
+            // Send a turnless startup elicitation during Run B's thread/resume!
+            notify({
+              id: 'elic-run-b',
+              method: 'mcpServer/elicitation/request',
+              params: {
+                threadId: 'th-shared-hook',
+                serverName: 'docs-mcp',
+                mode: 'url',
+                elicitationId: 'elic-b-1',
+                url: 'https://example.invalid/auth',
+                message: 'Confirm Run B startup',
+              },
+            })
+            void elicitationResponded.promise.then(() => {
+              respond({
+                id,
+                result: {
+                  model: 'gpt-5.4',
+                  reasoningEffort: 'high',
+                  approvalPolicy: 'on-request',
+                  approvalsReviewer: 'user',
+                  sandbox: { type: 'workspaceWrite', writableRoots: [] },
+                  thread: { id: 'th-shared-hook' },
+                },
+              })
+              return undefined
+            })
+            return true
+          }
+          return false
+        },
+      )
+      return {
+        child,
+        close: async () => {
+          child.emit('exit', 0, null)
+          child.emit('close', 0, null)
+        },
+      }
+    })
+
+    try {
+      const runAId = randomUUID()
+      const runAEvents: NormalizedAgentEvent[] = []
+      for await (const ev of adapter.run(
+        {
+          runId: runAId,
+          sessionId: randomUUID(),
+          cwd: '/project',
+          model: 'gpt-5.4',
+          effort: 'high',
+          promptEnvelope: {
+            version: 'pact-agent-prompt-v1',
+            sessionId: randomUUID(),
+            message: { id: randomUUID(), content: 'Run A' },
+            comments: [],
+          },
+          host: {
+            interactions: {
+              requestUserInput: async () => {
+                runAUserInputs += 1
+                return { action: 'accept' }
+              },
+            },
+          },
+        },
+        new AbortController().signal,
+      )) {
+        runAEvents.push(ev)
+      }
+      expect(runAEvents.length).toBeGreaterThan(0)
+      expect(adapter.hasActiveBackgroundWork(runAId)).toBe(true)
+
+      const runBEvents: NormalizedAgentEvent[] = []
+      for await (const ev of adapter.run(
+        {
+          runId: randomUUID(),
+          sessionId: randomUUID(),
+          nativeSessionId: 'th-shared-hook',
+          cwd: '/project',
+          model: 'gpt-5.4',
+          effort: 'high',
+          promptEnvelope: {
+            version: 'pact-agent-prompt-v1',
+            sessionId: randomUUID(),
+            message: { id: randomUUID(), content: 'Run B' },
+            comments: [],
+          },
+          host: {
+            interactions: {
+              requestUserInput: async () => {
+                runBUserInputs += 1
+                return { action: 'accept' }
+              },
+            },
+          },
+        },
+        new AbortController().signal,
+      )) {
+        runBEvents.push(ev)
+      }
+
+      expect(runAUserInputs).toBe(0)
+      expect(runBUserInputs).toBe(1)
+      expect(runBEvents).toContainEqual(
+        expect.objectContaining({ type: 'run.model.resolved', model: 'gpt-5.4-mini' }),
+      )
+
+      pushNotify({
+        method: 'hook/completed',
+        params: {
+          threadId: 'th-shared-hook',
+          run: { id: 'hook-run-a', status: 'completed' },
+        },
+      })
+      await vi.waitFor(() => {
+        expect(adapter.hasActiveBackgroundWork(runAId)).toBe(false)
+      })
+    } finally {
+      await adapter.dispose()
+    }
+  })
+
+  it('Shard 3 #4/#5/#6: releases background owner on missing model, serializes delayed thread/settings/update physical barrier before next dispatch, and sanitizes RPC errors without leaking data/secrets', async () => {
+    let settingsUpdateCount = 0
+    let resumeCount = 0
+    let turnStartCount = 0
+    let resolveDelayedSettingsUpdate!: () => void
+    const settingsUpdateStarted = Promise.withResolvers<void>()
+
+    const adapter = new CodexAgentAdapter('/fake/codex', () => {
+      const child = fakeCodexProcess(
+        (request, respond, notify) => {
+          const id = Reflect.get(request, 'id')
+          const method = String(Reflect.get(request, 'method'))
+          const params = (Reflect.get(request, 'params') ?? {}) as Record<string, unknown>
+          if (method === 'initialize') {
+            respond({ id, result: { userAgent: 'codex_cli_rs/0.163.0' } })
+          } else if (method === 'turn/start') {
+            turnStartCount += 1
+            const turnId = `turn-barrier-${turnStartCount}`
+            respond({ id, result: { turn: { id: turnId } } })
+            notify({
+              method: 'turn/completed',
+              params: {
+                threadId: String(params['threadId']),
+                turn: { id: turnId, status: 'completed' },
+              },
+            })
+          }
+        },
+        (request, respond, notify) => {
+          const id = Reflect.get(request, 'id')
+          const method = String(Reflect.get(request, 'method'))
+          const params = (Reflect.get(request, 'params') ?? {}) as Record<string, unknown>
+          if (method === 'thread/start') {
+            // Return thread WITHOUT model to exercise pre-turn missing-model failure.
+            respond({
+              id,
+              result: {
+                model: undefined,
+                reasoningEffort: undefined,
+                approvalPolicy: 'on-request',
+                approvalsReviewer: 'user',
+                sandbox: { type: 'workspaceWrite', writableRoots: [] },
+                thread: { id: 'th-no-model' },
+              },
+            })
+            return true
+          }
+          if (method === 'thread/resume') {
+            if (params['threadId'] === 'th-secret-err') {
+              respond({
+                id,
+                error: {
+                  code: -32000,
+                  message: 'rate limit exceeded token=sk-secret999999999999',
+                  data: { cookie: 'SENSITIVE_MARKER_DATA' },
+                },
+              })
+              return true
+            }
+            resumeCount += 1
+            respond({
+              id,
+              result: {
+                model: 'gpt-5.4',
+                reasoningEffort: 'high',
+                approvalPolicy: resumeCount === 1 ? 'on-request' : 'never',
+                approvalsReviewer: 'user',
+                sandbox:
+                  resumeCount === 1
+                    ? { type: 'workspaceWrite', writableRoots: [] }
+                    : { type: 'dangerFullAccess' },
+                thread: { id: String(params['threadId']) },
+              },
+            })
+            return true
+          }
+          if (method === 'thread/settings/update') {
+            settingsUpdateCount += 1
+            settingsUpdateStarted.resolve()
+            void new Promise<void>((resolve) => {
+              resolveDelayedSettingsUpdate = resolve
+            }).then(() => {
+              respond({ id, result: {} })
+              notify({
+                method: 'thread/settings/updated',
+                params: {
+                  threadId: String(params['threadId']),
+                  threadSettings: {
+                    approvalPolicy: 'never',
+                    approvalsReviewer: 'user',
+                    sandboxPolicy: { type: 'dangerFullAccess' },
+                  },
+                },
+              })
+              return undefined
+            })
+            return true
+          }
+          return false
+        },
+      )
+      return {
+        child,
+        close: async () => {
+          child.emit('exit', 0, null)
+          child.emit('close', 0, null)
+        },
+      }
+    })
+
+    try {
+      // 1. Missing model after thread/start MUST release background work cleanly (Shard 3 #4).
+      const missingModelRunId = randomUUID()
+      await expect(
+        (async () => {
+          const seen: NormalizedAgentEvent[] = []
+          for await (const ev of adapter.run(
+            {
+              runId: missingModelRunId,
+              sessionId: randomUUID(),
+              cwd: '/project',
+              model: null,
+              effort: null,
+              promptEnvelope: {
+                version: 'pact-agent-prompt-v1',
+                sessionId: randomUUID(),
+                message: { id: randomUUID(), content: 'No model' },
+                comments: [],
+              },
+            },
+            new AbortController().signal,
+          )) {
+            seen.push(ev)
+          }
+          return seen
+        })(),
+      ).rejects.toThrow(/did not resolve the model/u)
+      expect(adapter.hasActiveBackgroundWork(missingModelRunId)).toBe(false)
+
+      // 2. Sanitized RPC error preserves quota classification without leaking data/secrets (Shard 3 #6).
+      let caughtError: unknown
+      try {
+        const seen: NormalizedAgentEvent[] = []
+        for await (const ev of adapter.run(
+          {
+            runId: randomUUID(),
+            sessionId: randomUUID(),
+            nativeSessionId: 'th-secret-err',
+            cwd: '/project',
+            model: 'gpt-5.4',
+            effort: 'high',
+            promptEnvelope: {
+              version: 'pact-agent-prompt-v1',
+              sessionId: randomUUID(),
+              message: { id: randomUUID(), content: 'Secret err' },
+              comments: [],
+            },
+          },
+          new AbortController().signal,
+        )) {
+          seen.push(ev)
+        }
+        expect(seen).toEqual([])
+      } catch (err: unknown) {
+        caughtError = err
+      }
+      expect(caughtError).toMatchObject({ kind: 'quota_or_rate_limit' })
+      const errMsg = caughtError instanceof Error ? caughtError.message : ''
+      expect(errMsg.length).toBeLessThanOrEqual(240)
+      expect(errMsg).not.toContain('sk-secret999999999999')
+      expect(errMsg).not.toContain('SENSITIVE_MARKER_DATA')
+
+      // 3. Cancelled thread/settings/update holds physical barrier blocking next Run on same thread (Shard 3 #5).
+      const barrierRun1Id = randomUUID()
+      const abort1 = new AbortController()
+      const run1Promise = (async () => {
+        const seen: NormalizedAgentEvent[] = []
+        for await (const ev of adapter.run(
+          {
+            runId: barrierRun1Id,
+            sessionId: randomUUID(),
+            nativeSessionId: 'th-barrier',
+            cwd: '/project',
+            model: 'gpt-5.4',
+            effort: 'high',
+            permissionMode: 'full',
+            promptEnvelope: {
+              version: 'pact-agent-prompt-v1',
+              sessionId: randomUUID(),
+              message: { id: randomUUID(), content: 'Update perms' },
+              comments: [],
+            },
+          },
+          abort1.signal,
+        )) {
+          seen.push(ev)
+        }
+        return seen
+      })()
+      await settingsUpdateStarted.promise
+      abort1.abort()
+      await expect(run1Promise).rejects.toThrow(/interrupted|cancelled|aborted/iu)
+      expect(adapter.hasActiveBackgroundWork(barrierRun1Id)).toBe(true)
+
+      // Start Run 2 on the same thread while Run 1's settings/update is physically still in flight.
+      const run2Promise = (async () => {
+        const events: NormalizedAgentEvent[] = []
+        for await (const ev of adapter.run(
+          {
+            runId: randomUUID(),
+            sessionId: randomUUID(),
+            nativeSessionId: 'th-barrier',
+            cwd: '/project',
+            model: 'gpt-5.4',
+            effort: 'high',
+            permissionMode: 'full',
+            promptEnvelope: {
+              version: 'pact-agent-prompt-v1',
+              sessionId: randomUUID(),
+              message: { id: randomUUID(), content: 'After barrier' },
+              comments: [],
+            },
+          },
+          new AbortController().signal,
+        )) {
+          events.push(ev)
+        }
+        return events
+      })()
+      await new Promise((resolve) => setTimeout(resolve, 40))
+      // Neither a second settings update nor turn/start may be dispatched until physical barrier settles!
+      expect(settingsUpdateCount).toBe(1)
+      expect(turnStartCount).toBe(0)
+
+      resolveDelayedSettingsUpdate()
+      const run2Events = await run2Promise
+      expect(turnStartCount).toBe(1)
+      expect(run2Events).toContainEqual(
+        expect.objectContaining({ type: 'turn.completed', outcome: 'completed' }),
+      )
+      await vi.waitFor(() => {
+        expect(adapter.hasActiveBackgroundWork(barrierRun1Id)).toBe(false)
+      })
+    } finally {
+      await adapter.dispose()
+    }
+  })
+})

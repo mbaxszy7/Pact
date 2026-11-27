@@ -342,6 +342,8 @@ export interface RunLifecycleSink {
     | undefined
   recordOutputFailure?: ((error: Error) => void) | undefined
   waitForRootOutput?: (() => Promise<void>) | undefined
+  /** Same root's latest append-only input scope; frozen duty/settings remain unchanged. */
+  currentPromptEnvelope?: (() => AgentPromptEnvelope) | undefined
   observeNativeTitle?: NativeTitleObserver
   observeNativeDelta?: ((observation: NativeLoopDeltaObservation) => void) | undefined
 }
@@ -411,8 +413,6 @@ export interface AgentRunInput {
   peerAssistanceAllowed?: boolean
   cwd: string
   promptEnvelope: AgentPromptEnvelope
-  /** Same root's latest append-only input scope; frozen duty/settings remain unchanged. */
-  currentPromptEnvelope?: () => AgentPromptEnvelope
   model: string | null
   effort: string | null
   speed?: AgentSpeed

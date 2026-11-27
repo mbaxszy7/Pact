@@ -914,8 +914,8 @@ function applyEventWithinTransaction(
     transaction
       .update(agentRuns)
       .set({
-        nativeTurnId: event.turnId,
-        dispatchPhase: 'accepted',
+        nativeTurnId: sql`COALESCE(${agentRuns.nativeTurnId}, ${event.turnId})`,
+        dispatchPhase: sql`CASE WHEN ${agentRuns.dispatchPhase} = 'ended' THEN 'ended' ELSE 'accepted' END`,
         ...(!archive ? { status: 'running' as const, updatedAt: now } : {}),
       })
       .where(eq(agentRuns.id, runId))

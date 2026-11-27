@@ -77,9 +77,12 @@ export class RunOutputArchiver {
   private archiveTailValue: Promise<void> | undefined
   private archivePendingValue = 0
   private outputFailureValue: AgentExecutionError | undefined
+  private failureRecorded = false
+  private failureEndingSettled = false
+  private failureRecordingErrorValue: unknown
   private completedReceiptValue: CompletedNativeReceipt | undefined
   private reportedTitleValue = false
-  private terminalSettledWithFailure = false
+  private drainingPendingPublished = false
 
   constructor(private readonly host: RunOutputArchiverHost) {
     this.foregroundBuffer = new AgentStreamBuffer(
@@ -91,8 +94,16 @@ export class RunOutputArchiver {
     )
   }
 
+  get sessionId(): string {
+    return this.host.run.sessionId
+  }
+
   get outputFailure(): AgentExecutionError | undefined {
     return this.outputFailureValue
+  }
+
+  get failureRecordingError(): unknown {
+    return this.failureRecordingErrorValue
   }
 
   get archiveBuffer(): AgentStreamBuffer | undefined {
@@ -173,7 +184,7 @@ export class RunOutputArchiver {
       fact.type === 'text.completed' &&
       Buffer.byteLength(fact.text, 'utf8') > CONVERSATION_MARKDOWN_BYTES
 
-    const apply = async (): Promise<void> => {
+    const applySmallSync = (): void => {
       if (
         !this.host.isOwned() ||
         this.archiveController.signal.aborted ||
@@ -211,19 +222,8 @@ export class RunOutputArchiver {
         }
         return
       }
-      if (large && fact.type === 'text.completed') {
-        const { text, ...metadata } = fact
-        const patch = await this.host.completeAnswer(
-          metadata,
-          (bodySignal) => RunOutputArchiver.answerParts(text, bodySignal),
-          this.archiveController.signal,
-          true,
-        )
-        this.emitPublished(patch, false)
-      } else {
-        const patch = this.host.applyEvent(fact, true)
-        this.emitPublished(patch, false)
-      }
+      const patch = this.host.applyEvent(fact, true)
+      this.emitPublished(patch, false)
       if (fact.type === 'turn.started' || fact.type === 'turn.completed') {
         this.host.markInjectedCutoffs()
       }
@@ -237,11 +237,38 @@ export class RunOutputArchiver {
     }
 
     if (!large && !this.archiveTailValue) {
-      // Small facts preserve synchronous durable commit order.
-      void apply().catch((error: unknown) => {
+      // Small facts execute strictly synchronously so any body write failure latches
+      // quarantine BEFORE a same-tick turn.completed can finalize an incomplete prefix.
+      try {
+        applySmallSync()
+      } catch (error: unknown) {
         this.handleArchiveError(error)
-      })
+      }
       return
+    }
+
+    const applyQueued = async (): Promise<void> => {
+      if (
+        !this.host.isOwned() ||
+        this.archiveController.signal.aborted ||
+        this.outputFailureValue
+      ) {
+        return
+      }
+      if (large && fact.type === 'text.completed') {
+        this.flush()
+        if (this.outputFailureValue) return
+        const { text, ...metadata } = fact
+        const patch = await this.host.completeAnswer(
+          metadata,
+          (bodySignal) => RunOutputArchiver.answerParts(text, bodySignal),
+          this.archiveController.signal,
+          true,
+        )
+        this.emitPublished(patch, false)
+        return
+      }
+      applySmallSync()
     }
     if (this.archivePendingValue >= MAX_PENDING_ARCHIVE_ITEMS) {
       this.markAborted(
@@ -261,7 +288,7 @@ export class RunOutputArchiver {
     }
     this.archivePendingValue += 1
     const task = (this.archiveTailValue ?? Promise.resolve())
-      .then(apply)
+      .then(applyQueued)
       .catch((error: unknown) => {
         this.handleArchiveError(error)
       })
@@ -334,17 +361,53 @@ export class RunOutputArchiver {
    * discards buffered deltas, aborts pending archive streaming, and publishes output failure.
    */
   markAborted(error: unknown): AgentExecutionError {
-    if (this.outputFailureValue) return this.outputFailureValue
-    const failure = classifyAgentError(error)
+    const failure = this.outputFailureValue ?? classifyAgentError(error)
     this.outputFailureValue = failure
     this.archiveController.abort()
     this.foregroundBuffer.discard()
     this.archiveBufferValue?.discard()
-    this.emitPublished(this.host.recordOutputFailure(failure), false)
+    if (!this.failureRecorded) {
+      try {
+        const patch = this.host.recordOutputFailure(failure)
+        this.failureRecorded = true
+        this.emitPublished(patch, false)
+      } catch (recordError: unknown) {
+        if (this.failureRecordingErrorValue === undefined) {
+          this.failureRecordingErrorValue = recordError
+        }
+      }
+    }
     if (this.host.isRunEnded()) {
-      this.emitPublished(this.host.settleKnownNativeEnding(), false)
+      this.emitFailureEndingOnce()
     }
     return failure
+  }
+
+  /**
+   * Drains committed progress patches across BOTH foreground and archive buffers in strict
+   * ascending `observation.sequence` order (optionally bounded to `< beforeSequence`).
+   */
+  publishPendingInOrder(beforeSequence?: number): void {
+    if (this.drainingPendingPublished) return
+    this.drainingPendingPublished = true
+    try {
+      while (true) {
+        const fgSeq = this.foregroundBuffer.peekNextCommittedSequence()
+        const archSeq = this.archiveBufferValue?.peekNextCommittedSequence()
+        const fgEligible =
+          fgSeq !== undefined && (beforeSequence === undefined || fgSeq < beforeSequence)
+        const archEligible =
+          archSeq !== undefined && (beforeSequence === undefined || archSeq < beforeSequence)
+        if (!fgEligible && !archEligible) break
+        if (fgEligible && (!archEligible || fgSeq <= archSeq)) {
+          if (!this.foregroundBuffer.publishNextCommitted()) break
+        } else if (archEligible && this.archiveBufferValue) {
+          if (!this.archiveBufferValue.publishNextCommitted()) break
+        }
+      }
+    } finally {
+      this.drainingPendingPublished = false
+    }
   }
 
   /**
@@ -377,6 +440,9 @@ export class RunOutputArchiver {
       // oxlint-disable-next-line no-await-in-loop -- Archive tasks may chain onto archiveTail during drain.
       await current
     }
+    if (this.failureRecordingErrorValue !== undefined) {
+      throw this.failureRecordingErrorValue
+    }
   }
 
   /**
@@ -386,7 +452,7 @@ export class RunOutputArchiver {
     let ok = true
     if (!this.foregroundBuffer.dispose()) ok = false
     if (this.archiveBufferValue && !this.archiveBufferValue.dispose()) ok = false
-    return ok && !this.outputFailureValue
+    return ok && !this.outputFailureValue && this.failureRecordingErrorValue === undefined
   }
 
   private async admitForegroundEvent(
@@ -495,18 +561,25 @@ export class RunOutputArchiver {
   }
 
   private emitFailureEndingOnce(): void {
-    if (this.terminalSettledWithFailure || !this.outputFailureValue) return
-    this.terminalSettledWithFailure = true
-    this.emitPublished(this.host.settleKnownNativeEnding(this.outputFailureValue), false)
+    if (this.failureEndingSettled || !this.outputFailureValue) return
+    try {
+      const patch = this.host.settleKnownNativeEnding(this.outputFailureValue)
+      this.failureEndingSettled = true
+      this.emitPublished(patch, false)
+    } catch (settleError: unknown) {
+      if (this.failureRecordingErrorValue === undefined) {
+        this.failureRecordingErrorValue = settleError
+      }
+    }
   }
 
   /**
-   * Serialized PublishLane: guarantees any already-committed foreground progress patches
-   * are published strictly before a non-progress commit patch.
+   * Serialized PublishLane: guarantees any already-committed foreground or archive progress
+   * patches with an earlier observation.sequence are published strictly before a newer patch.
    */
   private emitPublished(patch: ConversationPatch, progress: boolean): void {
     if (!progress) {
-      this.foregroundBuffer.publishPending()
+      this.publishPendingInOrder(patch.observation.sequence)
     }
     this.host.publish(patch, progress)
   }

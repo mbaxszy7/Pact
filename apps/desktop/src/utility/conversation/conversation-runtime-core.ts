@@ -1596,6 +1596,41 @@ export class ConversationRuntimeCore {
     return () => this.notificationListeners.delete(listener)
   }
 
+  private readonly drainingSessionPublications = new Set<string>()
+
+  private drainPendingStreamPublications(sessionId: string, beforeSequence: number): void {
+    if (this.drainingSessionPublications.has(sessionId)) return
+    this.drainingSessionPublications.add(sessionId)
+    try {
+      const buffers = new Set<AgentStreamBuffer>()
+      const activeBuffer = this.activeExecutions.get(sessionId)?.streamBuffer
+      if (activeBuffer) buffers.add(activeBuffer)
+      for (const owner of this.nativeObservations.values()) {
+        if (owner.archiver.sessionId !== sessionId) continue
+        buffers.add(owner.archiver.foregroundBuffer)
+        if (owner.archiver.archiveBuffer) buffers.add(owner.archiver.archiveBuffer)
+      }
+      while (buffers.size > 0) {
+        let earliestBuffer: AgentStreamBuffer | undefined
+        let earliestSeq: number | undefined
+        for (const buffer of buffers) {
+          const seq = buffer.peekNextCommittedSequence()
+          if (seq === undefined || seq >= beforeSequence) continue
+          if (earliestSeq === undefined || seq < earliestSeq) {
+            earliestSeq = seq
+            earliestBuffer = buffer
+          }
+        }
+        if (!earliestBuffer) break
+        if (!earliestBuffer.publishNextCommitted()) {
+          buffers.delete(earliestBuffer)
+        }
+      }
+    } finally {
+      this.drainingSessionPublications.delete(sessionId)
+    }
+  }
+
   publish(patch: ConversationPatch, progress = false, streamOwner?: NativeObservation): void {
     const streamTrace = progress && streamOwner ? this.currentStreamTrace(streamOwner) : undefined
     if (streamTrace) this.bumpStreamTrace(streamTrace, streamTrace.data.publication, 'attempts')
@@ -1682,7 +1717,9 @@ export class ConversationRuntimeCore {
       }
       conversationPatchSchema.parse(patch)
     }
-    if (!progress) this.activeExecutions.get(patch.sessionId)?.streamBuffer?.publishPending()
+    if (!progress) {
+      this.drainPendingStreamPublications(patch.sessionId, patch.observation.sequence)
+    }
     if (progress && !this.interestedSessionIds.has(patch.sessionId)) {
       if (streamTrace) {
         this.bumpStreamTrace(streamTrace, streamTrace.data.publication, 'suppressed')

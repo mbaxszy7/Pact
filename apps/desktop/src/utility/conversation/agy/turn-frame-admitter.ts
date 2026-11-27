@@ -28,8 +28,10 @@ export interface AgyTurnFrameAdmitterHost {
   readonly prePromptReplayedToolCallIds: ReadonlySet<string>
   readonly expectedFullPromptText: string
   readonly expectedPromptContent: string
-  readonly stagedPreBindReservation: NativeMemoryReservation | undefined
-  readonly foreignExecIdsReservation: NativeMemoryReservation | undefined
+  readonly getStagedPreBindReservation: () => NativeMemoryReservation | undefined
+  readonly releaseStagedPreBindReservation: () => void
+  readonly getForeignExecIdsReservation: () => NativeMemoryReservation | undefined
+  readonly releaseForeignExecIdsReservation: () => void
   readonly projectValidatedFrame: (validated: ValidatedAgyFrame) => Generator<NormalizedAgentEvent>
 }
 
@@ -40,11 +42,13 @@ export interface AgyTurnFrameAdmitterHost {
 export class AgyTurnFrameAdmitter {
   private stagedPreBindBytes = 0
   private foreignExecIdsBytes = 0
+  private closedFlag = false
 
   constructor(private readonly host: AgyTurnFrameAdmitterHost) {}
 
   addKnownForeignExecutionId(execId: string): void {
-    const { activeRun, foreignExecIdsReservation } = this.host
+    if (this.closedFlag) return
+    const { activeRun } = this.host
     if (activeRun.knownForeignExecutionIds.has(execId)) return
     const entryBytes = Buffer.byteLength(execId, 'utf8') + 32
     const nextBytes = this.foreignExecIdsBytes + entryBytes
@@ -58,7 +62,7 @@ export class AgyTurnFrameAdmitter {
         false,
       )
     }
-    foreignExecIdsReservation?.resize(nextBytes)
+    this.host.getForeignExecIdsReservation()?.resize(nextBytes)
     this.foreignExecIdsBytes = nextBytes
     activeRun.knownForeignExecutionIds.add(execId)
   }
@@ -66,17 +70,37 @@ export class AgyTurnFrameAdmitter {
   clearStagedPreBindNotifications(): void {
     this.host.activeRun.stagedPreBindNotifications.length = 0
     this.stagedPreBindBytes = 0
-    this.host.stagedPreBindReservation?.resize(0)
+    if (!this.closedFlag) {
+      this.host.getStagedPreBindReservation()?.resize(0)
+    }
+  }
+
+  /**
+   * Idempotent teardown shared by normal iterator exit and emergency forceCleanup:
+   * empties staged queues and releases both working-memory reservations at most once.
+   */
+  close(): void {
+    if (this.closedFlag) return
+    this.closedFlag = true
+    this.host.activeRun.stagedPreBindNotifications.length = 0
+    this.stagedPreBindBytes = 0
+    this.foreignExecIdsBytes = 0
+    try {
+      this.host.releaseStagedPreBindReservation()
+    } finally {
+      this.host.releaseForeignExecIdsReservation()
+    }
   }
 
   *drainStagedPreBindNotes(): Generator<NormalizedAgentEvent> {
-    const { activeRun, mcpServer, stagedPreBindReservation, projectValidatedFrame } = this.host
+    if (this.closedFlag) return
+    const { activeRun, mcpServer, projectValidatedFrame } = this.host
     const boundExecId = activeRun.providerExecutionId
     if (!boundExecId || activeRun.stagedPreBindNotifications.length === 0) return
-    const queued = activeRun.stagedPreBindNotifications.splice(0)
-    this.stagedPreBindBytes = 0
-    stagedPreBindReservation?.resize(0)
-    for (const staged of queued) {
+    while (!this.closedFlag && activeRun.stagedPreBindNotifications.length > 0) {
+      const staged = activeRun.stagedPreBindNotifications.shift()!
+      this.stagedPreBindBytes = Math.max(0, this.stagedPreBindBytes - staged.bytes)
+      this.host.getStagedPreBindReservation()?.resize(this.stagedPreBindBytes)
       // Retain arrival-time attribution: execution-less frames observed while a foreign turn
       // was active, or frames carrying a different execution_id, never replay into this root.
       if (staged.frame.executionId !== boundExecId) continue
@@ -111,6 +135,7 @@ export class AgyTurnFrameAdmitter {
   }
 
   *admitAndProject(validated: ValidatedAgyFrame): Generator<NormalizedAgentEvent> {
+    if (this.closedFlag) return
     const {
       runtime,
       input,
@@ -119,7 +144,6 @@ export class AgyTurnFrameAdmitter {
       prePromptReplayedToolCallIds,
       expectedFullPromptText,
       expectedPromptContent,
-      stagedPreBindReservation,
       projectValidatedFrame,
     } = this.host
 
@@ -260,7 +284,7 @@ export class AgyTurnFrameAdmitter {
           false,
         )
       }
-      stagedPreBindReservation?.resize(nextStagedBytes)
+      this.host.getStagedPreBindReservation()?.resize(nextStagedBytes)
       this.stagedPreBindBytes = nextStagedBytes
       activeRun.stagedPreBindNotifications.push({
         frame: validated,

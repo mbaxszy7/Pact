@@ -45,28 +45,32 @@ export class NativeThreadArchivedError extends AgentExecutionError {
   }
 }
 
-/** Also recognizes the bounded, durable resume rejection saved by older builds. */
+/** Also recognizes the bounded, durable resume rejection saved by older and current builds. */
 export function isCodexArchivedSessionRejection(error: unknown, nativeSessionId: string): boolean {
+  const matchesArchivedMessage = (message: string): boolean =>
+    ['session', 'thread'].some((subject) => {
+      const statement = `${subject} ${nativeSessionId} is archived`
+      // Native errors can append recovery instructions after this exact statement.
+      return (
+        message === statement || message === `${statement}.` || message.startsWith(`${statement}. `)
+      )
+    })
+
   let payload = error
   if (typeof payload === 'string') {
     const prefix = 'Codex thread/resume rejected: '
     if (!payload.startsWith(prefix) || payload.length > 1024) return false
+    const rest = payload.slice(prefix.length)
     try {
-      payload = JSON.parse(payload.slice(prefix.length))
+      payload = JSON.parse(rest)
     } catch {
-      return false
+      return matchesArchivedMessage(rest)
     }
   }
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return false
   const message = Reflect.get(payload, 'message')
   if (typeof message !== 'string') return false
-  return ['session', 'thread'].some((subject) => {
-    const statement = `${subject} ${nativeSessionId} is archived`
-    // Native errors can append recovery instructions after this exact statement.
-    return (
-      message === statement || message === `${statement}.` || message.startsWith(`${statement}. `)
-    )
-  })
+  return matchesArchivedMessage(message)
 }
 
 /** This attempt created no native actor and dispatched no startup/model request. */
