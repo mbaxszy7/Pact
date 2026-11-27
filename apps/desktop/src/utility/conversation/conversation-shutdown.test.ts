@@ -229,6 +229,20 @@ it.each(['exact', 'drain_first'] as const)(
     await f.reopen()
     expect(f.db.conversationRepository.findRun(f.runId)?.nativeEffectsState).toBe('settled')
     expect(f.db.conversationRepository.read(f.sessionId).messages).toEqual(before.messages)
+    // Production message pagination (excluding hidden archived rows) must retain the pre-checkpoint visible prefix.
+    const visiblePage = f.db.conversationRepository.readPage({
+      scope: 'messages',
+      sessionId: f.sessionId,
+    })
+    if (visiblePage.scope !== 'messages') throw new Error('Expected messages page')
+    const assistantEntry = visiblePage.messages.find((entry) => entry.message.role === 'assistant')
+    expect(assistantEntry).toMatchObject({
+      kind: 'complete',
+      message: {
+        content: 'Saved prefix.',
+        state: 'incomplete',
+      },
+    })
   },
 )
 

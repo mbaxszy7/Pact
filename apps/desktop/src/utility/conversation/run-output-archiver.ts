@@ -28,6 +28,7 @@ export interface RunOutputArchiverHost {
   isOwned(): boolean
   isDisposed(): boolean
   ownsCurrentControl(): boolean
+  ownsAdmittedForegroundBatch(): boolean
   isRunEnded(): boolean
   applyStreamBatch(
     events: readonly Extract<
@@ -86,7 +87,7 @@ export class RunOutputArchiver {
 
   constructor(private readonly host: RunOutputArchiverHost) {
     this.foregroundBuffer = new AgentStreamBuffer(
-      (events) => this.host.applyStreamBatch(events, !this.host.ownsCurrentControl()),
+      (events) => this.host.applyStreamBatch(events, !this.host.ownsAdmittedForegroundBatch()),
       (patch) => this.emitPublished(patch, true),
       (error) => {
         this.markAborted(error)
@@ -574,13 +575,11 @@ export class RunOutputArchiver {
   }
 
   /**
-   * Serialized PublishLane: guarantees any already-committed foreground or archive progress
-   * patches with an earlier observation.sequence are published strictly before a newer patch.
+   * Delegates publication to the session-wide ordered host lane (`ConversationRuntimeCore.publish`),
+   * which drains all earlier committed patches across every Run buffer in the Session for both
+   * `progress` and durable patches.
    */
   private emitPublished(patch: ConversationPatch, progress: boolean): void {
-    if (!progress) {
-      this.publishPendingInOrder(patch.observation.sequence)
-    }
     this.host.publish(patch, progress)
   }
 

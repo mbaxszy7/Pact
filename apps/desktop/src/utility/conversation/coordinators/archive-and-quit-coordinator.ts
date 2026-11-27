@@ -1066,6 +1066,7 @@ export class ArchiveAndQuitCoordinator {
     for (const owner of this.core.nativeObservations.values()) {
       owner.sourceReader?.retire()
       this.core.recovery.clearBackgroundStop(owner)
+      owner.observationController.abort()
       owner.archiver.archiveController.abort()
     }
     await Promise.allSettled(
@@ -1075,6 +1076,7 @@ export class ArchiveAndQuitCoordinator {
     )
     for (const owner of this.core.nativeObservations.values()) {
       try {
+        if (owner.archiver.failureRecordingError !== undefined) flushed = false
         if (owner.archiver.archiveBuffer && !owner.archiver.archiveBuffer.dispose()) flushed = false
       } catch {
         flushed = false

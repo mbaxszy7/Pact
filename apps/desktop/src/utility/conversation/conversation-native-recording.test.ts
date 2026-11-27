@@ -43,6 +43,14 @@ const native = vi.hoisted(() => ({
   retainNext: false,
   terminalGate: undefined as Promise<void> | undefined,
   unavailableReport: false,
+  customRun: undefined as
+    | ((
+        agentId: RuntimeAgentId,
+        executorId: string,
+        input: AgentRunInput,
+        signal: AbortSignal,
+      ) => AsyncIterable<NormalizedAgentEvent>)
+    | undefined,
   inspect:
     vi.fn<
       (
@@ -59,6 +67,10 @@ async function* scriptedRun(
   input: AgentRunInput,
   signal: AbortSignal,
 ): AsyncIterable<NormalizedAgentEvent> {
+  if (native.customRun) {
+    yield* native.customRun(agentId, executorId, input, signal)
+    return
+  }
   if (native.background.size + native.extraBackground >= 8)
     throw new NativeCapacityError(
       'All eight native background contexts are occupied; no native actor was created.',
@@ -183,6 +195,7 @@ afterEach(() => {
   native.retainNext = false
   native.terminalGate = undefined
   native.unavailableReport = false
+  native.customRun = undefined
   native.inspect.mockReset()
 })
 
@@ -1043,3 +1056,189 @@ it.each(['codex', 'claude'] as const)(
     }
   },
 )
+
+it('S1-F2 & S1-F3: retains observer until foreground exits after Stop+settled and delivers independent background reports after root body failure', async () => {
+  // 1. S1-F2: Stop after verified ended evidence, adapter synchronously reports settled BEFORE yielding final text.completed & turn.completed.
+  const f1 = await fixture('codex')
+  try {
+    const pauseBeforeSettled = Promise.withResolvers<void>()
+    const reachedPause = Promise.withResolvers<void>()
+    native.customRun = async function* (agentId, executorId, input) {
+      native.actors += 1
+      native.inputs.set(input.runId, input)
+      input.host?.lifecycle?.recordExecutor?.(executorId)
+      const nativeSessionId = `native:${input.sessionId}`
+      input.host?.lifecycle?.recordDispatch?.('possibly_sent', nativeSessionId, executorId)
+      yield { type: 'session.started', agentId, nativeSessionId }
+      input.host?.lifecycle?.recordDispatch?.('accepted', nativeSessionId, executorId)
+      yield { type: 'turn.started', agentId, turnId: `turn:${input.runId}` }
+      yield {
+        type: 'text.delta',
+        agentId,
+        turnId: `turn:${input.runId}`,
+        outputId: 'answer',
+        text: 'Prefix ',
+      }
+      input.host?.lifecycle?.recordNativeEvidence?.({
+        kind: 'ended',
+        source: 'live_terminal',
+        outcome: 'completed',
+        identity: {
+          sessionId: input.sessionId,
+          agentId,
+          runId: input.runId,
+          requestId: input.runId,
+          nativeSessionId,
+          nativeTurnId: `turn:${input.runId}`,
+          bindingGeneration: input.bindingGeneration!,
+          executorId,
+        },
+      })
+      reachedPause.resolve()
+      await pauseBeforeSettled.promise
+      // Adapter synchronously settles effects BEFORE yielding final text.completed & turn.completed
+      input.host?.effects?.reportNativeEffects?.({
+        runId: input.runId,
+        generation: input.nativeGeneration!,
+        state: 'settled',
+        reason: 'native_work_drained',
+      })
+      yield {
+        type: 'text.completed',
+        agentId,
+        turnId: `turn:${input.runId}`,
+        outputId: 'answer',
+        text: 'Prefix and full verified body.',
+      }
+      yield { type: 'turn.completed', agentId, turnId: `turn:${input.runId}`, outcome: 'completed' }
+    }
+
+    const drafts = f1.db.conversationRepository.readPage({
+      scope: 'drafts',
+      sessionId: f1.sessionId,
+    })
+    if (drafts.scope !== 'drafts') throw new Error('Missing drafts')
+    const sent = await f1.flow.send({
+      sessionId: f1.sessionId,
+      clientMessageId: randomUUID(),
+      content: 'Run stop-before-yield test',
+      expectedCommentsRevision: drafts.commentsRevision,
+      commentIds: [],
+      route: { type: 'agent', agentId: 'codex' },
+    })
+    if (!sent.ok) throw new Error('Expected send to succeed')
+    const runId = sent.value.runs[0]!.id
+    await reachedPause.promise
+    expect(f1.flow.stop({ sessionId: f1.sessionId }).ok).toBe(true)
+    pauseBeforeSettled.resolve()
+    await vi.waitFor(() =>
+      expect(f1.flow.diagnostics()).toMatchObject({
+        activeExecutions: 0,
+        preparingExecutions: 0,
+      }),
+    )
+    expect(f1.db.conversationRepository.findRun(runId)).toMatchObject({
+      nativeOutcome: 'completed',
+      nativeEffectsState: 'settled',
+    })
+    const allMessages = f1.db.conversationRepository.read(f1.sessionId).messages
+    expect(allMessages.some((m) => m.content.includes('Prefix and full verified body.'))).toBe(true)
+  } finally {
+    await f1.dispose()
+  }
+
+  // 2. S1-F3: Root body output failure aborts archiveController, yet independent background report still persists.
+  const f2 = await fixture('claude')
+  try {
+    const releaseBg = Promise.withResolvers<void>()
+    let savedInput: AgentRunInput | undefined
+    let savedExecutorId = ''
+    let savedNativeSessionId = ''
+    native.customRun = async function* (agentId, executorId, input) {
+      native.actors += 1
+      native.inputs.set(input.runId, input)
+      savedInput = input
+      savedExecutorId = executorId
+      savedNativeSessionId = `native:${input.sessionId}`
+      input.host?.lifecycle?.recordExecutor?.(executorId)
+      input.host?.lifecycle?.recordDispatch?.('possibly_sent', savedNativeSessionId, executorId)
+      yield { type: 'session.started', agentId, nativeSessionId: savedNativeSessionId }
+      input.host?.lifecycle?.recordDispatch?.('accepted', savedNativeSessionId, executorId)
+      yield { type: 'turn.started', agentId, turnId: `turn:${input.runId}` }
+      native.background.add(input.runId)
+      // Commit verified terminal receipt first, then corrupt root body archive lane to abort archiveController.
+      input.host?.lifecycle?.recordNativeEvidence?.({
+        kind: 'ended',
+        source: 'live_terminal',
+        outcome: 'completed',
+        identity: {
+          sessionId: input.sessionId,
+          agentId,
+          runId: input.runId,
+          requestId: input.runId,
+          nativeSessionId: savedNativeSessionId,
+          nativeTurnId: `turn:${input.runId}`,
+          bindingGeneration: input.bindingGeneration!,
+          executorId,
+        },
+      })
+      input.host?.effects?.recordArchivedEvent?.({
+        type: 'text.delta',
+        agentId,
+        turnId: `turn:${input.runId}`,
+        outputId: '',
+        text: 'bad-metadata-triggers-root-body-failure',
+      })
+      await releaseBg.promise
+    }
+    const drafts2 = f2.db.conversationRepository.readPage({
+      scope: 'drafts',
+      sessionId: f2.sessionId,
+    })
+    if (drafts2.scope !== 'drafts') throw new Error('Missing drafts')
+    const sent2 = await f2.flow.send({
+      sessionId: f2.sessionId,
+      clientMessageId: randomUUID(),
+      content: 'Run root-body-fail then background report',
+      expectedCommentsRevision: drafts2.commentsRevision,
+      commentIds: [],
+      route: { type: 'agent', agentId: 'claude' },
+    })
+    if (!sent2.ok) throw new Error('Expected send to succeed')
+    const runId2 = sent2.value.runs[0]!.id
+    await vi.waitFor(() => expect(savedInput).toBeDefined())
+    // Deliver independent background report AFTER root body lane failed and aborted archiveController!
+    await savedInput!.host!.effects!.recordBackgroundReport!({
+      agentId: 'claude',
+      runId: runId2,
+      nativeSessionId: savedNativeSessionId,
+      nativeTurnId: `turn:${runId2}`,
+      bindingGeneration: savedInput!.bindingGeneration!,
+      executorId: savedExecutorId,
+      frameId: randomUUID(),
+      nativeMessageId: 'bg-report-after-root-body-fail',
+      text: 'Independent background report survived root body failure.',
+    })
+    releaseBg.resolve()
+    native.background.delete(runId2)
+    savedInput!.host!.effects!.reportNativeEffects!({
+      runId: runId2,
+      generation: savedInput!.nativeGeneration!,
+      state: 'settled',
+    })
+    await vi.waitFor(() =>
+      expect(f2.flow.diagnostics()).toMatchObject({
+        activeExecutions: 0,
+        preparingExecutions: 0,
+      }),
+    )
+    const messages2 = f2.db.conversationRepository.read(f2.sessionId).messages
+    const reportMsg = messages2.find((m) => isConversationBackgroundReport(m))
+    expect(reportMsg).toMatchObject({
+      content: 'Independent background report survived root body failure.',
+      state: 'complete',
+    })
+  } finally {
+    await f2.dispose()
+  }
+})

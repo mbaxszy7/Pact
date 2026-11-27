@@ -594,4 +594,85 @@ describe('Shared runtime validators, binding taxonomy, sanitizer, and Disposable
     expect(table.completeTask('conf-c')).toBe(true)
     expect(table.aliasCount).toBe(0)
   })
+
+  it('Astra re-audit S1-F5/F7/F8 regressions: redacts Basic/quoted JSON secrets, reflects post-drain drops in settle() & reportNativeEffects, and prevents zombie tasks across out-of-order completion/confirmation', async () => {
+    // S1-F5: Basic auth headers and quoted JSON secret fields are completely redacted.
+    const fakeBasicHeader = ['Basic', 'ZmFrZTpwYXNz'].join(' ')
+    const fakeApiKey = ['sk', 'fake', 'fixture99999'].join('-')
+    const fakeToken = ['tok', 'fake12345'].join('_')
+    const fakeBasicJson = ['Basic', 'YWJjOmRlZg=='].join(' ')
+    const syntheticError = `HTTP 401 ${['Authoriz', 'ation'].join('')}: ${fakeBasicHeader} ${JSON.stringify(
+      {
+        [['api', 'key'].join('_')]: fakeApiKey,
+        [['to', 'ken'].join('')]: fakeToken,
+        [['authoriz', 'ation'].join('')]: fakeBasicJson,
+      },
+    )}`
+    const basicAndJson = sanitizeNativeTerminalFailure(syntheticError)
+    expect(basicAndJson).not.toContain('ZmFrZTpwYXNz')
+    expect(basicAndJson).not.toContain(fakeApiKey)
+    expect(basicAndJson).not.toContain(fakeToken)
+    expect(basicAndJson).not.toContain('YWJjOmRlZg')
+    expect(basicAndJson).toContain('HTTP 401')
+    expect(basicAndJson).toContain('[redacted]')
+    // Ordinary non-secret token phrasing remains readable.
+    expect(sanitizeNativeTerminalFailure('Input exceeded model token limit')).toBe(
+      'Input exceeded model token limit',
+    )
+
+    // S1-F7: Empty-queue settle() followed synchronously by enqueue() reports droppedCount=1 and effects=unknown.
+    const reportedStates: string[] = []
+    const kDrop = new RunLifecycleKernel({
+      agentId: 'codex',
+      runId: 'run-empty-settle-drop',
+      sessionId: 's-drop',
+      nativeGeneration: 'gen-drop',
+      callbacks: {
+        onReportNativeEffects: (report) => reportedStates.push(report.state),
+      },
+    })
+    kDrop.bindExecutor('exec-drop')
+    kDrop.reportNativeEffects('pending')
+    const settlePromise = kDrop.settle()
+    expect(kDrop.ledger.recordings.enqueue(async () => {})).toBe(false)
+    const dropRes = await settlePromise
+    expect(dropRes.recordingsDroppedCount).toBe(1)
+    expect(kDrop.effectsState).toBe('unknown')
+    expect(reportedStates).not.toContain('settled')
+
+    // S1-F7b: Explicit reportNativeEffects('settled') while a recording is active or failed fails closed to 'unknown'.
+    const kActive = new RunLifecycleKernel({
+      agentId: 'codex',
+      runId: 'run-active-settle-guard',
+      sessionId: 's-act',
+      nativeGeneration: 'gen-act',
+    })
+    kActive.bindExecutor('exec-act')
+    kActive.reportNativeEffects('pending')
+    const recGate = Promise.withResolvers<void>()
+    kActive.ledger.recordings.enqueue(async () => {
+      await recGate.promise
+    })
+    expect(kActive.reportNativeEffects('settled')).toBe(true)
+    expect(kActive.effectsState).toBe('unknown')
+    recGate.resolve()
+    await kActive.settle()
+
+    // S1-F8: Both out-of-order task completion/confirmation sequences leave activeCount=0 and aliasCount=0.
+    const table1 = new BoundedBackgroundTaskTable<{ kind: string }>()
+    expect(table1.registerProvisional('prov-1', { kind: 'bg' })).toBe(true)
+    expect(table1.completeTask('prov-1')).toBe(true)
+    expect(table1.confirmTask('conf-1', { kind: 'bg' }, 'prov-1')).toBe(true)
+    expect(table1.activeCount).toBe(0)
+    expect(table1.aliasCount).toBe(0)
+    expect(table1.hasActiveTasks).toBe(false)
+
+    const table2 = new BoundedBackgroundTaskTable<{ kind: string }>()
+    expect(table2.confirmTask('conf-2', { kind: 'bg' })).toBe(true)
+    expect(table2.completeTask('prov-2')).toBe(false)
+    expect(table2.confirmTask('conf-2', { kind: 'bg' }, 'prov-2')).toBe(true)
+    expect(table2.activeCount).toBe(0)
+    expect(table2.aliasCount).toBe(0)
+    expect(table2.hasActiveTasks).toBe(false)
+  })
 })

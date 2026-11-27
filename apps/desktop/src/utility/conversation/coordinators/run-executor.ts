@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 
 import type {
+  AgentAdapter,
   AgentPromptEnvelope,
   AgentRunInput,
   RunExecutionHost,
@@ -62,6 +63,7 @@ export class RunExecutor {
     return this.trackExecution(run, async (execution) => {
       await this.executeAttempts(execution, run, initialPrompt, cwd, settings, executablePaths)
       if (this.core.conversations.findRun(run.id)?.status !== 'completed') return
+      const primaryRunId = run.id
       try {
         await this.core.collaboration.executeRoutedContinuation(
           execution,
@@ -71,6 +73,9 @@ export class RunExecutor {
           executablePaths,
         )
       } catch (error) {
+        if (execution.run.id !== primaryRunId) {
+          throw error
+        }
         if (
           !this.core.disposed &&
           !execution.abortController.signal.aborted &&
@@ -133,31 +138,42 @@ export class RunExecutor {
         let drainError: unknown
         try {
           const owner = this.core.nativeObservations.get(execution.run.id)
-          if (owner) {
+          const archiverForRun = owner?.archiver ?? execution.lastArchiver
+          if (archiverForRun) {
             try {
-              await owner.archiver.drain()
+              await archiverForRun.drain()
             } catch (error: unknown) {
               drainError = error
             }
           }
-          if (owner && !owner.adapter.hasActiveBackgroundWork?.(execution.run.id)) {
-            if (execution.streamBuffer && !execution.streamBuffer.flush()) {
-              drainError ??= new Error('The last foreground output could not be committed.')
+          if (owner) {
+            owner.foregroundExited = true
+            if (!owner.adapter.hasActiveBackgroundWork?.(execution.run.id)) {
+              if (execution.streamBuffer && !execution.streamBuffer.flush()) {
+                drainError ??= new Error('The last foreground output could not be committed.')
+              }
+              if (
+                owner.archiver.archiveBuffer &&
+                (!owner.archiver.archiveBuffer.flush() || !owner.archiver.archiveBuffer.dispose())
+              ) {
+                drainError ??= new Error('The late native output could not be committed.')
+              }
+              owner.release?.()
+              if (this.core.nativeObservations.get(execution.run.id) === owner) {
+                owner.observationController.abort()
+                this.settleOrphanedPendingEffects(
+                  execution.run.id,
+                  Boolean(execution.enteredNativeAdapter) || execution.deliveryPossible,
+                )
+                this.core.retireStreamTrace(owner, execution.streamBuffer)
+                owner.sourceReader?.retire()
+                this.core.recovery.clearBackgroundStop(owner)
+                this.core.nativeObservations.delete(execution.run.id)
+              }
             }
-            if (
-              owner.archiver.archiveBuffer &&
-              (!owner.archiver.archiveBuffer.flush() || !owner.archiver.archiveBuffer.dispose())
-            ) {
-              drainError ??= new Error('The late native output could not be committed.')
-            }
-            this.settleOrphanedPendingEffects(
-              execution.run.id,
-              Boolean(execution.enteredNativeAdapter) || execution.deliveryPossible,
-            )
-            this.core.retireStreamTrace(owner, execution.streamBuffer)
-            owner.sourceReader?.retire()
-            this.core.recovery.clearBackgroundStop(owner)
-            this.core.nativeObservations.delete(execution.run.id)
+          }
+          if (drainError === undefined && archiverForRun?.failureRecordingError !== undefined) {
+            drainError = archiverForRun.failureRecordingError
           }
           await this.finalizeWorkspaceChanges(execution.run.id)
           const settled = this.core.conversations.reconcileCompletedCollaboration(execution.run.id)
@@ -166,7 +182,7 @@ export class RunExecutor {
         } finally {
           execution.streamBuffer?.dispose()
           execution.streamBuffer = undefined
-          const finished = this.core.conversations.findRun(run.id)
+          const finished = this.core.conversations.findRun(execution.run.id)
           const task = this.core.conversations.collaboration(run.sessionId)
           if (
             !this.core.disposed &&
@@ -175,9 +191,9 @@ export class RunExecutor {
             (finished?.status !== 'completed' ||
               finished.dispatchPhase !== 'ended' ||
               finished.nativeOutcome !== 'completed' ||
-              !this.core.conversations.hasCompleteResponse(run.id) ||
+              !this.core.conversations.hasCompleteResponse(execution.run.id) ||
               finished.nativeEffectsState === 'unknown' ||
-              (task?.runId === run.id && task.status === 'failed'))
+              (task?.runId === execution.run.id && task.status === 'failed'))
           ) {
             this.core.publish(
               this.core.conversations.pauseConversationQueue(
@@ -477,6 +493,13 @@ export class RunExecutor {
     executablePaths: Record<RuntimeAgentId, string>,
   ): Promise<void> {
     const diagnosticStartedAt = Date.now()
+    // Reset per-Run delivery & adapter state so a reused ActiveExecution (e.g., @all Secondary)
+    // never inherits the Primary Run's deliveryPossible or adapter ownership.
+    execution.deliveryPossible = false
+    execution.enteredNativeAdapter = false
+    execution.adapter = undefined
+    execution.streamBuffer = undefined
+    execution.lastArchiver = undefined
     recordDiagnostic({
       operation: 'send',
       scope: 'run',
@@ -485,46 +508,79 @@ export class RunExecutor {
       runId: run.id,
       agentId: run.agentId,
     })
-    const context = this.core.conversations.nativeContext(run.sessionId, run.agentId)
-    const peerAssistanceAllowed =
-      !run.collaboration &&
-      this.core.conversations.internalMessage(run.userMessageId, run.sessionId)?.route?.type !==
-        'all'
+    let context: ReturnType<ConversationRuntimeCore['conversations']['nativeContext']>
+    let peerAssistanceAllowed = false
     const signal = execution.abortController.signal
-    const recordingIssue = await this.core.workspaceChanges?.start(run, signal)
-    if (recordingIssue) {
-      this.core.publish(
-        this.core.conversations.recordWorkspaceRecordingUnavailable(run.id, recordingIssue),
+    let adapter: AgentAdapter
+    try {
+      context = this.core.conversations.nativeContext(run.sessionId, run.agentId)
+      peerAssistanceAllowed =
+        !run.collaboration &&
+        this.core.conversations.internalMessage(run.userMessageId, run.sessionId)?.route?.type !==
+          'all'
+      const recordingIssue = await this.core.workspaceChanges?.start(run, signal)
+      if (recordingIssue) {
+        this.core.publish(
+          this.core.conversations.recordWorkspaceRecordingUnavailable(run.id, recordingIssue),
+        )
+      }
+      adapter = await this.core.adapterFor(
+        run.sessionId,
+        run.agentId,
+        executablePaths[run.agentId],
+        signal,
+        cwd,
       )
-    }
-    const adapter = await this.core.adapterFor(
-      run.sessionId,
-      run.agentId,
-      executablePaths[run.agentId],
-      signal,
-      cwd,
-    )
-    execution.adapter = adapter
-    this.core.archiveAndQuit.nativeMetadataChanged()
-    const currentBinding = this.core.conversations.nativeContext(run.sessionId, run.agentId)
-    if (
-      currentBinding &&
-      (currentBinding.continuationState !== 'ready' ||
-        currentBinding.bindingGeneration !== run.bindingGeneration ||
-        (run.nativeSessionId && currentBinding.nativeSessionId !== run.nativeSessionId))
-    ) {
-      throw new RunOperationConflictError(
-        'The native binding is no longer ready for this prepared task.',
-      )
-    }
-    if (!this.ownsExecution(execution, run.id)) return
-    this.retireChangedSourceGrants(run.sessionId, run.agentId)
-    if (this.core.nativeObservations.size >= 40 && !this.core.nativeObservations.has(run.id)) {
-      throw new AgentExecutionError(
-        'runtime_incompatible',
-        'Native observation capacity is occupied.',
-        false,
-      )
+      execution.adapter = adapter
+      this.core.archiveAndQuit.nativeMetadataChanged()
+      const currentBinding = this.core.conversations.nativeContext(run.sessionId, run.agentId)
+      if (
+        currentBinding &&
+        (currentBinding.continuationState !== 'ready' ||
+          currentBinding.bindingGeneration !== run.bindingGeneration ||
+          (run.nativeSessionId && currentBinding.nativeSessionId !== run.nativeSessionId))
+      ) {
+        throw new RunOperationConflictError(
+          'The native binding is no longer ready for this prepared task.',
+        )
+      }
+      if (!this.ownsExecution(execution, run.id)) return
+      this.retireChangedSourceGrants(run.sessionId, run.agentId)
+      if (this.core.nativeObservations.size >= 40 && !this.core.nativeObservations.has(run.id)) {
+        throw new NativeCapacityError('Native observation capacity is occupied.')
+      }
+    } catch (error) {
+      if (this.core.disposed) return
+      const saved = this.core.conversations.findRun(run.id)
+      if (execution.cancelledByUser || saved?.status === 'interrupted') {
+        if (saved?.nativeEffectsState === 'pending') {
+          this.core.publish(
+            this.core.conversations.recordNativeEffects(
+              run.id,
+              'not_dispatched',
+              'stopped_before_native_dispatch',
+            ),
+          )
+        }
+        return
+      }
+      const failure = classifyAgentError(error)
+      this.core.conversations.finishCollaboration(run.id, false, failure.message)
+      if (saved && ['starting', 'running', 'recovering'].includes(saved.status)) {
+        this.core.publish(
+          this.core.conversations.failRun(run.id, failure.kind, failure.message, false),
+        )
+        if (error instanceof NativeCapacityError) {
+          this.core.publish(
+            this.core.conversations.recordNativeEffects(
+              run.id,
+              'not_dispatched',
+              'native_capacity_not_started',
+            ),
+          )
+        }
+      }
+      return
     }
 
     const generation = randomUUID()
@@ -545,15 +601,16 @@ export class RunExecutor {
 
     const ownsCurrentNativeRun = (): boolean =>
       this.core.activeExecutions.get(run.sessionId) === execution &&
+      execution.run.id === run.id &&
       this.core.conversations.ownsNativeControl(run.id)
+    const ownsAdmittedForegroundBatch = (): boolean => {
+      if (!ownsCurrentNativeRun()) return false
+      const saved = this.core.conversations.findRun(run.id)
+      return Boolean(saved && ['starting', 'running', 'recovering'].includes(saved.status))
+    }
     const ownsForegroundOutput = (): boolean => {
       if (!this.ownsExecution(execution, run.id)) return false
-      const saved = this.core.conversations.findRun(run.id)
-      return Boolean(
-        saved &&
-        ['starting', 'running', 'recovering'].includes(saved.status) &&
-        this.core.conversations.ownsNativeControl(run.id),
-      )
+      return ownsAdmittedForegroundBatch()
     }
     const currentControl = (): boolean => !this.core.disposed && ownsCurrentNativeRun()
 
@@ -568,6 +625,7 @@ export class RunExecutor {
       isOwned: stillOwned,
       isDisposed: () => this.core.disposed,
       ownsCurrentControl: ownsForegroundOutput,
+      ownsAdmittedForegroundBatch,
       isRunEnded: () => this.core.conversations.findRun(run.id)?.dispatchPhase === 'ended',
       applyStreamBatch: (events, archive) =>
         archive
@@ -630,11 +688,14 @@ export class RunExecutor {
       generation,
       adapter,
       archiver,
+      foregroundExited: false,
+      observationController: new AbortController(),
     }
     ownerRef = owner
     this.core.nativeObservations.set(run.id, owner)
     owner.streamTrace = this.core.createStreamTrace(run, owner)
     execution.streamBuffer = archiver.foregroundBuffer
+    execution.lastArchiver = archiver
 
     const closingObservation = (): NativeObservation['shutdown'] => {
       const shutdown = owner.shutdown
@@ -664,11 +725,13 @@ export class RunExecutor {
     }
 
     let enteredNativeAdapter = false
+    let runDeliveryPossible = false
 
     const release = (): void => {
-      if (!stillOwned() || adapter.hasActiveBackgroundWork?.(run.id)) return
+      if (!stillOwned() || !owner.foregroundExited || adapter.hasActiveBackgroundWork?.(run.id))
+        return
       if (archiver.archiveTail) {
-        void archiver.archiveTail.then(release)
+        void archiver.archiveTail.then(release, release)
         return
       }
       if (
@@ -679,15 +742,32 @@ export class RunExecutor {
         return
       }
       archiver.flush()
-      archiver.dispose()
-      if (archiver.outputFailure) this.core.workspaceChanges?.observeUncertainEffects(run.id)
-      this.settleOrphanedPendingEffects(run.id, enteredNativeAdapter || execution.deliveryPossible)
+      const disposedOk = archiver.dispose()
+      if (!disposedOk || archiver.outputFailure || archiver.failureRecordingError !== undefined) {
+        this.core.workspaceChanges?.observeUncertainEffects(run.id)
+      }
+      if (archiver.failureRecordingError !== undefined) {
+        recordDiagnostic({
+          operation: 'native_check',
+          phase: 'failed',
+          level: 'warn',
+          scope: 'run',
+          sessionId: run.sessionId,
+          runId: run.id,
+          agentId: run.agentId,
+          runtimeBoundary: 'archive',
+          code: classifyAgentError(archiver.failureRecordingError).kind,
+        })
+      }
+      owner.observationController.abort()
+      this.settleOrphanedPendingEffects(run.id, enteredNativeAdapter || runDeliveryPossible)
       this.core.retireStreamTrace(owner, archiver.foregroundBuffer)
       owner.sourceReader?.retire()
       this.core.recovery.clearBackgroundStop(owner)
       this.core.nativeObservations.delete(run.id)
       void this.finalizeWorkspaceChanges(run.id).catch(() => undefined)
     }
+    owner.release = release
 
     const interactionOwner = () => ({
       id: run.id,
@@ -935,7 +1015,10 @@ export class RunExecutor {
               })
             }
             if (phase === 'possibly_sent' || phase === 'accepted') {
-              execution.deliveryPossible = true
+              runDeliveryPossible = true
+              if (execution.run.id === run.id) {
+                execution.deliveryPossible = true
+              }
             }
             if (stillOwned()) {
               this.core.publish(
@@ -1033,7 +1116,7 @@ export class RunExecutor {
             archiver.admitArchiveEventSync(event)
           },
           recordBackgroundReportUnavailable: (value) => {
-            if (!stillOwned() || archiver.archiveController.signal.aborted) return
+            if (!stillOwned() || owner.observationController.signal.aborted) return
             const report = nativeBackgroundReportIdentitySchema.parse(value)
             if (
               report.runId !== run.id ||
@@ -1045,7 +1128,7 @@ export class RunExecutor {
             if (patch) this.core.publish(patch)
           },
           recordBackgroundReport: async (value) => {
-            if (!stillOwned() || archiver.archiveController.signal.aborted) return
+            if (!stillOwned() || owner.observationController.signal.aborted) return
             const report = nativeBackgroundReportSchema.parse(value)
             if (
               report.runId !== run.id ||
@@ -1054,16 +1137,18 @@ export class RunExecutor {
               return
             }
             try {
-              if (archiver.archiveTail) await archiver.archiveTail
-              if (!stillOwned() || archiver.archiveController.signal.aborted) return
+              if (archiver.archiveTail) {
+                await archiver.archiveTail.catch(() => undefined)
+              }
+              if (!stillOwned() || owner.observationController.signal.aborted) return
               const patch = await this.core.conversations.recordBackgroundReport(
                 report,
                 (bodySignal) => RunOutputArchiver.answerParts(report.text, bodySignal),
-                archiver.archiveController.signal,
+                owner.observationController.signal,
               )
               if (patch && stillOwned()) this.core.publish(patch)
             } catch (error) {
-              if (!stillOwned() || archiver.archiveController.signal.aborted) return
+              if (!stillOwned() || owner.observationController.signal.aborted) return
               const patch = this.core.conversations.recordBackgroundReportUnavailable(report)
               if (patch) this.core.publish(patch)
               recordDiagnostic({
@@ -1362,7 +1447,7 @@ export class RunExecutor {
           currentContext &&
           currentContext.nativeSessionId === context.nativeSessionId &&
           currentContext.bindingGeneration === context.bindingGeneration &&
-          (!execution.deliveryPossible || saved.dispatchPhase === 'rejected') &&
+          (!runDeliveryPossible || saved.dispatchPhase === 'rejected') &&
           !saved.nativeTurnId &&
           !saved.nativeOutcome &&
           (saved.nativeEffectsState === undefined ||
@@ -1408,7 +1493,7 @@ export class RunExecutor {
           saved.dispatchPhase === 'not_sent' &&
           !saved.nativeTurnId &&
           !saved.nativeOutcome &&
-          !execution.deliveryPossible &&
+          !runDeliveryPossible &&
           !adapter.hasActiveBackgroundWork?.(run.id)
         if (capacityRefusedBeforeStartup) {
           this.core.publish(
@@ -1431,7 +1516,7 @@ export class RunExecutor {
                   saved.dispatchPhase === 'rejected' &&
                   !saved.nativeTurnId &&
                   !saved.nativeOutcome &&
-                  !execution.deliveryPossible))) ||
+                  !runDeliveryPossible))) ||
               capacityRefusedBeforeStartup))
         if (
           error instanceof NativeThreadOccupiedError ||
@@ -1486,6 +1571,7 @@ export class RunExecutor {
       }
     } finally {
       archiver.foregroundBuffer.flush()
+      owner.foregroundExited = true
       release()
     }
   }

@@ -1717,9 +1717,7 @@ export class ConversationRuntimeCore {
       }
       conversationPatchSchema.parse(patch)
     }
-    if (!progress) {
-      this.drainPendingStreamPublications(patch.sessionId, patch.observation.sequence)
-    }
+    this.drainPendingStreamPublications(patch.sessionId, patch.observation.sequence)
     if (progress && !this.interestedSessionIds.has(patch.sessionId)) {
       if (streamTrace) {
         this.bumpStreamTrace(streamTrace, streamTrace.data.publication, 'suppressed')

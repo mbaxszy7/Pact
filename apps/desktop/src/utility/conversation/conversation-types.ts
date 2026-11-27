@@ -55,6 +55,7 @@ export interface ActiveExecution {
   cancelledByUser?: boolean | undefined
   abortController: AbortController
   streamBuffer?: AgentStreamBuffer | undefined
+  lastArchiver?: RunOutputArchiver | undefined
   completion?: Promise<void> | undefined
   promptEnvelope?: AgentPromptEnvelope | undefined
   steering?:
@@ -197,6 +198,9 @@ export interface NativeObservation {
   generation: string
   adapter: AgentAdapter
   archiver: RunOutputArchiver
+  foregroundExited: boolean
+  observationController: AbortController
+  release?: (() => void) | undefined
   backgroundStop?:
     | {
         controller: AbortController

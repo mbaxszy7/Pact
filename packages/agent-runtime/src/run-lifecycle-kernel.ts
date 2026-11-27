@@ -143,9 +143,12 @@ export function classifyBindingRejection(input: {
 export const NATIVE_TERMINAL_FAILURE_MAX_CHARS = 240
 
 const REDACT_SECRET_PATTERNS: readonly RegExp[] = [
-  /\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/giu,
+  /["']?(?:proxy-)?authorization["']?\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\r\n,;}\]]+)/giu,
+  /\b(?:Bearer|Basic|Digest|ApiKey)\s+[A-Za-z0-9._~+/=-]{4,}/giu,
+  /\bToken\s+(?=[A-Za-z0-9._~+/=-]*[0-9._+/=-])[A-Za-z0-9._~+/=-]{8,}/gu,
   /\bsk-[A-Za-z0-9_-]{12,}/gu,
-  /\b(?:api[_-]?key|token|secret|authorization)\s*[:=]\s*["']?[^\s"',;]{6,}["']?/giu,
+  /\bAIza[0-9A-Za-z_-]{20,}/gu,
+  /["']?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|client[_-]?secret|x-api-key|set-cookie|cookie|password|passwd|pwd|secret|token)["']?\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s"',;}\]]+)/giu,
 ]
 
 /**
@@ -615,8 +618,19 @@ export class RunLifecycleKernel<TMeta = undefined> {
       if (this.effectsStateValue === 'settled' || this.effectsStateValue === 'unknown') {
         return false
       }
-      if (this.ledger.hasUncertainOverflow) {
+      const recordingSnapshot = this.ledger.recordings.snapshot()
+      if (this.ledger.hasUncertainOverflow || recordingSnapshot.overflowed) {
         return this.reportNativeEffects('unknown', 'native_work_overflow')
+      }
+      if (recordingSnapshot.failedCount > 0) {
+        return this.reportNativeEffects('unknown', 'native_recording_failed')
+      }
+      if (
+        recordingSnapshot.droppedCount > 0 ||
+        this.ledger.recordings.activeCount > 0 ||
+        this.ledger.recordings.queuedCount > 0
+      ) {
+        return this.reportNativeEffects('unknown', 'native_recording_drain_incomplete')
       }
       this.effectsStateValue = 'settled'
       this.callbacks.onReportNativeEffects?.({
@@ -727,11 +741,12 @@ export class RunLifecycleKernel<TMeta = undefined> {
       if (this.phaseValue !== 'Settled') {
         this.transition('Settled')
       }
+      const deferredSnapshot = this.ledger.recordings.snapshot()
       return {
         cleanupErrors,
         recordingsDrained: false,
-        recordingsFailedCount: drainResult.failedCount,
-        recordingsDroppedCount: drainResult.droppedCount,
+        recordingsFailedCount: deferredSnapshot.failedCount,
+        recordingsDroppedCount: deferredSnapshot.droppedCount,
         disposalsDeferred: true,
       }
     }
@@ -747,8 +762,32 @@ export class RunLifecycleKernel<TMeta = undefined> {
     const scopeErrors = await this.disposables.disposeAll()
     cleanupErrors.push(...scopeErrors)
 
+    // Re-read live ledger counters AFTER the last async cleanup point so enqueues rejected
+    // synchronously after drain() resolved are reflected in both effects state and return counts.
+    const finalSnapshot = this.ledger.recordings.snapshot()
+    const finalRecordingsUncertain =
+      recordingsUncertain ||
+      !finalSnapshot.drained ||
+      finalSnapshot.overflowed ||
+      finalSnapshot.failedCount > 0 ||
+      finalSnapshot.droppedCount > 0
+
+    if (finalRecordingsUncertain) {
+      const reason =
+        !drainResult.drained || !finalSnapshot.drained || finalSnapshot.droppedCount > 0
+          ? 'native_recording_drain_incomplete'
+          : finalSnapshot.overflowed
+            ? 'native_recording_overflow'
+            : 'native_recording_failed'
+      this.reportNativeEffects('unknown', reason)
+    }
+
     if (!options.retainBackgroundObservation) {
-      if (this.ledger.hasPendingWork || this.ledger.hasUncertainOverflow || recordingsUncertain) {
+      if (
+        this.ledger.hasPendingWork ||
+        this.ledger.hasUncertainOverflow ||
+        finalRecordingsUncertain
+      ) {
         this.reportNativeEffects('unknown', 'native_work_unconfirmed')
       } else if (this.effectsStateValue === 'pending') {
         this.reportNativeEffects('settled')
@@ -756,7 +795,7 @@ export class RunLifecycleKernel<TMeta = undefined> {
       this.ledger.dispose()
     } else if (this.ledger.hasPendingWork) {
       this.reportNativeEffects('pending')
-    } else if (this.ledger.hasUncertainOverflow || recordingsUncertain) {
+    } else if (this.ledger.hasUncertainOverflow || finalRecordingsUncertain) {
       this.reportNativeEffects('unknown', 'native_work_overflow')
     } else if (this.effectsStateValue === 'pending') {
       this.reportNativeEffects('settled')
@@ -767,9 +806,9 @@ export class RunLifecycleKernel<TMeta = undefined> {
     }
     return {
       cleanupErrors,
-      recordingsDrained: drainResult.drained,
-      recordingsFailedCount: drainResult.failedCount,
-      recordingsDroppedCount: drainResult.droppedCount,
+      recordingsDrained: drainResult.drained && finalSnapshot.drained,
+      recordingsFailedCount: finalSnapshot.failedCount,
+      recordingsDroppedCount: finalSnapshot.droppedCount,
       disposalsDeferred: false,
     }
   }

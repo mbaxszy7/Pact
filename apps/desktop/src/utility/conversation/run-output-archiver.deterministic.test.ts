@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import type { ConversationPatch, NativeProbeResult, NormalizedAgentEvent } from '@pact/contracts'
 
-import { CONVERSATION_MARKDOWN_BYTES } from '@pact/contracts'
+import { CONVERSATION_MARKDOWN_BYTES, CONVERSATION_STREAM_BATCH_BYTES } from '@pact/contracts'
 
 import { RunOutputArchiver, type RunOutputArchiverHost } from './run-output-archiver'
 
@@ -57,6 +57,7 @@ function createHarness(options: HarnessOptions) {
   let reconciledCount = 0
   let uncertainEffectsCount = 0
   let cutoffsMarked = 0
+  let archiverRef: RunOutputArchiver | undefined
 
   const nextPatch = (label: string): ConversationPatch => {
     commitSeq += 1
@@ -78,6 +79,7 @@ function createHarness(options: HarnessOptions) {
     isOwned: () => true,
     isDisposed: () => false,
     ownsCurrentControl: () => hasControl,
+    ownsAdmittedForegroundBatch: () => hasControl,
     isRunEnded: () => runEnded,
     applyStreamBatch: (events, archive) => {
       for (const item of events) {
@@ -107,6 +109,7 @@ function createHarness(options: HarnessOptions) {
     recordWorkflowPlan: () => undefined,
     recordWorkflowReview: () => undefined,
     publish: (patch) => {
+      archiverRef?.publishPendingInOrder(patch.observation.sequence)
       if (options.failOnPublishSeq === patch.observation.sequence) {
         throw new Error(`injected-publish-fault-${patch.observation.sequence}`)
       }
@@ -125,6 +128,7 @@ function createHarness(options: HarnessOptions) {
   }
 
   const archiver = new RunOutputArchiver(host)
+  archiverRef = archiver
 
   return {
     archiver,
@@ -419,5 +423,84 @@ describe('RunOutputArchiver deterministic single-writer invariants', () => {
     expect(orderHarness.publishedLabels).toEqual(orderHarness.committedLabels)
     const seqs = orderHarness.publishedLabels.map((l) => Number(l.split(':')[0]))
     expect(seqs).toEqual([...seqs].toSorted((a, b) => a - b))
+  })
+
+  it('Astra re-audit S1-F1 & S1-F6 regressions: preserves visible foreground batch during shutdown dispose and orders archive capacity commit before foreground progress flush', async () => {
+    // 1. S1-F1: shutdown sets disposed=true (making ownsCurrentControl false) before foregroundBuffer.dispose(),
+    //    yet ownsAdmittedForegroundBatch() remains true so already-admitted foreground deltas commit as visible (archive=false).
+    const batchFlags: boolean[] = []
+    let disposed = false
+    const shutdownArchiver = new RunOutputArchiver({
+      run: {
+        id: 'run-shutdown-fg',
+        sessionId: 'session-1',
+        agentId: 'codex',
+        bindingGeneration: 1,
+      },
+      peerAssistanceAllowed: true,
+      isOwned: () => !disposed,
+      isDisposed: () => disposed,
+      ownsCurrentControl: () => !disposed,
+      ownsAdmittedForegroundBatch: () => true,
+      isRunEnded: () => false,
+      applyStreamBatch: (_events, archive) => {
+        batchFlags.push(archive)
+        return makePatch(batchFlags.length, `batch-${archive ? 'arch' : 'fg'}`)
+      },
+      applyEvent: () => makePatch(99, 'event'),
+      completeAnswer: async () => makePatch(100, 'answer'),
+      recordNativeEvidence: () => makePatch(101, 'evidence'),
+      recordOutputFailure: () => makePatch(102, 'failure'),
+      settleKnownNativeEnding: () => makePatch(103, 'ending'),
+      recordWorkflowPlan: () => undefined,
+      recordWorkflowReview: () => undefined,
+      publish: () => undefined,
+      observeNormalizedDelta: () => undefined,
+      markInjectedCutoffs: () => undefined,
+      reconcileCompletedCollaboration: () => undefined,
+      observeUncertainEffects: () => undefined,
+    })
+    await shutdownArchiver.admitEvent(
+      {
+        agentId: 'codex',
+        type: 'text.delta',
+        turnId: 'turn-1',
+        outputId: 'out-1',
+        text: 'tail before 250ms checkpoint',
+      },
+      'foreground',
+    )
+    disposed = true
+    expect(shutdownArchiver.foregroundBuffer.dispose()).toBe(true)
+    expect(batchFlags).toEqual([false])
+
+    // 2. S1-F6: archive buffer commits seq N via capacity before 75ms timer; foreground flushes seq N+1;
+    //    published order across progress patches is strictly ascending [N, N+1].
+    const orderHarness = createHarness({ seed: 20_004 })
+    await orderHarness.archiver.admitEvent(
+      {
+        agentId: 'codex',
+        type: 'text.delta',
+        turnId: 'turn-1',
+        outputId: 'out-cap',
+        text: 'fg-pending',
+      },
+      'foreground',
+    )
+    // Trigger archive capacity commit (>CONVERSATION_STREAM_BATCH_BYTES) before foreground flushes.
+    orderHarness.archiver.admitArchiveEventSync({
+      agentId: 'codex',
+      type: 'text.delta',
+      turnId: 'turn-1',
+      outputId: 'out-cap',
+      text: 'a'.repeat(CONVERSATION_STREAM_BATCH_BYTES + 2048),
+    })
+    expect(orderHarness.archiver.archiveBuffer?.peekNextCommittedSequence()).toBe(1)
+    // Force foreground flush BEFORE archive's 75ms visible timer fires.
+    orderHarness.archiver.foregroundBuffer.flush()
+    orderHarness.archiver.dispose()
+    const publishedSeqs = orderHarness.publishedLabels.map((l) => Number(l.split(':')[0]))
+    expect(publishedSeqs.length).toBeGreaterThanOrEqual(2)
+    expect(publishedSeqs).toEqual([...publishedSeqs].toSorted((a, b) => a - b))
   })
 })
