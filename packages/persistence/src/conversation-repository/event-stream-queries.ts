@@ -113,6 +113,8 @@ export async function completeAnswer(
   )
 }
 
+const preAdmittedBackgroundReports = new WeakMap<ConversationRepositoryHost, Set<string>>()
+
 export function admitBackgroundReportPending(
   repo: ConversationRepositoryHost,
   report: BackgroundReportIdentity,
@@ -125,17 +127,19 @@ export function admitBackgroundReportPending(
     .get()
   if (existingInput) return undefined
   const existingMessage = repo.database
-    .select({
-      state: conversationMessages.state,
-      revision: conversationMessages.contentRevision,
-    })
+    .select({ id: conversationMessages.id })
     .from(conversationMessages)
     .where(eq(conversationMessages.id, id))
     .get()
-  if (existingMessage && (existingMessage.state === 'complete' || existingMessage.revision > 0)) {
-    return undefined
+  if (existingMessage) return undefined
+  const patch = commitBackgroundReport(repo, report, id, undefined, 'pending')
+  let pending = preAdmittedBackgroundReports.get(repo)
+  if (!pending) {
+    pending = new Set<string>()
+    preAdmittedBackgroundReports.set(repo, pending)
   }
-  return commitBackgroundReport(repo, report, id, undefined, 'pending')
+  pending.add(id)
+  return patch
 }
 
 export async function recordBackgroundReport(
@@ -147,6 +151,7 @@ export async function recordBackgroundReport(
   signal.throwIfAborted()
   const run = backgroundReportRun(repo, report)
   const id = backgroundReportId(report)
+  const preAdmitted = preAdmittedBackgroundReports.get(repo)?.delete(id) ?? false
   const digest = createHash('sha256').update(report.text).digest('hex')
   const previous = repo.database
     .select({
@@ -167,8 +172,8 @@ export async function recordBackgroundReport(
     return undefined
   }
   // A prior complete or unavailable admission is already durable. Never re-seal a replay
-  // after its uncommitted body was discarded on cancellation or cold startup. An in-flight
-  // pre-admitted `pending` placeholder (state='incomplete', contentRevision=0) proceeds to seal.
+  // after its uncommitted body was discarded on cancellation or cold startup; only consume
+  // a live in-process one-shot pre-admission created by `admitBackgroundReportPending`.
   const existingMessage = repo.database
     .select({
       id: conversationMessages.id,
@@ -178,10 +183,15 @@ export async function recordBackgroundReport(
     .from(conversationMessages)
     .where(eq(conversationMessages.id, id))
     .get()
-  if (existingMessage && (existingMessage.state === 'complete' || existingMessage.revision > 0)) {
+  if (
+    existingMessage &&
+    !(preAdmitted && existingMessage.state === 'incomplete' && existingMessage.revision === 0)
+  ) {
     return undefined
   }
-  commitBackgroundReport(repo, report, id, undefined, 'pending')
+  if (!existingMessage) {
+    commitBackgroundReport(repo, report, id, undefined, 'pending')
+  }
   return sealAnswerBody(repo, run, id, report.nativeMessageId, source, signal, (body) => {
     if (body.sha256 !== digest)
       throw new RunOperationConflictError('The complete background update source changed.')
