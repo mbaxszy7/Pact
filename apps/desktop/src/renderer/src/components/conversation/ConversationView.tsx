@@ -1,4 +1,3 @@
-import { defaultRangeExtractor, useVirtualizer } from '@tanstack/react-virtual'
 import { BookOpen, Info, MessageSquareText } from 'lucide-react'
 import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
@@ -6,10 +5,6 @@ import { createPortal } from 'react-dom'
 import type {
   AnchoredComment,
   CollaborationSession,
-  CollaborationTask,
-  ConversationDisplayOrder,
-  ConversationPage,
-  MessageCommentAnchor,
   RelayDecisionAnswer,
   RuntimeAgentId,
   SessionCatalogChange,
@@ -18,18 +13,11 @@ import type {
   SideChatSyncMainReceipt,
   SkillSelection,
   UserInformationDeclaration,
-  WorkspaceChangeSet,
 } from '@pact/contracts'
 import type { ConversationImage } from '@pact/contracts/images'
 
 import {
   collaborationActor,
-  collaborationInputGate,
-  collaborationInputProcessing,
-  compareConversationDisplayOrder,
-  CONVERSATION_MARKDOWN_BYTES,
-  CONVERSATION_WINDOW_MESSAGES,
-  conversationMessageOrder,
   defaultTaskStageRoles,
   isCollaborationOpenMode,
   otherAgent,
@@ -38,8 +26,6 @@ import {
   resolveActiveAgentPair,
   resolveLegacyCompatibleTaskStageRoles,
   validateSideChatMainSyncContent,
-  WORKSPACE_CHANGE_FILES,
-  WORKSPACE_OPERATION_TIMEOUT_MS,
 } from '@pact/contracts'
 
 import type { RelayDecisionPresentation } from '../scheduling/RelayDecisionCard'
@@ -76,66 +62,36 @@ import {
 import {
   agentName,
   buildMentionOptions,
-  cancelWorkspaceFileLoadWaiters,
-  coalesceWorkspaceLoadIntent,
   CONVERSATION_WIDTH,
   EMPTY_COMMENTS,
   EMPTY_IMAGES,
   EMPTY_SKILLS,
-  enqueueWorkspaceFileLoadWaiter,
-  hasRecordingWarning,
-  hasVisibleChanges,
   ignoreSkillChanges,
   mentionQueryAt,
-  OLDER_HISTORY_SCROLL_THRESHOLD,
-  promoteWorkspaceFileLoadWaiter,
   resolvePlanStatusLabel,
   sha256Hex,
-  TRANSCRIPT_OVERSCAN,
-  tryAcquireWorkspaceFileLoadSlot,
-  upsertWorkspaceFilesLru,
   type MentionOption,
   type MentionQuery,
-  type WorkspaceFileLoadIntent,
 } from './conversation-view-helpers'
 import {
   conversationWindowStartOrder,
   isRunResponseComplete,
   nativeInputRequests,
 } from './conversation-window'
-import { CurrentPlanPanel, type CurrentPlanDocument } from './CurrentPlanPanel'
-import { EditorialMessageItem, type ConversationTranscriptRow } from './EditorialMessageItem'
+import { CurrentPlanPanel } from './CurrentPlanPanel'
+import { EditorialMessageItem } from './EditorialMessageItem'
 import { ImageGallery } from './ImageGallery'
-import {
-  clearProjectionHighlight,
-  focusProjectionRange,
-  isProjectionHighlightOwned,
-  planSelectionSource,
-  pulseMessageTarget,
-  reportSelectionSource,
-  reportSourceSelector,
-  selectedTextRange,
-} from './message-selection'
 import { NativePermissionCard } from './NativePermissionCard'
 import { NativeForkRecovery, SessionForkDialog, type SessionForkOpening } from './SessionFork'
 import { TaskReplacementConfirmation } from './TaskReplacementConfirmation'
 import { commentDraftSaveSucceeded, hasDecisionAnswers, sameDecision } from './useConversation'
+import {
+  useConversationPlanPreview,
+  type ConversationMessageNavigation,
+} from './useConversationPlanPreview'
+import { useConversationTranscriptVirtualizer } from './useConversationTranscriptVirtualizer'
+import { useConversationWorkspaceChanges } from './useConversationWorkspaceChanges'
 import { useSkillComposer } from './useSkillComposer'
-import { WorkspaceChangesCard, type WorkspaceChangesList } from './WorkspaceChangesCard'
-
-interface WorkspaceFileLoadSlot {
-  changeSetId: string
-  generation: number
-  inFlight: boolean
-  inFlightRevision: number
-  inFlightExpand: boolean
-  inFlightOpen: boolean
-  inFlightContextGeneration?: number | undefined
-  timedOut: boolean
-  timeout?: number | undefined
-  waitingForConcurrency: boolean
-  queued?: WorkspaceFileLoadIntent | undefined
-}
 
 export interface ConversationViewProps {
   planPanelHost?: HTMLElement | null | undefined
@@ -229,18 +185,7 @@ export interface ConversationViewProps {
   onOpenProjectFile: (target: ProjectFileTarget) => void
   onOpenComment: (comment: AnchoredComment) => void
   onNotice: (message: string) => void
-  messageNavigation?:
-    | {
-        navigationId?: string
-        messageId: string
-        queuedOperationId?: string | undefined
-        startOffset: number
-        endOffset: number
-        textBasis?: MessageCommentAnchor['textBasis']
-        plan?: MessageCommentAnchor['plan']
-        report?: MessageCommentAnchor['report']
-      }
-    | undefined
+  messageNavigation?: ConversationMessageNavigation | undefined
 }
 
 export function ConversationView({
@@ -334,459 +279,9 @@ export function ConversationView({
     setForkPoint((current) => (current?.sourceSessionId === session.id ? current : undefined))
   }, [session.id])
 
-  // Bounded LRU map (max 8 entries) keyed by changeSetId prevents expanding Card B from wiping Card A.
-  const [workspaceFilesById, setWorkspaceFilesById] = useState<Map<string, WorkspaceChangesList>>(
-    () => new Map(),
-  )
-  const workspaceFilesMapRef = useRef<Map<string, WorkspaceChangesList>>(new Map())
-  const workspaceFileLoadsRef = useRef<Map<string, WorkspaceFileLoadSlot>>(new Map())
-  const workspaceLoadOwnerIdRef = useRef<symbol>(Symbol('workspace-file-loads'))
-  const loadWorkspaceFilesRef = useRef<
-    | ((
-        changeSetId: string,
-        expand?: boolean,
-        open?: boolean,
-        contextGeneration?: number,
-        targetRevision?: number,
-      ) => Promise<void>)
-    | undefined
-  >(undefined)
-  const [undoingChangeSetId, setUndoingChangeSetId] = useState<string>()
-  const undoingChangeSetRef = useRef<string | undefined>(undefined)
-  const [undoingFile, setUndoingFile] = useState<{ changeSetId: string; path: string }>()
-  const undoingFileRef = useRef<{ changeSetId: string; path: string } | undefined>(undefined)
-  const workspaceOwnerActiveRef = useRef(true)
-  const defaultWorkspaceChangesIdRef = useRef<string | undefined>(undefined)
-
-  const upsertWorkspaceFiles = useCallback(
-    (changeSetId: string, entry: WorkspaceChangesList): void => {
-      const next = upsertWorkspaceFilesLru(workspaceFilesMapRef.current, changeSetId, entry)
-      workspaceFilesMapRef.current = next
-      setWorkspaceFilesById(next)
-    },
-    [],
-  )
-
-  const currentWorkspaceChangeSetRevision = useCallback(
-    (changeSetId: string): number | undefined => {
-      const summary = messageInteractionRef.current.snapshot?.runs.find(
-        (run) => run.workspaceChanges?.id === changeSetId,
-      )?.workspaceChanges
-      return summary ? (summary.revision ?? 0) : undefined
-    },
-    [],
-  )
-
-  const clearAllWorkspaceLoads = useCallback((): void => {
-    cancelWorkspaceFileLoadWaiters(workspaceLoadOwnerIdRef.current)
-    workspaceLoadOwnerIdRef.current = Symbol('workspace-file-loads')
-    for (const slot of workspaceFileLoadsRef.current.values()) {
-      slot.generation += 1
-      slot.queued = undefined
-      slot.waitingForConcurrency = false
-      if (slot.timeout !== undefined) {
-        window.clearTimeout(slot.timeout)
-        slot.timeout = undefined
-      }
-    }
-    workspaceFileLoadsRef.current.clear()
-  }, [])
-
-  useEffect(() => {
-    workspaceOwnerActiveRef.current = true
-    return () => {
-      workspaceOwnerActiveRef.current = false
-      clearAllWorkspaceLoads()
-    }
-  }, [clearAllWorkspaceLoads])
-
-  useEffect(() => {
-    clearAllWorkspaceLoads()
-    const empty = new Map<string, WorkspaceChangesList>()
-    workspaceFilesMapRef.current = empty
-    setWorkspaceFilesById(empty)
-    defaultWorkspaceChangesIdRef.current = undefined
-  }, [session.id, clearAllWorkspaceLoads])
-
-  const loadWorkspaceFiles = useCallback(
-    async (
-      changeSetId: string,
-      expand = false,
-      open = false,
-      contextGeneration?: number,
-      targetRevision?: number,
-    ): Promise<void> => {
-      const existing = workspaceFilesMapRef.current.get(changeSetId)
-      const revision = currentWorkspaceChangeSetRevision(changeSetId) ?? targetRevision ?? 0
-      const current = (existing?.revision ?? 0) === revision ? existing : undefined
-      let slot = workspaceFileLoadsRef.current.get(changeSetId)
-
-      // Cache hits never allocate a tracking slot.
-      if (!slot) {
-        if (
-          current &&
-          !current.loading &&
-          !current.error &&
-          ((!expand && current.files.length) || (expand && !current.expanded))
-        ) {
-          upsertWorkspaceFiles(changeSetId, { ...current, expanded: expand || current.expanded })
-          if (open && current.files[0])
-            onOpenWorkspaceChanges(
-              changeSetId,
-              current.files[0].path,
-              contextGeneration,
-              current.revision,
-            )
-          return
-        }
-        if (current && !current.loading && expand && !current.nextPath && !current.error) return
-      }
-
-      if (slot && (slot.inFlight || slot.waitingForConcurrency)) {
-        slot.queued = coalesceWorkspaceLoadIntent(slot.queued, {
-          expand,
-          open,
-          contextGeneration,
-          targetRevision: revision,
-        })
-        if (slot.waitingForConcurrency && slot.queued.open) {
-          promoteWorkspaceFileLoadWaiter(workspaceLoadOwnerIdRef.current, changeSetId)
-        }
-        return
-      }
-
-      if (!slot) {
-        slot = {
-          changeSetId,
-          generation: 0,
-          inFlight: false,
-          inFlightRevision: revision,
-          inFlightExpand: expand,
-          inFlightOpen: open,
-          inFlightContextGeneration: contextGeneration,
-          timedOut: false,
-          waitingForConcurrency: false,
-        }
-        workspaceFileLoadsRef.current.set(changeSetId, slot)
-      }
-
-      const releasePhysicalSlot = tryAcquireWorkspaceFileLoadSlot()
-      if (!releasePhysicalSlot) {
-        const waitingSlot = slot
-        waitingSlot.waitingForConcurrency = true
-        waitingSlot.queued = coalesceWorkspaceLoadIntent(waitingSlot.queued, {
-          expand,
-          open,
-          contextGeneration,
-          targetRevision: revision,
-        })
-        enqueueWorkspaceFileLoadWaiter({
-          ownerId: workspaceLoadOwnerIdRef.current,
-          changeSetId,
-          priority: waitingSlot.queued.open,
-          timeoutMs: WORKSPACE_OPERATION_TIMEOUT_MS,
-          shouldDispatch: () => {
-            if (!workspaceOwnerActiveRef.current) return false
-            const currentSlot = workspaceFileLoadsRef.current.get(changeSetId)
-            if (
-              currentSlot !== waitingSlot ||
-              currentSlot.inFlight ||
-              !currentSlot.waitingForConcurrency
-            ) {
-              return false
-            }
-            const intent = currentSlot.queued
-            if (!intent) return false
-            if (!intent.open && currentWorkspaceChangeSetRevision(changeSetId) === undefined) {
-              currentSlot.waitingForConcurrency = false
-              currentSlot.queued = undefined
-              workspaceFileLoadsRef.current.delete(changeSetId)
-              return false
-            }
-            return true
-          },
-          onGrant: () => {
-            const currentSlot = workspaceFileLoadsRef.current.get(changeSetId)
-            if (
-              currentSlot !== waitingSlot ||
-              currentSlot.inFlight ||
-              !currentSlot.waitingForConcurrency
-            ) {
-              return
-            }
-            const intent = currentSlot.queued
-            currentSlot.waitingForConcurrency = false
-            currentSlot.queued = undefined
-            workspaceFileLoadsRef.current.delete(changeSetId)
-            if (intent) {
-              void loadWorkspaceFilesRef.current?.(
-                changeSetId,
-                intent.expand,
-                intent.open,
-                intent.contextGeneration,
-                intent.targetRevision,
-              )
-            }
-          },
-          onReject: (reason) => {
-            const currentSlot = workspaceFileLoadsRef.current.get(changeSetId)
-            if (
-              currentSlot !== waitingSlot ||
-              currentSlot.inFlight ||
-              !currentSlot.waitingForConcurrency
-            ) {
-              return
-            }
-            const intent = currentSlot.queued
-            currentSlot.waitingForConcurrency = false
-            currentSlot.queued = undefined
-            workspaceFileLoadsRef.current.delete(changeSetId)
-            if (!workspaceOwnerActiveRef.current || !intent) return
-            const message =
-              reason === 'queue_full'
-                ? 'Too many changed file lists are loading right now. Try again.'
-                : 'Loading changed files took too long. Try again.'
-            const existingEntry = workspaceFilesMapRef.current.get(changeSetId)
-            const latestRev =
-              currentWorkspaceChangeSetRevision(changeSetId) ?? intent.targetRevision
-            const currentEntry =
-              (existingEntry?.revision ?? 0) === latestRev ? existingEntry : undefined
-            upsertWorkspaceFiles(changeSetId, {
-              changeSetId,
-              revision: latestRev,
-              files: currentEntry?.files ?? [],
-              nextPath: currentEntry?.nextPath ?? null,
-              loading: false,
-              expanded: intent.expand || existingEntry?.expanded || false,
-              error: message,
-            })
-            if (intent.open) onNotice(message)
-          },
-        })
-        return
-      }
-
-      const activeSlot = slot
-      const generation = ++activeSlot.generation
-      activeSlot.waitingForConcurrency = false
-      activeSlot.inFlight = true
-      activeSlot.inFlightRevision = revision
-      activeSlot.inFlightExpand = expand || existing?.expanded || false
-      activeSlot.inFlightOpen = open
-      activeSlot.inFlightContextGeneration = contextGeneration
-      activeSlot.timedOut = false
-      if (activeSlot.timeout !== undefined) window.clearTimeout(activeSlot.timeout)
-      const initial: WorkspaceChangesList = {
-        changeSetId,
-        revision,
-        files: current?.files ?? [],
-        nextPath: current?.nextPath ?? null,
-        loading: true,
-        expanded: expand || existing?.expanded || false,
-      }
-      upsertWorkspaceFiles(changeSetId, initial)
-      const localTimeout = window.setTimeout(() => {
-        if (
-          !workspaceOwnerActiveRef.current ||
-          workspaceFileLoadsRef.current.get(changeSetId) !== activeSlot ||
-          generation !== activeSlot.generation
-        )
-          return
-        activeSlot.generation += 1
-        activeSlot.timedOut = true
-        activeSlot.timeout = undefined
-        upsertWorkspaceFiles(changeSetId, {
-          ...initial,
-          loading: false,
-          error: 'Loading changed files took too long. Try again.',
-        })
-        if (open) onNotice('Loading changed files took too long. Try again.')
-      }, WORKSPACE_OPERATION_TIMEOUT_MS)
-      activeSlot.timeout = localTimeout
-      try {
-        const result = await window.pact.readWorkspaceChanges({
-          changeSetId,
-          ...(current?.nextPath ? { afterPath: current.nextPath } : {}),
-        })
-        if (
-          !workspaceOwnerActiveRef.current ||
-          workspaceFileLoadsRef.current.get(changeSetId) !== activeSlot ||
-          generation !== activeSlot.generation ||
-          activeSlot.timedOut
-        )
-          return
-        const latestRevision = currentWorkspaceChangeSetRevision(changeSetId)
-        if (latestRevision !== undefined && latestRevision !== revision) {
-          activeSlot.queued = coalesceWorkspaceLoadIntent(
-            activeSlot.queued,
-            {
-              expand: initial.expanded,
-              open,
-              contextGeneration,
-              targetRevision: latestRevision,
-            },
-            { autoRefresh: true },
-          )
-          return
-        }
-        if (!result.ok) {
-          upsertWorkspaceFiles(changeSetId, {
-            ...initial,
-            loading: false,
-            error: result.error.message,
-          })
-          if (open) onNotice(result.error.message)
-          return
-        }
-        if (
-          result.value.changeSet.id !== changeSetId ||
-          result.value.changeSet.sessionId !== session.id
-        )
-          throw new Error('These file changes do not belong to this session.')
-        if ((result.value.changeSet.revision ?? 0) !== revision)
-          throw new Error('Changed files were updated while loading. Try again.')
-        const files = [...initial.files, ...result.value.files]
-        if (files.length > WORKSPACE_CHANGE_FILES)
-          throw new Error('Too many changed files to display at once.')
-        if (new Set(files.map((file) => file.path)).size !== files.length)
-          throw new Error('Changed file list contained duplicate paths.')
-        if (!result.value.nextPath && files.length !== result.value.changeSet.fileCount)
-          throw new Error('Changed file list is incomplete. Try again.')
-        if (result.value.nextPath && result.value.nextPath === current?.nextPath)
-          throw new Error('Couldn’t load the next page of changed files.')
-        upsertWorkspaceFiles(changeSetId, {
-          ...initial,
-          revision: result.value.changeSet.revision ?? 0,
-          files,
-          nextPath: result.value.nextPath,
-          loading: false,
-        })
-        if (open) {
-          const first = files[0]
-          if (first)
-            onOpenWorkspaceChanges(
-              changeSetId,
-              first.path,
-              contextGeneration,
-              result.value.changeSet.revision,
-            )
-          else onNotice('No changed files were recorded for this turn.')
-        }
-      } catch (failure) {
-        if (
-          !workspaceOwnerActiveRef.current ||
-          workspaceFileLoadsRef.current.get(changeSetId) !== activeSlot ||
-          generation !== activeSlot.generation ||
-          activeSlot.timedOut
-        )
-          return
-        const latestRevision = currentWorkspaceChangeSetRevision(changeSetId)
-        if (latestRevision !== undefined && latestRevision !== revision) {
-          activeSlot.queued = coalesceWorkspaceLoadIntent(
-            activeSlot.queued,
-            {
-              expand: initial.expanded,
-              open,
-              contextGeneration,
-              targetRevision: latestRevision,
-            },
-            { autoRefresh: true },
-          )
-          return
-        }
-        const message = failure instanceof Error ? failure.message : 'Couldn’t load changed files.'
-        upsertWorkspaceFiles(changeSetId, { ...initial, loading: false, error: message })
-        if (open) onNotice(message)
-      } finally {
-        window.clearTimeout(localTimeout)
-        let replayIntent: WorkspaceFileLoadIntent | undefined
-        if (workspaceFileLoadsRef.current.get(changeSetId) === activeSlot) {
-          if (activeSlot.timeout === localTimeout) activeSlot.timeout = undefined
-          activeSlot.inFlight = false
-          activeSlot.timedOut = false
-          replayIntent = activeSlot.queued
-          activeSlot.queued = undefined
-          if (!activeSlot.waitingForConcurrency) {
-            workspaceFileLoadsRef.current.delete(changeSetId)
-          }
-        }
-        releasePhysicalSlot()
-        if (workspaceOwnerActiveRef.current && replayIntent) {
-          void loadWorkspaceFilesRef.current?.(
-            changeSetId,
-            replayIntent.expand,
-            replayIntent.open,
-            replayIntent.contextGeneration,
-            replayIntent.targetRevision,
-          )
-        }
-      }
-    },
-    [
-      currentWorkspaceChangeSetRevision,
-      onNotice,
-      onOpenWorkspaceChanges,
-      session.id,
-      upsertWorkspaceFiles,
-    ],
-  )
-
-  useLayoutEffect(() => {
-    loadWorkspaceFilesRef.current = loadWorkspaceFiles
-  }, [loadWorkspaceFiles])
-
-  const latestChangesRun = history.window?.latestRun
-  const newestChangesId = hasVisibleChanges(latestChangesRun)
-    ? latestChangesRun?.workspaceChanges?.id
-    : undefined
-  useEffect(() => {
-    if (visible && newestChangesId && defaultWorkspaceChangesIdRef.current !== newestChangesId) {
-      defaultWorkspaceChangesIdRef.current = newestChangesId
-      void loadWorkspaceFiles(newestChangesId)
-    }
-  }, [visible, newestChangesId, loadWorkspaceFiles])
-
-  const undoWorkspaceChanges = useCallback(
-    (changeSetId: string): void => {
-      if (undoingChangeSetRef.current || undoingFileRef.current) return
-      undoingChangeSetRef.current = changeSetId
-      setUndoingChangeSetId(changeSetId)
-      void onUndoWorkspaceChanges(changeSetId).finally(() => {
-        undoingChangeSetRef.current = undefined
-        if (workspaceOwnerActiveRef.current) setUndoingChangeSetId(undefined)
-      })
-    },
-    [onUndoWorkspaceChanges],
-  )
-
-  const handleUndoWorkspaceFile = useCallback(
-    async (changeSetId: string, path: string): Promise<boolean> => {
-      if (!onUndoWorkspaceFile || undoingChangeSetRef.current || undoingFileRef.current) {
-        return false
-      }
-      const target = { changeSetId, path }
-      undoingFileRef.current = target
-      setUndoingFile(target)
-      try {
-        return await onUndoWorkspaceFile(changeSetId, path)
-      } finally {
-        undoingFileRef.current = undefined
-        if (workspaceOwnerActiveRef.current) setUndoingFile(undefined)
-      }
-    },
-    [onUndoWorkspaceFile],
-  )
-
   const [commentEditor, setCommentEditor] = useState<CommentEditorState | undefined>(undefined)
   const [savingComment, setSavingComment] = useState(false)
   const pendingCommentSave = useRef<CommentEditorState | undefined>(undefined)
-  const gapRetryRef = useRef<{ mode: 'around'; messageId: string } | { mode: 'latest' }>({
-    mode: 'latest',
-  })
-  const [copyFeedback, setCopyFeedback] = useState<
-    { messageId: string; result: 'copying' | 'copied' | 'failed' } | undefined
-  >(undefined)
-  const copyFeedbackTimerRef = useRef<number | undefined>(undefined)
   const composerRef = useRef<ComposerEditorHandle>(null)
   const [gallery, setGallery] = useState<{ images: ConversationImage[]; initialId: string }>()
   const openImageGallery = useCallback(
@@ -804,32 +299,8 @@ export function ConversationView({
   const dismissedMention = useRef<MentionQuery | undefined>(undefined)
   const [mentionQuery, setMentionQuery] = useState<MentionQuery | undefined>()
   const [activeMentionIndex, setActiveMentionIndex] = useState(0)
-  const copyRequestGenerationRef = useRef(0)
-  const copyActiveRef = useRef(true)
-  const transcriptRef = useRef<HTMLElement>(null)
-  const transcriptContentRef = useRef<HTMLDivElement>(null)
-  const messageListRef = useRef<HTMLOListElement>(null)
-  const [listOffset, setListOffset] = useState(24)
-  const [selectionMessageIds, setSelectionMessageIds] = useState<string[]>([])
-  const [selectionPlan, setSelectionPlan] = useState<MessageCommentAnchor['plan']>()
-  const [selectionReport, setSelectionReport] = useState<MessageCommentAnchor['report']>()
-  const [restorationReport, setRestorationReport] = useState<MessageCommentAnchor['report']>()
-  const [restorationPlan, setRestorationPlan] = useState<MessageCommentAnchor['plan']>()
-  const [restorationMessageIds, setRestorationMessageIds] = useState<string[]>([])
-  const [requestedResponseId, setRequestedResponseId] = useState<string>()
-  const [focusedRowKey, setFocusedRowKey] = useState<string>()
-  const olderRequestedRef = useRef(false)
-  const scrollIntentRef = useRef<'older' | 'newer' | 'drag' | 'start' | undefined>(undefined)
-  const lastScrollRef = useRef({ top: 0, backward: false })
-  const historyReadDirectionRef = useRef<'older' | 'latest'>('older')
-  const prependAnchorRef = useRef<
-    { messageId: string; top: number; beforeDisplay: ConversationDisplayOrder } | undefined
-  >(undefined)
-  const focusAfterPageRef = useRef<'latest' | undefined>(undefined)
   const commentTextareaRef = useRef<HTMLTextAreaElement>(null)
   const commentFocusRef = useRef<{ visible: boolean; cancel?: () => void }>({ visible })
-  const messageRefs = useRef(new Map<string, HTMLElement>())
-  const messagesRef = useRef(snapshot?.messages)
   // Completed Markdown can skip Composer/stream renders; its stable event
   // handlers read the latest projection only when the user acts.
   const messageInteractionRef = useRef({
@@ -838,57 +309,6 @@ export function ConversationView({
     onNotice,
     onOpenProjectFile,
   })
-  const [dismissedNavigation, setDismissedNavigation] = useState<typeof messageNavigation>()
-  const [cardPlanNavigation, setCardPlanNavigation] = useState<
-    NonNullable<ConversationViewProps['messageNavigation']> & { sessionId: string }
-  >()
-  const planSourceNavigation =
-    messageNavigation?.plan && dismissedNavigation !== messageNavigation
-      ? messageNavigation
-      : cardPlanNavigation?.sessionId === session.id
-        ? cardPlanNavigation
-        : undefined
-  const openRecordedPlan = useCallback(
-    (source: { runId: string; messageId: string; version: number }): void => {
-      setDismissedNavigation(messageNavigation)
-      setCardPlanNavigation({
-        sessionId: session.id,
-        navigationId: crypto.randomUUID(),
-        messageId: source.messageId,
-        startOffset: 0,
-        endOffset: 0,
-        plan: { runId: source.runId, version: source.version },
-      })
-      onOpenPlan?.()
-    },
-    [messageNavigation, onOpenPlan, session.id],
-  )
-  const planSourceNavigationRef = useRef(planSourceNavigation)
-  planSourceNavigationRef.current = planSourceNavigation
-  const openPlanCallback = useRef(onOpenPlan)
-  openPlanCallback.current = onOpenPlan
-  const appliedNavigationRef = useRef<typeof messageNavigation>(undefined)
-  const queueDockRef = useRef<HTMLDivElement>(null)
-  const appliedGapResyncRef = useRef(0)
-  const gapRestoreRef = useRef<
-    | {
-        messageId: string
-        top: number
-        plan?: MessageCommentAnchor['plan']
-        report?: MessageCommentAnchor['report']
-        selection?: {
-          messageId?: string
-          startOffset: number
-          endOffset: number
-          highlight?: boolean
-          plan?: MessageCommentAnchor['plan']
-          report?: MessageCommentAnchor['report']
-        }
-      }
-    | undefined
-  >(undefined)
-  const stickToBottomRef = useRef(true)
-  const wasVisibleRef = useRef(visible)
 
   const runsById = useMemo(
     () => new Map((snapshot?.runs ?? []).map((run) => [run.id, run])),
@@ -918,17 +338,40 @@ export function ConversationView({
   }, [snapshot?.messages, runsById])
   const latestRun = history.window?.latestRun
 
-  const [currentPlan, setCurrentPlan] = useState<{
-    sessionId: string
-    task?: CollaborationTask | undefined
-    replacement?:
-      | Extract<ConversationPage, { scope: 'collaboration' }>['view']['replacement']
-      | undefined
-    planSync?: Extract<ConversationPage, { scope: 'collaboration' }>['view']['planSync'] | undefined
-    source?: { runId: string; messageId: string } | undefined
-    error?: string | undefined
-  }>()
-  const [planRefresh, setPlanRefresh] = useState(0)
+  const {
+    dismissedNavigation,
+    dismissCommentNavigation,
+    isNavigationApplied,
+    markNavigationApplied,
+    openRecordedPlan,
+    currentPlan,
+    planningTask,
+    unfinishedTask,
+    inputGateState,
+    planRecovery,
+    decisionSource,
+    decisionKey,
+    decisionTakeover,
+    planSourcePreview,
+    planSourceKey,
+    handlePanelPlanReady,
+    handlePlanRevealApplied,
+    handleClosePlanPanel,
+    refreshTaskPlan,
+    latestPlanVersion,
+    showCurrentPlan,
+  } = useConversationPlanPreview({
+    sessionId: session.id,
+    visible,
+    latestRun,
+    queueRevision: snapshot?.queue?.revision,
+    messageNavigation,
+    onPlanAvailable,
+    onOpenPlan,
+    onClosePlan,
+    onRegisterShowCurrentPlan,
+  })
+
   const [answeredDecisionKey, setAnsweredDecisionKey] = useState<string>()
   const [replacement, setReplacement] = useState<{
     sessionId: string
@@ -941,94 +384,6 @@ export function ConversationView({
   // One frozen replacement reference per confirmation; uncertain acknowledgments retry the same proof.
   const replacementAttempt = useRef<{ taskId: string; revision: number } | undefined>(undefined)
   const replacementRestoreFocus = useRef(false)
-  const planReadOwner = useRef<{
-    active: boolean
-    pending: boolean
-    desired?: { sessionId: string; key: string } | undefined
-  }>({ active: true, pending: false })
-  const planAvailableCallback = useRef(onPlanAvailable)
-  planAvailableCallback.current = onPlanAvailable
-  const planReadKey = `${latestRun?.id ?? ''}:${latestRun?.status ?? ''}:${latestRun && !['starting', 'running', 'recovering'].includes(latestRun.status) ? latestRun.updatedAt : ''}:${snapshot?.queue?.revision ?? ''}:${planRefresh}`
-
-  useEffect(() => {
-    const owner = planReadOwner.current
-    owner.active = true
-    return () => {
-      owner.active = false
-      owner.desired = undefined
-    }
-  }, [])
-
-  useEffect(() => {
-    const owner = planReadOwner.current
-    owner.desired = visible ? { sessionId: session.id, key: planReadKey } : undefined
-    const read = async (): Promise<void> => {
-      if (owner.pending || !owner.active || !owner.desired) return
-      owner.pending = true
-      const requested = owner.desired
-      try {
-        const response = await window.pact.getConversation({
-          scope: 'collaboration',
-          sessionId: requested.sessionId,
-          projection: 'current',
-        })
-        if (!owner.active || owner.desired !== requested) return
-        if (!response.ok || response.value.scope !== 'collaboration') {
-          setCurrentPlan((current) => ({
-            ...(current?.sessionId === requested.sessionId ? current : {}),
-            sessionId: requested.sessionId,
-            error: response.ok ? 'Plan unavailable.' : response.error.message,
-          }))
-          return
-        }
-        const view = response.value.view
-        const task = view.task ?? undefined
-        setCurrentPlan({
-          sessionId: requested.sessionId,
-          task,
-          replacement: view.replacement,
-          source: view.planSource,
-          planSync: view.planSync,
-        })
-        if (!planSourceNavigationRef.current)
-          planAvailableCallback.current?.(
-            requested.sessionId,
-            task?.planReference && view.planSource ? task.id : undefined,
-          )
-      } catch {
-        if (owner.active && owner.desired === requested)
-          setCurrentPlan((current) => ({
-            ...(current?.sessionId === requested.sessionId ? current : {}),
-            sessionId: requested.sessionId,
-            error: 'Plan unavailable.',
-          }))
-      } finally {
-        owner.pending = false
-        if (owner.active && owner.desired && owner.desired !== requested) void read()
-      }
-    }
-    void read()
-  }, [session.id, planReadKey, visible])
-
-  const currentTask = currentPlan?.sessionId === session.id ? currentPlan.task : undefined
-  const planningTask =
-    currentTask && (currentTask.kind === 'plan' || Boolean(currentTask.planReference))
-      ? currentTask
-      : undefined
-  const unfinishedTask = currentTask?.status === 'complete' ? undefined : currentTask
-  const inputGateState = unfinishedTask ? collaborationInputGate(unfinishedTask) : undefined
-  const planRecovery =
-    currentPlan?.sessionId === session.id && currentPlan.planSync?.runId === unfinishedTask?.runId
-      ? currentPlan?.planSync
-      : undefined
-  const decisionSource = unfinishedTask
-    ? collaborationInputProcessing(unfinishedTask).decision
-    : undefined
-  const decisionKey =
-    unfinishedTask && decisionSource
-      ? `${unfinishedTask.id}:${decisionSource.runId}:${unfinishedTask.inputSequence}`
-      : undefined
-  const decisionTakeover = Boolean(decisionSource)
   const nativeRequests = nativeInputRequests(snapshot)
   const nativeQuestions = nativeRequests.filter(
     ({ request }) => request.kind && request.kind !== 'approval',
@@ -1504,38 +859,13 @@ export function ConversationView({
     ? `${mentionListId}-${filteredMentionOptions[activeMentionIndex]?.token.slice(1) ?? 'none'}`
     : undefined
 
-  const scrollVersion = `${snapshot?.messages.at(-1)?.id ?? ''}:${snapshot?.messages.length ?? 0}:${snapshot?.activities.length ?? 0}:${snapshot?.runs.length ?? 0}:${loading}`
-  const residentMessages = snapshot?.messages
-  const navigationMessage = messageNavigation
-    ? residentMessages?.find((message) => message.id === messageNavigation.messageId)
-    : undefined
   useEffect(() => {
     dismissedMention.current = undefined
     setMentionQuery(undefined)
     setActiveMentionIndex(0)
   }, [session.id])
 
-  const historyLoadingPage = history.loadingPage
-  const hasOlderHistory = history.window?.hasOlder
-  const hasNewerHistory = Boolean(
-    history.window &&
-    (history.window.hasNewer ||
-      (history.window.latestCompleteAssistantSequence ?? -1) >
-        (residentMessages?.reduce(
-          (latest, message) => Math.max(latest, conversationMessageOrder(message).sequence),
-          -1,
-        ) ?? -1)),
-  )
-  const ensureMessage = history.ensureMessage
-  const recoverFromGap = history.recoverFromGap
-  const loadLatestForGap = history.recoverLatest ?? history.loadLatest
-  const historyLoading = history.loadingPage
-  const gapRecoveryPending = history.gapRecoveryPending
-  const historyResyncToken = history.historyResyncToken
-  const protectReading = history.protectReading
-
   useLayoutEffect(() => {
-    messagesRef.current = snapshot?.messages
     messageInteractionRef.current = {
       snapshot,
       messageMeta: history.window?.messageMeta,
@@ -1544,951 +874,72 @@ export function ConversationView({
     }
   }, [snapshot, history.window?.messageMeta, onNotice, onOpenProjectFile])
 
-  // Refresh any cached workspace file lists whose changeSet revision advanced (e.g. recording -> settled).
-  const workspaceChangesRevisionKey = useMemo(
-    () =>
-      (snapshot?.runs ?? [])
-        .filter((run) => Boolean(run.workspaceChanges))
-        .map((run) => `${run.workspaceChanges!.id}:${run.workspaceChanges!.revision ?? 0}`)
-        .join('|'),
-    [snapshot?.runs],
-  )
-  useEffect(() => {
-    const runs = messageInteractionRef.current.snapshot?.runs
-    if (!runs?.length) return
-    const trackedIds = new Set<string>([
-      ...workspaceFilesMapRef.current.keys(),
-      ...workspaceFileLoadsRef.current.keys(),
-    ])
-    for (const changeSetId of trackedIds) {
-      const summary = runs.find((run) => run.workspaceChanges?.id === changeSetId)?.workspaceChanges
-      if (!summary) continue
-      const nextRevision = summary.revision ?? 0
-      const list = workspaceFilesMapRef.current.get(changeSetId)
-      const slot = workspaceFileLoadsRef.current.get(changeSetId)
-      if (slot?.inFlight) {
-        if (slot.inFlightRevision === nextRevision) continue
-        slot.generation += 1
-        if (slot.timeout !== undefined) {
-          window.clearTimeout(slot.timeout)
-          slot.timeout = undefined
-        }
-        slot.queued = coalesceWorkspaceLoadIntent(
-          slot.queued,
-          {
-            expand: slot.inFlightExpand || list?.expanded || false,
-            open: slot.inFlightOpen,
-            contextGeneration: slot.inFlightContextGeneration,
-            targetRevision: nextRevision,
-          },
-          { autoRefresh: true },
-        )
-        continue
-      }
-      if (slot?.waitingForConcurrency && slot.queued) {
-        if (slot.queued.targetRevision !== nextRevision) {
-          slot.queued = { ...slot.queued, targetRevision: nextRevision }
-        }
-        continue
-      }
-      if (list && (list.revision ?? 0) !== nextRevision) {
-        void loadWorkspaceFiles(changeSetId, list.expanded)
-      }
-    }
-  }, [workspaceChangesRevisionKey, loadWorkspaceFiles])
-
   const openProjectFile = useCallback((target: ProjectFileTarget): void => {
     messageInteractionRef.current.onOpenProjectFile(target)
   }, [])
-  const registerMessageElement = useCallback(
-    (messageId: string, element: HTMLElement | null): void => {
-      if (element) messageRefs.current.set(messageId, element)
-      else messageRefs.current.delete(messageId)
-    },
-    [],
-  )
 
-  const visibleReadingSource = useCallback(():
-    | {
-        messageId: string
-        element: HTMLElement
-        plan?: MessageCommentAnchor['plan']
-      }
-    | undefined => {
-    const transcript = transcriptRef.current
-    if (!transcript) return undefined
-    const viewport = transcript.getBoundingClientRect()
-    const visibleElement = (element: HTMLElement): boolean => {
-      const rect = element.getBoundingClientRect()
-      return rect.bottom > viewport.top && rect.top < viewport.bottom
-    }
-    let first:
-      | { messageId: string; element: HTMLElement; plan?: MessageCommentAnchor['plan'] }
-      | undefined
-    const consider = (candidate: NonNullable<typeof first>): void => {
-      if (!visibleElement(candidate.element)) return
-      if (
-        !first ||
-        first.element.compareDocumentPosition(candidate.element) & Node.DOCUMENT_POSITION_PRECEDING
-      )
-        first = candidate
-    }
-    for (const message of messagesRef.current ?? []) {
-      const element = messageRefs.current.get(message.id)
-      if (element) consider({ messageId: message.id, element })
-    }
-    for (const document of transcript.querySelectorAll<HTMLElement>('[data-pact-plan-run-id]')) {
-      const plan = planSelectionSource(document)
-      const messageId = document.dataset.pactPlanMessageId
-      const element = document.closest<HTMLElement>('.pact-review-card')
-      if (plan && messageId && element) consider({ messageId, element, plan })
-    }
-    return first
-  }, [])
-
-  const readingPositionLost = history.readingPositionLost
-  const hasProtectedSelection = useCallback((): boolean => {
-    const selection = window.getSelection()
-    const anchor = selection?.anchorNode
-    const messageId = (
-      anchor instanceof HTMLElement ? anchor : anchor?.parentElement
-    )?.closest<HTMLElement>('[data-pact-message-id]')?.dataset.pactMessageId
-    return Boolean(
-      selection &&
-      !selection.isCollapsed &&
-      transcriptRef.current?.contains(selection.anchorNode) &&
-      messagesRef.current?.find((message) => message.id === messageId)?.state !== 'streaming' &&
-      !isProjectionHighlightOwned(),
-    )
-  }, [])
-
-  const clearOffscreenOrdinarySelection = useCallback((): void => {
-    const selection = window.getSelection()
-    const transcript = transcriptRef.current
-    if (
-      !selection ||
-      selection.isCollapsed ||
-      !transcript?.contains(selection.anchorNode) ||
-      isProjectionHighlightOwned()
-    )
-      return
-    const anchor = selection.anchorNode
-    const selectedMessageId = (
-      anchor instanceof HTMLElement ? anchor : anchor?.parentElement
-    )?.closest<HTMLElement>('[data-pact-message-id]')?.dataset.pactMessageId
-    const selectedIds = selectionMessageIds.length
-      ? selectionMessageIds
-      : selectedMessageId
-        ? [selectedMessageId]
-        : []
-    const viewport = transcript.getBoundingClientRect()
-    const selectedRows = selectionPlan
-      ? [transcript.querySelector<HTMLElement>(`[data-pact-plan-run-id="${selectionPlan.runId}"]`)]
-      : selectedIds.map((id) => messageRefs.current.get(id))
-    const offscreen = selectedRows.some((row) => {
-      if (!row) return true
-      const rect = row.getBoundingClientRect()
-      return rect.bottom <= viewport.top || rect.top >= viewport.bottom
-    })
-    if (!offscreen) return
-    const restore = gapRestoreRef.current
-    if (restore?.selection) {
-      gapRestoreRef.current = {
-        messageId: restore.messageId,
-        top: restore.top,
-        ...(restore.plan ? { plan: restore.plan } : {}),
-      }
-      setRestorationMessageIds([restore.messageId])
-    }
-    selection.removeAllRanges()
-    setSelectionMessageIds([])
-  }, [selectionMessageIds, selectionPlan])
-
-  const snapshotFoldGuard = useCallback(
-    (): boolean =>
-      visible &&
-      stickToBottomRef.current &&
-      !hasProtectedSelection() &&
-      !history.gapRecoveryPending &&
-      !Object.values(history.window?.messageMeta ?? {}).some((meta) => meta.bodyResync),
-    [visible, hasProtectedSelection, history.gapRecoveryPending, history.window?.messageMeta],
-  )
-  useLayoutEffect(() => {
-    history.setSnapshotFoldGuard?.(snapshotFoldGuard)
-    return () => history.setSnapshotFoldGuard?.(undefined)
-  }, [history, snapshotFoldGuard])
-
-  const collapseCompletedOutput = useCallback(() => {
-    const runId = history.window?.preserveRunId
-    if (!runId) return
-    const run = runsById.get(runId)
-    if (
-      !run?.outputSnapshots?.settled ||
-      history.loadingPage ||
-      history.pageError ||
-      !snapshotFoldGuard()
-    )
-      return
-    const canonical = snapshot?.messages.find(
-      (message) => message.runId === run.id && message.outputSnapshot?.canonical,
-    )
-    if (!canonical || canonical.state !== 'complete') return
-    void history.collapseEarlierResponses?.(run.id)
-  }, [history, runsById, snapshotFoldGuard, snapshot?.messages])
-  useEffect(collapseCompletedOutput, [collapseCompletedOutput])
-
-  const rows = useMemo<ConversationTranscriptRow[]>(() => {
-    const messages = (snapshot?.messages ?? []).filter(
-      (message) =>
-        message.role !== 'assistant' ||
-        message.content.trim() ||
-        history.window?.messageMeta[message.id]?.oversized ||
-        history.window?.messageMeta[message.id]?.hasComments ||
-        Boolean(
-          message.runId &&
-          (hasVisibleChanges(runsById.get(message.runId)) ||
-            runsById.get(message.runId)?.collaboration),
-        ),
-    )
-    const result: ConversationTranscriptRow[] = messages.map((message) => ({
-      key:
-        message.outputSnapshot && message.outputSnapshot.ordinal > 0
-          ? `message:${message.id}`
-          : history.window?.sourceMessageId === message.id
-            ? `source:${message.id}`
-            : message.replyToMessageId
-              ? `reply:${message.replyToMessageId}:${message.agentId ?? 'unknown'}:${message.runId ?? 'unknown'}`
-              : `message:${message.id}`,
-      message,
-      run: undefined,
-      context: undefined,
-    }))
-    for (const context of history.window?.runContexts ?? []) {
-      const run = runsById.get(context.runId)
-      if (run && !isRunResponseComplete(run))
-        result.push({ key: `run-context:${context.runId}`, message: undefined, run, context })
-    }
-    result.sort((left, right) =>
-      compareConversationDisplayOrder(
-        left.message ? conversationMessageOrder(left.message) : left.context!.order,
-        right.message ? conversationMessageOrder(right.message) : right.context!.order,
-      ),
-    )
-    const artifactGroups = history.window?.runArtifacts ?? []
-    const latestArtifactIds = new Set(artifactGroups.map((group) => group.latestRunId))
-    for (const run of snapshot?.runs ?? []) {
-      if ((!hasVisibleChanges(run) && !hasRecordingWarning(run)) || !latestArtifactIds.has(run.id))
-        continue
-      const replyIndex = result.findIndex(
-        (row) =>
-          row.message?.replyToMessageId === run.userMessageId &&
-          row.message.agentId === run.agentId &&
-          row.message.outputSnapshot?.canonical !== false,
-      )
-      if (run.outputSnapshots?.count && replyIndex < 0) continue
-      const userIndex =
-        replyIndex >= 0
-          ? replyIndex
-          : result.findIndex(
-              (row) =>
-                row.message?.id === run.userMessageId ||
-                row.message?.replyToMessageId === run.userMessageId,
-            )
-      if (userIndex < 0) continue
-      let index = userIndex + 1
-      while (index < result.length) {
-        const next = result[index]!
-        if (
-          next.message?.replyToMessageId !== run.userMessageId &&
-          next.run?.userMessageId !== run.userMessageId
-        )
-          break
-        const nextRun =
-          next.run ?? (next.message?.runId ? runsById.get(next.message.runId) : undefined)
-        if (nextRun && nextRun.createdAt > run.createdAt) break
-        index += 1
-      }
-      result.splice(index, 0, { key: `changes:${run.id}`, message: undefined, run })
-    }
-    for (const run of snapshot?.runs ?? []) {
-      if (
-        !run.collaboration ||
-        ['starting', 'running', 'recovering'].includes(run.status) ||
-        result.some(
-          (row) =>
-            row.run?.id === run.id ||
-            (row.message?.role === 'assistant' && row.message.runId === run.id),
-        )
-      )
-        continue
-      const userIndex = result.findIndex((row) => row.message?.id === run.userMessageId)
-      if (userIndex >= 0)
-        result.splice(userIndex + 1, 0, {
-          key: `reply:${run.userMessageId}:${run.agentId}:${run.id}`,
-          message: undefined,
-          run,
-        })
-    }
-    if (
-      activeRun &&
-      !activeRunHasMessage &&
-      !result.some((row) => row.context?.runId === activeRun.id)
-    )
-      result.push({
-        key: `reply:${activeRun.userMessageId}:${activeRun.agentId}:${activeRun.id}`,
-        message: undefined,
-        run: activeRun,
-      })
-    return result
-  }, [
-    snapshot?.messages,
-    history.window?.messageMeta,
-    history.window?.sourceMessageId,
-    activeRun,
-    activeRunHasMessage,
-    snapshot?.runs,
-    history.window?.runArtifacts,
-    history.window?.runContexts,
-    runsById,
-  ])
-
-  const rowKeySignature = useMemo(() => rows.map((row) => row.key).join('\0'), [rows])
-  const rowKeys = useMemo(
-    () => (rowKeySignature ? rowKeySignature.split('\0') : []),
-    [rowKeySignature],
-  )
-  const getRowKey = useCallback((index: number) => rowKeys[index]!, [rowKeys])
-  const pinnedIndexes = useMemo(() => {
-    const ids = new Set(selectionMessageIds)
-    const workLogRunId = history.window?.activityView?.manual
-      ? history.window.activityView.runId
-      : undefined
-    const workLogComplete = isRunResponseComplete(
-      workLogRunId ? runsById.get(workLogRunId) : undefined,
-    )
-    const planRunId =
-      selectionPlan?.runId ??
-      selectionReport?.runId ??
-      restorationReport?.runId ??
-      restorationPlan?.runId ??
-      (messageNavigation && dismissedNavigation !== messageNavigation
-        ? (messageNavigation.plan?.runId ?? messageNavigation.report?.runId)
-        : undefined)
-    for (const id of restorationMessageIds) ids.add(id)
-    if (messageNavigation && dismissedNavigation !== messageNavigation)
-      ids.add(messageNavigation.messageId)
-    return rows.flatMap((row, index) =>
-      row.key === focusedRowKey ||
-      (row.message && ids.has(row.message.id)) ||
-      Boolean(
-        planRunId &&
-        !row.context &&
-        row.message?.outputSnapshot?.canonical !== false &&
-        (row.run?.id === planRunId || row.message?.runId === planRunId),
-      ) ||
-      Boolean(
-        workLogRunId &&
-        (workLogComplete
-          ? row.message?.id === activityOwnerMessageByRun.get(workLogRunId)
-          : row.context?.runId === workLogRunId ||
-            (!history.window?.runContexts?.some((context) => context.runId === workLogRunId) &&
-              (row.run?.id === workLogRunId ||
-                row.message?.id === activityOwnerMessageByRun.get(workLogRunId)))),
-      )
-        ? [index]
-        : [],
-    )
-  }, [
-    selectionMessageIds,
-    selectionPlan,
-    selectionReport,
-    restorationReport,
-    restorationPlan,
-    restorationMessageIds,
-    focusedRowKey,
-    messageNavigation,
-    dismissedNavigation,
-    rows,
-    history.window?.activityView,
-    history.window?.runContexts,
-    activityOwnerMessageByRun,
-    runsById,
-  ])
-
-  const virtualizer = useVirtualizer({
-    count: rows.length,
-    getScrollElement: () => transcriptRef.current,
-    estimateSize: () => 180,
-    getItemKey: getRowKey,
-    overscan: TRANSCRIPT_OVERSCAN,
-    useFlushSync: true,
-    measureElement: (element, entry) =>
-      entry?.borderBoxSize[0]?.blockSize ?? element.getBoundingClientRect().height,
-    scrollMargin: listOffset,
-    rangeExtractor: useCallback(
-      (range) => {
-        const indexes = new Set(pinnedIndexes.slice(0, CONVERSATION_WINDOW_MESSAGES))
-        for (const index of defaultRangeExtractor(range)) {
-          if (indexes.size >= CONVERSATION_WINDOW_MESSAGES) break
-          indexes.add(index)
-        }
-        return [...indexes].toSorted((a, b) => a - b)
-      },
-      [pinnedIndexes],
-    ),
-  })
-  virtualizer.shouldAdjustScrollPositionOnItemSizeChange = (item, _delta, instance) => {
-    if (scrollIntentRef.current === 'start') return false
-    const top = transcriptRef.current?.scrollTop ?? instance.scrollOffset ?? 0
-    return instance.itemSizeCache.has(item.key) ? item.end <= top : item.start < top
-  }
-  const virtualRows = virtualizer.getVirtualItems()
-  const isViewportCommitted = useCallback(
-    (transcript: HTMLElement): boolean => {
-      if (Math.abs((virtualizer.scrollOffset ?? 0) - transcript.scrollTop) > 1) return false
-      const current = virtualizer.getVirtualItems()
-      return (
-        current.length === virtualRows.length &&
-        current.every((item, index) => {
-          const rendered = virtualRows[index]!
-          return (
-            item.index === rendered.index &&
-            item.key === rendered.key &&
-            item.start === rendered.start &&
-            item.size === rendered.size
-          )
-        })
-      )
-    },
-    [virtualizer, virtualRows],
-  )
-  const mountedRowKeys = virtualRows.map((row) => row.key).join(':')
-  const retainedRowKeys = useMemo(() => new Set(rowKeys), [rowKeys])
-  const pruneMeasurements = useCallback(() => {
-    for (const key of virtualizer.itemSizeCache.keys()) {
-      if (!retainedRowKeys.has(String(key))) virtualizer.itemSizeCache.delete(key)
-    }
-  }, [virtualizer, retainedRowKeys])
-  const measureRow = useCallback(
-    (element: HTMLLIElement | null) => {
-      if (element) pruneMeasurements()
-      virtualizer.measureElement(element)
-    },
-    [virtualizer, pruneMeasurements],
-  )
-  useLayoutEffect(() => {
-    pruneMeasurements()
-  }, [pruneMeasurements])
-  const cancelPrepend = useCallback(() => {
-    if (!prependAnchorRef.current) return
-    prependAnchorRef.current = undefined
-    setRestorationMessageIds([])
-  }, [])
-
-  useEffect(() => {
-    const protectSelection = (): void => {
-      const selection = window.getSelection()
-      const transcript = transcriptRef.current
-      const ids: string[] = []
-      let plan: MessageCommentAnchor['plan']
-      let report: MessageCommentAnchor['report']
-      if (selection && !selection.isCollapsed && selection.rangeCount === 1 && transcript) {
-        const range = selection.getRangeAt(0)
-        if (transcript.contains(range.commonAncestorContainer)) {
-          const node = range.commonAncestorContainer
-          const host = (
-            node instanceof HTMLElement ? node : node.parentElement
-          )?.closest<HTMLElement>('[data-pact-message-content]')
-          if (host) {
-            plan = planSelectionSource(host)
-            report = reportSelectionSource(host)
-          }
-          for (const [id, row] of messageRefs.current) {
-            if (
-              messagesRef.current?.find((message) => message.id === id)?.state !== 'streaming' &&
-              range.intersectsNode(row)
-            )
-              if (!ids.includes(id)) ids.push(id)
-          }
-        }
-      }
-      setSelectionMessageIds((previous) =>
-        previous.length === ids.length && previous.every((id, index) => id === ids[index])
-          ? previous
-          : ids,
-      )
-      setSelectionPlan((previous) =>
-        previous?.runId === plan?.runId && previous?.version === plan?.version ? previous : plan,
-      )
-      if (ids.length > 0) {
-        stickToBottomRef.current = false
-        scrollIntentRef.current = undefined
-      }
-      setSelectionReport((previous) =>
-        JSON.stringify(previous) === JSON.stringify(report) ? previous : report,
-      )
-    }
-    document.addEventListener('selectionchange', protectSelection)
-    return () => document.removeEventListener('selectionchange', protectSelection)
-  }, [])
-
-  useEffect(() => {
-    if (historyResyncToken === 0) {
-      appliedGapResyncRef.current = 0
-      gapRestoreRef.current = undefined
-      gapRetryRef.current = { mode: 'latest' }
-      setRestorationPlan(undefined)
-      setRestorationReport(undefined)
-    }
-  }, [historyResyncToken])
-
-  useLayoutEffect(() => {
-    const element = transcriptRef.current
-    if (visible && scrollVersion && element && stickToBottomRef.current)
-      element.scrollTop = element.scrollHeight
-  }, [scrollVersion, visible, mountedRowKeys])
-
-  useLayoutEffect(() => {
-    if (wasVisibleRef.current === visible) return
-    wasVisibleRef.current = visible
-    if (visible) return
-    cancelPrepend()
-    const transcript = transcriptRef.current
-    const selection = window.getSelection()
-    const host =
-      selection?.anchorNode instanceof HTMLElement
-        ? selection.anchorNode.closest<HTMLElement>('[data-pact-message-content]')
-        : selection?.anchorNode?.parentElement?.closest<HTMLElement>('[data-pact-message-content]')
-    const selectedId = host?.closest<HTMLElement>('[data-pact-message-id]')?.dataset.pactMessageId
-    const plan = host ? planSelectionSource(host) : undefined
-    const report = host ? reportSelectionSource(host) : undefined
-    const selected =
-      snapshot?.messages.find((message) => message.id === selectedId)?.state !== 'streaming' &&
-      selection &&
-      !selection.isCollapsed &&
-      host &&
-      transcript?.contains(host)
-        ? selectedTextRange(host, selection, CONVERSATION_MARKDOWN_BYTES)
-        : undefined
-    const anchor = visibleReadingSource()
-    const row = anchor?.element
-    if (!anchor || !row || (stickToBottomRef.current && !selected)) {
-      protectReading(undefined)
-      return
-    }
-    gapRestoreRef.current = {
-      messageId: anchor.messageId,
-      top: row.getBoundingClientRect().top,
-      ...(anchor.plan ? { plan: anchor.plan } : {}),
-      ...(selected && selectedId
-        ? {
-            selection: {
-              messageId: selectedId,
-              highlight: isProjectionHighlightOwned(),
-              startOffset: selected.startOffset,
-              endOffset: selected.endOffset,
-              ...(plan ? { plan } : {}),
-              ...(report ? { report } : {}),
-            },
-          }
-        : {}),
-    }
-    setRestorationMessageIds([anchor.messageId, ...(selected && selectedId ? [selectedId] : [])])
-    setRestorationPlan(anchor.plan ?? (selected ? plan : undefined))
-    setRestorationReport(selected ? report : undefined)
-    protectReading(anchor.messageId)
-    stickToBottomRef.current = false
-    scrollIntentRef.current = undefined
-  }, [protectReading, snapshot?.messages, visible, cancelPrepend, visibleReadingSource])
-
-  useLayoutEffect(() => {
-    if (!residentMessages) return undefined
-    const anchor = prependAnchorRef.current
-    if (!anchor) return undefined
-    const oldest = history.window ? conversationWindowStartOrder(history.window) : undefined
-    if (!oldest || compareConversationDisplayOrder(oldest, anchor.beforeDisplay) >= 0)
-      return undefined
-    const message = messageRefs.current.get(anchor.messageId)
-    const transcript = transcriptRef.current
-    if (!transcript) return undefined
-    if (!message) {
-      const index = rows.findIndex((row) => row.message?.id === anchor.messageId)
-      if (index >= 0) virtualizer.scrollToIndex(index, { align: 'start' })
-      else {
-        prependAnchorRef.current = undefined
-        setRestorationMessageIds([])
-      }
-      return undefined
-    }
-    virtualizer.scrollToOffset(
-      transcript.scrollTop + message.getBoundingClientRect().top - anchor.top,
-    )
-    const frame = requestAnimationFrame(() => {
-      if (
-        prependAnchorRef.current !== anchor ||
-        !message.isConnected ||
-        !isViewportCommitted(transcript) ||
-        Math.abs(message.getBoundingClientRect().top - anchor.top) > 2
-      )
-        return undefined
-      prependAnchorRef.current = undefined
-      setRestorationMessageIds([])
-      return undefined
-    })
-    return () => cancelAnimationFrame(frame)
-  }, [residentMessages, history.window, rows, virtualizer, virtualRows, isViewportCommitted])
-
-  useLayoutEffect(() => {
-    const restore = gapRestoreRef.current
-    const transcript = transcriptRef.current
-    if (
-      !visible ||
-      loading ||
-      !snapshot?.messages ||
-      !transcript ||
-      historyLoading ||
-      gapRecoveryPending
-    )
-      return undefined
-    if (!restore && !readingPositionLost) return undefined
-    const message = restore?.plan
-      ? transcript
-          .querySelector<HTMLElement>(`[data-pact-plan-run-id="${restore.plan.runId}"]`)
-          ?.closest<HTMLElement>('.pact-review-card')
-      : restore
-        ? messageRefs.current.get(restore.messageId)
-        : undefined
-    if (restore?.plan && !message && !readingPositionLost) return undefined
-    if (restore && !message && !readingPositionLost) {
-      const index = rows.findIndex((row) => row.message?.id === restore.messageId)
-      if (index >= 0) {
-        virtualizer.scrollToIndex(index, { align: 'start' })
-        return undefined
-      }
-    }
-    if (!message || readingPositionLost) {
-      gapRestoreRef.current = undefined
-      setRestorationMessageIds([])
-      gapRetryRef.current = { mode: 'latest' }
-      setRestorationPlan(undefined)
-      setRestorationReport(undefined)
-      protectReading(undefined)
-      stickToBottomRef.current = true
-      transcript.scrollTop = transcript.scrollHeight
-      if (!readingPositionLost) void loadLatestForGap()
-      return undefined
-    }
-    if (!restore) return undefined
-    const selectionMessage = restore.selection?.messageId
-      ? messageRefs.current.get(restore.selection.messageId)
-      : message
-    if (
-      restore.selection?.messageId &&
-      !selectionMessage &&
-      !restore.selection.plan &&
-      !restore.selection.report
-    ) {
-      const index = rows.findIndex((row) => row.message?.id === restore.selection!.messageId)
-      if (index >= 0) {
-        virtualizer.scrollToIndex(index, { align: 'start' })
-        return undefined
-      }
-      gapRestoreRef.current = {
-        messageId: restore.messageId,
-        top: restore.top,
-        ...(restore.plan ? { plan: restore.plan } : {}),
-      }
-      setRestorationMessageIds([restore.messageId])
-      setSelectionMessageIds([])
-      const currentSelection = window.getSelection()
-      if (transcript.contains(currentSelection?.anchorNode ?? null))
-        currentSelection?.removeAllRanges()
-      return undefined
-    }
-    virtualizer.scrollToOffset(
-      transcript.scrollTop + message.getBoundingClientRect().top - restore.top,
-    )
-    const content = restore.selection?.plan
-      ? transcript.querySelector<HTMLElement>(
-          `[data-pact-plan-run-id="${restore.selection.plan.runId}"] [data-pact-message-content]`,
-        )
-      : restore.selection?.report
-        ? transcript.querySelector<HTMLElement>(
-            `${reportSourceSelector(restore.selection.report)} [data-pact-message-content]`,
-          )
-        : selectionMessage?.querySelector<HTMLElement>('[data-pact-message-content]')
-    const frame = requestAnimationFrame(() => {
-      if (
-        gapRestoreRef.current !== restore ||
-        !wasVisibleRef.current ||
-        !message.isConnected ||
-        !isViewportCommitted(transcript) ||
-        Math.abs(message.getBoundingClientRect().top - restore.top) > 2
-      )
-        return undefined
-      if (restore.selection) {
-        if (
-          !content?.isConnected ||
-          !focusProjectionRange(
-            content,
-            restore.selection.startOffset,
-            restore.selection.endOffset,
-            { scroll: false, highlight: restore.selection.highlight ?? false },
-          )
-        )
-          return undefined
-        setSelectionMessageIds([restore.selection.messageId ?? restore.messageId])
-      }
-      gapRestoreRef.current = undefined
-      setRestorationMessageIds([])
-      setRestorationPlan(undefined)
-      setRestorationReport(undefined)
-      return undefined
-    })
-    return () => cancelAnimationFrame(frame)
-  }, [
+  const { renderWorkspaceChanges } = useConversationWorkspaceChanges({
+    sessionId: session.id,
     visible,
-    loading,
-    snapshot?.messages,
-    historyLoading,
-    gapRecoveryPending,
-    protectReading,
-    readingPositionLost,
-    loadLatestForGap,
+    snapshot,
+    latestChangesRun: latestRun,
+    activeRun,
+    activeWorkspaceDiff,
+    activeWorkspaceFilePath,
+    onUndoWorkspaceChanges,
+    onUndoWorkspaceFile,
+    onPrepareWorkspaceChanges,
+    onOpenWorkspaceChanges,
+    onNotice,
+  })
+
+  const {
+    transcriptRef,
+    transcriptContentRef,
+    messageListRef,
+    queueDockRef,
+    listOffset,
     rows,
     virtualizer,
     virtualRows,
-    isViewportCommitted,
-    messageNavigation,
-  ])
-
-  useEffect(() => {
-    const token = historyResyncToken
-    if (!visible || !token || token === appliedGapResyncRef.current || historyLoading) return
-    appliedGapResyncRef.current = token
-    cancelPrepend()
-    scrollIntentRef.current = undefined
-    const transcript = transcriptRef.current
-    const firstVisible = visibleReadingSource()
-    if (!firstVisible || !transcript) {
-      gapRetryRef.current = { mode: 'latest' }
-      gapRestoreRef.current = undefined
-      setRestorationPlan(undefined)
-      setRestorationReport(undefined)
-      protectReading(undefined)
-      stickToBottomRef.current = true
-      if (transcript) transcript.scrollTop = transcript.scrollHeight
-      void loadLatestForGap()
-      return
-    }
-    const row = firstVisible.element
-    if (!row) return
-    const selection = window.getSelection()
-    const selectionHost = (() => {
-      if (!selection || selection.rangeCount !== 1) return undefined
-      const node = selection.getRangeAt(0).commonAncestorContainer
-      return (
-        (node instanceof HTMLElement
-          ? node.closest<HTMLElement>('[data-pact-message-content]')
-          : node.parentElement?.closest<HTMLElement>('[data-pact-message-content]')) ?? undefined
-      )
-    })()
-    const selectedMessageId =
-      selectionHost?.closest<HTMLElement>('[data-pact-message-id]')?.dataset.pactMessageId
-    const plan = selectionHost ? planSelectionSource(selectionHost) : undefined
-    const report = selectionHost ? reportSelectionSource(selectionHost) : undefined
-    const selected =
-      selectedMessageId &&
-      snapshot?.messages.find((message) => message.id === selectedMessageId)?.state !==
-        'streaming' &&
-      selection &&
-      selectionHost
-        ? selectedTextRange(selectionHost, selection, CONVERSATION_MARKDOWN_BYTES)
-        : undefined
-    gapRestoreRef.current = {
-      messageId: firstVisible.messageId,
-      top: row.getBoundingClientRect().top,
-      ...(firstVisible.plan ? { plan: firstVisible.plan } : {}),
-      ...(selected && selectedMessageId
-        ? {
-            selection: {
-              messageId: selectedMessageId,
-              startOffset: selected.startOffset,
-              endOffset: selected.endOffset,
-              highlight: isProjectionHighlightOwned(),
-              ...(plan ? { plan } : {}),
-              ...(report ? { report } : {}),
-            },
-          }
-        : {}),
-    }
-    setRestorationMessageIds([
-      firstVisible.messageId,
-      ...(selected && selectedMessageId ? [selectedMessageId] : []),
-    ])
-    setRestorationPlan(firstVisible.plan ?? (selected ? plan : undefined))
-    setRestorationReport(selected ? report : undefined)
-    gapRetryRef.current = { mode: 'around', messageId: firstVisible.messageId }
-    stickToBottomRef.current = false
-    void recoverFromGap(firstVisible.messageId)
-  }, [
-    historyResyncToken,
+    measureRow,
+    hasOlderHistory,
+    hasNewerHistory,
+    copyFeedback,
+    revealReport,
+    revealReportRequestId,
+    revealReportOffset,
+    registerMessageElement,
+    copyMessage,
+    loadLatest,
+    handlePlanReady,
+    beginDetailRead,
+    viewSavedResponse,
+    handleInputHeightDelta,
+    resetScrollForSubmit,
+    handleTranscriptFocusCapture,
+    handleTranscriptBlurCapture,
+    handleTranscriptPointerDown,
+    handleTranscriptWheel,
+    handleTranscriptKeyDown,
+    handleTranscriptScroll,
+    handleRetryHistoryPage,
+  } = useConversationTranscriptVirtualizer({
     visible,
-    historyLoading,
-    recoverFromGap,
-    loadLatestForGap,
-    protectReading,
-    snapshot?.messages,
-    visibleReadingSource,
-    cancelPrepend,
-  ])
-
-  useEffect(() => {
-    if (historyLoadingPage || !focusAfterPageRef.current) return
-    const direction = focusAfterPageRef.current
-    focusAfterPageRef.current = undefined
-    if (direction === 'latest' && !hasNewerHistory) {
-      const last = residentMessages?.findLast((message) => message.role !== 'system')
-      if (last) messageRefs.current.get(last.id)?.focus({ preventScroll: true })
-    }
-  }, [historyLoadingPage, hasNewerHistory, residentMessages])
-
-  useLayoutEffect(() => {
-    const content = transcriptContentRef.current
-    if (!content || typeof ResizeObserver === 'undefined') return undefined
-    const observer = new ResizeObserver(() => {
-      const transcript = transcriptRef.current
-      const list = messageListRef.current
-      if (transcript && list)
-        setListOffset(
-          list.getBoundingClientRect().top -
-            transcript.getBoundingClientRect().top +
-            transcript.scrollTop,
-        )
-      if (transcript && !document.hidden && stickToBottomRef.current)
-        transcript.scrollTop = transcript.scrollHeight
-    })
-    observer.observe(content)
-    return () => observer.disconnect()
-  }, [])
-
-  useEffect(() => {
-    if (!visible || !messageNavigation || dismissedNavigation === messageNavigation)
-      return undefined
-    if (appliedNavigationRef.current === messageNavigation) return undefined
-    if (messageNavigation.plan) return undefined
-    cancelPrepend()
-    stickToBottomRef.current = false
-    scrollIntentRef.current = undefined
-    gapRestoreRef.current = undefined
-    setRestorationMessageIds([])
-    setRestorationPlan(undefined)
-    setRestorationReport(undefined)
-    if (
-      messageNavigation.queuedOperationId &&
-      queuedInput?.id === messageNavigation.queuedOperationId
-    ) {
-      const dock = queueDockRef.current
-      if (!dock) return undefined
-      const focusDock = (): void => {
-        dock.scrollIntoView({ behavior: 'smooth', block: 'center' })
-        pulseMessageTarget(dock)
-        appliedNavigationRef.current = messageNavigation
-      }
-      const frame = requestAnimationFrame(focusDock)
-      return () => cancelAnimationFrame(frame)
-    }
-    void ensureMessage(messageNavigation.messageId)
-    if (history.window?.sourceMessageId !== messageNavigation.messageId) return undefined
-    if (messageNavigation.plan || messageNavigation.report) return undefined
-    const message = navigationMessage
-      ? messageRefs.current.get(messageNavigation.messageId)
-      : undefined
-    if (!message && navigationMessage) {
-      const index = rows.findIndex((row) => row.message?.id === messageNavigation.messageId)
-      if (index >= 0) virtualizer.scrollToIndex(index, { align: 'center' })
-      return undefined
-    }
-    if (message) {
-      stickToBottomRef.current = false
-      const focus = (): boolean => {
-        if (hasProtectedSelection()) return false
-        if (
-          focusProjectionRange(
-            message,
-            messageNavigation.startOffset,
-            messageNavigation.endOffset,
-            { scroll: false },
-          )
-        ) {
-          const transcript = transcriptRef.current
-          const range = window.getSelection()?.getRangeAt(0).getBoundingClientRect()
-          if (transcript && range) {
-            virtualizer.scrollToOffset(
-              transcript.scrollTop +
-                range.top -
-                transcript.getBoundingClientRect().top -
-                transcript.clientHeight / 2 +
-                range.height / 2,
-              { behavior: 'smooth' },
-            )
-          }
-          appliedNavigationRef.current = messageNavigation
-          return true
-        }
-        if (messageNavigation.textBasis === 'plain-visible-v1') {
-          const transcript = transcriptRef.current
-          const rect = message.getBoundingClientRect()
-          if (transcript && rect.height > 0) {
-            virtualizer.scrollToOffset(
-              transcript.scrollTop +
-                rect.top -
-                transcript.getBoundingClientRect().top -
-                transcript.clientHeight / 2 +
-                rect.height / 2,
-              { behavior: 'smooth' },
-            )
-          }
-          pulseMessageTarget(message)
-          appliedNavigationRef.current = messageNavigation
-          return true
-        }
-        return false
-      }
-      const frame = focus() ? undefined : requestAnimationFrame(() => void focus())
-      return () => {
-        if (frame !== undefined) cancelAnimationFrame(frame)
-      }
-    }
-    return undefined
-  }, [
-    ensureMessage,
+    loading,
+    snapshot,
+    history,
+    activeRun,
+    activeRunHasMessage,
+    runsById,
+    activityOwnerMessageByRun,
+    queuedInputId: queuedInput?.id,
+    messageNavigation,
     dismissedNavigation,
-    hasProtectedSelection,
-    messageNavigation,
-    queuedInput?.id,
-    history.window?.sourceMessageId,
-    visible,
-    navigationMessage,
-    mountedRowKeys,
-    rows,
-    virtualizer,
-    cancelPrepend,
-  ])
-
-  useEffect(() => clearProjectionHighlight, [messageNavigation, dismissedNavigation])
-
-  useLayoutEffect(() => {
-    if (!requestedResponseId || !visible) return
-    const index = rows.findIndex((row) => row.message?.id === requestedResponseId)
-    if (index < 0) return
-    virtualizer.scrollToIndex(index, { align: 'center' })
-    const element = messageRefs.current.get(requestedResponseId)
-    if (!element) return
-    element.focus({ preventScroll: true })
-    setRequestedResponseId(undefined)
-    setRestorationMessageIds([])
-  }, [requestedResponseId, visible, rows, mountedRowKeys, virtualizer])
+    dismissCommentNavigation,
+    isNavigationApplied,
+    markNavigationApplied,
+  })
 
   useLayoutEffect(() => {
     commentFocusRef.current.visible = visible
@@ -2546,120 +997,6 @@ export function ConversationView({
     })
     return cancel
   }, [commentDraftId, planPanelExpanded])
-
-  useEffect(() => {
-    copyActiveRef.current = true
-    return () => {
-      copyActiveRef.current = false
-      copyRequestGenerationRef.current += 1
-      if (copyFeedbackTimerRef.current !== undefined) clearTimeout(copyFeedbackTimerRef.current)
-    }
-  }, [])
-
-  const copyMessage = useCallback(async (messageId: string, content: string): Promise<void> => {
-    const generation = ++copyRequestGenerationRef.current
-    if (copyFeedbackTimerRef.current !== undefined) clearTimeout(copyFeedbackTimerRef.current)
-    setCopyFeedback({ messageId, result: 'copying' })
-    let result: 'copied' | 'failed' = 'copied'
-    try {
-      await navigator.clipboard.writeText(content)
-    } catch {
-      result = 'failed'
-    }
-    if (!copyActiveRef.current || generation !== copyRequestGenerationRef.current) return
-    setCopyFeedback({ messageId, result })
-    copyFeedbackTimerRef.current = window.setTimeout(() => {
-      copyFeedbackTimerRef.current = undefined
-      setCopyFeedback(undefined)
-    }, 2_000)
-  }, [])
-
-  const dismissCommentNavigation = (): void => {
-    setDismissedNavigation(messageNavigation)
-    clearProjectionHighlight()
-  }
-
-  const loadOlder = useCallback(async (): Promise<void> => {
-    if (
-      snapshot &&
-      snapshot.messages.length + (history.window?.runContexts?.length ?? 0) >=
-        CONVERSATION_WINDOW_MESSAGES &&
-      hasProtectedSelection()
-    ) {
-      return
-    }
-    if (olderRequestedRef.current || history.loadingPage || !hasOlderHistory) return
-    const transcript = transcriptRef.current
-    const firstVisible = snapshot?.messages.find((message) => {
-      const row = messageRefs.current.get(message.id)
-      return (
-        row &&
-        transcript &&
-        row.getBoundingClientRect().bottom > transcript.getBoundingClientRect().top &&
-        row.getBoundingClientRect().top < transcript.getBoundingClientRect().bottom
-      )
-    })
-    const element = firstVisible ? messageRefs.current.get(firstVisible.id) : undefined
-    if (!firstVisible || !element) return
-    olderRequestedRef.current = true
-    scrollIntentRef.current = undefined
-    historyReadDirectionRef.current = 'older'
-    stickToBottomRef.current = false
-    if (firstVisible && element) {
-      prependAnchorRef.current = {
-        messageId: firstVisible.id,
-        top: element.getBoundingClientRect().top,
-        beforeDisplay: conversationWindowStartOrder(history.window!)!,
-      }
-      setRestorationMessageIds([firstVisible.id])
-    }
-    try {
-      await history.loadOlder()
-    } finally {
-      olderRequestedRef.current = false
-    }
-  }, [snapshot, history, hasProtectedSelection, hasOlderHistory])
-
-  const loadLatest = async (): Promise<void> => {
-    setRequestedResponseId(undefined)
-    gapRestoreRef.current = undefined
-    setRestorationPlan(undefined)
-    setRestorationReport(undefined)
-    cancelPrepend()
-    setRestorationMessageIds([])
-    dismissCommentNavigation()
-    const currentSelection = window.getSelection()
-    if (transcriptRef.current?.contains(currentSelection?.anchorNode ?? null))
-      currentSelection?.removeAllRanges()
-    setSelectionMessageIds([])
-    protectReading(undefined)
-    historyReadDirectionRef.current = 'latest'
-    stickToBottomRef.current = true
-    scrollIntentRef.current = undefined
-    focusAfterPageRef.current = 'latest'
-    await history.loadLatest()
-  }
-
-  const requestOlderAtTop = useCallback(
-    (scrollTop: number): void => {
-      if (
-        visible &&
-        !loading &&
-        !history.pageError &&
-        !history.loadingPage &&
-        !gapRecoveryPending &&
-        scrollTop < OLDER_HISTORY_SCROLL_THRESHOLD
-      )
-        void loadOlder()
-    },
-    [visible, loading, history.pageError, history.loadingPage, gapRecoveryPending, loadOlder],
-  )
-  useLayoutEffect(() => {
-    const intent = scrollIntentRef.current
-    const transcript = transcriptRef.current
-    if (transcript && (intent === 'older' || (intent === 'drag' && lastScrollRef.current.backward)))
-      requestOlderAtTop(transcript.scrollTop)
-  }, [virtualRows, requestOlderAtTop])
 
   const editorValue = useMemo<ComposerDocument>(
     () => ({
@@ -2860,7 +1197,7 @@ export function ConversationView({
     const submittedKey = decisionKey
     const sent = await onSend('', [], undefined, undefined, decisionReply)
     if (sent) setAnsweredDecisionKey(submittedKey)
-    setPlanRefresh((value) => value + 1)
+    refreshTaskPlan()
   }
 
   const submit = async (): Promise<void> => {
@@ -2963,9 +1300,7 @@ export function ConversationView({
       disabled
     )
       return
-    stickToBottomRef.current = true
-    cancelPrepend()
-    scrollIntentRef.current = undefined
+    resetScrollForSubmit()
     const removed = document.text.length - document.text.trimStart().length
     if (unfinishedTask && sendRoute?.type === 'all') {
       onNotice('Choose one Agent for this feedback batch.')
@@ -3005,10 +1340,10 @@ export function ConversationView({
     )
     if (sent) {
       setAnsweredDecisionKey(submittedDecisionKey)
-      setPlanRefresh((value) => value + 1)
+      refreshTaskPlan()
       skillComposer.close()
       setMentionQuery(undefined)
-    } else if (decisionReply) setPlanRefresh((value) => value + 1)
+    } else if (decisionReply) refreshTaskPlan()
   }
 
   const cancelReplacement = (): void => {
@@ -3056,12 +1391,12 @@ export function ConversationView({
       if (sent) {
         replacementAttempt.current = undefined
         setReplacement(undefined)
-        setPlanRefresh((value) => value + 1)
+        refreshTaskPlan()
         skillComposer.close()
         setMentionQuery(undefined)
       } else {
         setReplacementFailed(true)
-        setPlanRefresh((value) => value + 1)
+        refreshTaskPlan()
       }
     } finally {
       setReplacementBusy(false)
@@ -3148,260 +1483,6 @@ export function ConversationView({
     [session.id, recoveryLocked],
   )
 
-  const handlePlanReady = useCallback(
-    (host: HTMLElement, onApplied?: () => void): (() => void) | undefined => {
-      if (!visible || gapRecoveryPending || historyLoading || loading) return undefined
-      const reveal = (): boolean => {
-        const restore = gapRestoreRef.current
-        const content = host.querySelector<HTMLElement>('[data-pact-message-content]')
-        if (!content?.isConnected) return false
-        const matches = (source: {
-          plan?: MessageCommentAnchor['plan']
-          report?: MessageCommentAnchor['report']
-        }): boolean => {
-          if (source.plan) return source.plan.runId === host.dataset.pactPlanRunId
-          if (source.report) {
-            const actual = reportSelectionSource(host)
-            return actual?.runId === source.report.runId
-          }
-          return false
-        }
-        if (restore?.selection && matches(restore.selection)) {
-          const transcript = transcriptRef.current
-          const row =
-            restore.plan || restore.report
-              ? host.closest<HTMLElement>('.pact-review-card')
-              : messageRefs.current.get(restore.messageId)
-          if (
-            !transcript ||
-            !row ||
-            !isViewportCommitted(transcript) ||
-            Math.abs(row.getBoundingClientRect().top - restore.top) > 2
-          )
-            return false
-          if (
-            !focusProjectionRange(
-              content,
-              restore.selection.startOffset,
-              restore.selection.endOffset,
-              { scroll: false, highlight: restore.selection.highlight ?? false },
-            )
-          )
-            return false
-          gapRestoreRef.current = undefined
-          setRestorationMessageIds([])
-          setRestorationPlan(undefined)
-          setRestorationReport(undefined)
-          return true
-        }
-        if (
-          (!messageNavigation?.plan && !messageNavigation?.report) ||
-          dismissedNavigation === messageNavigation ||
-          appliedNavigationRef.current === messageNavigation
-        )
-          return true
-        if (
-          !matches(messageNavigation) ||
-          history.window?.sourceMessageId !== messageNavigation.messageId ||
-          hasProtectedSelection()
-        )
-          return false
-        if (
-          !focusProjectionRange(
-            content,
-            messageNavigation.startOffset,
-            messageNavigation.endOffset,
-            { scroll: false },
-          )
-        )
-          return false
-        const transcript = transcriptRef.current
-        const range = window.getSelection()?.getRangeAt(0).getBoundingClientRect()
-        if (transcript && range)
-          virtualizer.scrollToOffset(
-            transcript.scrollTop +
-              range.top -
-              transcript.getBoundingClientRect().top -
-              transcript.clientHeight / 2 +
-              range.height / 2,
-            { behavior: 'smooth' },
-          )
-        appliedNavigationRef.current = messageNavigation
-        return true
-      }
-      const frame = requestAnimationFrame(() => {
-        if (reveal()) onApplied?.()
-      })
-      return () => {
-        cancelAnimationFrame(frame)
-      }
-    },
-    [
-      visible,
-      gapRecoveryPending,
-      historyLoading,
-      loading,
-      messageNavigation,
-      dismissedNavigation,
-      history.window?.sourceMessageId,
-      hasProtectedSelection,
-      isViewportCommitted,
-      virtualizer,
-    ],
-  )
-
-  const revealReport =
-    messageNavigation && dismissedNavigation !== messageNavigation
-      ? messageNavigation.report
-      : restorationReport
-  const revealReportRequestId =
-    messageNavigation && dismissedNavigation !== messageNavigation
-      ? messageNavigation.navigationId
-      : `restore:${gapRecoveryPending ?? ''}:${gapRestoreRef.current?.messageId ?? ''}`
-  const [planSourcePreview, setPlanSourcePreview] = useState<{
-    key: string
-    taskId?: string | undefined
-    plan?: CurrentPlanDocument | undefined
-    error?: string | undefined
-  }>()
-  const planSourceRead = useRef<{
-    active: boolean
-    pending: boolean
-    desired?: { key: string; sessionId: string; runId: string; version: number } | undefined
-  }>({ active: true, pending: false })
-  const planSourceKey = planSourceNavigation?.plan
-    ? `${session.id}:${planSourceNavigation.navigationId ?? ''}:${planSourceNavigation.plan.runId}:${planSourceNavigation.plan.version}:${planSourceNavigation.startOffset}:${planSourceNavigation.endOffset}:${planSourceNavigation.textBasis ?? ''}:${planRefresh}`
-    : undefined
-
-  useEffect(() => {
-    const owner = planSourceRead.current
-    owner.active = true
-    return () => {
-      owner.active = false
-      owner.desired = undefined
-    }
-  }, [])
-
-  useEffect(() => {
-    const owner = planSourceRead.current
-    const anchor = planSourceNavigationRef.current?.plan
-    owner.desired =
-      visible && planSourceKey && anchor
-        ? {
-            key: planSourceKey,
-            sessionId: session.id,
-            runId: anchor.runId,
-            version: anchor.version,
-          }
-        : undefined
-    if (owner.desired) openPlanCallback.current?.()
-    const read = async (): Promise<void> => {
-      if (!owner.active || owner.pending || !owner.desired) return
-      owner.pending = true
-      const requested = owner.desired
-      try {
-        const result = await window.pact.getConversation({
-          scope: 'collaboration',
-          projection: 'plan',
-          sessionId: requested.sessionId,
-          runId: requested.runId,
-        })
-        if (!owner.active || owner.desired !== requested) return
-        const view =
-          result.ok && result.value.scope === 'collaboration' ? result.value.view : undefined
-        const source = view?.planSource
-        const task = view?.task
-        if (
-          !task?.planReference ||
-          task.planVersion !== requested.version ||
-          source?.runId !== requested.runId
-        ) {
-          setPlanSourcePreview({ key: requested.key, error: 'This plan source is unavailable.' })
-          return
-        }
-        setPlanSourcePreview({
-          key: requested.key,
-          taskId: task.id,
-          plan: {
-            runId: requested.runId,
-            messageId: source.messageId,
-            version: requested.version,
-            author:
-              task.planReference.author ?? task.planAuthor ?? collaborationActor(task, 'plan'),
-            content: '',
-            document: task.planReference.document,
-            sessionId: requested.sessionId,
-            aroundOffset: planSourceNavigationRef.current?.startOffset,
-            endOffset: planSourceNavigationRef.current?.endOffset,
-            navigationId: planSourceNavigationRef.current?.navigationId,
-            basis:
-              planSourceNavigationRef.current?.textBasis === 'plain-visible-v1'
-                ? 'plain-visible-v1'
-                : undefined,
-            status: 'Original version',
-          },
-        })
-        planAvailableCallback.current?.(requested.sessionId, task.id)
-        openPlanCallback.current?.()
-      } catch {
-        if (owner.active && owner.desired === requested)
-          setPlanSourcePreview({ key: requested.key, error: 'This plan source is unavailable.' })
-      } finally {
-        owner.pending = false
-        if (owner.active && owner.desired && owner.desired !== requested) void read()
-      }
-    }
-    void read()
-  }, [session.id, planSourceKey, visible])
-
-  const handlePanelPlanReady = useCallback(
-    (host: HTMLElement): (() => void) | undefined => {
-      if (
-        !visible ||
-        !planSourceNavigation?.plan ||
-        planSourceNavigation.endOffset <= planSourceNavigation.startOffset ||
-        appliedNavigationRef.current === planSourceNavigation
-      )
-        return undefined
-      if (
-        host.dataset.pactPlanRunId !== planSourceNavigation.plan.runId ||
-        Number(host.dataset.pactPlanVersion) !== planSourceNavigation.plan.version
-      )
-        return undefined
-      const frame = requestAnimationFrame(() => {
-        const content = host.querySelector<HTMLElement>('[data-pact-message-content]')
-        if (
-          content?.isConnected &&
-          focusProjectionRange(
-            content,
-            planSourceNavigation.startOffset,
-            planSourceNavigation.endOffset,
-          )
-        )
-          appliedNavigationRef.current = planSourceNavigation
-      })
-      return () => cancelAnimationFrame(frame)
-    },
-    [visible, planSourceNavigation],
-  )
-
-  const beginDetailRead = useCallback((): void => {
-    stickToBottomRef.current = false
-    scrollIntentRef.current = undefined
-  }, [])
-
-  const viewSavedResponse = useCallback(
-    (messageId: string): void => {
-      cancelPrepend()
-      stickToBottomRef.current = false
-      scrollIntentRef.current = undefined
-      setRequestedResponseId(messageId)
-      setRestorationMessageIds([messageId])
-      void history.ensureMessage(messageId)
-    },
-    [cancelPrepend, history],
-  )
-
   const requestForkForMessage = useCallback(
     (messageId: string): void => {
       setForkPoint({
@@ -3412,10 +1493,6 @@ export function ConversationView({
     },
     [onForkSessionStarted, session.id],
   )
-
-  const refreshTaskPlan = useCallback((): void => {
-    setPlanRefresh((value) => value + 1)
-  }, [])
 
   const saveComment = async (): Promise<void> => {
     if (!commentEditor?.body.trim() || disabled || savingComment) return
@@ -3480,70 +1557,6 @@ export function ConversationView({
     }
   }
 
-  const handleInputHeightDelta = useCallback(
-    (delta: number): void => {
-      if (!visible || !stickToBottomRef.current || hasProtectedSelection()) return
-      const selection = window.getSelection()
-      if (
-        selection &&
-        !selection.isCollapsed &&
-        transcriptRef.current?.contains(selection.anchorNode) &&
-        !isProjectionHighlightOwned()
-      ) {
-        return
-      }
-      const transcript = transcriptRef.current
-      if (!transcript || !Number.isFinite(delta) || Math.abs(delta) <= 0.5) return
-      scrollIntentRef.current = undefined
-      transcript.scrollTop = Math.max(0, transcript.scrollHeight - transcript.clientHeight)
-    },
-    [hasProtectedSelection, visible],
-  )
-
-  const renderWorkspaceChanges = useCallback(
-    (changeSet: WorkspaceChangeSet): React.JSX.Element => {
-      const cached = workspaceFilesById.get(changeSet.id)
-      const list =
-        cached && (cached.revision ?? 0) === (changeSet.revision ?? 0) ? cached : undefined
-      const activeFilePathForCard = activeWorkspaceDiff
-        ? activeWorkspaceDiff.sessionId === session.id &&
-          activeWorkspaceDiff.changeSetId === changeSet.id
-          ? activeWorkspaceDiff.path
-          : undefined
-        : activeWorkspaceFilePath
-      return (
-        <WorkspaceChangesCard
-          changeSet={changeSet}
-          list={list}
-          undoing={undoingChangeSetId === changeSet.id}
-          disabled={Boolean(activeRun || undoingChangeSetId || undoingFile)}
-          activeFilePath={activeFilePathForCard}
-          undoingPath={undoingFile?.changeSetId === changeSet.id ? undoingFile.path : undefined}
-          onUndo={undoWorkspaceChanges}
-          onUndoFile={onUndoWorkspaceFile ? handleUndoWorkspaceFile : undefined}
-          onView={(id) => void loadWorkspaceFiles(id, false, true, onPrepareWorkspaceChanges())}
-          onShowFiles={(id) => void loadWorkspaceFiles(id, true)}
-          onOpenFile={(id, path) => onOpenWorkspaceChanges(id, path, undefined, changeSet.revision)}
-        />
-      )
-    },
-    [
-      workspaceFilesById,
-      undoingChangeSetId,
-      undoingFile,
-      activeRun,
-      activeWorkspaceDiff,
-      activeWorkspaceFilePath,
-      session.id,
-      undoWorkspaceChanges,
-      onUndoWorkspaceFile,
-      handleUndoWorkspaceFile,
-      loadWorkspaceFiles,
-      onPrepareWorkspaceChanges,
-      onOpenWorkspaceChanges,
-    ],
-  )
-
   const commentEditorView = commentEditor ? (
     <CommentEditorCard
       editor={commentEditor}
@@ -3578,39 +1591,6 @@ export function ConversationView({
       onRemoveCommentDraft={onRemoveCommentDraft}
     />
   )
-
-  const sourcePreview =
-    planSourceKey && planSourcePreview?.key === planSourceKey ? planSourcePreview : undefined
-  const latestPlanVersion =
-    sourcePreview?.plan &&
-    planningTask?.planReference &&
-    currentPlan?.source &&
-    planningTask.id === sourcePreview.taskId &&
-    planningTask.planVersion > sourcePreview.plan.version
-      ? planningTask.planVersion
-      : undefined
-  const showCurrentPlan = (): void => {
-    if (planSourceNavigation) {
-      planSourceRead.current.desired = undefined
-      setPlanSourcePreview(undefined)
-      setCardPlanNavigation(undefined)
-      setDismissedNavigation(messageNavigation)
-      planAvailableCallback.current?.(
-        session.id,
-        planningTask?.planReference && currentPlan?.source ? planningTask.id : undefined,
-      )
-    }
-    onOpenPlan?.()
-  }
-  const showCurrentPlanRef = useRef(showCurrentPlan)
-  useLayoutEffect(() => {
-    showCurrentPlanRef.current = showCurrentPlan
-  })
-  useEffect(() => {
-    if (!onRegisterShowCurrentPlan) return undefined
-    onRegisterShowCurrentPlan(() => showCurrentPlanRef.current())
-    return () => onRegisterShowCurrentPlan(undefined)
-  }, [onRegisterShowCurrentPlan])
 
   return (
     <main className="@container/conversation flex h-full min-h-0 flex-col">
@@ -3662,11 +1642,7 @@ export function ConversationView({
               latestVersion={latestPlanVersion}
               onOpenLatest={showCurrentPlan}
               onPlanReady={handlePanelPlanReady}
-              onRevealApplied={(id) => {
-                const navigation = planSourceNavigationRef.current
-                if (navigation?.navigationId === id && navigation.plan)
-                  appliedNavigationRef.current = navigation
-              }}
+              onRevealApplied={handlePlanRevealApplied}
               loading={
                 planSourceKey
                   ? planSourcePreview?.key !== planSourceKey
@@ -3681,16 +1657,8 @@ export function ConversationView({
                     ? currentPlan.error
                     : undefined
               }
-              onClose={() => {
-                if (planSourceNavigation) {
-                  planSourceRead.current.desired = undefined
-                  setPlanSourcePreview(undefined)
-                  setCardPlanNavigation(undefined)
-                  setDismissedNavigation(messageNavigation)
-                }
-                onClosePlan?.()
-              }}
-              onRetry={() => setPlanRefresh((value) => value + 1)}
+              onClose={handleClosePlanPanel}
+              onRetry={refreshTaskPlan}
               onOpenProjectFile={openProjectFile}
               onCreatePlanComment={
                 recoveryLocked || inputTakeover ? undefined : handleCreatePlanComment
@@ -3738,62 +1706,12 @@ export function ConversationView({
         aria-label="Conversation messages"
         className="min-h-0 flex-1 overflow-auto px-section pt-5 pb-8 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-focus"
         style={{ overflowAnchor: 'none' }}
-        onFocusCapture={(event) => {
-          const row = event.target.closest<HTMLElement>('[data-pact-row-key]')
-          setFocusedRowKey(row?.dataset.pactRowKey)
-        }}
-        onBlurCapture={(event) => {
-          if (!event.currentTarget.contains(event.relatedTarget)) setFocusedRowKey(undefined)
-        }}
-        onPointerDown={(event) => {
-          cancelPrepend()
-          scrollIntentRef.current =
-            event.target === event.currentTarget || event.pointerType === 'touch'
-              ? 'drag'
-              : undefined
-        }}
-        onWheel={(event) => {
-          cancelPrepend()
-          scrollIntentRef.current = event.deltaY < 0 ? 'older' : 'newer'
-          if (scrollIntentRef.current === 'older') {
-            stickToBottomRef.current = false
-            requestOlderAtTop(event.currentTarget.scrollTop)
-          }
-        }}
-        onKeyDown={(event) => {
-          if (event.target !== event.currentTarget) return
-          cancelPrepend()
-          scrollIntentRef.current =
-            event.key === 'Home'
-              ? 'start'
-              : ['PageUp', 'ArrowUp'].includes(event.key)
-                ? 'older'
-                : ['End', 'PageDown', 'ArrowDown'].includes(event.key)
-                  ? 'newer'
-                  : undefined
-          if (scrollIntentRef.current === 'older' || scrollIntentRef.current === 'start') {
-            stickToBottomRef.current = false
-            requestOlderAtTop(event.currentTarget.scrollTop)
-          }
-        }}
-        onScroll={(event) => {
-          const element = event.currentTarget
-          const scrollingUp = element.scrollTop < lastScrollRef.current.top
-          lastScrollRef.current = { top: element.scrollTop, backward: scrollingUp }
-          clearOffscreenOrdinarySelection()
-          const intent = scrollIntentRef.current
-          if (intent === 'older' || intent === 'start' || (intent === 'drag' && scrollingUp))
-            stickToBottomRef.current = false
-          else if (intent === 'newer' || intent === 'drag')
-            stickToBottomRef.current =
-              element.scrollHeight - element.scrollTop - element.clientHeight < 36
-          if (stickToBottomRef.current && !hasProtectedSelection()) {
-            protectReading(undefined)
-            collapseCompletedOutput()
-          }
-          if ((intent === 'older' || intent === 'start' || intent === 'drag') && scrollingUp)
-            requestOlderAtTop(element.scrollTop)
-        }}
+        onFocusCapture={handleTranscriptFocusCapture}
+        onBlurCapture={handleTranscriptBlurCapture}
+        onPointerDown={handleTranscriptPointerDown}
+        onWheel={handleTranscriptWheel}
+        onKeyDown={handleTranscriptKeyDown}
+        onScroll={handleTranscriptScroll}
       >
         <div
           ref={transcriptContentRef}
@@ -3815,16 +1733,7 @@ export function ConversationView({
               <button
                 className="cursor-pointer font-medium text-primary hover:underline focus-visible:outline-2 focus-visible:outline-focus"
                 type="button"
-                onClick={() => {
-                  if (!history.gapRecoveryPending) {
-                    if (historyReadDirectionRef.current === 'latest') void loadLatest()
-                    else void loadOlder()
-                    return
-                  }
-                  const retry = gapRetryRef.current
-                  if (retry.mode === 'around') void history.recoverFromGap(retry.messageId)
-                  else void loadLatestForGap()
-                }}
+                onClick={handleRetryHistoryPage}
               >
                 Retry
               </button>
@@ -3901,10 +1810,7 @@ export function ConversationView({
                             ? 'plain-visible-v1'
                             : undefined
                         }
-                        revealReportOffset={
-                          gapRestoreRef.current?.selection?.startOffset ??
-                          messageNavigation?.startOffset
-                        }
+                        revealReportOffset={revealReportOffset}
                         onRegisterMessageElement={registerMessageElement}
                         onBeginDetailRead={beginDetailRead}
                         onCopyMessage={copyMessage}

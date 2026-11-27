@@ -14,10 +14,6 @@ export const MAX_PRODUCTION_FILE_LINES = 2500
  *   its entry MUST be removed from this ratchet immediately.
  */
 export const LEGACY_FILE_LINE_RATCHET = Object.freeze({
-  'apps/desktop/src/renderer/src/components/conversation/useConversation.ts': 4662,
-  'packages/contracts/src/index.ts': 4470,
-  'apps/desktop/src/renderer/src/components/conversation/ConversationView.tsx': 4199,
-  'packages/persistence/src/conversation-repository/collaboration-queries.ts': 3293,
   'apps/desktop/src/main/utility-process/client.ts': 3264,
   'packages/persistence/src/side-chat-persistence.ts': 2878,
   'packages/persistence/src/conversation-repository/handoff-source-queries.ts': 2857,
