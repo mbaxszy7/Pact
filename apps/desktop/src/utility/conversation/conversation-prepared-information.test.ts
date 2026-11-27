@@ -38,7 +38,7 @@ vi.mock('./codex-agent-adapter.js', async () => {
       override async *run(input: AgentRunInput) {
         const document = input.promptEnvelope.clarificationAnswer
         if (document) {
-          const reader = input.collaborationSourceReader!,
+          const reader = input.host!.workflow!.sourceReader!,
             index: unknown = JSON.parse(
               reader.read(
                 reader.navigation(
@@ -258,9 +258,9 @@ it('supplies the accepted clarification value as current user input for both nat
     const captured = native.inputs.find(
       (input) => input.promptEnvelope.message.id === f.input.clientMessageId,
     )!
-    const navigate = (
-      target: Parameters<NonNullable<typeof captured.collaborationSourceReader>['navigation']>[0],
-    ) => captured.collaborationSourceReader!.navigation(target, 'sourceReference')
+    const sourceReader = captured.host!.workflow!.sourceReader!
+    const navigate = (target: Parameters<typeof sourceReader.navigation>[0]) =>
+      sourceReader.navigation(target, 'sourceReference')
     const codex = codexPromptInput(captured.promptEnvelope, navigate),
       claude = await claudePromptContent(captured.promptEnvelope, undefined, navigate),
       codexText = codex

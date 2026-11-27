@@ -164,15 +164,13 @@ describe('adversarial review instructions', () => {
       retire: () => undefined,
     }
     const nativeCap = resolveAgentCollaborationSourceCapability({
-      collaborationSourceReader: { ...baseReader, readNativeRoot: baseReader.read },
+      sourceReader: { ...baseReader, readNativeRoot: baseReader.read },
     })
     const sourceRefCap = resolveAgentCollaborationSourceCapability({
-      collaborationSourceReader: baseReader,
+      sourceReader: baseReader,
     })
     const legacyCap = resolveAgentCollaborationSourceCapability({
-      readCollaborationSourcePart: () => {
-        throw new Error('unused')
-      },
+      sourceReader: { ...baseReader, supportedForms: ['legacy'] },
     })
     const noneCap = resolveAgentCollaborationSourceCapability({})
 

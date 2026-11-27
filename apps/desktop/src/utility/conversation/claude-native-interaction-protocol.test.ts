@@ -79,8 +79,16 @@ for await (const line of lines) {
     spawn: ownedSpawn as unknown as typeof spawn,
   })
   const controller = new AbortController()
-  const evidence = vi.fn<NonNullable<AgentRunInput['recordNativeEvidence']>>()
-  const archived = vi.fn<NonNullable<AgentRunInput['recordArchivedEvent']>>()
+  const evidence =
+    vi.fn<
+      NonNullable<
+        NonNullable<NonNullable<AgentRunInput['host']>['lifecycle']>['recordNativeEvidence']
+      >
+    >()
+  const archived =
+    vi.fn<
+      NonNullable<NonNullable<NonNullable<AgentRunInput['host']>['effects']>['recordArchivedEvent']>
+    >()
   const runId = crypto.randomUUID(),
     sessionId = crypto.randomUUID()
   const outcome = (async () => {
@@ -99,8 +107,14 @@ for await (const line of lines) {
           message: { id: crypto.randomUUID(), content: 'Synthetic zero-model stderr transport' },
           comments: [],
         },
-        recordNativeEvidence: evidence,
-        recordArchivedEvent: archived,
+        host: {
+          lifecycle: {
+            recordNativeEvidence: evidence,
+          },
+          effects: {
+            recordArchivedEvent: archived,
+          },
+        },
       },
       controller.signal,
     ))
@@ -210,29 +224,35 @@ for await (const line of lines) {
       { mode: 0o700 },
     )
     const adapter = new ClaudeAgentAdapter(executable)
-    const requestPermission = vi.fn<NonNullable<AgentRunInput['requestPermission']>>(
-      async (_request, signal) => {
-        if (kind === 'abort')
-          await new Promise<void>((_resolve, reject) => {
-            if (signal.aborted) reject(new Error('Interrupted'))
-            else
-              signal.addEventListener('abort', () => reject(new Error('Interrupted')), {
-                once: true,
-              })
-          })
-        if (kind === 'decline') return 'decline' as const
-        if (kind === 'session-rule') {
-          expect(_request.actions?.map((action) => action.id)).toContain('native-updates')
-          return 'native-updates'
-        }
-        if (kind.endsWith('-rule') || kind === 'mixed-rules') {
-          expect(_request.actions?.map((action) => action.id)).not.toContain('native-updates')
-          return kind === 'forged-rule' ? 'native-updates' : 'allow'
-        }
-        throw new Error('Expired fixture callback; token=never-export-this')
-      },
-    )
-    const requestUserInput = vi.fn<NonNullable<AgentRunInput['requestUserInput']>>(async () => {
+    const requestPermission = vi.fn<
+      NonNullable<
+        NonNullable<NonNullable<AgentRunInput['host']>['interactions']>['requestPermission']
+      >
+    >(async (_request, signal) => {
+      if (kind === 'abort')
+        await new Promise<void>((_resolve, reject) => {
+          if (signal.aborted) reject(new Error('Interrupted'))
+          else
+            signal.addEventListener('abort', () => reject(new Error('Interrupted')), {
+              once: true,
+            })
+        })
+      if (kind === 'decline') return 'decline' as const
+      if (kind === 'session-rule') {
+        expect(_request.actions?.map((action) => action.id)).toContain('native-updates')
+        return 'native-updates'
+      }
+      if (kind.endsWith('-rule') || kind === 'mixed-rules') {
+        expect(_request.actions?.map((action) => action.id)).not.toContain('native-updates')
+        return kind === 'forged-rule' ? 'native-updates' : 'allow'
+      }
+      throw new Error('Expired fixture callback; token=never-export-this')
+    })
+    const requestUserInput = vi.fn<
+      NonNullable<
+        NonNullable<NonNullable<AgentRunInput['host']>['interactions']>['requestUserInput']
+      >
+    >(async () => {
       throw new Error('Expired fixture input')
     })
     try {
@@ -252,8 +272,12 @@ for await (const line of lines) {
           effort: null,
           permissionMode: 'ask',
           peerAssistanceAllowed: false,
-          requestPermission,
-          requestUserInput,
+          host: {
+            interactions: {
+              requestPermission,
+              requestUserInput,
+            },
+          },
         },
         new AbortController().signal,
       ))

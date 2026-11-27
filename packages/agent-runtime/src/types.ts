@@ -6,7 +6,6 @@ import type {
   CollaborationInputObservation,
   CollaborationRetainedPlan,
   CollaborationReviewObservation,
-  CollaborationSourceReadResult,
   ConfirmedUnsentBoundary,
   NativeBackgroundReport,
   NativeBackgroundReportIdentity,
@@ -388,88 +387,28 @@ export interface RunInteractionPort {
 }
 
 /**
- * Grouped host ports replacing the flat 35-callback bag on `AgentRunInput`.
- * Wave 3 wires `host` in `RunExecutor`; Wave 4 completes adapter cutover and removes
- * the legacy flat callback properties from `AgentRunInput`.
+ * Grouped host ports replacing the former flat 30+ callback bag on `AgentRunInput`.
+ * Zero legacy flat callback properties remain on `AgentRunInput`.
  */
 export interface RunExecutionHost {
-  readonly lifecycle: RunLifecycleSink
-  readonly effects: RunEffectsSink
-  readonly workflow: RunWorkflowSink
-  readonly interactions: RunInteractionPort
+  readonly lifecycle?: RunLifecycleSink | undefined
+  readonly effects?: RunEffectsSink | undefined
+  readonly workflow?: RunWorkflowSink | undefined
+  readonly interactions?: RunInteractionPort | undefined
   readonly recovery?: RunRecoveryPort | undefined
 }
 
 export interface AgentRunInput {
-  /** Grouped host ports (target Wave 3/4 contract). */
+  /** Grouped host ports (lifecycle, effects, workflow, interactions, recovery). */
   host?: RunExecutionHost | undefined
-
-  /** Optional bounded observation; failures cannot affect native control or output. */
-  observeNativeDelta?: (observation: NativeLoopDeltaObservation) => void
-  /** Optional Relay evidence capture; it supplies no new business authority. */
-  recovery?: RunRecoveryPort | undefined
-  /** Bind the creating executor before any native startup callback; this is not model dispatch. */
-  recordExecutor?: (executorId: string) => void
-  /** An owned Native name fact; logicalTitle excludes Pact's derived display prefix. */
-  observeNativeTitle?: NativeTitleObserver
   runId: string
   sessionId: string
   permissionMode?: SessionPermissionMode | undefined
   nativeSessionId?: string
   nativeGeneration?: string
   bindingGeneration?: number
-  recordNativeEvidence?: (evidence: NativeProbeResult) => void
-  /** Native user input incorporated into the original Turn's context, not fully handled. */
-  recordInputConsumption?: (
-    inputId: string,
-    identity: Pick<NativeEvidenceIdentity, 'nativeSessionId' | 'nativeTurnId' | 'executorId'>,
-  ) => void
-  /** Output processing failed; native control and work observation remain owned. */
-  recordOutputFailure?: (error: Error) => void
-  /** Join already-delivered root output before its Query releases text workspace; never await native work settlement here. */
-  waitForRootOutput?: () => Promise<void>
-  /** Seal a provider-authored background update before reading more of this Query. */
-  recordBackgroundReport?: (report: NativeBackgroundReport) => Promise<void>
-  /** Retain an attributable report whose body cannot be materialized within the Query's working budget. */
-  recordBackgroundReportUnavailable?: (identity: NativeBackgroundReportIdentity) => void
-  recordArchivedEvent?: (event: NormalizedAgentEvent) => void
-  /** Capture authenticated native metadata; Repository promotes only a normally completed root. */
-  recordWorkflowPlan?: (plan: { nativeId: string; text: string }) => void
-  recordWorkflowPlanUnavailable?: () => void
-  /** Persist a bounded open-mode final publish_plan intent before acknowledging the tool call. */
-  recordOpenPlanFinalIntent?: (intent: AgentOpenPlanFinalIntent) => boolean | void
-  recordWorkflowPlanRetained?: (plan: CollaborationRetainedPlan) => void
-  recordWorkflowReview?: (result: CollaborationReviewObservation) => void
-  recordWorkflowInputResult?: (result: CollaborationInputObservation) => void
-  /** Legacy callback removed in Wave 4 adapter cutover; new callers use `host.workflow.sourceReader`. */
-  readCollaborationSourcePart?: ((input: unknown) => CollaborationSourceReadResult) | undefined
-  /** Borrowed from the current NativeObservation; never included in frozen execution JSON. */
-  collaborationSourceReader?: AgentCollaborationSourceReader | undefined
-  getPlanCheckpoint?: (nativeSessionId: string) => ClaudePlanCheckpointSource | undefined
-  recordDispatch?: (
-    phase: 'possibly_sent' | 'accepted' | 'rejected',
-    nativeSessionId?: string,
-    executorId?: string,
-  ) => void
-  /** Conversation supplies this frozen route policy; legacy callers default to allowed. */
+  /** Conversation supplies this frozen route policy; defaults to allowed when omitted. */
   peerAssistanceAllowed?: boolean
-  /** Captures pre-touch baseline before a native file edit/delete mutates disk. */
-  anchorFileBeforeEdit?: (path: string, signal: AbortSignal) => Promise<void>
-  /** Observes applied native results; recording failure must never deny a native tool. */
-  recordFileChange?: (change: NativeFileChange, signal: AbortSignal) => Promise<void>
-  recordUncertainEffects?: (reason: string, scope?: 'unlisted' | 'recorded_files') => void
-  /** Publish a changed live work projection without writing another durable effects receipt. */
-  backgroundWorkChanged?: () => void
-  /** Run/generation-bound native observation, independent of foreground completion. */
-  reportNativeEffects?: (report: {
-    runId: string
-    generation: string
-    state: 'pending' | 'settled' | 'unknown'
-    reason?: string
-  }) => void
-  /** Called only when the native permission policy asks the user. */
-  requestPermission?: NativePermissionRequester
-  requestUserInput?: NativeUserInputRequester
   cwd: string
   promptEnvelope: AgentPromptEnvelope
   /** Same root's latest append-only input scope; frozen duty/settings remain unchanged. */

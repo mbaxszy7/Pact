@@ -156,28 +156,30 @@ describe('Codex bounded native protocol', () => {
           },
         },
       ]
-      const requestPermission = vi.fn<NonNullable<AgentRunInput['requestPermission']>>(
-        async (request) => {
-          expect(request.actions?.map((action) => action.label)).not.toContain(
-            'Review and allow command rule…',
-          )
-          expect(request.actions?.map((action) => action.label)).not.toContain(
-            'Review and allow host rule…',
-          )
-          expect(request.actions?.map((action) => action.label)).not.toContain(
-            'Review and block host rule…',
-          )
-          expect(request.actions?.map((action) => action.scope).join(' ')).not.toContain(
-            'Persistence:',
-          )
-          if (kind === 'forged') return 'native-7'
-          const selectedAction = request.actions?.find((action) =>
-            kind === 'session' ? action.kind === 'rule' : action.kind === 'allow',
-          )
-          if (!selectedAction) throw new Error('Required scoped action missing')
-          return selectedAction.id
-        },
-      )
+      const requestPermission = vi.fn<
+        NonNullable<
+          NonNullable<NonNullable<AgentRunInput['host']>['interactions']>['requestPermission']
+        >
+      >(async (request) => {
+        expect(request.actions?.map((action) => action.label)).not.toContain(
+          'Review and allow command rule…',
+        )
+        expect(request.actions?.map((action) => action.label)).not.toContain(
+          'Review and allow host rule…',
+        )
+        expect(request.actions?.map((action) => action.label)).not.toContain(
+          'Review and block host rule…',
+        )
+        expect(request.actions?.map((action) => action.scope).join(' ')).not.toContain(
+          'Persistence:',
+        )
+        if (kind === 'forged') return 'native-7'
+        const selectedAction = request.actions?.find((action) =>
+          kind === 'session' ? action.kind === 'rule' : action.kind === 'allow',
+        )
+        if (!selectedAction) throw new Error('Required scoped action missing')
+        return selectedAction.id
+      })
       const child = nativeProcess((request, send) => {
         const { id, method } = request
         if (method === 'initialize') send({ id, result: {} })
@@ -245,12 +247,16 @@ describe('Codex bounded native protocol', () => {
             effort: null,
             permissionMode: 'native',
             peerAssistanceAllowed: false,
-            requestPermission,
             promptEnvelope: {
               version: 'pact-agent-prompt-v1',
               sessionId: 'session-1',
               message: { id: 'message-1', content: 'Synthetic scoped approval' },
               comments: [],
+            },
+            host: {
+              interactions: {
+                requestPermission,
+              },
             },
           },
           new AbortController().signal,
@@ -448,9 +454,13 @@ describe('Codex bounded native protocol', () => {
               message: { id: 'message-1', content: 'Hello' },
               comments: [],
             },
-            recordExecutor: () => order.push('executor'),
-            recordDispatch: (phase) => phases.push(phase),
-            recordNativeEvidence: (fact) => evidence.push(fact.kind),
+            host: {
+              lifecycle: {
+                recordExecutor: () => order.push('executor'),
+                recordDispatch: (phase) => phases.push(phase),
+                recordNativeEvidence: (fact) => evidence.push(fact.kind),
+              },
+            },
           },
           new AbortController().signal,
         ))
@@ -994,7 +1004,11 @@ describe('Codex bounded native protocol', () => {
               message: { id: `message-${index}`, content: 'Review code' },
               comments: [],
             },
-            recordExecutor: (executor) => executorIds.push(executor),
+            host: {
+              lifecycle: {
+                recordExecutor: (executor) => executorIds.push(executor),
+              },
+            },
           }
           const events: NormalizedAgentEvent[] = []
           // oxlint-disable-next-line no-await-in-loop -- Later Turns deliberately reuse the same native Thread/capability.

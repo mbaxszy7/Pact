@@ -61,7 +61,7 @@ function adapter(id: RuntimeAgentId) {
         text: 'Owned answer',
       }
       yield { agentId: id, type: 'turn.completed', turnId: input.runId, outcome: 'completed' }
-      input.reportNativeEffects?.({
+      input.host?.effects?.reportNativeEffects?.({
         runId: input.runId,
         generation: input.nativeGeneration!,
         state: 'settled',

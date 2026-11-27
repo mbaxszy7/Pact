@@ -52,12 +52,12 @@ async function* scriptedRun(
   native.finishMode = 'normal'
   native.inputs.set(input.runId, input)
   native.background.add(input.runId)
-  input.recordExecutor?.(executorId)
+  input.host?.lifecycle?.recordExecutor?.(executorId)
   const nativeSessionId = input.nativeSessionId ?? `native:${input.sessionId}`
   const turnId = randomUUID()
-  input.recordDispatch?.('possibly_sent', nativeSessionId, executorId)
+  input.host?.lifecycle?.recordDispatch?.('possibly_sent', nativeSessionId, executorId)
   yield { type: 'session.started', agentId: 'codex', nativeSessionId }
-  input.recordDispatch?.('accepted', nativeSessionId, executorId)
+  input.host?.lifecycle?.recordDispatch?.('accepted', nativeSessionId, executorId)
   yield { type: 'turn.started', agentId: 'codex', turnId }
   yield {
     type: 'text.delta',
@@ -78,7 +78,7 @@ async function* scriptedRun(
   })
   signal.throwIfAborted()
   if (finishMode !== 'normal') {
-    input.recordNativeEvidence?.({
+    input.host?.lifecycle?.recordNativeEvidence?.({
       kind: 'ended',
       source: 'live_terminal',
       outcome: 'completed',
@@ -94,11 +94,11 @@ async function* scriptedRun(
       },
     })
     if (finishMode === 'fail_body_after_terminal') {
-      input.recordOutputFailure?.(
+      input.host?.lifecycle?.recordOutputFailure?.(
         new Error('The terminal arrived before final body storage failed.'),
       )
       native.background.delete(input.runId)
-      input.reportNativeEffects?.({
+      input.host?.effects?.reportNativeEffects?.({
         runId: input.runId,
         generation: input.nativeGeneration!,
         state: 'settled',
@@ -116,7 +116,7 @@ async function* scriptedRun(
   yield { type: 'turn.completed', agentId: 'codex', turnId, outcome: 'completed' }
   if (finishMode === 'seal_body_after_terminal') {
     native.background.delete(input.runId)
-    input.reportNativeEffects?.({
+    input.host?.effects?.reportNativeEffects?.({
       runId: input.runId,
       generation: input.nativeGeneration!,
       state: 'settled',
@@ -1024,7 +1024,7 @@ it.each(['lost ACK', 'rejected result', 'rejected callback', 'accepted ACK'] as 
       input.recordDispatch('possibly_sent')
       const root = native.inputs.get(input.runId)!
       const run = f.db.conversationRepository.findRun(input.runId)!
-      root.recordInputConsumption?.(input.inputId, {
+      root.host?.lifecycle?.recordInputConsumption?.(input.inputId, {
         nativeSessionId: run.nativeSessionId!,
         nativeTurnId: run.nativeTurnId!,
         executorId: run.executorId!,
@@ -1079,14 +1079,20 @@ it('a retained original observer accepts a late exact receipt after foreground c
       executorId: run.executorId!,
     }
     expect(() =>
-      root.recordInputConsumption?.(request.inputId, { ...identity, nativeTurnId: randomUUID() }),
+      root.host?.lifecycle?.recordInputConsumption?.(request.inputId, {
+        ...identity,
+        nativeTurnId: randomUUID(),
+      }),
     ).toThrow(/original execution/u)
     expect(() =>
-      root.recordInputConsumption?.(request.inputId, { ...identity, executorId: randomUUID() }),
+      root.host?.lifecycle?.recordInputConsumption?.(request.inputId, {
+        ...identity,
+        executorId: randomUUID(),
+      }),
     ).toThrow(/original execution/u)
     expect(f.db.conversationRepository.unresolvedSteerInputs(runId)).toHaveLength(1)
-    root.recordInputConsumption?.(request.inputId, identity)
-    root.recordInputConsumption?.(request.inputId, identity)
+    root.host?.lifecycle?.recordInputConsumption?.(request.inputId, identity)
+    root.host?.lifecycle?.recordInputConsumption?.(request.inputId, identity)
     expect(f.db.conversationRepository.unresolvedSteerInputs(runId)).toHaveLength(0)
     expect(f.db.conversationRepository.skillInvocation(request.inputId)).toMatchObject({
       version: 'pact-skills-v1',
@@ -1107,7 +1113,11 @@ it('observes exact-run progress without changing suppression, retirement or late
   try {
     const first = await f.send()
     const initialInput = native.inputs.get(first)!
-    initialInput.observeNativeDelta?.({ kind: 'text', identity: 'matched', bytes: 15 })
+    initialInput.host?.lifecycle?.observeNativeDelta?.({
+      kind: 'text',
+      identity: 'matched',
+      bytes: 15,
+    })
     await vi.waitFor(() => expect(f.flow.diagnostics().suppressedProgress).toBeGreaterThan(0))
     const live = f.flow.diagnostics().streamTraces.find((trace) => trace.runId === first)!
     const sourceGrant = initialInput.promptEnvelope.sourceGrant
@@ -1135,14 +1145,20 @@ it('observes exact-run progress without changing suppression, retirement or late
     if (drafts.scope !== 'drafts') throw new Error('Fixture drafts unavailable')
     native.finishMode = 'seal_body_after_terminal'
     const second = await f.send({ expectedCommentsRevision: drafts.commentsRevision })
-    initialInput.observeNativeDelta?.({ kind: 'text', identity: 'matched', bytes: 999 })
+    initialInput.host?.lifecycle?.observeNativeDelta?.({
+      kind: 'text',
+      identity: 'matched',
+      bytes: 999,
+    })
     expect(f.flow.diagnostics().streamTraces.find((trace) => trace.runId === first)).toEqual(
       settled,
     )
     expect(
       f.flow.diagnostics().streamTraces.find((trace) => trace.runId === second)?.loop.text,
     ).toBe(0)
-    native.inputs.get(second)!.observeNativeDelta?.({ kind: 'text', identity: 'matched', bytes: 7 })
+    native.inputs
+      .get(second)!
+      .host?.lifecycle?.observeNativeDelta?.({ kind: 'text', identity: 'matched', bytes: 7 })
     native.finishes.get(second)!()
     await vi.waitFor(() => expect(f.flow.diagnostics().activeExecutions).toBe(0))
     expect(f.flow.diagnostics().streamTraces.map((trace) => trace.runId)).toEqual([second])
@@ -1165,7 +1181,7 @@ it.each(['accepted', 'consumed'] as const)(
     let preparedError: string | null = null
     native.steer.mockImplementation(async (input) => {
       const root = native.inputs.get(input.runId)!,
-        reader = root.collaborationSourceReader!
+        reader = root.host!.workflow!.sourceReader!
       const batch = input.promptEnvelope.inputBatchRef!
       let read: import('@pact/contracts').CollaborationSourceWireRead
       try {
@@ -1182,7 +1198,7 @@ it.each(['accepted', 'consumed'] as const)(
       const run = f.db.conversationRepository.findRun(input.runId)!
       if (ending === 'accepted') input.recordDispatch('accepted')
       else
-        root.recordInputConsumption?.(input.inputId, {
+        root.host?.lifecycle?.recordInputConsumption?.(input.inputId, {
           nativeSessionId: run.nativeSessionId!,
           nativeTurnId: run.nativeTurnId!,
           executorId: run.executorId!,
@@ -1218,7 +1234,7 @@ it('the native original-Batch selector retains B0 through Steer B1 and retires b
     input.recordDispatch('possibly_sent')
     const original = native.inputs.get(input.runId)!,
       run = f.db.conversationRepository.findRun(input.runId)!
-    original.recordInputConsumption?.(input.inputId, {
+    original.host?.lifecycle?.recordInputConsumption?.(input.inputId, {
       nativeSessionId: run.nativeSessionId!,
       nativeTurnId: run.nativeTurnId!,
       executorId: run.executorId!,
@@ -1230,7 +1246,7 @@ it('the native original-Batch selector retains B0 through Steer B1 and retires b
     const r0 = await f.send(),
       repo = f.db.conversationRepository,
       input = native.inputs.get(r0)!,
-      reader = input.collaborationSourceReader!,
+      reader = input.host!.workflow!.sourceReader!,
       b0 = repo.inputBatchForRun(r0)!,
       run = repo.findRun(r0)!,
       root = { threadId: run.nativeSessionId!, turnId: run.nativeTurnId! },
@@ -1263,7 +1279,7 @@ it('the native original-Batch selector retains B0 through Steer B1 and retires b
     expect(() => reader.readNativeRoot!(request, root)).toThrow(/Batch|Run|retired Turn/u)
     expect(
       JSON.parse(
-        next.collaborationSourceReader!.readNativeRoot!(request, {
+        next.host!.workflow!.sourceReader!.readNativeRoot!(request, {
           threadId: nextRun.nativeSessionId!,
           turnId: nextRun.nativeTurnId!,
         }).page.text,

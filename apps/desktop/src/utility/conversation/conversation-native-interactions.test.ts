@@ -42,7 +42,7 @@ async function* startupRun(
   signal: AbortSignal,
 ): AsyncIterable<NormalizedAgentEvent> {
   native.starts.push({ runId: input.runId, executorId })
-  if (!native.omitExecutor) input.recordExecutor?.(executorId)
+  if (!native.omitExecutor) input.host?.lifecycle?.recordExecutor?.(executorId)
   const request: NativeUserInputRequest = {
     kind: native.kind,
     title: 'Startup request',
@@ -65,15 +65,16 @@ async function* startupRun(
         }
       : {}),
   }
-  if (!input.requestUserInput) throw new Error('Missing public startup callback')
-  const answer = await input.requestUserInput(request, signal)
+  if (!input.host?.interactions?.requestUserInput)
+    throw new Error('Missing public startup callback')
+  const answer = await input.host?.interactions?.requestUserInput(request, signal)
   native.replies.push(answer)
   signal.throwIfAborted()
   const nativeSessionId = `native:${input.runId}`
-  input.recordDispatch?.('possibly_sent', nativeSessionId, executorId)
+  input.host?.lifecycle?.recordDispatch?.('possibly_sent', nativeSessionId, executorId)
   native.dispatched += 1
   yield { agentId, type: 'session.started', nativeSessionId }
-  input.recordDispatch?.('accepted', nativeSessionId, executorId)
+  input.host?.lifecycle?.recordDispatch?.('accepted', nativeSessionId, executorId)
   yield { agentId, type: 'turn.started', turnId: `turn:${input.runId}` }
   yield {
     agentId,

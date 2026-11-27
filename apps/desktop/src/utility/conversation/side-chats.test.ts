@@ -74,16 +74,19 @@ function createMockAdapter(agentId: RuntimeAgentId) {
     async *run(input: AgentRunInput, signal: AbortSignal): AsyncGenerator<NormalizedAgentEvent> {
       this.ownerSessionId = input.sessionId
       mockState.runs.push(input)
-      input.recordExecutor?.(this.executorId)
+      input.host?.lifecycle?.recordExecutor?.(this.executorId)
       const nativeSessionId = input.nativeSessionId ?? `${agentId}:${input.sessionId}`
-      input.recordDispatch?.('possibly_sent', nativeSessionId, this.executorId)
+      input.host?.lifecycle?.recordDispatch?.('possibly_sent', nativeSessionId, this.executorId)
       yield { agentId, type: 'session.started', nativeSessionId }
-      input.recordDispatch?.('accepted', nativeSessionId, this.executorId)
+      input.host?.lifecycle?.recordDispatch?.('accepted', nativeSessionId, this.executorId)
       yield { agentId, type: 'turn.started', turnId: input.runId }
 
-      if (mockState.requestPermissionSessions.has(input.sessionId) && input.requestPermission) {
-        const permPromise = input
-          .requestPermission(
+      if (
+        mockState.requestPermissionSessions.has(input.sessionId) &&
+        input.host?.interactions?.requestPermission
+      ) {
+        const permPromise = input.host?.interactions
+          ?.requestPermission(
             {
               title: 'Run diagnostic command',
               detail: 'Side chat requests native takeover permission',
@@ -151,7 +154,7 @@ function createMockAdapter(agentId: RuntimeAgentId) {
         turnId: input.runId,
         outcome: signal.aborted ? 'interrupted' : 'completed',
       }
-      input.reportNativeEffects?.({
+      input.host?.effects?.reportNativeEffects?.({
         runId: input.runId,
         generation: input.nativeGeneration!,
         state: 'settled',
@@ -766,7 +769,7 @@ describe('syncSideChatToMain behavior', () => {
     )
     const parentRun = mockState.runs.find((r) => r.sessionId === f.parentSessionId)!
     expect(parentRun.promptEnvelope.message.content).toBe('Use optimistic locking here')
-    expect(parentRun.collaborationSourceReader).toBeDefined()
+    expect(parentRun.host?.workflow?.sourceReader).toBeDefined()
 
     // Live title resolution updates originSideChat.sideChatTitle on read.
     f.db.sessionRepository.rename(sideChatId, 'Deadlock investigation')

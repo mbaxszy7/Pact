@@ -219,12 +219,18 @@ async function verifyNativeReplacement(materialized: boolean): Promise<void> {
             },
             comments: [],
           },
-          recordExecutor: (executorId) => repo.recordExecutor(prior.id, executorId),
-          recordDispatch: (phase, nativeSessionId, executorId) =>
-            repo.recordDispatch(prior.id, phase, nativeSessionId, executorId),
-          recordNativeEvidence: (evidence) => repo.recordNativeEvidence(evidence),
-          reportNativeEffects: (report) =>
-            repo.recordNativeEffects(prior.id, report.state, report.reason),
+          host: {
+            lifecycle: {
+              recordExecutor: (executorId) => repo.recordExecutor(prior.id, executorId),
+              recordDispatch: (phase, nativeSessionId, executorId) =>
+                repo.recordDispatch(prior.id, phase, nativeSessionId, executorId),
+              recordNativeEvidence: (evidence) => repo.recordNativeEvidence(evidence),
+            },
+            effects: {
+              reportNativeEffects: (report) =>
+                repo.recordNativeEffects(prior.id, report.state, report.reason),
+            },
+          },
         },
         controller.signal,
       ))
@@ -276,7 +282,9 @@ async function verifyNativeReplacement(materialized: boolean): Promise<void> {
       })
     if (!captured) throw new Error('The authoritative immutable input was not admitted')
 
-    const recovery = (runId: string): NonNullable<AgentRunInput['recovery']> => ({
+    const recovery = (
+      runId: string,
+    ): NonNullable<NonNullable<AgentRunInput['host']>['recovery']> => ({
       inputSha256: captured.inputSha256,
       recordEffectiveSettings: (settings, identity) => {
         effectiveReceipts.push({ runId, settings, identity })
@@ -290,53 +298,74 @@ async function verifyNativeReplacement(materialized: boolean): Promise<void> {
         repo.recordConfirmedUnsent(runId, nativeGeneration, boundary, identity)
       },
     })
-    const input = (runId: string): AgentRunInput => ({
-      runId,
-      sessionId,
-      cwd: owned.cwd,
-      model: null,
-      effort: null,
-      permissionMode: 'full',
-      speed: 'standard',
-      nativeGeneration,
-      bindingGeneration: original.bindingGeneration ?? 1,
-      ...(originalNativeSessionId ? { nativeSessionId: originalNativeSessionId } : {}),
-      peerAssistanceAllowed: false,
-      promptEnvelope: restoreExecutionInput(
-        repo.frozenExecutionEnvelope(original.id),
-        () => {
-          throw new Error('This ordinary native fixture contains no image capability')
-        },
-        undefined,
-      ),
-      recordExecutor: (executorId) => repo.recordExecutor(runId, executorId),
-      recordNativeEvidence: (evidence) => repo.recordNativeEvidence(evidence),
-      reportNativeEffects: (report) => {
-        expect(report.runId).toBe(runId)
-        expect(report.generation).toBe(nativeGeneration)
-        repo.recordNativeEffects(runId, report.state, report.reason)
+    const input = (
+      runId: string,
+      overrides?: {
+        nativeSessionId?: string
+        recordDispatch?: NonNullable<
+          NonNullable<AgentRunInput['host']>['lifecycle']
+        >['recordDispatch']
+        recovery?: NonNullable<AgentRunInput['host']>['recovery']
       },
-    })
+    ): AgentRunInput => {
+      const resolvedNativeSessionId = overrides?.nativeSessionId ?? originalNativeSessionId
+      return {
+        runId,
+        sessionId,
+        cwd: owned.cwd,
+        model: null,
+        effort: null,
+        permissionMode: 'full',
+        speed: 'standard',
+        nativeGeneration,
+        bindingGeneration: original.bindingGeneration ?? 1,
+        ...(resolvedNativeSessionId ? { nativeSessionId: resolvedNativeSessionId } : {}),
+        peerAssistanceAllowed: false,
+        promptEnvelope: restoreExecutionInput(
+          repo.frozenExecutionEnvelope(original.id),
+          () => {
+            throw new Error('This ordinary native fixture contains no image capability')
+          },
+          undefined,
+        ),
+        host: {
+          lifecycle: {
+            recordExecutor: (executorId) => repo.recordExecutor(runId, executorId),
+            recordNativeEvidence: (evidence) => repo.recordNativeEvidence(evidence),
+            ...(overrides?.recordDispatch ? { recordDispatch: overrides.recordDispatch } : {}),
+          },
+          effects: {
+            reportNativeEffects: (report) => {
+              expect(report.runId).toBe(runId)
+              expect(report.generation).toBe(nativeGeneration)
+              repo.recordNativeEffects(runId, report.state, report.reason)
+            },
+          },
+          ...(overrides?.recovery ? { recovery: overrides.recovery } : {}),
+        },
+      }
+    }
     const run = async (value: AgentRunInput) => {
       for await (const event of adapter.run(value, controller.signal))
         repo.applyEvent(sessionId, value.runId, event)
     }
     await expect(
-      run({
-        ...input(original.id),
-        recovery: recovery(original.id),
-        recordDispatch: (phase, nativeSessionId, executorId) => {
-          repo.recordDispatch(original.id, phase, nativeSessionId, executorId)
-          if (phase !== 'possibly_sent') return
-          originalDispatchAttempts++
-          expect(roots).toHaveLength(baselineTurns)
-          expect(provider.requests).toHaveLength(baselineTurns)
-          // The genuine writer invokes this durable callback before sink.write.
-          // No native reply or native file is changed by this controlled fault.
-          repo.recordDispatch(original.id, 'rejected', nativeSessionId, executorId)
-          throw new Error('Injected owned pre-write transport interruption')
-        },
-      }),
+      run(
+        input(original.id, {
+          recovery: recovery(original.id),
+          recordDispatch: (phase, nativeSessionId, executorId) => {
+            repo.recordDispatch(original.id, phase, nativeSessionId, executorId)
+            if (phase !== 'possibly_sent') return
+            originalDispatchAttempts++
+            expect(roots).toHaveLength(baselineTurns)
+            expect(provider.requests).toHaveLength(baselineTurns)
+            // The genuine writer invokes this durable callback before sink.write.
+            // No native reply or native file is changed by this controlled fault.
+            repo.recordDispatch(original.id, 'rejected', nativeSessionId, executorId)
+            throw new Error('Injected owned pre-write transport interruption')
+          },
+        }),
+      ),
     ).rejects.toMatchObject({ kind: 'protocol_error' })
     expect(effectiveReceipts).toHaveLength(1)
     const actual = effectiveReceipts[0]!
@@ -396,19 +425,20 @@ async function verifyNativeReplacement(materialized: boolean): Promise<void> {
     })
     expect(repo.schedulingBudget(`input:${original.userMessageId}`)?.automaticResends).toBe(1)
     expect(repo.canDispatchReexecution(replacement.id)).toBe(true)
-    const replacementAttempt = run({
-      ...input(replacement.id),
-      nativeSessionId: actual.identity.nativeSessionId,
-      recovery: {
-        ...recovery(replacement.id),
-        expected: { settings: actual.settings, ...actual.identity },
-        canDispatch: () => repo.canDispatchReexecution(replacement.id),
-      },
-      recordDispatch: (phase, nativeSessionId, executorId) => {
-        if (phase === 'possibly_sent') replacementDispatchAttempts++
-        repo.recordDispatch(replacement.id, phase, nativeSessionId, executorId)
-      },
-    })
+    const replacementAttempt = run(
+      input(replacement.id, {
+        nativeSessionId: actual.identity.nativeSessionId,
+        recovery: {
+          ...recovery(replacement.id),
+          expected: { settings: actual.settings, ...actual.identity },
+          canDispatch: () => repo.canDispatchReexecution(replacement.id),
+        },
+        recordDispatch: (phase, nativeSessionId, executorId) => {
+          if (phase === 'possibly_sent') replacementDispatchAttempts++
+          repo.recordDispatch(replacement.id, phase, nativeSessionId, executorId)
+        },
+      }),
+    )
     if (!materialized) {
       await expect(replacementAttempt).rejects.toMatchObject({
         kind: 'context_resume_failed',

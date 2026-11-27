@@ -107,11 +107,11 @@ function adapter(agentId: RuntimeAgentId) {
       }
       signal.addEventListener('abort', aborted, { once: true })
       try {
-        input.recordExecutor?.(this.executorId)
+        input.host?.lifecycle?.recordExecutor?.(this.executorId)
         const nativeSessionId = input.nativeSessionId ?? `${agentId}:${input.sessionId}`
-        input.recordDispatch?.('possibly_sent', nativeSessionId, this.executorId)
+        input.host?.lifecycle?.recordDispatch?.('possibly_sent', nativeSessionId, this.executorId)
         yield { type: 'session.started', agentId, nativeSessionId }
-        input.recordDispatch?.('accepted', nativeSessionId, this.executorId)
+        input.host?.lifecycle?.recordDispatch?.('accepted', nativeSessionId, this.executorId)
         yield { type: 'turn.started', agentId, turnId: input.runId }
         yield {
           type: 'text.delta',
@@ -123,7 +123,7 @@ function adapter(agentId: RuntimeAgentId) {
         const outcome = await run.ending.promise
         // Disposal merely releases our fixture iterator; it supplies no ending fact.
         if (!outcome) return
-        input.recordNativeEvidence?.({
+        input.host?.lifecycle?.recordNativeEvidence?.({
           kind: 'ended',
           source: 'live_terminal',
           outcome,
@@ -200,7 +200,7 @@ function value<T>(result: RpcResult<T>): T {
 
 function effectsSettled(run: ControlledRun) {
   run.background = false
-  run.input.reportNativeEffects?.({
+  run.input.host?.effects?.reportNativeEffects?.({
     runId: run.input.runId,
     generation: run.input.nativeGeneration!,
     state: 'settled',
@@ -623,7 +623,7 @@ describe('Conversation workspace archive', () => {
     })
     const run = await f.start()
     await writeFile(file, 'After\n')
-    await run.input.recordFileChange?.(
+    await run.input.host?.effects?.recordFileChange?.(
       {
         operationId: randomUUID(),
         path: 'recorded.txt',
@@ -1382,7 +1382,7 @@ describe('Conversation workspace archive', () => {
         await writeFile(nativeFile, 'Before\n')
         const active = await f.start()
         await writeFile(nativeFile, 'After\n')
-        await active.input.recordFileChange?.(
+        await active.input.host?.effects?.recordFileChange?.(
           {
             operationId: randomUUID(),
             path: 'native-recorded.txt',

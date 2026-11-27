@@ -65,15 +65,15 @@ async function* scriptedRun(
     )
   native.actors += 1
   native.inputs.set(input.runId, input)
-  input.recordExecutor?.(executorId)
+  input.host?.lifecycle?.recordExecutor?.(executorId)
   const nativeSessionId = input.nativeSessionId ?? `native:${input.sessionId}`
-  input.recordDispatch?.('possibly_sent', nativeSessionId, executorId)
+  input.host?.lifecycle?.recordDispatch?.('possibly_sent', nativeSessionId, executorId)
   yield { type: 'session.started', agentId, nativeSessionId }
-  input.recordDispatch?.('accepted', nativeSessionId, executorId)
+  input.host?.lifecycle?.recordDispatch?.('accepted', nativeSessionId, executorId)
   yield { type: 'turn.started', agentId, turnId: `turn:${input.runId}` }
   const path = `file-${native.actors}.ts`
   await writeFile(join(input.cwd, path), 'export const value = 1\n')
-  await input.recordFileChange?.(
+  await input.host?.effects?.recordFileChange?.(
     {
       operationId: randomUUID(),
       path,
@@ -94,7 +94,7 @@ async function* scriptedRun(
   if (native.terminalGate) await native.terminalGate
   yield { type: 'turn.completed', agentId, turnId: `turn:${input.runId}`, outcome: 'completed' }
   if (native.unavailableReport && agentId === 'claude')
-    input.recordBackgroundReportUnavailable?.({
+    input.host?.effects?.recordBackgroundReportUnavailable?.({
       agentId,
       runId: input.runId,
       nativeSessionId,
@@ -105,7 +105,7 @@ async function* scriptedRun(
       nativeMessageId: 'owned-unavailable-report',
     })
   if (!native.background.has(input.runId))
-    input.reportNativeEffects?.({
+    input.host?.effects?.reportNativeEffects?.({
       runId: input.runId,
       generation: input.nativeGeneration!,
       state: 'settled',
@@ -519,7 +519,11 @@ async function fixture(agentId: RuntimeAgentId) {
   const endBackground = (runId: string) => {
     native.background.delete(runId)
     const input = native.inputs.get(runId)!
-    input.reportNativeEffects?.({ runId, generation: input.nativeGeneration!, state: 'settled' })
+    input.host?.effects?.reportNativeEffects?.({
+      runId,
+      generation: input.nativeGeneration!,
+      state: 'settled',
+    })
   }
   return {
     db,
@@ -582,7 +586,7 @@ it.each(['codex', 'claude'] as const)(
       const revision = f.workspace.summary(firstId)!.revision!
       const input = native.inputs.get(firstId)!
       await writeFile(join(f.projectDirectory, 'late.ts'), 'export const late = true\n')
-      await input.recordFileChange!(
+      await input.host?.effects?.recordFileChange!(
         {
           operationId: randomUUID(),
           path: 'late.ts',
@@ -596,7 +600,7 @@ it.each(['codex', 'claude'] as const)(
       expect(recorded).toMatchObject({ state: 'recording', fileCount: 2, finalizedAt: null })
       expect(recorded.revision).toBeGreaterThan(revision)
       await writeFile(join(f.projectDirectory, 'file-1.ts'), 'export const value = 2\n')
-      await input.recordFileChange!(
+      await input.host?.effects?.recordFileChange!(
         {
           operationId: randomUUID(),
           path: 'file-1.ts',
@@ -716,7 +720,7 @@ it('pauses the original foreground queue when its retained observer later loses 
       id: queuedId,
       state: 'queued',
     })
-    input.reportNativeEffects!({
+    input.host?.effects?.reportNativeEffects!({
       runId: input.runId,
       generation: input.nativeGeneration!,
       state: 'unknown',
@@ -766,7 +770,7 @@ it('never auto-dispatches a peer-anchored queue while another current background
     const queuedId = f.db.conversationRepository.queueState(f.sessionId).input!.id
     const input = native.inputs.get(original)!
     native.background.delete(original)
-    input.reportNativeEffects!({
+    input.host?.effects?.reportNativeEffects!({
       runId: original,
       generation: input.nativeGeneration!,
       state: 'unknown',
@@ -822,7 +826,7 @@ it('keeps unknown current background work visible and blocks Send after a newer 
     expect(f.db.conversationRepository.findRun(refused)?.dispatchPhase).toBe('not_sent')
     native.extraBackground = 0
     const input = native.inputs.get(original)!
-    input.reportNativeEffects!({
+    input.host?.effects?.reportNativeEffects!({
       runId: original,
       generation: input.nativeGeneration!,
       state: 'unknown',

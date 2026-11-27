@@ -30,8 +30,8 @@ vi.mock('./codex-agent-adapter.js', () => ({
     async *run(input: AgentRunInput, signal: AbortSignal): AsyncIterable<NormalizedAgentEvent> {
       native.runs++
       const nativeSessionId = `native:${input.sessionId}`
-      input.recordExecutor?.(this.executorId)
-      input.recordDispatch?.('accepted', nativeSessionId, this.executorId)
+      input.host?.lifecycle?.recordExecutor?.(this.executorId)
+      input.host?.lifecycle?.recordDispatch?.('accepted', nativeSessionId, this.executorId)
       yield { type: 'session.started', agentId: this.id, nativeSessionId }
       yield { type: 'turn.started', agentId: this.id, turnId: input.runId }
       yield {
@@ -48,7 +48,7 @@ vi.mock('./codex-agent-adapter.js', () => ({
       })
       native.interrupts++
       const drain = () =>
-        input.reportNativeEffects?.({
+        input.host?.effects?.reportNativeEffects?.({
           runId: input.runId,
           generation: input.nativeGeneration!,
           state: 'settled',
@@ -71,17 +71,17 @@ vi.mock('./codex-agent-adapter.js', () => ({
             executorId: this.executorId,
           },
         }
-        input.recordNativeEvidence?.(evidence)
+        input.host?.lifecycle?.recordNativeEvidence?.(evidence)
         if (native.mode !== 'drain_first') drain()
       }
-      input.recordArchivedEvent?.({
+      input.host?.effects?.recordArchivedEvent?.({
         type: 'text.delta',
         agentId: this.id,
         turnId: input.runId,
         outputId: 'answer',
         text: 'Late text must not be appended.',
       })
-      input.recordWorkflowPlan?.({
+      input.host?.workflow?.recordPlan?.({
         nativeId: 'late-plan',
         text: 'No new workflow action during shutdown.',
       })

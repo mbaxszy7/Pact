@@ -30,7 +30,6 @@ import {
   encodeBoundedOpenPlanProgressToken,
   peerRequestToolInputSchema,
   sessionTitleInputSchema,
-  type CollaborationSourceReadResult,
   type CollaborationTask,
   type CollaborationTurnAuthorization,
   type RuntimeAgentId,
@@ -99,7 +98,6 @@ export interface AgyMcpServerConfig {
   peerTargetAgentId: Exclude<RuntimeAgentId, 'agy'> | undefined
   sourceGrant: { runId: string; grant: string } | undefined
   sourceReader: AgentCollaborationSourceReader | undefined
-  legacySourceReader: ((input: unknown) => CollaborationSourceReadResult) | undefined
   isPlanRetentionCurrent: () => boolean
   recordOpenPlanFinalIntent?: ((intent: AgentOpenPlanFinalIntent) => boolean | void) | undefined
   reserveCorrelationBytes?: (nextBytes: number) => boolean
@@ -132,8 +130,7 @@ export class AgyRunMcpServer {
       () => config.getRootStepIdx() ?? (config.hasZeroTurnStepBoundary() ? 0 : undefined),
     )
     this.sourceCapability = resolveAgentCollaborationSourceCapability({
-      readCollaborationSourcePart: config.legacySourceReader,
-      collaborationSourceReader: config.sourceReader,
+      sourceReader: config.sourceReader,
     })
     if (this.sourceCapability.tier !== 'none') {
       this.allowedToolNames.add('read_collaboration_source')
@@ -984,9 +981,7 @@ export class AgyRunMcpServer {
                   : this.sourceCapability.legacy
                     ? this.config.sourceReader
                     : undefined,
-                !hasSourceRefArg && this.sourceCapability.legacy
-                  ? this.config.legacySourceReader
-                  : undefined,
+                undefined,
               )
         const serialized = JSON.stringify(page)
         if (Buffer.byteLength(serialized, 'utf8') > COLLABORATION_PAGE_BYTES * 2) {

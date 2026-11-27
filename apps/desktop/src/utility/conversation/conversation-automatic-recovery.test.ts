@@ -49,9 +49,9 @@ vi.mock('./codex-agent-adapter.js', () => ({
       native.runs.push(input)
       if (native.mode === 'unsent') {
         const session = input.nativeSessionId ?? this.nativeSessionId
-        input.recordExecutor?.(this.executorId)
+        input.host?.lifecycle?.recordExecutor?.(this.executorId)
         yield { type: 'session.started', agentId: 'codex', nativeSessionId: session }
-        input.recovery?.recordEffectiveSettings(
+        input.host?.recovery?.recordEffectiveSettings(
           {
             version: 1,
             provider: 'codex',
@@ -64,13 +64,13 @@ vi.mock('./codex-agent-adapter.js', () => ({
           },
           { executorId: this.executorId, nativeSessionId: session },
         )
-        if (!input.recovery?.expected) {
-          input.recordDispatch?.('rejected', session, this.executorId)
-          input.recovery?.recordConfirmedUnsent(
+        if (!input.host?.recovery?.expected) {
+          input.host?.lifecycle?.recordDispatch?.('rejected', session, this.executorId)
+          input.host?.recovery?.recordConfirmedUnsent(
             { kind: 'codex_root_frame_not_written', requestId: 42 },
             { executorId: this.executorId, nativeSessionId: session },
           )
-          input.reportNativeEffects?.({
+          input.host?.effects?.reportNativeEffects?.({
             runId: input.runId,
             generation: input.nativeGeneration!,
             state: 'settled',
@@ -82,12 +82,12 @@ vi.mock('./codex-agent-adapter.js', () => ({
             true,
           )
         }
-        const admitted = input.recovery.canDispatch?.() === true
+        const admitted = input.host?.recovery.canDispatch?.() === true
         native.fences.push(admitted)
         if (!admitted) throw new Error('The replacement was withheld at its actual write boundary.')
         const turnId = randomUUID()
-        input.recordDispatch?.('possibly_sent', session, this.executorId)
-        input.recordDispatch?.('accepted', session, this.executorId)
+        input.host?.lifecycle?.recordDispatch?.('possibly_sent', session, this.executorId)
+        input.host?.lifecycle?.recordDispatch?.('accepted', session, this.executorId)
         yield { type: 'turn.started', agentId: 'codex', turnId }
         yield {
           type: 'text.completed',
@@ -96,7 +96,7 @@ vi.mock('./codex-agent-adapter.js', () => ({
           outputId: randomUUID(),
           text: 'Complete original task response.',
         }
-        input.reportNativeEffects?.({
+        input.host?.effects?.reportNativeEffects?.({
           runId: input.runId,
           generation: input.nativeGeneration!,
           state: 'settled',
@@ -106,10 +106,10 @@ vi.mock('./codex-agent-adapter.js', () => ({
       }
       const session = randomUUID(),
         executor = randomUUID()
-      input.recordExecutor?.(executor)
-      input.recordDispatch?.('possibly_sent', session, executor)
+      input.host?.lifecycle?.recordExecutor?.(executor)
+      input.host?.lifecycle?.recordDispatch?.('possibly_sent', session, executor)
       yield { type: 'session.started', agentId: 'codex', nativeSessionId: session }
-      input.recordDispatch?.('accepted', session, executor)
+      input.host?.lifecycle?.recordDispatch?.('accepted', session, executor)
       yield { type: 'turn.started', agentId: 'codex', turnId: randomUUID() }
       throw new AgentExecutionError(
         'transient_transport',
@@ -621,7 +621,7 @@ describe('automatic recovery through Conversation', () => {
     expect(replacement!.runId).not.toBe(original!.runId)
     expect(replacement!.promptEnvelope.message).toEqual(original!.promptEnvelope.message)
     expect(replacement!.promptEnvelope.comments).toEqual(original!.promptEnvelope.comments)
-    expect(replacement!.recovery?.expected).toMatchObject({
+    expect(replacement!.host?.recovery?.expected).toMatchObject({
       executorId: f.repo.executionInput(original!.runId)!.proof!.executorId,
       settings: {
         model: 'original-native-model',

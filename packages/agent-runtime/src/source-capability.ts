@@ -2,7 +2,6 @@ import type {
   CodexCollaborationSourceWireRead,
   CollaborationSourceAnyRead,
   CollaborationSourceNativeRoot,
-  CollaborationSourceReadResult,
   CollaborationSourceWireResult,
   CollaborationTask,
   CollaborationTurnAuthorization,
@@ -44,10 +43,9 @@ export interface AgentCollaborationSourceReader {
 }
 
 export function resolveAgentCollaborationSourceCapability(input: {
-  readCollaborationSourcePart?: ((input: unknown) => CollaborationSourceReadResult) | undefined
-  collaborationSourceReader?: AgentCollaborationSourceReader | undefined
+  sourceReader?: AgentCollaborationSourceReader | undefined
 }): AgentCollaborationSourceCapability {
-  const reader = input.collaborationSourceReader
+  const reader = input.sourceReader
   const allowedForms =
     reader?.supportedForms !== undefined
       ? new Set<AgentSourceReadForm>(reader.supportedForms)
@@ -57,9 +55,7 @@ export function resolveAgentCollaborationSourceCapability(input: {
     (allowedForms === undefined || allowedForms.has('nativeRoot'))
   const hasSourceReader =
     Boolean(reader) && (allowedForms === undefined || allowedForms.has('sourceReference'))
-  const hasLegacy = reader
-    ? allowedForms === undefined || allowedForms.has('legacy')
-    : Boolean(input.readCollaborationSourcePart)
+  const hasLegacy = Boolean(reader) && (allowedForms === undefined || allowedForms.has('legacy'))
   const tier: AgentSourceReadCapabilityTier = hasNativeRoot
     ? 'nativeRoot'
     : hasSourceReader

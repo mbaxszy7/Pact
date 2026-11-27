@@ -119,12 +119,15 @@ function input(): AgentRunInput {
     },
   }
 }
-function capture(): NonNullable<AgentRunInput['recovery']> {
+function capture(): NonNullable<NonNullable<AgentRunInput['host']>['recovery']> {
   return {
     inputSha256: 'a'.repeat(64),
     recordEffectiveSettings:
-      vi.fn<NonNullable<AgentRunInput['recovery']>['recordEffectiveSettings']>(),
-    recordConfirmedUnsent: vi.fn<NonNullable<AgentRunInput['recovery']>['recordConfirmedUnsent']>(),
+      vi.fn<
+        NonNullable<NonNullable<AgentRunInput['host']>['recovery']>['recordEffectiveSettings']
+      >(),
+    recordConfirmedUnsent:
+      vi.fn<NonNullable<NonNullable<AgentRunInput['host']>['recovery']>['recordConfirmedUnsent']>(),
   }
 }
 async function consume(adapter: CodexAgentAdapter | ClaudeAgentAdapter, value: AgentRunInput) {
@@ -231,9 +234,13 @@ describe('Codex reexecution evidence at the real root writer', () => {
       await expect(
         consume(f.adapter, {
           ...value,
-          recovery,
-          recordDispatch: (phase) => {
-            if (phase === 'possibly_sent') throw new NativeInputWithheldError()
+          host: {
+            recovery,
+            lifecycle: {
+              recordDispatch: (phase) => {
+                if (phase === 'possibly_sent') throw new NativeInputWithheldError()
+              },
+            },
           },
         }),
       ).rejects.toBeInstanceOf(NativeInputWithheldError)
@@ -261,7 +268,9 @@ describe('Codex reexecution evidence at the real root writer', () => {
     const f = codexFixture({ nativeError: true }),
       recovery = capture()
     try {
-      await expect(consume(f.adapter, { ...input(), recovery })).rejects.toBeInstanceOf(Error)
+      await expect(consume(f.adapter, { ...input(), host: { recovery } })).rejects.toBeInstanceOf(
+        Error,
+      )
       expect(f.starts).toHaveLength(1)
       expect(recovery.recordConfirmedUnsent).not.toHaveBeenCalled()
     } finally {
@@ -277,7 +286,7 @@ describe('Codex reexecution evidence at the real root writer', () => {
         await consume(f.adapter, {
           ...input(),
           speed: unknown === 'speed' ? 'native' : 'standard',
-          recovery,
+          host: { recovery },
         })
         expect(f.starts).toHaveLength(1)
         expect(recovery.recordEffectiveSettings).not.toHaveBeenCalled()
@@ -293,21 +302,23 @@ describe('Codex reexecution evidence at the real root writer', () => {
         recovery = capture(),
         value = input()
       try {
-        await consume(f.adapter, { ...value, recovery })
+        await consume(f.adapter, { ...value, host: { recovery } })
         const settings = vi.mocked(recovery.recordEffectiveSettings).mock.calls[0]![0]
         if (changed === 'settings') f.model('another-native-model')
         await expect(
           consume(f.adapter, {
             ...value,
             runId: randomUUID(),
-            recovery: {
-              ...capture(),
-              expected: {
-                settings,
-                executorId: changed === 'executor' ? 'other-executor' : f.adapter.executorId,
-                nativeSessionId: value.nativeSessionId!,
+            host: {
+              recovery: {
+                ...capture(),
+                expected: {
+                  settings,
+                  executorId: changed === 'executor' ? 'other-executor' : f.adapter.executorId,
+                  nativeSessionId: value.nativeSessionId!,
+                },
+                canDispatch: () => changed !== 'authority',
               },
-              canDispatch: () => changed !== 'authority',
             },
           }),
         ).rejects.toBeInstanceOf(NativeInputWithheldError)
@@ -472,7 +483,7 @@ describe('Claude reexecution evidence at the actual SDK producer', () => {
     const f = claudeFixture(),
       recovery = capture()
     try {
-      await consume(f.adapter, { ...input(), recovery })
+      await consume(f.adapter, { ...input(), host: { recovery } })
       expect(f.settingsReads()).toBe(1)
       expect(recovery.recordEffectiveSettings).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -501,7 +512,7 @@ describe('Claude reexecution evidence at the actual SDK producer', () => {
         }),
         recovery = capture()
       try {
-        await consume(f.adapter, { ...input(), recovery })
+        await consume(f.adapter, { ...input(), host: { recovery } })
         expect(f.prompts).toHaveLength(1)
         expect(recovery.recordEffectiveSettings).not.toHaveBeenCalled()
       } finally {
@@ -513,15 +524,24 @@ describe('Claude reexecution evidence at the actual SDK producer', () => {
   it('does not publish unsent while an unconsumed producer can still yield, then records its natural no-yield close', async () => {
     const f = claudeFixture({ holdProducer: true }),
       recovery = capture(),
-      report = vi.fn<NonNullable<AgentRunInput['reportNativeEffects']>>(),
+      report =
+        vi.fn<
+          NonNullable<
+            NonNullable<NonNullable<AgentRunInput['host']>['effects']>['reportNativeEffects']
+          >
+        >(),
       value = input()
     try {
       const result = consume(f.adapter, {
         ...value,
-        recovery,
-        reportNativeEffects: report,
-        recordDispatch: (phase) => {
-          if (phase === 'possibly_sent') throw new NativeInputWithheldError()
+        host: {
+          recovery,
+          effects: { reportNativeEffects: report },
+          lifecycle: {
+            recordDispatch: (phase) => {
+              if (phase === 'possibly_sent') throw new NativeInputWithheldError()
+            },
+          },
         },
       })
       await vi.waitFor(() => expect(f.settingsReads()).toBe(1))
@@ -543,7 +563,9 @@ describe('Claude reexecution evidence at the actual SDK producer', () => {
     const f = claudeFixture({ lateFailure: true }),
       recovery = capture()
     try {
-      await expect(consume(f.adapter, { ...input(), recovery })).rejects.toBeInstanceOf(Error)
+      await expect(consume(f.adapter, { ...input(), host: { recovery } })).rejects.toBeInstanceOf(
+        Error,
+      )
       expect(f.prompts).toHaveLength(1)
       expect(recovery.recordConfirmedUnsent).not.toHaveBeenCalled()
     } finally {
@@ -568,14 +590,16 @@ describe('Claude reexecution evidence at the actual SDK producer', () => {
       await expect(
         consume(f.adapter, {
           ...value,
-          recovery: {
-            ...capture(),
-            expected: {
-              settings,
-              executorId: 'original-executor',
-              nativeSessionId: value.nativeSessionId!,
+          host: {
+            recovery: {
+              ...capture(),
+              expected: {
+                settings,
+                executorId: 'original-executor',
+                nativeSessionId: value.nativeSessionId!,
+              },
+              canDispatch: () => true,
             },
-            canDispatch: () => true,
           },
         }),
       ).rejects.toBeInstanceOf(NativeInputWithheldError)

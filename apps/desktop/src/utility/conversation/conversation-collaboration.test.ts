@@ -226,7 +226,7 @@ function adapter(agentId: RuntimeAgentId) {
       const report = native.next
       native.next = undefined
       if (report?.stopBeforeDispatch) {
-        input.reportNativeEffects?.({
+        input.host?.effects?.reportNativeEffects?.({
           runId: input.runId,
           generation: input.nativeGeneration!,
           state: 'settled',
@@ -235,8 +235,8 @@ function adapter(agentId: RuntimeAgentId) {
         throw Error('Fixture cancelled before the native request was written.')
       }
       if (report?.rejectedWithUncertainEffects) {
-        input.recordDispatch?.('rejected')
-        input.reportNativeEffects?.({
+        input.host?.lifecycle?.recordDispatch?.('rejected')
+        input.host?.effects?.reportNativeEffects?.({
           runId: input.runId,
           generation: input.nativeGeneration!,
           state: 'unknown',
@@ -245,11 +245,11 @@ function adapter(agentId: RuntimeAgentId) {
         throw Error('Fixture observed rejection with unresolved native effects.')
       }
       const executor = report?.nativeQuestion || report?.nativeExecutor ? randomUUID() : undefined
-      if (executor) input.recordExecutor?.(executor)
+      if (executor) input.host?.lifecycle?.recordExecutor?.(executor)
       const nativeSessionId = input.nativeSessionId ?? randomUUID()
-      input.recordDispatch?.('possibly_sent', nativeSessionId, executor)
+      input.host?.lifecycle?.recordDispatch?.('possibly_sent', nativeSessionId, executor)
       yield { agentId, type: 'session.started', nativeSessionId }
-      input.recordDispatch?.('accepted', nativeSessionId, executor)
+      input.host?.lifecycle?.recordDispatch?.('accepted', nativeSessionId, executor)
       yield { agentId, type: 'turn.started', turnId: input.runId }
       if (native.hold)
         await Promise.race([
@@ -261,7 +261,7 @@ function adapter(agentId: RuntimeAgentId) {
         ])
       signal.throwIfAborted()
       if (report?.failedNativeEnding) {
-        input.reportNativeEffects?.({
+        input.host?.effects?.reportNativeEffects?.({
           runId: input.runId,
           generation: input.nativeGeneration!,
           state: 'settled',
@@ -271,7 +271,7 @@ function adapter(agentId: RuntimeAgentId) {
       }
       if (native.fail) throw Error('Fixture failure after accepted delivery')
       const phase = input.promptEnvelope.collaboration
-      const sourceReader = input.collaborationSourceReader
+      const sourceReader = input.host?.workflow?.sourceReader
       if (sourceReader) {
         const targets: import('@pact/agent-runtime').AgentSourceTarget[] = [
           { source: 'handoff_sources' },
@@ -304,7 +304,7 @@ function adapter(agentId: RuntimeAgentId) {
           text: `${agentId} ordinary response.`,
         }
         yield { agentId, type: 'turn.completed', turnId: input.runId, outcome: 'completed' }
-        input.reportNativeEffects?.({
+        input.host?.effects?.reportNativeEffects?.({
           runId: input.runId,
           generation: input.nativeGeneration!,
           state: 'settled',
@@ -320,12 +320,12 @@ function adapter(agentId: RuntimeAgentId) {
         const hash = createHash('sha256')
         let manifestText = ''
         for (;;) {
-          const page = input.readCollaborationSourcePart!({
+          const reader = input.host!.workflow!.sourceReader!
+          const page = reader.read({
             ...input.promptEnvelope.sourceGrant,
             document,
             offset,
-          })
-          const reader = input.collaborationSourceReader!
+          }).page
           const reference = reader.navigation({ source: 'document', document }, 'sourceReference')
           const ownedPage = reader.read({ ...reference, offset }).page
           expect(ownedPage.text).toBe(page.text)
@@ -352,7 +352,7 @@ function adapter(agentId: RuntimeAgentId) {
         })
       }
       if (report?.nativeQuestion) {
-        const answered = await input.requestUserInput?.(
+        const answered = await input.host?.interactions?.requestUserInput?.(
           {
             kind: 'questions',
             title: 'Clarify the scope',
@@ -364,17 +364,17 @@ function adapter(agentId: RuntimeAgentId) {
         if (answered?.action !== 'accept') throw Error('The fixture question was not answered.')
       }
       const auth = input.promptEnvelope.collaborationAuthorization
-      if (report?.input) input.recordWorkflowInputResult?.(report.input)
+      if (report?.input) input.host?.workflow?.recordInputResult?.(report.input)
       else if (collaborationPlanMode(phase, auth)) {
         if (report?.plan !== null)
-          input.recordWorkflowPlan?.({
+          input.host?.workflow?.recordPlan?.({
             nativeId: `plan-${input.runId}`,
             text:
               report?.plan ?? native.plans.shift() ?? '1. Implement scope. 2. Verify cancellation.',
           })
       } else if (phase.stage === 'collaborate') {
         if (typeof report?.plan === 'string') {
-          input.recordWorkflowPlan?.({
+          input.host?.workflow?.recordPlan?.({
             nativeId: `plan-${input.runId}`,
             text: report.plan,
           })
@@ -383,12 +383,12 @@ function adapter(agentId: RuntimeAgentId) {
       } else if (phase.stage === 'implement' || phase.stage === 'repair') {
         if (!native.noCodeChanges) native.recordCodeChange?.(input)
       } else if (phase.stage === 'plan_review' || phase.stage === 'code_review') {
-        input.recordWorkflowReview?.(
+        input.host?.workflow?.recordReview?.(
           report?.review ?? native.nextReview ?? native.reviews.shift() ?? { verdict: 'accepted' },
         )
         native.nextReview = undefined
       } else if (collaborationInputResultRequired(phase, auth))
-        input.recordWorkflowInputResult?.({ outcome: 'processed' })
+        input.host?.workflow?.recordInputResult?.({ outcome: 'processed' })
       yield {
         agentId,
         type: 'text.completed',
@@ -397,7 +397,7 @@ function adapter(agentId: RuntimeAgentId) {
         text: report?.answer ?? `${phase.stage} complete.`,
       }
       yield { agentId, type: 'turn.completed', turnId: input.runId, outcome: 'completed' }
-      input.reportNativeEffects?.({
+      input.host?.effects?.reportNativeEffects?.({
         runId: input.runId,
         generation: input.nativeGeneration!,
         state: 'settled',
@@ -1611,7 +1611,7 @@ describe('Native workflow admission and durable dispatch', () => {
       actor = input.promptEnvelope.collaboration!.actor,
       document = input.promptEnvelope.collaboration!.planReference!.document,
       grant = input.promptEnvelope.sourceGrant!,
-      reader = input.readCollaborationSourcePart!
+      reader = (raw: unknown) => input.host!.workflow!.sourceReader!.read(raw).page
     const first = reader({ ...grant, document, offset: 0 })
     expect(first.nextOffset).toBe(4096)
     const before = f.db.performanceDiagnostics()!.sqlite.operations
@@ -3709,7 +3709,9 @@ describe('Explicit Plan questions', () => {
           revision.promptEnvelope.collaborationAuthorization,
         ),
       ).toBe(true)
-      expect(revision.getPlanCheckpoint?.(revision.nativeSessionId!)).toBeUndefined()
+      expect(
+        revision.host?.workflow?.getPlanCheckpoint?.(revision.nativeSessionId!),
+      ).toBeUndefined()
     } finally {
       native.hold = undefined
       hold.resolve()

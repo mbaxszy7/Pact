@@ -1191,10 +1191,8 @@ export class RunExecutor {
         },
       }
 
-      // Pass the grouped `host` ports; flat fields are deleted in Wave 4 once all 3 adapters cut over.
       const runInput: AgentRunInput = {
         host,
-        recovery,
         runId: run.id,
         sessionId: run.sessionId,
         permissionMode: run.permissionMode,
@@ -1208,84 +1206,6 @@ export class RunExecutor {
         model: settings.agents[run.agentId].model,
         effort: settings.agents[run.agentId].effort,
         speed: run.speed ?? 'native',
-        ...(host.lifecycle.recordExecutor ? { recordExecutor: host.lifecycle.recordExecutor } : {}),
-        ...(host.lifecycle.observeNativeTitle
-          ? { observeNativeTitle: host.lifecycle.observeNativeTitle }
-          : {}),
-        ...(host.lifecycle.observeNativeDelta
-          ? { observeNativeDelta: host.lifecycle.observeNativeDelta }
-          : {}),
-        ...(host.lifecycle.recordDispatch ? { recordDispatch: host.lifecycle.recordDispatch } : {}),
-        ...(host.lifecycle.recordNativeEvidence
-          ? { recordNativeEvidence: host.lifecycle.recordNativeEvidence }
-          : {}),
-        ...(host.lifecycle.recordInputConsumption
-          ? { recordInputConsumption: host.lifecycle.recordInputConsumption }
-          : {}),
-        ...(host.lifecycle.recordOutputFailure
-          ? { recordOutputFailure: host.lifecycle.recordOutputFailure }
-          : {}),
-        ...(host.lifecycle.waitForRootOutput
-          ? { waitForRootOutput: host.lifecycle.waitForRootOutput }
-          : {}),
-        ...(host.effects.recordArchivedEvent
-          ? { recordArchivedEvent: host.effects.recordArchivedEvent }
-          : {}),
-        ...(host.effects.recordBackgroundReportUnavailable
-          ? { recordBackgroundReportUnavailable: host.effects.recordBackgroundReportUnavailable }
-          : {}),
-        ...(host.effects.recordBackgroundReport
-          ? { recordBackgroundReport: host.effects.recordBackgroundReport }
-          : {}),
-        ...(host.effects.anchorFileBeforeEdit
-          ? { anchorFileBeforeEdit: host.effects.anchorFileBeforeEdit }
-          : {}),
-        ...(host.effects.recordFileChange
-          ? { recordFileChange: host.effects.recordFileChange }
-          : {}),
-        ...(host.effects.recordUncertainEffects
-          ? { recordUncertainEffects: host.effects.recordUncertainEffects }
-          : {}),
-        ...(host.effects.backgroundWorkChanged
-          ? { backgroundWorkChanged: host.effects.backgroundWorkChanged }
-          : {}),
-        ...(host.effects.reportNativeEffects
-          ? { reportNativeEffects: host.effects.reportNativeEffects }
-          : {}),
-        collaborationSourceReader: host.workflow.sourceReader,
-        ...(host.workflow.getPlanCheckpoint
-          ? { getPlanCheckpoint: host.workflow.getPlanCheckpoint }
-          : {}),
-        readCollaborationSourcePart: owner.sourceReader
-          ? (raw) => {
-              const {
-                binding: _binding,
-                nextRead: _nextRead,
-                ...page
-              } = owner.sourceReader!.read(raw).page
-              return page
-            }
-          : undefined,
-        ...(host.workflow.recordPlan ? { recordWorkflowPlan: host.workflow.recordPlan } : {}),
-        ...(host.workflow.recordOpenPlanFinalIntent
-          ? { recordOpenPlanFinalIntent: host.workflow.recordOpenPlanFinalIntent }
-          : {}),
-        ...(host.workflow.recordPlanRetained
-          ? { recordWorkflowPlanRetained: host.workflow.recordPlanRetained }
-          : {}),
-        ...(host.workflow.recordPlanUnavailable
-          ? { recordWorkflowPlanUnavailable: host.workflow.recordPlanUnavailable }
-          : {}),
-        ...(host.workflow.recordReview ? { recordWorkflowReview: host.workflow.recordReview } : {}),
-        ...(host.workflow.recordInputResult
-          ? { recordWorkflowInputResult: host.workflow.recordInputResult }
-          : {}),
-        ...(host.interactions.requestPermission
-          ? { requestPermission: host.interactions.requestPermission }
-          : {}),
-        ...(host.interactions.requestUserInput
-          ? { requestUserInput: host.interactions.requestUserInput }
-          : {}),
       }
 
       for await (const event of adapter.run(runInput, signal)) {

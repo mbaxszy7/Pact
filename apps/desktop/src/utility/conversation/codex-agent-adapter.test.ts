@@ -219,9 +219,19 @@ it.each([
         options: [{ label: 'Current request' }, { label: 'All pending requests' }],
       },
     ]
-    const record = vi.fn<NonNullable<AgentRunInput['recordWorkflowInputResult']>>()
+    const record =
+      vi.fn<
+        NonNullable<
+          NonNullable<NonNullable<AgentRunInput['host']>['workflow']>['recordInputResult']
+        >
+      >()
     const calls = Promise.withResolvers<void>()
-    const evidence = vi.fn<NonNullable<AgentRunInput['recordNativeEvidence']>>()
+    const evidence =
+      vi.fn<
+        NonNullable<
+          NonNullable<NonNullable<AgentRunInput['host']>['lifecycle']>['recordNativeEvidence']
+        >
+      >()
     let url = '',
       server = ''
     const child = fakeCodexProcess((request, respond, notify) => {
@@ -315,8 +325,17 @@ it.each([
     try {
       await collectRun(adapter, {
         ...input,
-        recordWorkflowInputResult: record,
-        recordNativeEvidence: evidence,
+        host: {
+          ...input.host,
+          lifecycle: {
+            ...input.host?.lifecycle,
+            recordNativeEvidence: evidence,
+          },
+          workflow: {
+            ...input.host?.workflow,
+            recordInputResult: record,
+          },
+        },
       })
       await calls.promise
       expect(record.mock.calls.map(([result]) => result.outcome)).toEqual(
@@ -476,19 +495,31 @@ it.each([
     try {
       await collectRun(adapter, {
         ...input,
-        recordWorkflowPlanRetained: (candidate) => {
-          if (mode === 'save-failure') throw new Error('Final confirmation write failed')
-          order.push('confirmed')
-          retained.push(candidate)
+        host: {
+          ...input.host,
+          lifecycle: {
+            ...input.host?.lifecycle,
+            recordNativeEvidence: (value) => evidence.push(value),
+          },
+          effects: {
+            ...input.host?.effects,
+            reportNativeEffects: (report) => {
+              effects.push(report.state)
+              if (report.state === 'settled') order.push('settled')
+            },
+          },
+          workflow: {
+            ...input.host?.workflow,
+            recordPlanRetained: (candidate) => {
+              if (mode === 'save-failure') throw new Error('Final confirmation write failed')
+              order.push('confirmed')
+              retained.push(candidate)
+            },
+            recordPlanUnavailable: () => {
+              invalidated++
+            },
+          },
         },
-        reportNativeEffects: (report) => {
-          effects.push(report.state)
-          if (report.state === 'settled') order.push('settled')
-        },
-        recordWorkflowPlanUnavailable: () => {
-          invalidated++
-        },
-        recordNativeEvidence: (value) => evidence.push(value),
       })
       await protocol.promise
       const held =
@@ -719,47 +750,55 @@ it('does not settle an early retention after its invalidation write fails with a
           collaboration: frozen,
           collaborationAuthorization: authorization,
         },
-        recordExecutor: (id) => {
-          f.repo.recordExecutor(run.id, id)
-        },
-        recordDispatch: (phase, nativeSessionId, executorId) => {
-          f.repo.recordDispatch(run.id, phase, nativeSessionId, executorId)
-        },
-        recordWorkflowPlanRetained: (plan) => {
-          f.repo.recordWorkflowPlanRetained(run.id, plan)
-          retainedCandidates++
-        },
-        recordWorkflowPlanUnavailable: () => {
-          invalidations++
-          throw new Error('Unavailable candidate write failed')
-        },
-        recordOutputFailure: () => {
-          outputFailed = true
-          f.repo.recordOutputFailure(run.id, {
-            kind: 'protocol_error',
-            message: 'Plan invalidation failed.',
-          })
-        },
-        recordNativeEvidence: (evidence) => {
-          const metadata =
-            evidence.kind === 'ended'
-              ? {
-                  kind: evidence.kind,
-                  source: evidence.source,
-                  identity: evidence.identity,
-                  outcome: evidence.outcome,
-                  ...(evidence.planUnavailable || evidence.output?.planUnavailable
-                    ? { planUnavailable: true as const }
-                    : {}),
-                }
-              : evidence
-          f.repo.recordNativeEvidence(metadata, 'retry')
-          if (!outputFailed && evidence.kind === 'ended' && evidence.output?.retainedPlan)
-            f.repo.recordNativeEvidence(evidence, 'retry')
-        },
-        reportNativeEffects: (report) => {
-          f.repo.recordNativeEffects(run.id, report.state, report.reason)
-          if (report.state === 'settled') f.repo.reconcileCompletedCollaboration(run.id)
+        host: {
+          lifecycle: {
+            recordExecutor: (id) => {
+              f.repo.recordExecutor(run.id, id)
+            },
+            recordDispatch: (phase, nativeSessionId, executorId) => {
+              f.repo.recordDispatch(run.id, phase, nativeSessionId, executorId)
+            },
+            recordOutputFailure: () => {
+              outputFailed = true
+              f.repo.recordOutputFailure(run.id, {
+                kind: 'protocol_error',
+                message: 'Plan invalidation failed.',
+              })
+            },
+            recordNativeEvidence: (evidence) => {
+              const metadata =
+                evidence.kind === 'ended'
+                  ? {
+                      kind: evidence.kind,
+                      source: evidence.source,
+                      identity: evidence.identity,
+                      outcome: evidence.outcome,
+                      ...(evidence.planUnavailable || evidence.output?.planUnavailable
+                        ? { planUnavailable: true as const }
+                        : {}),
+                    }
+                  : evidence
+              f.repo.recordNativeEvidence(metadata, 'retry')
+              if (!outputFailed && evidence.kind === 'ended' && evidence.output?.retainedPlan)
+                f.repo.recordNativeEvidence(evidence, 'retry')
+            },
+          },
+          effects: {
+            reportNativeEffects: (report) => {
+              f.repo.recordNativeEffects(run.id, report.state, report.reason)
+              if (report.state === 'settled') f.repo.reconcileCompletedCollaboration(run.id)
+            },
+          },
+          workflow: {
+            recordPlanRetained: (plan) => {
+              f.repo.recordWorkflowPlanRetained(run.id, plan)
+              retainedCandidates++
+            },
+            recordPlanUnavailable: () => {
+              invalidations++
+              throw new Error('Unavailable candidate write failed')
+            },
+          },
         },
       },
       new AbortController().signal,
@@ -849,9 +888,15 @@ it('preserves a 12 MiB native plan independently of natural text and ignores for
       adapter,
       {
         ...input,
-        recordWorkflowPlan: (value) => {
-          expect(value).toEqual({ nativeId: 'root-plan', text: plan })
-          recorded.push('plan')
+        host: {
+          ...input.host,
+          workflow: {
+            ...input.host?.workflow,
+            recordPlan: (value) => {
+              expect(value).toEqual({ nativeId: 'root-plan', text: plan })
+              recorded.push('plan')
+            },
+          },
         },
       },
       new AbortController().signal,
@@ -2345,7 +2390,12 @@ describe('Codex Agent lifecycle', () => {
   )
 
   it('keeps an observed Hook owned across a terminal and settles only its matching completion', async () => {
-    const report = vi.fn<NonNullable<AgentRunInput['reportNativeEffects']>>()
+    const report =
+      vi.fn<
+        NonNullable<
+          NonNullable<NonNullable<AgentRunInput['host']>['effects']>['reportNativeEffects']
+        >
+      >()
     let notify: ((value: object) => void) | undefined
     const child = fakeCodexProcess((request, respond, send) => {
       const id = Reflect.get(request, 'id'),
@@ -2378,12 +2428,16 @@ describe('Codex Agent lifecycle', () => {
           cwd: '/project',
           model: null,
           effort: null,
-          reportNativeEffects: report,
           promptEnvelope: {
             version: 'pact-agent-prompt-v1',
             sessionId: 'session-1',
             message: { id: 'message-1', content: 'Hello' },
             comments: [],
+          },
+          host: {
+            effects: {
+              reportNativeEffects: report,
+            },
           },
         },
         new AbortController().signal,
@@ -2417,8 +2471,16 @@ describe('Codex Agent lifecycle', () => {
 
   it('keeps old and new Hook completions with their exact Run owners', async () => {
     const reports = [
-      vi.fn<NonNullable<AgentRunInput['reportNativeEffects']>>(),
-      vi.fn<NonNullable<AgentRunInput['reportNativeEffects']>>(),
+      vi.fn<
+        NonNullable<
+          NonNullable<NonNullable<AgentRunInput['host']>['effects']>['reportNativeEffects']
+        >
+      >(),
+      vi.fn<
+        NonNullable<
+          NonNullable<NonNullable<AgentRunInput['host']>['effects']>['reportNativeEffects']
+        >
+      >(),
     ]
     let count = 0
     let notify: ((value: object) => void) | undefined
@@ -2458,12 +2520,16 @@ describe('Codex Agent lifecycle', () => {
             cwd: '/project',
             model: null,
             effort: null,
-            reportNativeEffects: reports[i]!,
             promptEnvelope: {
               version: 'pact-agent-prompt-v1',
               sessionId: 'session-1',
               message: { id: `message-${i}`, content: 'Hello' },
               comments: [],
+            },
+            host: {
+              effects: {
+                reportNativeEffects: reports[i]!,
+              },
             },
           },
           new AbortController().signal,
@@ -2558,11 +2624,19 @@ describe('Codex Agent lifecycle', () => {
   })
 
   it('routes startup MCP input to the current creator while an unidentified old creation remains unknown', async () => {
-    const oldInput = vi.fn<NonNullable<AgentRunInput['requestUserInput']>>(async () => ({
+    const oldInput = vi.fn<
+      NonNullable<
+        NonNullable<NonNullable<AgentRunInput['host']>['interactions']>['requestUserInput']
+      >
+    >(async () => ({
       action: 'decline',
     }))
     let answer: ((value: { action: 'decline' }) => void) | undefined
-    const newInput = vi.fn<NonNullable<AgentRunInput['requestUserInput']>>(
+    const newInput = vi.fn<
+      NonNullable<
+        NonNullable<NonNullable<AgentRunInput['host']>['interactions']>['requestUserInput']
+      >
+    >(
       () =>
         new Promise((resolve) => {
           answer = resolve
@@ -2806,7 +2880,6 @@ describe('Codex Agent lifecycle', () => {
       try {
         for await (const event of adapter.run(
           {
-            observeNativeDelta: observer,
             runId: 'run-2',
             sessionId: 'session-1',
             cwd: '/project',
@@ -2817,6 +2890,11 @@ describe('Codex Agent lifecycle', () => {
               sessionId: 'session-1',
               message: { id: 'message-1', content: 'Hello' },
               comments: [],
+            },
+            host: {
+              lifecycle: {
+                observeNativeDelta: observer,
+              },
             },
           },
           new AbortController().signal,
@@ -3198,10 +3276,16 @@ describe('Codex Agent lifecycle', () => {
             message: { id: 'message-1', content: 'Hello' },
             comments: [],
           },
-          recordNativeEvidence: (fact) => evidence.push(fact.kind),
-          reportNativeEffects: (report) => {
-            reports.push(report.state)
-            releases.push(report.reason)
+          host: {
+            lifecycle: {
+              recordNativeEvidence: (fact) => evidence.push(fact.kind),
+            },
+            effects: {
+              reportNativeEffects: (report) => {
+                reports.push(report.state)
+                releases.push(report.reason)
+              },
+            },
           },
         },
         controller.signal,
@@ -3282,9 +3366,15 @@ describe('Codex Agent lifecycle', () => {
       const consume = collectRun(
         adapter,
         {
-          requestPermission: (_request, signal) => waitForUser<string>(signal),
-          requestUserInput: (_request, signal) => waitForUser(signal),
-          recordNativeEvidence: (fact) => evidence.push(fact.kind),
+          host: {
+            lifecycle: {
+              recordNativeEvidence: (fact) => evidence.push(fact.kind),
+            },
+            interactions: {
+              requestPermission: (_request, signal) => waitForUser<string>(signal),
+              requestUserInput: (_request, signal) => waitForUser(signal),
+            },
+          },
         },
         controller.signal,
       ).catch((error: unknown) => error)
@@ -3353,13 +3443,17 @@ describe('Codex Agent lifecycle', () => {
     const consume = collectRun(
       adapter,
       {
-        requestPermission: (request, signal) => {
-          interactionSignal = signal
-          const action = request.actions?.find((candidate) => candidate.kind === 'allow')
-          if (!action) throw new Error('Missing current-call action')
-          return new Promise<string>((resolve) => {
-            allow = () => resolve(action.id)
-          })
+        host: {
+          interactions: {
+            requestPermission: (request, signal) => {
+              interactionSignal = signal
+              const action = request.actions?.find((candidate) => candidate.kind === 'allow')
+              if (!action) throw new Error('Missing current-call action')
+              return new Promise<string>((resolve) => {
+                allow = () => resolve(action.id)
+              })
+            },
+          },
         },
       },
       controller.signal,
@@ -3465,13 +3559,17 @@ describe('Codex Agent lifecycle', () => {
     const consume = collectRun(
       adapter,
       {
-        requestPermission: (request, signal) => {
-          childSignal = signal
-          const action = request.actions?.find((candidate) => candidate.kind === 'allow')
-          if (!action) throw new Error('Missing current-call action')
-          return new Promise<string>((resolve) => {
-            allow = () => resolve(action.id)
-          })
+        host: {
+          interactions: {
+            requestPermission: (request, signal) => {
+              childSignal = signal
+              const action = request.actions?.find((candidate) => candidate.kind === 'allow')
+              if (!action) throw new Error('Missing current-call action')
+              return new Promise<string>((resolve) => {
+                allow = () => resolve(action.id)
+              })
+            },
+          },
         },
       },
       controller.signal,
@@ -3934,11 +4032,29 @@ function codexSteerFixture(onSteer?: Parameters<typeof fakeCodexProcess>[0]) {
   const inputId = randomUUID(),
     controller = new AbortController(),
     methods: string[] = []
-  const consumed = vi.fn<NonNullable<AgentRunInput['recordInputConsumption']>>()
+  const consumed =
+    vi.fn<
+      NonNullable<
+        NonNullable<NonNullable<AgentRunInput['host']>['lifecycle']>['recordInputConsumption']
+      >
+    >()
   const rpcConsumption = vi.fn<AgentSteerInput['recordConsumption']>()
-  const dispatch = vi.fn<NonNullable<AgentRunInput['recordDispatch']>>()
-  const evidence = vi.fn<NonNullable<AgentRunInput['recordNativeEvidence']>>()
-  const failure = vi.fn<NonNullable<AgentRunInput['recordOutputFailure']>>()
+  const dispatch =
+    vi.fn<
+      NonNullable<NonNullable<NonNullable<AgentRunInput['host']>['lifecycle']>['recordDispatch']>
+    >()
+  const evidence =
+    vi.fn<
+      NonNullable<
+        NonNullable<NonNullable<AgentRunInput['host']>['lifecycle']>['recordNativeEvidence']
+      >
+    >()
+  const failure =
+    vi.fn<
+      NonNullable<
+        NonNullable<NonNullable<AgentRunInput['host']>['lifecycle']>['recordOutputFailure']
+      >
+    >()
   const phases: string[] = [],
     events: NormalizedAgentEvent[] = []
   let notifyNative: ((event: object) => void) | undefined
@@ -3968,10 +4084,14 @@ function codexSteerFixture(onSteer?: Parameters<typeof fakeCodexProcess>[0]) {
     {
       nativeGeneration: 'generation-1',
       bindingGeneration: 1,
-      recordDispatch: dispatch,
-      recordInputConsumption: consumed,
-      recordNativeEvidence: evidence,
-      recordOutputFailure: failure,
+      host: {
+        lifecycle: {
+          recordDispatch: dispatch,
+          recordInputConsumption: consumed,
+          recordNativeEvidence: evidence,
+          recordOutputFailure: failure,
+        },
+      },
     },
     controller.signal,
     (event) => events.push(event),
@@ -4085,12 +4205,16 @@ describe('Codex Native display metadata', () => {
     })
     const adapter = new CodexAgentAdapter('/fake/codex', forkingFactory(child))
     const run = collectRun(adapter, {
-      requestPermission: (request) =>
-        new Promise((settle) => {
-          const action = request.actions?.find((candidate) => candidate.kind === 'allow')
-          if (!action) throw new Error('Missing current-call action')
-          release = () => settle(action.id)
-        }),
+      host: {
+        interactions: {
+          requestPermission: (request) =>
+            new Promise((settle) => {
+              const action = request.actions?.find((candidate) => candidate.kind === 'allow')
+              if (!action) throw new Error('Missing current-call action')
+              release = () => settle(action.id)
+            }),
+        },
+      },
     })
     try {
       await vi.waitFor(() => expect(release).toBeDefined())
@@ -4165,7 +4289,12 @@ describe('Codex Native display metadata', () => {
     try {
       await collectRun(adapter)
       const signal = new AbortController().signal
-      const observation = vi.fn<NonNullable<AgentRunInput['observeNativeTitle']>>()
+      const observation =
+        vi.fn<
+          NonNullable<
+            NonNullable<NonNullable<AgentRunInput['host']>['lifecycle']>['observeNativeTitle']
+          >
+        >()
       expect(
         await adapter.enrichTitle(
           {
@@ -4835,19 +4964,25 @@ it('keeps the exact foreground cancellation observable until the App shutdown pr
     {
       nativeGeneration: 'generation-1',
       bindingGeneration: 1,
-      recordNativeEvidence: (evidence) => {
-        if (
-          evidence.kind === 'ended' &&
-          evidence.source === 'live_terminal' &&
-          evidence.identity.nativeTurnId === 'turn-1'
-        )
-          liveEnding = true
-        if (liveEnding && workDrained) proof.resolve()
-      },
-      reportNativeEffects: (report) => {
-        if (report.state === 'settled' && report.reason === 'native_work_drained')
-          workDrained = true
-        if (liveEnding && workDrained) proof.resolve()
+      host: {
+        lifecycle: {
+          recordNativeEvidence: (evidence) => {
+            if (
+              evidence.kind === 'ended' &&
+              evidence.source === 'live_terminal' &&
+              evidence.identity.nativeTurnId === 'turn-1'
+            )
+              liveEnding = true
+            if (liveEnding && workDrained) proof.resolve()
+          },
+        },
+        effects: {
+          reportNativeEffects: (report) => {
+            if (report.state === 'settled' && report.reason === 'native_work_drained')
+              workDrained = true
+            if (liveEnding && workDrained) proof.resolve()
+          },
+        },
       },
     },
     controller.signal,
@@ -4936,8 +5071,16 @@ function foregroundCommandFixture(options: {
     | 'completed-before-stop'
 }) {
   const controller = new AbortController()
-  const evidence = vi.fn<NonNullable<AgentRunInput['recordNativeEvidence']>>()
-  const settled = vi.fn<NonNullable<AgentRunInput['reportNativeEffects']>>()
+  const evidence =
+    vi.fn<
+      NonNullable<
+        NonNullable<NonNullable<AgentRunInput['host']>['lifecycle']>['recordNativeEvidence']
+      >
+    >()
+  const settled =
+    vi.fn<
+      NonNullable<NonNullable<NonNullable<AgentRunInput['host']>['effects']>['reportNativeEffects']>
+    >()
   const events: NormalizedAgentEvent[] = []
   const methods: string[] = [],
     terminated: string[] = []
@@ -5037,7 +5180,16 @@ function foregroundCommandFixture(options: {
   const adapter = new CodexAgentAdapter('/fake/codex', forkingFactory(child))
   const outcome = collectRun(
     adapter,
-    { recordNativeEvidence: evidence, reportNativeEffects: settled },
+    {
+      host: {
+        lifecycle: {
+          recordNativeEvidence: evidence,
+        },
+        effects: {
+          reportNativeEffects: settled,
+        },
+      },
+    },
     controller.signal,
     (event) => events.push(event),
   ).catch((error: unknown) => error)
@@ -5325,13 +5477,17 @@ it.each(['cold', 'loaded'] as const)(
           sourceGrant: { runId, grant },
           inputBatchRef: { id: batchId, revision: 0, memberCount: 0 },
         },
-        collaborationSourceReader: {
-          identity: { runId, grant },
-          navigation,
-          read: () => {
-            throw Error('Projection fixture does not read sources')
+        host: {
+          workflow: {
+            sourceReader: {
+              identity: { runId, grant },
+              navigation,
+              read: () => {
+                throw Error('Projection fixture does not read sources')
+              },
+              retire: () => undefined,
+            },
           },
-          retire: () => undefined,
         },
       })
       expect(methods).not.toContain('mcpServerStatus/list')
@@ -5378,7 +5534,10 @@ it('keeps Codex root and Steer source arguments bound to the exact current owner
       ? { sourceReference: 'controlled-root-reference', offset: 0 }
       : { ...target, runId, grant, offset: 0 }
   })
-  const dispatch = vi.fn<NonNullable<AgentRunInput['recordDispatch']>>()
+  const dispatch =
+    vi.fn<
+      NonNullable<NonNullable<NonNullable<AgentRunInput['host']>['lifecycle']>['recordDispatch']>
+    >()
   let notifyRoot: ((value: object) => void) | undefined,
     rootText = '',
     steerText = ''
@@ -5428,14 +5587,20 @@ it('keeps Codex root and Steer source arguments bound to the exact current owner
       bindingGeneration: 1,
       peerAssistanceAllowed: false,
       promptEnvelope: envelope,
-      recordDispatch: dispatch,
-      collaborationSourceReader: {
-        identity: { runId, grant },
-        navigation,
-        read: () => {
-          throw Error('Encoding fixture does not read sources')
+      host: {
+        lifecycle: {
+          recordDispatch: dispatch,
         },
-        retire: () => undefined,
+        workflow: {
+          sourceReader: {
+            identity: { runId, grant },
+            navigation,
+            read: () => {
+              throw Error('Encoding fixture does not read sources')
+            },
+            retire: () => undefined,
+          },
+        },
       },
     },
     controller.signal,
@@ -5567,16 +5732,20 @@ it.each([
           sourceGrant: { runId, grant },
           inputBatchRef: { id: batchId, revision: 0, memberCount: 0 },
         },
-        collaborationSourceReader: {
-          identity: { runId, grant },
-          navigation,
-          read: () => {
-            throw Error('Projection fixture does not read sources')
+        host: {
+          workflow: {
+            sourceReader: {
+              identity: { runId, grant },
+              navigation,
+              read: () => {
+                throw Error('Projection fixture does not read sources')
+              },
+              readNativeRoot: () => {
+                throw Error('Projection does not read')
+              },
+              retire: () => undefined,
+            },
           },
-          readNativeRoot: () => {
-            throw Error('Projection does not read')
-          },
-          retire: () => undefined,
         },
       })
       expect(methods).not.toContain('mcpServerStatus/list')

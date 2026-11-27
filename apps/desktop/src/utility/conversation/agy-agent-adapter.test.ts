@@ -13,6 +13,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest
 
 import {
   resolveAgentCollaborationSourceCapability,
+  type AgentCollaborationSourceReader,
   type AgentNativeForkBoundary,
   type AgentNativeForkWitness,
   type AgentRunInput,
@@ -23,9 +24,12 @@ import {
   collaborationPlanRetentionInputSchema,
   collaborationPublishPlanInputSchema,
   collaborationReviewInputSchema,
+  collaborationSourceAnyReadSchema,
+  collaborationSourceReadResultSchema,
   normalizedAgentEventSchema,
   peerRequestToolInputSchema,
   sessionTitleInputSchema,
+  type CollaborationSourceReadResult,
   type CollaborationTask,
   type CollaborationTurnAuthorization,
   type NativeBackgroundReport,
@@ -231,10 +235,49 @@ async function createDbFixture(
   }
 }
 
+const LEGACY_SOURCE_FN = Symbol('legacySourceFn')
+type LegacySourceWrapper = AgentCollaborationSourceReader & {
+  [LEGACY_SOURCE_FN]?: (raw: unknown) => CollaborationSourceReadResult
+}
+
+function legacySourceReader(
+  readFn: (raw: unknown) => CollaborationSourceReadResult,
+  identity: { runId: string; grant: string } = { runId: '', grant: '' },
+): LegacySourceWrapper {
+  const wrapper: LegacySourceWrapper = {
+    identity,
+    supportedForms: ['legacy'],
+    navigation: (target) => ({ ...wrapper.identity, ...target, offset: 0 }),
+    read: (raw) => {
+      const request = collaborationSourceAnyReadSchema.parse(raw)
+      if (request.runId !== wrapper.identity.runId || request.grant !== wrapper.identity.grant) {
+        throw new Error('This source capability does not belong to the current root.')
+      }
+      const page = collaborationSourceReadResultSchema.parse(readFn(raw))
+      return {
+        submitted: 'legacy',
+        request,
+        page: {
+          ...page,
+          binding: {
+            submitted: 'legacy',
+            callerRunId: wrapper.identity.runId,
+            grantSha256: createHash('sha256').update(wrapper.identity.grant).digest('hex'),
+            referenceSha256: null,
+          },
+        },
+      }
+    },
+    retire: () => undefined,
+    [LEGACY_SOURCE_FN]: readFn,
+  }
+  return wrapper
+}
+
 function makeBaseRunInput(cwd: string, overrides: Partial<AgentRunInput> = {}): AgentRunInput {
   const sessionId = overrides.sessionId ?? randomUUID()
   const runId = overrides.runId ?? randomUUID()
-  return {
+  const result: AgentRunInput = {
     sessionId,
     runId,
     cwd,
@@ -250,6 +293,14 @@ function makeBaseRunInput(cwd: string, overrides: Partial<AgentRunInput> = {}): 
     },
     ...overrides,
   }
+  const reader = result.host?.workflow?.sourceReader
+  if (reader && LEGACY_SOURCE_FN in reader && result.promptEnvelope.sourceGrant) {
+    Object.defineProperty(reader, 'identity', {
+      value: result.promptEnvelope.sourceGrant,
+      configurable: true,
+    })
+  }
+  return result
 }
 
 function makeCollaborationTask(
@@ -639,7 +690,12 @@ describe('AgyAgentAdapter probe, permissions, and B4 read-only ironclad wall', (
     const run1Id = randomUUID()
     const { task, authorization } = makeCollaborationTask(sessionId, run1Id, 'plan')
     const capturedPlans: Array<{ nativeId: string; text: string }> = []
-    const requestPermissionSpy = vi.fn<NonNullable<AgentRunInput['requestPermission']>>()
+    const requestPermissionSpy =
+      vi.fn<
+        NonNullable<
+          NonNullable<NonNullable<AgentRunInput['host']>['interactions']>['requestPermission']
+        >
+      >()
 
     // Even if session permissionMode is 'full', read-only stage MUST use 'standard' connection!
     const run1Input = makeBaseRunInput(cwd, {
@@ -647,15 +703,6 @@ describe('AgyAgentAdapter probe, permissions, and B4 read-only ironclad wall', (
       runId: run1Id,
       permissionMode: 'full',
       speed: 'fast',
-      requestPermission: requestPermissionSpy,
-      recordWorkflowPlan: (plan) => capturedPlans.push(plan),
-      readCollaborationSourcePart: () => ({
-        source: 'inputs',
-        offset: 0,
-        nextOffset: null,
-        totalBytes: 2,
-        text: '[]',
-      }),
       promptEnvelope: {
         version: 'pact-agent-prompt-v1',
         sessionId,
@@ -664,6 +711,21 @@ describe('AgyAgentAdapter probe, permissions, and B4 read-only ironclad wall', (
         sourceGrant: { runId: run1Id, grant: 'g-1' },
         collaboration: task,
         collaborationAuthorization: authorization,
+      },
+      host: {
+        workflow: {
+          recordPlan: (plan) => capturedPlans.push(plan),
+          sourceReader: legacySourceReader(() => ({
+            source: 'inputs',
+            offset: 0,
+            nextOffset: null,
+            totalBytes: 2,
+            text: '[]',
+          })),
+        },
+        interactions: {
+          requestPermission: requestPermissionSpy,
+        },
       },
     })
 
@@ -855,9 +917,13 @@ describe('AgyAgentAdapter probe, permissions, and B4 read-only ironclad wall', (
       adapter.run(
         makeBaseRunInput(cwd, {
           permissionMode: 'ask',
-          async requestPermission(req) {
-            capturedCardActions = req.actions ?? []
-            return 'agy-allow-once'
+          host: {
+            interactions: {
+              async requestPermission(req) {
+                capturedCardActions = req.actions ?? []
+                return 'agy-allow-once'
+              },
+            },
           },
         }),
         new AbortController().signal,
@@ -875,12 +941,21 @@ describe('AgyAgentAdapter probe, permissions, and B4 read-only ironclad wall', (
     })
 
     // 3. Full access (`requirements.md:517`) explicitly denies residual session/request_permission WITHOUT prompting UI!
-    const fullUiSpy = vi.fn<NonNullable<AgentRunInput['requestPermission']>>()
+    const fullUiSpy =
+      vi.fn<
+        NonNullable<
+          NonNullable<NonNullable<AgentRunInput['host']>['interactions']>['requestPermission']
+        >
+      >()
     await collectEvents(
       adapter.run(
         makeBaseRunInput(cwd, {
           permissionMode: 'full',
-          requestPermission: fullUiSpy,
+          host: {
+            interactions: {
+              requestPermission: fullUiSpy,
+            },
+          },
         }),
         new AbortController().signal,
       ),
@@ -984,14 +1059,18 @@ describe('AgyAgentAdapter B5 Elicitation, S5 Title/Peer MCP, B8 Steer & Backgrou
     const events1 = await collectEvents(
       adapter.run(
         makeBaseRunInput(cwd, {
-          async requestUserInput(req) {
-            expect(req.kind).toBe('form')
-            expect(req.fields[0]).toMatchObject({
-              id: 'storage',
-              type: 'select',
-              required: true,
-            })
-            return { action: 'accept', values: { storage: 'sqlite' } }
+          host: {
+            interactions: {
+              async requestUserInput(req) {
+                expect(req.kind).toBe('form')
+                expect(req.fields[0]).toMatchObject({
+                  id: 'storage',
+                  type: 'select',
+                  required: true,
+                })
+                return { action: 'accept', values: { storage: 'sqlite' } }
+              },
+            },
           },
         }),
         new AbortController().signal,
@@ -1012,13 +1091,17 @@ describe('AgyAgentAdapter B5 Elicitation, S5 Title/Peer MCP, B8 Steer & Backgrou
     await collectEvents(
       adapter.run(
         makeBaseRunInput(cwd, {
-          async requestUserInput(_req, waitSignal) {
-            runAbort.abort()
-            await new Promise((_r, rej) => {
-              if (waitSignal.aborted) rej(new Error('aborted'))
-              else waitSignal.addEventListener('abort', () => rej(new Error('aborted')))
-            })
-            return { action: 'accept', values: { storage: 'sqlite' } }
+          host: {
+            interactions: {
+              async requestUserInput(_req, waitSignal) {
+                runAbort.abort()
+                await new Promise((_r, rej) => {
+                  if (waitSignal.aborted) rej(new Error('aborted'))
+                  else waitSignal.addEventListener('abort', () => rej(new Error('aborted')))
+                })
+                return { action: 'accept', values: { storage: 'sqlite' } }
+              },
+            },
           },
         }),
         runAbort.signal,
@@ -1269,16 +1352,20 @@ describe('AgyAgentAdapter B5 Elicitation, S5 Title/Peer MCP, B8 Steer & Backgrou
     const runInput = makeBaseRunInput(cwd, {
       sessionId,
       runId,
-      recordBackgroundReport: async (report) => {
-        backgroundReports.push(report)
-      },
-      reportNativeEffects: (r) => effectReports.push(r),
       promptEnvelope: {
         version: 'pact-agent-prompt-v1',
         sessionId,
         requestSessionTitle: true,
         message: { id: randomUUID(), content: 'Start side chat check' },
         comments: [],
+      },
+      host: {
+        effects: {
+          recordBackgroundReport: async (report) => {
+            backgroundReports.push(report)
+          },
+          reportNativeEffects: (r) => effectReports.push(r),
+        },
       },
     })
     setPromptCutoffSupplement(runInput.promptEnvelope, {
@@ -1426,7 +1513,11 @@ describe('AgyAgentAdapter B5 Elicitation, S5 Title/Peer MCP, B8 Steer & Backgrou
         makeBaseRunInput(cwd, {
           sessionId,
           runId: run2Id,
-          reportNativeEffects: (r) => effectReports.push(r),
+          host: {
+            effects: {
+              reportNativeEffects: (r) => effectReports.push(r),
+            },
+          },
         }),
         new AbortController().signal,
       ),
@@ -1934,8 +2025,12 @@ describe('AgyAgentAdapter B5 Elicitation, S5 Title/Peer MCP, B8 Steer & Backgrou
     const events = await collectEvents(
       adapter.run(
         makeBaseRunInput(cwd, {
-          recordFileChange: async (change) => {
-            recordedChanges.push(change)
+          host: {
+            effects: {
+              recordFileChange: async (change) => {
+                recordedChanges.push(change)
+              },
+            },
           },
         }),
         new AbortController().signal,
@@ -2068,8 +2163,12 @@ describe('AgyAgentAdapter Shard-1 protocol, pool, security, and settlement invar
         adapterA.run(
           makeBaseRunInput(cwd, {
             runId: runAId,
-            recordExecutor: (execId) => {
-              runARecordedExecutor = execId
+            host: {
+              lifecycle: {
+                recordExecutor: (execId) => {
+                  runARecordedExecutor = execId
+                },
+              },
             },
           }),
           new AbortController().signal,
@@ -2092,11 +2191,15 @@ describe('AgyAgentAdapter Shard-1 protocol, pool, security, and settlement invar
             makeBaseRunInput(cwd2Root, {
               sessionId: sessionBId,
               runId: runBId,
-              recordExecutor: (execId) => {
-                runBRecordedExecutor = execId
-              },
-              recordNativeEvidence: (ev) => {
-                recordedEvidences.push({ kind: ev.kind, executorId: ev.identity.executorId })
+              host: {
+                lifecycle: {
+                  recordExecutor: (execId) => {
+                    runBRecordedExecutor = execId
+                  },
+                  recordNativeEvidence: (ev) => {
+                    recordedEvidences.push({ kind: ev.kind, executorId: ev.identity.executorId })
+                  },
+                },
               },
             }),
             new AbortController().signal,
@@ -2360,37 +2463,41 @@ describe('AgyAgentAdapter Shard-1 protocol, pool, security, and settlement invar
       adapter.run(
         makeBaseRunInput(cwd, {
           permissionMode: 'full',
-          waitForRootOutput: async () => {
-            if (mcpUrl) {
-              const rPost = await fetch(mcpUrl, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  jsonrpc: '2.0',
-                  id: 14,
-                  method: 'tools/call',
-                  params: {
-                    name: 'request_peer_assistance',
-                    arguments: { target: 'codex', kind: 'review' },
-                    _meta: {
-                      'antigravity.google/root_conversation_id': 'sid-mcp-strict',
-                      'antigravity.google/conversation_id': 'sid-mcp-strict',
-                      progressToken: 'traj-root:5',
-                    },
-                  },
-                }),
-              }).then((r) => r.json() as Promise<Record<string, unknown>>)
-              postReplyMcpError = (rPost.result as Record<string, unknown>).isError
-            }
-            releaseRootOutput?.()
-            await rootOutputGate
-          },
           promptEnvelope: {
             version: 'pact-agent-prompt-v1',
             sessionId: randomUUID(),
             requestSessionTitle: true,
             message: { id: randomUUID(), content: 'Check MCP strictness in full mode' },
             comments: [],
+          },
+          host: {
+            lifecycle: {
+              waitForRootOutput: async () => {
+                if (mcpUrl) {
+                  const rPost = await fetch(mcpUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      jsonrpc: '2.0',
+                      id: 14,
+                      method: 'tools/call',
+                      params: {
+                        name: 'request_peer_assistance',
+                        arguments: { target: 'codex', kind: 'review' },
+                        _meta: {
+                          'antigravity.google/root_conversation_id': 'sid-mcp-strict',
+                          'antigravity.google/conversation_id': 'sid-mcp-strict',
+                          progressToken: 'traj-root:5',
+                        },
+                      },
+                    }),
+                  }).then((r) => r.json() as Promise<Record<string, unknown>>)
+                  postReplyMcpError = (rPost.result as Record<string, unknown>).isError
+                }
+                releaseRootOutput?.()
+                await rootOutputGate
+              },
+            },
           },
         }),
         new AbortController().signal,
@@ -2777,7 +2884,13 @@ describe('AgyAgentAdapter Shard-1 protocol, pool, security, and settlement invar
     await expect(
       (async () => {
         for await (const ev of adapter.run(
-          makeBaseRunInput(cwd, { reportNativeEffects: (r) => missingEffects.push(r.state) }),
+          makeBaseRunInput(cwd, {
+            host: {
+              effects: {
+                reportNativeEffects: (r) => missingEffects.push(r.state),
+              },
+            },
+          }),
           new AbortController().signal,
         )) {
           missingEvents.push(ev)
@@ -2805,8 +2918,14 @@ describe('AgyAgentAdapter Shard-1 protocol, pool, security, and settlement invar
     const hungPromise = (async () => {
       for await (const ev of adapter.run(
         makeBaseRunInput(cwd, {
-          reportNativeEffects: (r) => hungEffects.push(r.state),
-          recordNativeEvidence: (evidence) => hungEvidenceKinds.push(evidence.kind),
+          host: {
+            lifecycle: {
+              recordNativeEvidence: (evidence) => hungEvidenceKinds.push(evidence.kind),
+            },
+            effects: {
+              reportNativeEffects: (r) => hungEffects.push(r.state),
+            },
+          },
         }),
         cancelCtrl.signal,
       )) {
@@ -2895,8 +3014,14 @@ describe('AgyAgentAdapter Shard-1 protocol, pool, security, and settlement invar
       const run1Promise = collectEvents(
         adapter.run(
           makeBaseRunInput(cwd, {
-            reportNativeEffects: (r) => effects1.push(r.state),
-            recordDispatch: (phase) => dispatches1.push(phase),
+            host: {
+              lifecycle: {
+                recordDispatch: (phase) => dispatches1.push(phase),
+              },
+              effects: {
+                reportNativeEffects: (r) => effects1.push(r.state),
+              },
+            },
           }),
           new AbortController().signal,
         ),
@@ -2948,7 +3073,11 @@ describe('AgyAgentAdapter Shard-1 protocol, pool, security, and settlement invar
       const run2Promise = collectEvents(
         adapter.run(
           makeBaseRunInput(cwd, {
-            reportNativeEffects: (r) => effects2.push(r.state),
+            host: {
+              effects: {
+                reportNativeEffects: (r) => effects2.push(r.state),
+              },
+            },
           }),
           abortCtrl.signal,
         ),
@@ -3184,9 +3313,13 @@ describe('AgyAgentAdapter Shard-1 protocol, pool, security, and settlement invar
         makeBaseRunInput(cwd, {
           runId: run1Id,
           nativeSessionId: 'sid-heavy-replay',
-          reportNativeEffects: (r) => effectStates.push(r.state),
-          recordBackgroundReport: async (r) => {
-            bgReports.push(r)
+          host: {
+            effects: {
+              reportNativeEffects: (r) => effectStates.push(r.state),
+              recordBackgroundReport: async (r) => {
+                bgReports.push(r)
+              },
+            },
           },
         }),
         new AbortController().signal,
@@ -3418,17 +3551,6 @@ describe('AgyAgentAdapter Shard-1 protocol, pool, security, and settlement invar
         runId: run1Id,
         model: 'gemini-4-carbon',
         effort: 'high',
-        recordDispatch: (status) => dispatchRecords.push(status),
-        recordWorkflowPlan: (p) => capturedPlans.push(p),
-        recordWorkflowPlanUnavailable: () => {
-          planUnavailableCount += 1
-        },
-        async requestUserInput(req) {
-          expect(req.kind).toBe('url')
-          // At the moment init-phase elicitation runs, `session/prompt` has NOT even been sent!
-          expect(dispatchRecords).toEqual([])
-          return { action: 'accept' }
-        },
         promptEnvelope: {
           version: 'pact-agent-prompt-v1',
           sessionId,
@@ -3436,6 +3558,25 @@ describe('AgyAgentAdapter Shard-1 protocol, pool, security, and settlement invar
           comments: [],
           collaboration: task,
           collaborationAuthorization: authorization,
+        },
+        host: {
+          lifecycle: {
+            recordDispatch: (status) => dispatchRecords.push(status),
+          },
+          workflow: {
+            recordPlan: (p) => capturedPlans.push(p),
+            recordPlanUnavailable: () => {
+              planUnavailableCount += 1
+            },
+          },
+          interactions: {
+            async requestUserInput(req) {
+              expect(req.kind).toBe('url')
+              // At the moment init-phase elicitation runs, `session/prompt` has NOT even been sent!
+              expect(dispatchRecords).toEqual([])
+              return { action: 'accept' }
+            },
+          },
         },
       }),
       new AbortController().signal,
@@ -3665,50 +3806,56 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
             },
             comments: [],
           },
-          recordDispatch: (phase, nativeId, executorId) => {
-            repo.recordDispatch(runA.id, phase, nativeId, executorId)
-          },
-          recordNativeEvidence: (evidence) => {
-            if (evidence.identity.nativeTurnId) {
-              recordedEvidenceIdsA.push(evidence.identity.nativeTurnId)
-            }
-            const metadata =
-              evidence.kind === 'ended'
-                ? {
-                    kind: evidence.kind,
-                    identity: evidence.identity,
-                    source: evidence.source,
-                    outcome: evidence.outcome,
-                  }
-                : evidence
-            repo.recordNativeEvidence(metadata, 'retry')
-          },
-          recordInputConsumption: (id, identity) => {
-            repo.recordQueuedSteerConsumption(
-              {
-                runId: runA.id,
-                sessionId,
-                bindingGeneration: runA.bindingGeneration ?? 1,
-                nativeSessionId: identity.nativeSessionId,
-                nativeTurnId: identity.nativeTurnId!,
-                executorId: identity.executorId,
+          host: {
+            lifecycle: {
+              recordDispatch: (phase, nativeId, executorId) => {
+                repo.recordDispatch(runA.id, phase, nativeId, executorId)
               },
-              id,
-            )
-          },
-          recordBackgroundReport: async (report) => {
-            await repo.recordBackgroundReport(
-              report,
-              async function* () {
-                yield report.text
+              recordNativeEvidence: (evidence) => {
+                if (evidence.identity.nativeTurnId) {
+                  recordedEvidenceIdsA.push(evidence.identity.nativeTurnId)
+                }
+                const metadata =
+                  evidence.kind === 'ended'
+                    ? {
+                        kind: evidence.kind,
+                        identity: evidence.identity,
+                        source: evidence.source,
+                        outcome: evidence.outcome,
+                      }
+                    : evidence
+                repo.recordNativeEvidence(metadata, 'retry')
               },
-              new AbortController().signal,
-            )
-            bgReportSaved = true
-          },
-          reportNativeEffects: (report) => {
-            recordedEffectsA.push({ state: report.state, reason: report.reason })
-            repo.recordNativeEffects(runA.id, report.state, report.reason)
+              recordInputConsumption: (id, identity) => {
+                repo.recordQueuedSteerConsumption(
+                  {
+                    runId: runA.id,
+                    sessionId,
+                    bindingGeneration: runA.bindingGeneration ?? 1,
+                    nativeSessionId: identity.nativeSessionId,
+                    nativeTurnId: identity.nativeTurnId!,
+                    executorId: identity.executorId,
+                  },
+                  id,
+                )
+              },
+            },
+            effects: {
+              recordBackgroundReport: async (report) => {
+                await repo.recordBackgroundReport(
+                  report,
+                  async function* () {
+                    yield report.text
+                  },
+                  new AbortController().signal,
+                )
+                bgReportSaved = true
+              },
+              reportNativeEffects: (report) => {
+                recordedEffectsA.push({ state: report.state, reason: report.reason })
+                repo.recordNativeEffects(runA.id, report.state, report.reason)
+              },
+            },
           },
         }),
         new AbortController().signal,
@@ -3867,27 +4014,33 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
           nativeGeneration: runB.id,
           model: 'gemini-4-carbon',
           effort: 'high',
-          recordDispatch: (phase, nativeId, executorId) => {
-            repo.recordDispatch(runB.id, phase, nativeId, executorId)
-          },
-          recordNativeEvidence: (evidence) => {
-            if (evidence.identity.nativeTurnId) {
-              recordedEvidenceIdsB.push(evidence.identity.nativeTurnId)
-            }
-            const metadata =
-              evidence.kind === 'ended'
-                ? {
-                    kind: evidence.kind,
-                    identity: evidence.identity,
-                    source: evidence.source,
-                    outcome: evidence.outcome,
-                  }
-                : evidence
-            repo.recordNativeEvidence(metadata, 'retry')
-          },
-          reportNativeEffects: (report) => {
-            recordedEffectsB.push({ state: report.state, reason: report.reason })
-            repo.recordNativeEffects(runB.id, report.state, report.reason)
+          host: {
+            lifecycle: {
+              recordDispatch: (phase, nativeId, executorId) => {
+                repo.recordDispatch(runB.id, phase, nativeId, executorId)
+              },
+              recordNativeEvidence: (evidence) => {
+                if (evidence.identity.nativeTurnId) {
+                  recordedEvidenceIdsB.push(evidence.identity.nativeTurnId)
+                }
+                const metadata =
+                  evidence.kind === 'ended'
+                    ? {
+                        kind: evidence.kind,
+                        identity: evidence.identity,
+                        source: evidence.source,
+                        outcome: evidence.outcome,
+                      }
+                    : evidence
+                repo.recordNativeEvidence(metadata, 'retry')
+              },
+            },
+            effects: {
+              reportNativeEffects: (report) => {
+                recordedEffectsB.push({ state: report.state, reason: report.reason })
+                repo.recordNativeEffects(runB.id, report.state, report.reason)
+              },
+            },
           },
         }),
         new AbortController().signal,
@@ -4049,9 +4202,13 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
     const mainAbort = new AbortController()
     const mainStream = mainAdapter.run(
       makeBaseRunInput(cwd, {
-        requestPermission: async (req) => {
-          mainPermCalls += 1
-          return req.actions?.[0]?.id ?? 'agy-cancel'
+        host: {
+          interactions: {
+            requestPermission: async (req) => {
+              mainPermCalls += 1
+              return req.actions?.[0]?.id ?? 'agy-cancel'
+            },
+          },
         },
       }),
       mainAbort.signal,
@@ -4066,9 +4223,13 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
     const sidePromise = collectEvents(
       sideAdapter.run(
         makeBaseRunInput(cwd, {
-          requestPermission: async () => {
-            sidePermCalls += 1
-            return 'allow-side'
+          host: {
+            interactions: {
+              requestPermission: async () => {
+                sidePermCalls += 1
+                return 'allow-side'
+              },
+            },
           },
         }),
         new AbortController().signal,
@@ -4422,15 +4583,6 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
         makeBaseRunInput(cwd, {
           sessionId,
           runId,
-          readCollaborationSourcePart: () => {
-            legacySourceCalls += 1
-            return {
-              source: 'inputs',
-              offset: 0,
-              nextOffset: null,
-              text: 'Frozen plan source',
-            }
-          },
           promptEnvelope: {
             version: 'pact-agent-prompt-v1',
             sessionId,
@@ -4439,6 +4591,19 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
             collaboration: task,
             collaborationAuthorization: authorization,
             sourceGrant: { runId, grant: grantId },
+          },
+          host: {
+            workflow: {
+              sourceReader: legacySourceReader(() => {
+                legacySourceCalls += 1
+                return {
+                  source: 'inputs',
+                  offset: 0,
+                  nextOffset: null,
+                  text: 'Frozen plan source',
+                }
+              }),
+            },
           },
         }),
         new AbortController().signal,
@@ -4663,14 +4828,20 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
     const events = await collectEvents(
       adapter.run(
         makeBaseRunInput(cwd, {
-          waitForRootOutput: async () => {
-            abortController.abort()
-          },
-          recordNativeEvidence: (ev) => {
-            if (ev.kind === 'ended') terminalEvidence.push(ev)
-          },
-          reportNativeEffects: (r) => {
-            effectReports.push({ state: r.state, reason: r.reason })
+          host: {
+            lifecycle: {
+              waitForRootOutput: async () => {
+                abortController.abort()
+              },
+              recordNativeEvidence: (ev) => {
+                if (ev.kind === 'ended') terminalEvidence.push(ev)
+              },
+            },
+            effects: {
+              reportNativeEffects: (r) => {
+                effectReports.push({ state: r.state, reason: r.reason })
+              },
+            },
           },
         }),
         abortController.signal,
@@ -4990,10 +5161,16 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
     await collectEvents(
       adapter.run(
         makeBaseRunInput(cwd, {
-          recordDispatch: (_p, _sid, execId) => {
-            if (execId) capturedExecutorId = execId
+          host: {
+            lifecycle: {
+              recordDispatch: (_p, _sid, execId) => {
+                if (execId) capturedExecutorId = execId
+              },
+            },
+            effects: {
+              reportNativeEffects: (r) => bgEffects.push({ state: r.state, reason: r.reason }),
+            },
           },
-          reportNativeEffects: (r) => bgEffects.push({ state: r.state, reason: r.reason }),
         }),
         new AbortController().signal,
       ),
@@ -5039,10 +5216,14 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
       adapter.run(
         makeBaseRunInput(cwd, {
           nativeSessionId: 'sid-oversized-pt',
-          waitForRootOutput: async () => {
-            await new Promise((r) => setTimeout(r, 20))
-            maxOversizedPtDelta =
-              (nativeWorkingMemoryDiagnostics().chargedBytes ?? 0) - beforeOversizedPtBytes
+          host: {
+            lifecycle: {
+              waitForRootOutput: async () => {
+                await new Promise((r) => setTimeout(r, 20))
+                maxOversizedPtDelta =
+                  (nativeWorkingMemoryDiagnostics().chargedBytes ?? 0) - beforeOversizedPtBytes
+              },
+            },
           },
         }),
         new AbortController().signal,
@@ -5116,10 +5297,12 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
         makeBaseRunInput(cwd, {
           model: 'gemini-post-reply',
           effort: null,
-          recovery: {
-            inputSha256: '5'.repeat(64),
-            recordEffectiveSettings: (s) => postReplySettings.push(s),
-            recordConfirmedUnsent: () => undefined,
+          host: {
+            recovery: {
+              inputSha256: '5'.repeat(64),
+              recordEffectiveSettings: (s) => postReplySettings.push(s),
+              recordConfirmedUnsent: () => undefined,
+            },
           },
         }),
         new AbortController().signal,
@@ -5144,10 +5327,12 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
         makeBaseRunInput(cwd, {
           model: null,
           effort: null,
-          recovery: {
-            inputSha256: '6'.repeat(64),
-            recordEffectiveSettings: (s) => unknownEffortSettings.push(s),
-            recordConfirmedUnsent: () => undefined,
+          host: {
+            recovery: {
+              inputSha256: '6'.repeat(64),
+              recordEffectiveSettings: (s) => unknownEffortSettings.push(s),
+              recordConfirmedUnsent: () => undefined,
+            },
           },
         }),
         new AbortController().signal,
@@ -5302,16 +5487,20 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
               collaboration: task,
               collaborationAuthorization: authorization,
             },
-            readCollaborationSourcePart: () => ({
-              source: 'inputs',
-              offset: 0,
-              nextOffset: null,
-              text: 'Frozen input source.',
-            }),
-            recovery: {
-              inputSha256: 'a'.repeat(64),
-              recordEffectiveSettings: (s) => recordedSettings.push(s),
-              recordConfirmedUnsent: () => undefined,
+            host: {
+              workflow: {
+                sourceReader: legacySourceReader(() => ({
+                  source: 'inputs',
+                  offset: 0,
+                  nextOffset: null,
+                  text: 'Frozen input source.',
+                })),
+              },
+              recovery: {
+                inputSha256: 'a'.repeat(64),
+                recordEffectiveSettings: (s) => recordedSettings.push(s),
+                recordConfirmedUnsent: () => undefined,
+              },
             },
           }),
           new AbortController().signal,
@@ -5712,12 +5901,16 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
               collaboration: task,
               collaborationAuthorization: authorization,
             },
-            readCollaborationSourcePart: () => ({
-              source: 'inputs',
-              offset: 0,
-              nextOffset: null,
-              text: 'Frozen input source.',
-            }),
+            host: {
+              workflow: {
+                sourceReader: legacySourceReader(() => ({
+                  source: 'inputs',
+                  offset: 0,
+                  nextOffset: null,
+                  text: 'Frozen input source.',
+                })),
+              },
+            },
           }),
           new AbortController().signal,
         ),
@@ -6157,13 +6350,17 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
               collaboration: task,
               collaborationAuthorization: authorization,
             },
-            readCollaborationSourcePart: () => ({
-              source: 'inputs',
-              offset: 0,
-              nextOffset: null,
-              text: 'Frozen Plan v1.',
-            }),
-            recordWorkflowReview: (obs) => recordedReviews.push(obs),
+            host: {
+              workflow: {
+                sourceReader: legacySourceReader(() => ({
+                  source: 'inputs',
+                  offset: 0,
+                  nextOffset: null,
+                  text: 'Frozen Plan v1.',
+                })),
+                recordReview: (obs) => recordedReviews.push(obs),
+              },
+            },
           }),
           new AbortController().signal,
         ),
@@ -6485,11 +6682,15 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
                 collaboration: task,
                 collaborationAuthorization: authorization,
               },
-              readCollaborationSourcePart: () => {
-                sourceReaderCalls += 1
-                return { source: 'inputs', offset: 0, nextOffset: null, text: 'Frozen Plan.' }
+              host: {
+                workflow: {
+                  sourceReader: legacySourceReader(() => {
+                    sourceReaderCalls += 1
+                    return { source: 'inputs', offset: 0, nextOffset: null, text: 'Frozen Plan.' }
+                  }),
+                  recordReview: (obs) => recordedReviews.push(obs),
+                },
               },
-              recordWorkflowReview: (obs) => recordedReviews.push(obs),
             }),
             new AbortController().signal,
           ),
@@ -6695,7 +6896,11 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
                 collaboration: task,
                 collaborationAuthorization: authorization,
               },
-              recordWorkflowReview: (obs) => recordedReviews.push(obs),
+              host: {
+                workflow: {
+                  recordReview: (obs) => recordedReviews.push(obs),
+                },
+              },
             }),
             new AbortController().signal,
           ),
@@ -6982,8 +7187,12 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
                 collaboration: task,
                 collaborationAuthorization: authorization,
               },
-              recordWorkflowPlan: (plan) => publishedPlans.push(plan),
-              recordOpenPlanFinalIntent: () => true,
+              host: {
+                workflow: {
+                  recordPlan: (plan) => publishedPlans.push(plan),
+                  recordOpenPlanFinalIntent: () => true,
+                },
+              },
             }),
             new AbortController().signal,
           ),
@@ -7317,28 +7526,32 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
                 collaboration: task,
                 collaborationAuthorization: authorization,
               },
-              waitForRootOutput: async () => {
-                // Late schema read_file AFTER root prompt reply MUST also be denied!
-                harness.sendToClient({
-                  jsonrpc: '2.0',
-                  id: 'p-late',
-                  method: 'session/request_permission',
-                  params: {
-                    sessionId: nativeSessionId,
-                    toolCall: {
-                      toolCallId: 'tc-late',
-                      name: 'read_file',
-                      args: { Path: join(appDataDir, 'mcp', mcpName, 'submit_review.json') },
-                    },
-                    options: [
-                      { optionId: 'allow', name: 'Allow', kind: 'allow_once' },
-                      { optionId: 'deny', name: 'Deny', kind: 'reject_once' },
-                    ],
+              host: {
+                lifecycle: {
+                  waitForRootOutput: async () => {
+                    // Late schema read_file AFTER root prompt reply MUST also be denied!
+                    harness.sendToClient({
+                      jsonrpc: '2.0',
+                      id: 'p-late',
+                      method: 'session/request_permission',
+                      params: {
+                        sessionId: nativeSessionId,
+                        toolCall: {
+                          toolCallId: 'tc-late',
+                          name: 'read_file',
+                          args: { Path: join(appDataDir, 'mcp', mcpName, 'submit_review.json') },
+                        },
+                        options: [
+                          { optionId: 'allow', name: 'Allow', kind: 'allow_once' },
+                          { optionId: 'deny', name: 'Deny', kind: 'reject_once' },
+                        ],
+                      },
+                    })
+                    await waitUntilCondition(() => harness.responses.some((r) => r.id === 'p-late'))
+                    holdAfterReplyResolve?.()
+                    await holdAfterReplyGate
                   },
-                })
-                await waitUntilCondition(() => harness.responses.some((r) => r.id === 'p-late'))
-                holdAfterReplyResolve?.()
-                await holdAfterReplyGate
+                },
               },
             }),
             new AbortController().signal,
@@ -7442,9 +7655,13 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
             askAdapter.run(
               makeBaseRunInput(cwd, {
                 permissionMode: 'ask',
-                requestPermission: async (_req) => {
-                  askPermCalled += 1
-                  return 'deny'
+                host: {
+                  interactions: {
+                    requestPermission: async (_req) => {
+                      askPermCalled += 1
+                      return 'deny'
+                    },
+                  },
                 },
               }),
               new AbortController().signal,
@@ -7525,9 +7742,13 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
           fullAdapter.run(
             makeBaseRunInput(cwd, {
               permissionMode: 'full',
-              requestPermission: async () => {
-                fullPermCardCalled += 1
-                return 'allow'
+              host: {
+                interactions: {
+                  requestPermission: async () => {
+                    fullPermCardCalled += 1
+                    return 'allow'
+                  },
+                },
               },
             }),
             new AbortController().signal,
@@ -7706,7 +7927,11 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
                 collaboration: task,
                 collaborationAuthorization: authorization,
               },
-              recordWorkflowReview: (obs) => recordedReviews.push(obs),
+              host: {
+                workflow: {
+                  recordReview: (obs) => recordedReviews.push(obs),
+                },
+              },
             }),
             new AbortController().signal,
           ),
@@ -7790,12 +8015,16 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
                   collaboration: task,
                   collaborationAuthorization: authorization,
                 },
-                recovery: {
-                  inputSha256: 'd'.repeat(64),
-                  recordEffectiveSettings: () => undefined,
-                  recordConfirmedUnsent: (proof) => unsentProofs.push(proof),
+                host: {
+                  workflow: {
+                    recordReview: (obs) => recordedReviews.push(obs),
+                  },
+                  recovery: {
+                    inputSha256: 'd'.repeat(64),
+                    recordEffectiveSettings: () => undefined,
+                    recordConfirmedUnsent: (proof) => unsentProofs.push(proof),
+                  },
                 },
-                recordWorkflowReview: (obs) => recordedReviews.push(obs),
               }),
               new AbortController().signal,
             ),
@@ -8001,7 +8230,11 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
                 collaboration: task,
                 collaborationAuthorization: authorization,
               },
-              recordWorkflowReview: (obs) => recordedReviews.push(obs),
+              host: {
+                workflow: {
+                  recordReview: (obs) => recordedReviews.push(obs),
+                },
+              },
             }),
             new AbortController().signal,
           ),
@@ -8385,14 +8618,18 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
               collaboration: task,
               collaborationAuthorization: authorization,
             },
-            readCollaborationSourcePart: () => ({
-              source: 'inputs',
-              offset: 0,
-              nextOffset: null,
-              text: 'Large DB source.',
-            }),
-            recordWorkflowPlan: (p) => publishedLargePlans.push(p.text),
-            recordOpenPlanFinalIntent: () => true,
+            host: {
+              workflow: {
+                sourceReader: legacySourceReader(() => ({
+                  source: 'inputs',
+                  offset: 0,
+                  nextOffset: null,
+                  text: 'Large DB source.',
+                })),
+                recordPlan: (p) => publishedLargePlans.push(p.text),
+                recordOpenPlanFinalIntent: () => true,
+              },
+            },
           }),
           new AbortController().signal,
         ),
@@ -8646,10 +8883,12 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
             makeBaseRunInput(cwd, {
               model: 'model-b',
               effort: effortMode,
-              recovery: {
-                inputSha256: 'c'.repeat(64),
-                recordEffectiveSettings: (s) => recordedSettings.push(s),
-                recordConfirmedUnsent: () => undefined,
+              host: {
+                recovery: {
+                  inputSha256: 'c'.repeat(64),
+                  recordEffectiveSettings: (s) => recordedSettings.push(s),
+                  recordConfirmedUnsent: () => undefined,
+                },
               },
             }),
             new AbortController().signal,
@@ -8736,10 +8975,12 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
             makeBaseRunInput(cwd, {
               model: 'model-b',
               effort: testCase.effort,
-              recovery: {
-                inputSha256: 'c'.repeat(64),
-                recordEffectiveSettings: (s) => recordedSettings.push(s),
-                recordConfirmedUnsent: () => undefined,
+              host: {
+                recovery: {
+                  inputSha256: 'c'.repeat(64),
+                  recordEffectiveSettings: (s) => recordedSettings.push(s),
+                  recordConfirmedUnsent: () => undefined,
+                },
               },
             }),
             new AbortController().signal,
@@ -8845,11 +9086,13 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
           collectEvents(
             adapter.run(
               makeBaseRunInput(cwd, {
-                recovery: {
-                  inputSha256: 'd'.repeat(64),
-                  canDispatch: () => false,
-                  recordEffectiveSettings: () => undefined,
-                  recordConfirmedUnsent: () => undefined,
+                host: {
+                  recovery: {
+                    inputSha256: 'd'.repeat(64),
+                    canDispatch: () => false,
+                    recordEffectiveSettings: () => undefined,
+                    recordConfirmedUnsent: () => undefined,
+                  },
                 },
               }),
               new AbortController().signal,
@@ -8903,11 +9146,13 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
             adapter.run(
               makeBaseRunInput(cwd, {
                 nativeSessionId: 'sid-zt-resumed',
-                recovery: {
-                  inputSha256: 'e'.repeat(64),
-                  canDispatch: () => false,
-                  recordEffectiveSettings: () => undefined,
-                  recordConfirmedUnsent: () => undefined,
+                host: {
+                  recovery: {
+                    inputSha256: 'e'.repeat(64),
+                    canDispatch: () => false,
+                    recordEffectiveSettings: () => undefined,
+                    recordConfirmedUnsent: () => undefined,
+                  },
                 },
               }),
               new AbortController().signal,
@@ -9012,11 +9257,13 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
           collectEvents(
             adapter.run(
               makeBaseRunInput(cwd, {
-                recovery: {
-                  inputSha256: 'f'.repeat(64),
-                  canDispatch: () => false,
-                  recordEffectiveSettings: () => undefined,
-                  recordConfirmedUnsent: () => undefined,
+                host: {
+                  recovery: {
+                    inputSha256: 'f'.repeat(64),
+                    canDispatch: () => false,
+                    recordEffectiveSettings: () => undefined,
+                    recordConfirmedUnsent: () => undefined,
+                  },
                 },
               }),
               new AbortController().signal,
@@ -9078,11 +9325,13 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
           collectEvents(
             adapter.run(
               makeBaseRunInput(cwd, {
-                recovery: {
-                  inputSha256: 'a'.repeat(64),
-                  canDispatch: () => false,
-                  recordEffectiveSettings: () => undefined,
-                  recordConfirmedUnsent: () => undefined,
+                host: {
+                  recovery: {
+                    inputSha256: 'a'.repeat(64),
+                    canDispatch: () => false,
+                    recordEffectiveSettings: () => undefined,
+                    recordConfirmedUnsent: () => undefined,
+                  },
                 },
               }),
               new AbortController().signal,
@@ -9703,11 +9952,15 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
               collaboration: task,
               collaborationAuthorization: authorization,
             },
-            readCollaborationSourcePart: () => {
-              sourceReaderCalls += 1
-              return { source: 'inputs', offset: 0, nextOffset: null, text: 'Frozen source.' }
+            host: {
+              workflow: {
+                sourceReader: legacySourceReader(() => {
+                  sourceReaderCalls += 1
+                  return { source: 'inputs', offset: 0, nextOffset: null, text: 'Frozen source.' }
+                }),
+                recordReview: (obs) => recordedReviews.push(obs),
+              },
             },
-            recordWorkflowReview: (obs) => recordedReviews.push(obs),
           }),
           new AbortController().signal,
         ),
@@ -9915,9 +10168,15 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
               collaboration: task,
               collaborationAuthorization: authorization,
             },
-            recordWorkflowPlan: (p) => publishedPlans.push(p),
-            recordOpenPlanFinalIntent: () => true,
-            recordNativeEvidence: (ev) => recordedEvidence.push(ev),
+            host: {
+              lifecycle: {
+                recordNativeEvidence: (ev) => recordedEvidence.push(ev),
+              },
+              workflow: {
+                recordPlan: (p) => publishedPlans.push(p),
+                recordOpenPlanFinalIntent: () => true,
+              },
+            },
           }),
           new AbortController().signal,
         ),
@@ -10235,10 +10494,12 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
                   collaboration: task,
                   collaborationAuthorization: authorization,
                 },
-                recovery: {
-                  inputSha256: 'b'.repeat(64),
-                  recordEffectiveSettings: () => undefined,
-                  recordConfirmedUnsent: (proof) => unsentProofs.push(proof),
+                host: {
+                  recovery: {
+                    inputSha256: 'b'.repeat(64),
+                    recordEffectiveSettings: () => undefined,
+                    recordConfirmedUnsent: (proof) => unsentProofs.push(proof),
+                  },
                 },
               }),
               new AbortController().signal,
@@ -10705,11 +10966,15 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
               collaboration: task,
               collaborationAuthorization: authorization,
             },
-            readCollaborationSourcePart: () => {
-              sourceReaderCalls += 1
-              return { source: 'inputs', offset: 0, nextOffset: null, text: 'Forbidden read.' }
+            host: {
+              workflow: {
+                sourceReader: legacySourceReader(() => {
+                  sourceReaderCalls += 1
+                  return { source: 'inputs', offset: 0, nextOffset: null, text: 'Forbidden read.' }
+                }),
+                recordReview: (obs) => recordedReviews.push(obs),
+              },
             },
-            recordWorkflowReview: (obs) => recordedReviews.push(obs),
           }),
           new AbortController().signal,
         ),
@@ -10965,9 +11230,13 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
                 collaboration: task,
                 collaborationAuthorization: authorization,
               },
-              readCollaborationSourcePart: () => {
-                sourceReaderCalls += 1
-                return { source: 'inputs', offset: 0, nextOffset: null, text: 'Forbidden.' }
+              host: {
+                workflow: {
+                  sourceReader: legacySourceReader(() => {
+                    sourceReaderCalls += 1
+                    return { source: 'inputs', offset: 0, nextOffset: null, text: 'Forbidden.' }
+                  }),
+                },
               },
             }),
             new AbortController().signal,
@@ -11606,10 +11875,12 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
               makeBaseRunInput(cwd, {
                 model: 'model-b',
                 effort: 'high',
-                recovery: {
-                  inputSha256: 'e'.repeat(64),
-                  recordEffectiveSettings: (s) => recordedSettings.push(s),
-                  recordConfirmedUnsent: () => undefined,
+                host: {
+                  recovery: {
+                    inputSha256: 'e'.repeat(64),
+                    recordEffectiveSettings: (s) => recordedSettings.push(s),
+                    recordConfirmedUnsent: () => undefined,
+                  },
                 },
               }),
               new AbortController().signal,
@@ -11665,10 +11936,12 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
             makeBaseRunInput(cwd, {
               model: 'model-b',
               effort: 'high',
-              recovery: {
-                inputSha256: 'e'.repeat(64),
-                recordEffectiveSettings: (s) => recordedSettings.push(s),
-                recordConfirmedUnsent: () => undefined,
+              host: {
+                recovery: {
+                  inputSha256: 'e'.repeat(64),
+                  recordEffectiveSettings: (s) => recordedSettings.push(s),
+                  recordConfirmedUnsent: () => undefined,
+                },
               },
             }),
             new AbortController().signal,
@@ -11953,11 +12226,15 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
               collaboration: repoTask,
               collaborationAuthorization: repoAuth,
             },
-            recordWorkflowPlan: (plan) => {
-              recordedPlans.push(plan)
-              repo.recordWorkflowPlan(runId, plan)
+            host: {
+              workflow: {
+                recordPlan: (plan) => {
+                  recordedPlans.push(plan)
+                  repo.recordWorkflowPlan(runId, plan)
+                },
+                recordOpenPlanFinalIntent: () => true,
+              },
             },
-            recordOpenPlanFinalIntent: () => true,
           }),
           new AbortController().signal,
         ),
@@ -12109,7 +12386,11 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
                 collaboration: isoTask,
                 collaborationAuthorization: isoAuth,
               },
-              recordOpenPlanFinalIntent: () => true,
+              host: {
+                workflow: {
+                  recordOpenPlanFinalIntent: () => true,
+                },
+              },
             }),
             new AbortController().signal,
           ),
@@ -12785,17 +13066,21 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
           adapter.run(
             makeBaseRunInput(cwd, {
               permissionMode: 'ask',
-              requestPermission: async () => {
-                permEnteredResolve?.()
-                const decision = await permGate
-                setTimeout(() => {
-                  h.sendToClient({
-                    jsonrpc: '2.0',
-                    id: prompt1Id,
-                    result: { stopReason: 'end_turn' },
-                  })
-                }, 10)
-                return decision
+              host: {
+                interactions: {
+                  requestPermission: async () => {
+                    permEnteredResolve?.()
+                    const decision = await permGate
+                    setTimeout(() => {
+                      h.sendToClient({
+                        jsonrpc: '2.0',
+                        id: prompt1Id,
+                        result: { stopReason: 'end_turn' },
+                      })
+                    }, 10)
+                    return decision
+                  },
+                },
               },
             }),
             new AbortController().signal,
@@ -12912,12 +13197,16 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
               collaboration: task,
               collaborationAuthorization: authorization,
             },
-            readCollaborationSourcePart: () => ({
-              source: 'inputs',
-              offset: 0,
-              nextOffset: null,
-              text: 'source',
-            }),
+            host: {
+              workflow: {
+                sourceReader: legacySourceReader(() => ({
+                  source: 'inputs',
+                  offset: 0,
+                  nextOffset: null,
+                  text: 'source',
+                })),
+              },
+            },
           }),
           new AbortController().signal,
         ),
@@ -13110,12 +13399,16 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
               collaboration: task,
               collaborationAuthorization: authorization,
             },
-            readCollaborationSourcePart: () => ({
-              source: 'inputs',
-              offset: 0,
-              nextOffset: null,
-              text: 'source',
-            }),
+            host: {
+              workflow: {
+                sourceReader: legacySourceReader(() => ({
+                  source: 'inputs',
+                  offset: 0,
+                  nextOffset: null,
+                  text: 'source',
+                })),
+              },
+            },
           }),
           new AbortController().signal,
         ),
@@ -13337,9 +13630,13 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
               collaboration: task,
               collaborationAuthorization: authorization,
             },
-            readCollaborationSourcePart: () => {
-              sourceReaderCalls += 1
-              return { source: 'inputs', offset: 0, nextOffset: null, text: 'Must never read!' }
+            host: {
+              workflow: {
+                sourceReader: legacySourceReader(() => {
+                  sourceReaderCalls += 1
+                  return { source: 'inputs', offset: 0, nextOffset: null, text: 'Must never read!' }
+                }),
+              },
             },
           }),
           new AbortController().signal,
@@ -13656,11 +13953,15 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
               collaboration: task,
               collaborationAuthorization: authorization,
             },
-            readCollaborationSourcePart: () => {
-              sourceReaderCalls += 1
-              return { source: 'inputs', offset: 0, nextOffset: null, text: 'Forbidden!' }
+            host: {
+              workflow: {
+                sourceReader: legacySourceReader(() => {
+                  sourceReaderCalls += 1
+                  return { source: 'inputs', offset: 0, nextOffset: null, text: 'Forbidden!' }
+                }),
+                recordReview: (obs) => recordedReviews.push(obs),
+              },
             },
-            recordWorkflowReview: (obs) => recordedReviews.push(obs),
           }),
           new AbortController().signal,
         ),
@@ -13795,9 +14096,13 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
                 comments: [],
                 sourceGrant: { runId: fullRunId, grant: fullGrantId },
               },
-              readCollaborationSourcePart: () => {
-                fullSrcCalls += 1
-                return { source: 'inputs', offset: 0, nextOffset: null, text: 'Forbidden!' }
+              host: {
+                workflow: {
+                  sourceReader: legacySourceReader(() => {
+                    fullSrcCalls += 1
+                    return { source: 'inputs', offset: 0, nextOffset: null, text: 'Forbidden!' }
+                  }),
+                },
               },
             }),
             new AbortController().signal,
@@ -14134,9 +14439,13 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
               requestSessionTitle: true,
               sourceGrant: { runId, grant: grantId },
             },
-            readCollaborationSourcePart: () => {
-              sourceReaderCalls += 1
-              return { source: 'inputs', offset: 0, nextOffset: null, text: 'Forbidden!' }
+            host: {
+              workflow: {
+                sourceReader: legacySourceReader(() => {
+                  sourceReaderCalls += 1
+                  return { source: 'inputs', offset: 0, nextOffset: null, text: 'Forbidden!' }
+                }),
+              },
             },
           }),
           new AbortController().signal,
@@ -14234,10 +14543,12 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
             makeBaseRunInput(cwd, {
               model: 'model-b',
               effort: null,
-              recovery: {
-                inputSha256: 'a'.repeat(64),
-                recordEffectiveSettings: (settings) => recordedSettings.push(settings),
-                recordConfirmedUnsent: () => undefined,
+              host: {
+                recovery: {
+                  inputSha256: 'a'.repeat(64),
+                  recordEffectiveSettings: (settings) => recordedSettings.push(settings),
+                  recordConfirmedUnsent: () => undefined,
+                },
               },
             }),
             new AbortController().signal,
@@ -14330,10 +14641,12 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
               makeBaseRunInput(cwd, {
                 model: 'model-b',
                 effort: 'high',
-                recovery: {
-                  inputSha256: 'b'.repeat(64),
-                  recordEffectiveSettings: (settings) => recordedSettings.push(settings),
-                  recordConfirmedUnsent: () => undefined,
+                host: {
+                  recovery: {
+                    inputSha256: 'b'.repeat(64),
+                    recordEffectiveSettings: (settings) => recordedSettings.push(settings),
+                    recordConfirmedUnsent: () => undefined,
+                  },
                 },
               }),
               new AbortController().signal,
@@ -14671,7 +14984,11 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
                 collaboration: task,
                 collaborationAuthorization: authorization,
               },
-              recordOpenPlanFinalIntent: () => true,
+              host: {
+                workflow: {
+                  recordOpenPlanFinalIntent: () => true,
+                },
+              },
             }),
             new AbortController().signal,
           ),
@@ -14880,8 +15197,12 @@ describe('AgyAgentAdapter Round-2 final review regressions', () => {
                 collaboration: task,
                 collaborationAuthorization: authorization,
               },
-              recordWorkflowPlan: (p) => recordedPlans.push(p),
-              recordOpenPlanFinalIntent: () => true,
+              host: {
+                workflow: {
+                  recordPlan: (p) => recordedPlans.push(p),
+                  recordOpenPlanFinalIntent: () => true,
+                },
+              },
             }),
             new AbortController().signal,
           ),
@@ -15651,9 +15972,13 @@ describe('AgyAgentAdapter Round-4 final review regressions', () => {
               collaboration: task,
               collaborationAuthorization: authorization,
             },
-            readCollaborationSourcePart: () => {
-              sourceReadCalls += 1
-              return { source: 'inputs', offset: 0, nextOffset: null, text: 'secret' }
+            host: {
+              workflow: {
+                sourceReader: legacySourceReader(() => {
+                  sourceReadCalls += 1
+                  return { source: 'inputs', offset: 0, nextOffset: null, text: 'secret' }
+                }),
+              },
             },
           }),
           new AbortController().signal,
@@ -16393,13 +16718,17 @@ describe('AgyAgentAdapter Round-4 final review regressions', () => {
             sessionId: pactSessionId,
             nativeSessionId,
             permissionMode: 'ask',
-            requestPermission: async () => 'deny',
             promptEnvelope: {
               version: 'pact-agent-prompt-v1',
               sessionId: pactSessionId,
               requestSessionTitle: true,
               message: { id: randomUUID(), content: 'Verify High #5 and High #6.' },
               comments: [],
+            },
+            host: {
+              interactions: {
+                requestPermission: async () => 'deny',
+              },
             },
           }),
           new AbortController().signal,
@@ -16903,10 +17232,6 @@ describe('AgyAgentAdapter Round-4 final review regressions', () => {
             makeBaseRunInput(cwd, {
               sessionId: pactSessionId,
               runId,
-              recordOpenPlanFinalIntent: () => true,
-              recordWorkflowPlanUnavailable: () => {
-                unavailableCalls += 1
-              },
               promptEnvelope: {
                 version: 'pact-agent-prompt-v1',
                 sessionId: pactSessionId,
@@ -16914,6 +17239,14 @@ describe('AgyAgentAdapter Round-4 final review regressions', () => {
                 comments: [],
                 collaboration: openTask,
                 collaborationAuthorization: authorization,
+              },
+              host: {
+                workflow: {
+                  recordOpenPlanFinalIntent: () => true,
+                  recordPlanUnavailable: () => {
+                    unavailableCalls += 1
+                  },
+                },
               },
             }),
             new AbortController().signal,
@@ -17076,10 +17409,6 @@ describe('AgyAgentAdapter Round-4 final review regressions', () => {
             makeBaseRunInput(cwd, {
               sessionId: pactSessionId,
               runId,
-              recordOpenPlanFinalIntent: () => true,
-              recordWorkflowPlanUnavailable: () => {
-                unavailableCalls += 1
-              },
               promptEnvelope: {
                 version: 'pact-agent-prompt-v1',
                 sessionId: pactSessionId,
@@ -17087,6 +17416,14 @@ describe('AgyAgentAdapter Round-4 final review regressions', () => {
                 comments: [],
                 collaboration: openTask,
                 collaborationAuthorization: authorization,
+              },
+              host: {
+                workflow: {
+                  recordOpenPlanFinalIntent: () => true,
+                  recordPlanUnavailable: () => {
+                    unavailableCalls += 1
+                  },
+                },
               },
             }),
             new AbortController().signal,
@@ -17311,13 +17648,15 @@ describe('AgyAgentAdapter Round-4 final review regressions', () => {
               makeBaseRunInput(cwd, {
                 model: 'gemini-4-carbon',
                 effort: 'high',
-                recovery: {
-                  inputSha256: 'c'.repeat(64),
-                  canDispatch: () => true,
-                  recordEffectiveSettings: (s) => {
-                    recordedSettings = s
+                host: {
+                  recovery: {
+                    inputSha256: 'c'.repeat(64),
+                    canDispatch: () => true,
+                    recordEffectiveSettings: (s) => {
+                      recordedSettings = s
+                    },
+                    recordConfirmedUnsent: () => undefined,
                   },
-                  recordConfirmedUnsent: () => undefined,
                 },
               }),
               new AbortController().signal,
@@ -17401,13 +17740,15 @@ describe('AgyAgentAdapter Round-4 final review regressions', () => {
             makeBaseRunInput(cwd, {
               model: 'gemini-4-carbon',
               effort: 'high',
-              recovery: {
-                inputSha256: 'd'.repeat(64),
-                canDispatch: () => true,
-                recordEffectiveSettings: (s) => {
-                  recordedEffort = s.effort
+              host: {
+                recovery: {
+                  inputSha256: 'd'.repeat(64),
+                  canDispatch: () => true,
+                  recordEffectiveSettings: (s) => {
+                    recordedEffort = s.effort
+                  },
+                  recordConfirmedUnsent: () => undefined,
                 },
-                recordConfirmedUnsent: () => undefined,
               },
             }),
             new AbortController().signal,
@@ -17493,13 +17834,15 @@ describe('AgyAgentAdapter Round-4 final review regressions', () => {
             makeBaseRunInput(cwd, {
               model: 'gemini-3.5-pro-high',
               effort: null,
-              recovery: {
-                inputSha256: 'e'.repeat(64),
-                canDispatch: () => true,
-                recordEffectiveSettings: (s) => {
-                  recordedSettings = s
+              host: {
+                recovery: {
+                  inputSha256: 'e'.repeat(64),
+                  canDispatch: () => true,
+                  recordEffectiveSettings: (s) => {
+                    recordedSettings = s
+                  },
+                  recordConfirmedUnsent: () => undefined,
                 },
-                recordConfirmedUnsent: () => undefined,
               },
             }),
             new AbortController().signal,
@@ -17671,8 +18014,12 @@ describe('AgyAgentAdapter Round-4 final review regressions', () => {
       await collectEvents(
         adapter.run(
           makeBaseRunInput(cwd, {
-            recordBackgroundReport: async (report) => {
-              bgReports.push(report)
+            host: {
+              effects: {
+                recordBackgroundReport: async (report) => {
+                  bgReports.push(report)
+                },
+              },
             },
           }),
           new AbortController().signal,
@@ -18012,7 +18359,6 @@ describe('AgyAgentAdapter Round-4 final review regressions', () => {
             sessionId: pactSessionId,
             runId,
             permissionMode: 'ask',
-            requestPermission: async () => 'allow',
             promptEnvelope: {
               version: 'pact-agent-prompt-v1',
               sessionId: pactSessionId,
@@ -18022,48 +18368,55 @@ describe('AgyAgentAdapter Round-4 final review regressions', () => {
               collaboration: task,
               collaborationAuthorization: authorization,
             },
-            collaborationSourceReader: {
-              identity: { runId, grant: grantId },
-              navigation: () => ({ runId, grant: grantId, source: 'inputs', offset: 0 }),
-              read: () => {
-                sourceReadCalls += 1
-                return {
-                  submitted: 'legacy',
-                  request: { runId, grant: grantId, source: 'inputs', offset: 0 },
-                  page: {
-                    source: 'inputs',
-                    offset: 0,
-                    nextOffset: null,
-                    text: 'native',
-                    binding: {
+            host: {
+              workflow: {
+                sourceReader: {
+                  identity: { runId, grant: grantId },
+                  navigation: () => ({ runId, grant: grantId, source: 'inputs', offset: 0 }),
+                  read: () => {
+                    sourceReadCalls += 1
+                    return {
                       submitted: 'legacy',
-                      callerRunId: runId,
-                      grantSha256: 'a'.repeat(64),
-                      referenceSha256: null,
-                    },
+                      request: { runId, grant: grantId, source: 'inputs', offset: 0 },
+                      page: {
+                        source: 'inputs',
+                        offset: 0,
+                        nextOffset: null,
+                        text: 'native',
+                        binding: {
+                          submitted: 'legacy',
+                          callerRunId: runId,
+                          grantSha256: 'a'.repeat(64),
+                          referenceSha256: null,
+                        },
+                      },
+                    }
                   },
-                }
-              },
-              readNativeRoot: () => {
-                sourceReadCalls += 1
-                return {
-                  submitted: 'nativeRoot',
-                  request: { runId, grant: grantId, source: 'inputs', offset: 0 },
-                  page: {
-                    source: 'inputs',
-                    offset: 0,
-                    nextOffset: null,
-                    text: 'native',
-                    binding: {
-                      submitted: 'legacy',
-                      callerRunId: runId,
-                      grantSha256: 'a'.repeat(64),
-                      referenceSha256: null,
-                    },
+                  readNativeRoot: () => {
+                    sourceReadCalls += 1
+                    return {
+                      submitted: 'nativeRoot',
+                      request: { runId, grant: grantId, source: 'inputs', offset: 0 },
+                      page: {
+                        source: 'inputs',
+                        offset: 0,
+                        nextOffset: null,
+                        text: 'native',
+                        binding: {
+                          submitted: 'legacy',
+                          callerRunId: runId,
+                          grantSha256: 'a'.repeat(64),
+                          referenceSha256: null,
+                        },
+                      },
+                    }
                   },
-                }
+                  retire: () => undefined,
+                },
               },
-              retire: () => undefined,
+              interactions: {
+                requestPermission: async () => 'allow',
+              },
             },
           }),
           new AbortController().signal,
@@ -18194,15 +18547,21 @@ describe('AgyAgentAdapter Wave-3 converged Run & Open-mode regressions', () => {
           makeBaseRunInput(cwd, {
             runId,
             permissionMode: 'auto',
-            waitForRootOutput: async () => {
-              enteredWaitForRootOutput = true
-              await rootOutputGate
-            },
-            recordBackgroundReport: async (report) => {
-              backgroundReports.push(report)
-            },
-            reportNativeEffects: (report) => {
-              effectStates.push({ state: report.state, reason: report.reason })
+            host: {
+              lifecycle: {
+                waitForRootOutput: async () => {
+                  enteredWaitForRootOutput = true
+                  await rootOutputGate
+                },
+              },
+              effects: {
+                recordBackgroundReport: async (report) => {
+                  backgroundReports.push(report)
+                },
+                reportNativeEffects: (report) => {
+                  effectStates.push({ state: report.state, reason: report.reason })
+                },
+              },
             },
           }),
           new AbortController().signal,
@@ -18392,20 +18751,6 @@ describe('AgyAgentAdapter Wave-3 converged Run & Open-mode regressions', () => {
             sessionId: pactSessionId,
             runId,
             permissionMode: 'auto',
-            recordFileChange: async () => {
-              await new Promise((r) => setTimeout(r, 25))
-            },
-            recordOpenPlanFinalIntent: (intent) => {
-              if (failFirstIntentPersist) {
-                failFirstIntentPersist = false
-                throw new Error('simulated sqlite write failure')
-              }
-              persistedIntents.push(intent)
-              return true
-            },
-            recordWorkflowPlanUnavailable: () => {
-              unavailableCount += 1
-            },
             promptEnvelope: {
               version: 'pact-agent-prompt-v1',
               sessionId: pactSessionId,
@@ -18413,6 +18758,26 @@ describe('AgyAgentAdapter Wave-3 converged Run & Open-mode regressions', () => {
               comments: [],
               collaboration: task,
               collaborationAuthorization: authorization,
+            },
+            host: {
+              effects: {
+                recordFileChange: async () => {
+                  await new Promise((r) => setTimeout(r, 25))
+                },
+              },
+              workflow: {
+                recordOpenPlanFinalIntent: (intent) => {
+                  if (failFirstIntentPersist) {
+                    failFirstIntentPersist = false
+                    throw new Error('simulated sqlite write failure')
+                  }
+                  persistedIntents.push(intent)
+                  return true
+                },
+                recordPlanUnavailable: () => {
+                  unavailableCount += 1
+                },
+              },
             },
           }),
           new AbortController().signal,
@@ -18526,7 +18891,6 @@ describe('AgyAgentAdapter Wave-3 converged Run & Open-mode regressions', () => {
             makeBaseRunInput(cwd, {
               sessionId: pactSessionId,
               runId,
-              recordWorkflowPlan: (plan) => recordedPlans.push(plan),
               promptEnvelope: {
                 version: 'pact-agent-prompt-v1',
                 sessionId: pactSessionId,
@@ -18534,6 +18898,11 @@ describe('AgyAgentAdapter Wave-3 converged Run & Open-mode regressions', () => {
                 comments: [],
                 collaboration: task,
                 collaborationAuthorization: authorization,
+              },
+              host: {
+                workflow: {
+                  recordPlan: (plan) => recordedPlans.push(plan),
+                },
               },
             }),
             new AbortController().signal,
@@ -18599,12 +18968,16 @@ describe('AgyAgentAdapter Wave-3 converged Run & Open-mode regressions', () => {
           collectEvents(
             adapter.run(
               makeBaseRunInput(cwd, {
-                reportNativeEffects: (r) => effectStates.push(r.state),
-                recovery: {
-                  inputSha256: 'd'.repeat(64),
-                  recordEffectiveSettings: () => undefined,
-                  recordConfirmedUnsent: () => {
-                    unsentRecorded = true
+                host: {
+                  effects: {
+                    reportNativeEffects: (r) => effectStates.push(r.state),
+                  },
+                  recovery: {
+                    inputSha256: 'd'.repeat(64),
+                    recordEffectiveSettings: () => undefined,
+                    recordConfirmedUnsent: () => {
+                      unsentRecorded = true
+                    },
                   },
                 },
               }),
@@ -18659,15 +19032,9 @@ describe('AgyAgentAdapter Round-5 audit regressions', () => {
       supportedForms: ['sourceReference'] as const,
     }
     const capRestricted = resolveAgentCollaborationSourceCapability({
-      collaborationSourceReader: readerBoth as unknown as NonNullable<
-        AgentRunInput['collaborationSourceReader']
+      sourceReader: readerBoth as unknown as NonNullable<
+        NonNullable<NonNullable<AgentRunInput['host']>['workflow']>['sourceReader']
       >,
-      readCollaborationSourcePart: () => ({
-        source: 'inputs',
-        text: '',
-        offset: 0,
-        nextOffset: null,
-      }),
     })
     expect(capRestricted).toEqual({
       nativeRoot: false,
@@ -18687,10 +19054,9 @@ describe('AgyAgentAdapter Round-5 audit regressions', () => {
       supportedForms: ['nativeRoot'] as const,
     }
     const capNoMethod = resolveAgentCollaborationSourceCapability({
-      collaborationSourceReader: readerNativeOnly as unknown as NonNullable<
-        AgentRunInput['collaborationSourceReader']
+      sourceReader: readerNativeOnly as unknown as NonNullable<
+        NonNullable<NonNullable<AgentRunInput['host']>['workflow']>['sourceReader']
       >,
-      readCollaborationSourcePart: undefined,
     })
     expect(capNoMethod).toEqual({
       nativeRoot: false,
@@ -18792,16 +19158,22 @@ describe('AgyAgentAdapter Round-5 audit regressions', () => {
       await collectEvents(
         adapter.run(
           makeBaseRunInput(cwd, {
-            recordDispatch: (phase) => {
-              if (phase === 'accepted') acceptedCount += 1
-            },
-            requestPermission: async () => {
-              permissionPromptCalls += 1
-              return 'allow'
-            },
-            requestUserInput: async () => {
-              userInputPromptCalls += 1
-              return { action: 'accept', content: { answer: 'yes' } }
+            host: {
+              lifecycle: {
+                recordDispatch: (phase) => {
+                  if (phase === 'accepted') acceptedCount += 1
+                },
+              },
+              interactions: {
+                requestPermission: async () => {
+                  permissionPromptCalls += 1
+                  return 'allow'
+                },
+                requestUserInput: async () => {
+                  userInputPromptCalls += 1
+                  return { action: 'accept', content: { answer: 'yes' } }
+                },
+              },
             },
           }),
           new AbortController().signal,
@@ -18930,7 +19302,11 @@ describe('AgyAgentAdapter Round-5 audit regressions', () => {
               message: { id: randomUUID(), content: 'hello' },
               comments: [],
             },
-            reportNativeEffects: (r) => effectStates.push(r.state),
+            host: {
+              effects: {
+                reportNativeEffects: (r) => effectStates.push(r.state),
+              },
+            },
           }),
           new AbortController().signal,
         ),
@@ -19135,7 +19511,6 @@ describe('AgyAgentAdapter Round-5 audit regressions', () => {
           makeBaseRunInput(cwd, {
             sessionId: pactSessionId,
             runId,
-            recordWorkflowPlan: (plan) => recordedPlans.push(plan),
             promptEnvelope: {
               version: 'pact-agent-prompt-v1',
               sessionId: pactSessionId,
@@ -19143,6 +19518,11 @@ describe('AgyAgentAdapter Round-5 audit regressions', () => {
               comments: [],
               collaboration: task,
               collaborationAuthorization: authorization,
+            },
+            host: {
+              workflow: {
+                recordPlan: (plan) => recordedPlans.push(plan),
+              },
             },
           }),
           new AbortController().signal,
@@ -19507,11 +19887,6 @@ describe('AgyAgentAdapter Round-5 audit regressions', () => {
           makeBaseRunInput(cwd, {
             sessionId: pactSessionId,
             runId,
-            recordWorkflowPlan: (plan) => publishedPlans.push(plan),
-            recordOpenPlanFinalIntent: () => {
-              persistCalls += 1
-              return allowPersist
-            },
             promptEnvelope: {
               version: 'pact-agent-prompt-v1',
               sessionId: pactSessionId,
@@ -19519,6 +19894,15 @@ describe('AgyAgentAdapter Round-5 audit regressions', () => {
               comments: [],
               collaboration: task,
               collaborationAuthorization: authorization,
+            },
+            host: {
+              workflow: {
+                recordPlan: (plan) => publishedPlans.push(plan),
+                recordOpenPlanFinalIntent: () => {
+                  persistCalls += 1
+                  return allowPersist
+                },
+              },
             },
           }),
           new AbortController().signal,
@@ -19665,13 +20049,17 @@ describe('AgyAgentAdapter Round-5 audit regressions', () => {
       await collectEvents(
         adapter.run(
           makeBaseRunInput(cwd, {
-            recordBackgroundReport: async (report) => {
-              recordedReports.push(report)
+            host: {
+              effects: {
+                recordBackgroundReport: async (report) => {
+                  recordedReports.push(report)
+                },
+                recordBackgroundReportUnavailable: () => {
+                  unavailableCount += 1
+                },
+                reportNativeEffects: (r) => effectStates.push(r.state),
+              },
             },
-            recordBackgroundReportUnavailable: () => {
-              unavailableCount += 1
-            },
-            reportNativeEffects: (r) => effectStates.push(r.state),
           }),
           new AbortController().signal,
         ),
@@ -19967,14 +20355,20 @@ describe('AgyAgentAdapter Wave-6 audit regressions', () => {
               message: { id: randomUUID(), content: 'Real Wave 6 prompt' },
               comments: [],
             },
-            recordDispatch: (phase) => dispatchPhases.push(phase),
-            requestPermission: async () => {
-              permissionCalls += 1
-              return 'allow'
-            },
-            requestUserInput: async () => {
-              elicitationCalls += 1
-              return { action: 'accept', content: { choice: 'yes' } }
+            host: {
+              lifecycle: {
+                recordDispatch: (phase) => dispatchPhases.push(phase),
+              },
+              interactions: {
+                requestPermission: async () => {
+                  permissionCalls += 1
+                  return 'allow'
+                },
+                requestUserInput: async () => {
+                  elicitationCalls += 1
+                  return { action: 'accept', content: { choice: 'yes' } }
+                },
+              },
             },
           }),
           new AbortController().signal,
@@ -20096,30 +20490,34 @@ describe('AgyAgentAdapter Wave-6 audit regressions', () => {
           adapter.run(
             makeBaseRunInput(cwd, {
               permissionMode: 'ask',
-              requestPermission: (_req, sig) =>
-                new Promise((done) => {
-                  sig.addEventListener(
-                    'abort',
-                    () => {
-                      permAborted = true
-                    },
-                    { once: true },
-                  )
-                  resolvePerm = done
-                  permPrompted()
-                }),
-              requestUserInput: (_req, sig) =>
-                new Promise((done) => {
-                  sig.addEventListener(
-                    'abort',
-                    () => {
-                      elicitAborted = true
-                    },
-                    { once: true },
-                  )
-                  resolveElicit = done
-                  elicitPrompted()
-                }),
+              host: {
+                interactions: {
+                  requestPermission: (_req, sig) =>
+                    new Promise((done) => {
+                      sig.addEventListener(
+                        'abort',
+                        () => {
+                          permAborted = true
+                        },
+                        { once: true },
+                      )
+                      resolvePerm = done
+                      permPrompted()
+                    }),
+                  requestUserInput: (_req, sig) =>
+                    new Promise((done) => {
+                      sig.addEventListener(
+                        'abort',
+                        () => {
+                          elicitAborted = true
+                        },
+                        { once: true },
+                      )
+                      resolveElicit = done
+                      elicitPrompted()
+                    }),
+                },
+              },
             }),
             new AbortController().signal,
           ),
@@ -20359,10 +20757,16 @@ describe('AgyAgentAdapter Wave-6 audit regressions', () => {
         adapter.run(
           makeBaseRunInput(cwd, {
             nativeSessionId,
-            observeNativeTitle: (title) => observedTitles.push(title),
-            recordNativeEvidence: (ev) => recordedEvidence.push(ev),
-            recordBackgroundReport: async (report) => {
-              recordedBgReports.push(report)
+            host: {
+              lifecycle: {
+                observeNativeTitle: (title) => observedTitles.push(title),
+                recordNativeEvidence: (ev) => recordedEvidence.push(ev),
+              },
+              effects: {
+                recordBackgroundReport: async (report) => {
+                  recordedBgReports.push(report)
+                },
+              },
             },
           }),
           new AbortController().signal,
@@ -20511,8 +20915,12 @@ describe('AgyAgentAdapter Wave-6 audit regressions', () => {
                 collaboration: openTask,
                 collaborationAuthorization: authorization,
               },
-              recordOpenPlanFinalIntent: () => {
-                // Intentionally return void (undefined) instead of `true`!
+              host: {
+                workflow: {
+                  recordOpenPlanFinalIntent: () => {
+                    // Intentionally return void (undefined) instead of `true`!
+                  },
+                },
               },
             }),
             new AbortController().signal,
@@ -20688,7 +21096,11 @@ describe('AgyAgentAdapter Wave-6 audit regressions', () => {
                 collaboration: task,
                 collaborationAuthorization: authorization,
               },
-              recordWorkflowPlan: (plan) => recordedPlans.push(plan),
+              host: {
+                workflow: {
+                  recordPlan: (plan) => recordedPlans.push(plan),
+                },
+              },
             }),
             new AbortController().signal,
           ),
@@ -20838,33 +21250,37 @@ describe('AgyAgentAdapter Wave-6 audit regressions', () => {
                 collaboration: task,
                 collaborationAuthorization: authorization,
               },
-              // Legacy-only AgentCollaborationSourceReader (`supportedForms: ['legacy']`, no `readCollaborationSourcePart`)!
-              collaborationSourceReader: {
-                identity: { runId, grant: grantId },
-                supportedForms: ['legacy'],
-                navigation: () => ({
-                  runId,
-                  grant: grantId,
-                  source: 'inputs',
-                  offset: 0,
-                }),
-                read: () => ({
-                  submitted: 'legacy',
-                  request: { runId, grant: grantId, source: 'inputs', offset: 0 },
-                  page: {
-                    source: 'inputs',
-                    offset: 0,
-                    nextOffset: null,
-                    text: 'LEGACY_ONLY_PLAN_BODY',
-                    binding: {
+              host: {
+                workflow: {
+                  // Legacy-only AgentCollaborationSourceReader (`supportedForms: ['legacy']`, no `readCollaborationSourcePart`)!
+                  sourceReader: {
+                    identity: { runId, grant: grantId },
+                    supportedForms: ['legacy'],
+                    navigation: () => ({
+                      runId,
+                      grant: grantId,
+                      source: 'inputs',
+                      offset: 0,
+                    }),
+                    read: () => ({
                       submitted: 'legacy',
-                      callerRunId: runId,
-                      grantSha256: createHash('sha256').update(grantId).digest('hex'),
-                      referenceSha256: 'a'.repeat(64),
-                    },
+                      request: { runId, grant: grantId, source: 'inputs', offset: 0 },
+                      page: {
+                        source: 'inputs',
+                        offset: 0,
+                        nextOffset: null,
+                        text: 'LEGACY_ONLY_PLAN_BODY',
+                        binding: {
+                          submitted: 'legacy',
+                          callerRunId: runId,
+                          grantSha256: createHash('sha256').update(grantId).digest('hex'),
+                          referenceSha256: 'a'.repeat(64),
+                        },
+                      },
+                    }),
+                    retire: () => {},
                   },
-                }),
-                retire: () => {},
+                },
               },
             }),
             new AbortController().signal,
@@ -21076,7 +21492,12 @@ describe('AgyAgentAdapter Wave-6 audit regressions', () => {
       }
     })
 
-    const requestPermissionSpy = vi.fn<NonNullable<AgentRunInput['requestPermission']>>()
+    const requestPermissionSpy =
+      vi.fn<
+        NonNullable<
+          NonNullable<NonNullable<AgentRunInput['host']>['interactions']>['requestPermission']
+        >
+      >()
     const capturedPlans: Array<{ nativeId: string; text: string }> = []
     const sessionId = randomUUID()
     const run1Id = randomUUID()
@@ -21101,8 +21522,6 @@ describe('AgyAgentAdapter Wave-6 audit regressions', () => {
             sessionId,
             runId: run1Id,
             permissionMode: 'ask',
-            requestPermission: requestPermissionSpy,
-            recordWorkflowPlan: (plan) => capturedPlans.push(plan),
             promptEnvelope: {
               version: 'pact-agent-prompt-v1',
               sessionId,
@@ -21111,6 +21530,14 @@ describe('AgyAgentAdapter Wave-6 audit regressions', () => {
               sourceGrant: { runId: run1Id, grant: 'g-plan' },
               collaboration: planTask,
               collaborationAuthorization: planAuth,
+            },
+            host: {
+              workflow: {
+                recordPlan: (plan) => capturedPlans.push(plan),
+              },
+              interactions: {
+                requestPermission: requestPermissionSpy,
+              },
             },
           }),
           new AbortController().signal,
@@ -21156,7 +21583,6 @@ describe('AgyAgentAdapter Wave-6 audit regressions', () => {
             nativeSessionId,
             bindingGeneration: 1,
             permissionMode: 'ask',
-            requestPermission: requestPermissionSpy,
             promptEnvelope: {
               version: 'pact-agent-prompt-v1',
               sessionId,
@@ -21165,6 +21591,11 @@ describe('AgyAgentAdapter Wave-6 audit regressions', () => {
               sourceGrant: { runId: run2Id, grant: 'g-review' },
               collaboration: reviewTask,
               collaborationAuthorization: reviewAuth,
+            },
+            host: {
+              interactions: {
+                requestPermission: requestPermissionSpy,
+              },
             },
           }),
           new AbortController().signal,
@@ -21367,9 +21798,11 @@ describe('AgyAgentAdapter Wave-6 audit regressions', () => {
         appDataDir: targetAppDataDir,
         processFactory: () => harness.child,
       })
-      const spyPerm = vi.fn<NonNullable<AgentRunInput['requestPermission']>>(() =>
-        Promise.resolve('agy-reject-once'),
-      )
+      const spyPerm = vi.fn<
+        NonNullable<
+          NonNullable<NonNullable<AgentRunInput['host']>['interactions']>['requestPermission']
+        >
+      >(() => Promise.resolve('agy-reject-once'))
       try {
         const sessionId = randomUUID()
         const runId = randomUUID()
@@ -21380,7 +21813,6 @@ describe('AgyAgentAdapter Wave-6 audit regressions', () => {
               sessionId,
               runId,
               permissionMode: 'ask',
-              requestPermission: spyPerm,
               promptEnvelope: {
                 version: 'pact-agent-prompt-v1',
                 sessionId,
@@ -21389,6 +21821,11 @@ describe('AgyAgentAdapter Wave-6 audit regressions', () => {
                 sourceGrant: { runId, grant: 'g-hardening' },
                 collaboration: task,
                 collaborationAuthorization: authorization,
+              },
+              host: {
+                interactions: {
+                  requestPermission: spyPerm,
+                },
               },
             }),
             new AbortController().signal,
@@ -21609,16 +22046,20 @@ describe('AgyAgentAdapter Wave-6 audit regressions', () => {
           makeBaseRunInput(cwd, {
             sessionId,
             runId: run.id,
-            recordFileChange: async (change, sig) => {
-              await wsChanges.record(run.id, change, sig)
-            },
-            recordUncertainEffects: (reason) => {
-              wsChanges.uncertain(run.id, reason)
-            },
-            reportNativeEffects: (effect) => {
-              if (effect.state === 'unknown') {
-                wsChanges.observeUncertainEffects(run.id)
-              }
+            host: {
+              effects: {
+                recordFileChange: async (change, sig) => {
+                  await wsChanges.record(run.id, change, sig)
+                },
+                recordUncertainEffects: (reason) => {
+                  wsChanges.uncertain(run.id, reason)
+                },
+                reportNativeEffects: (effect) => {
+                  if (effect.state === 'unknown') {
+                    wsChanges.observeUncertainEffects(run.id)
+                  }
+                },
+              },
             },
           }),
           runAbort.signal,
@@ -21772,11 +22213,15 @@ describe('AgyAgentAdapter Wave-6 audit regressions', () => {
         adapter.run(
           makeBaseRunInput(cwd, {
             nativeSessionId,
-            recordFileChange: async (change) => {
-              recordedChanges.push(change)
-            },
-            reportNativeEffects: (report) => {
-              effectStates.push(report.state)
+            host: {
+              effects: {
+                recordFileChange: async (change) => {
+                  recordedChanges.push(change)
+                },
+                reportNativeEffects: (report) => {
+                  effectStates.push(report.state)
+                },
+              },
             },
           }),
           new AbortController().signal,
@@ -21895,14 +22340,20 @@ describe('AgyAgentAdapter Wave-6 audit regressions', () => {
           adapter.run(
             makeBaseRunInput(cwd, {
               nativeSessionId,
-              recordDispatch: (phase) => {
-                dispatchPhases.push(phase)
-              },
-              recordFileChange: async (change) => {
-                recordedChanges.push(change)
-              },
-              reportNativeEffects: (report) => {
-                effectStates.push(report.state)
+              host: {
+                lifecycle: {
+                  recordDispatch: (phase) => {
+                    dispatchPhases.push(phase)
+                  },
+                },
+                effects: {
+                  recordFileChange: async (change) => {
+                    recordedChanges.push(change)
+                  },
+                  reportNativeEffects: (report) => {
+                    effectStates.push(report.state)
+                  },
+                },
               },
             }),
             new AbortController().signal,
@@ -22063,8 +22514,12 @@ describe('AgyAgentAdapter Wave-6 audit regressions', () => {
         adapter.run(
           makeBaseRunInput(cwd, {
             nativeSessionId,
-            recordFileChange: async (change) => {
-              recordedChanges.push({ path: change.path, kind: change.kind })
+            host: {
+              effects: {
+                recordFileChange: async (change) => {
+                  recordedChanges.push({ path: change.path, kind: change.kind })
+                },
+              },
             },
           }),
           new AbortController().signal,

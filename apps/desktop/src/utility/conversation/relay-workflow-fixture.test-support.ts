@@ -78,7 +78,7 @@ function readWorkflowSources(
   input: AgentRunInput,
   forbidden: import('@pact/contracts').CollaborationDocument[] = [],
 ): WorkflowSourceRead {
-  const read = input.readCollaborationSourcePart!,
+  const read = (raw: unknown) => input.host!.workflow!.sourceReader!.read(raw).page,
     grant = input.promptEnvelope.sourceGrant
   const result: WorkflowSourceRead = {
     runId: input.runId,
@@ -174,10 +174,10 @@ export function workflowAdapter(agentId: RuntimeAgentId, state: WorkflowNativeSt
       state.inputs.push(input)
       const nativeSessionId = input.nativeSessionId ?? `${input.sessionId}-${agentId}`,
         phase = input.promptEnvelope.collaboration
-      input.recordExecutor?.(this.executorId)
-      input.recordDispatch?.('possibly_sent', nativeSessionId, this.executorId)
+      input.host?.lifecycle?.recordExecutor?.(this.executorId)
+      input.host?.lifecycle?.recordDispatch?.('possibly_sent', nativeSessionId, this.executorId)
       yield { type: 'session.started', agentId, nativeSessionId }
-      input.recordDispatch?.('accepted', nativeSessionId, this.executorId)
+      input.host?.lifecycle?.recordDispatch?.('accepted', nativeSessionId, this.executorId)
       yield { type: 'turn.started', agentId, turnId: input.runId }
       if (state.loseObservation)
         throw new AgentExecutionError(
@@ -203,7 +203,7 @@ export function workflowAdapter(agentId: RuntimeAgentId, state: WorkflowNativeSt
           if (signal.aborted) done()
           else signal.addEventListener('abort', () => done(), { once: true })
         })
-        input.recordNativeEvidence?.({
+        input.host?.lifecycle?.recordNativeEvidence?.({
           kind: 'ended',
           source: 'stored_terminal',
           outcome: 'interrupted',
@@ -218,7 +218,7 @@ export function workflowAdapter(agentId: RuntimeAgentId, state: WorkflowNativeSt
             executorId: this.executorId,
           },
         })
-        input.reportNativeEffects?.({
+        input.host?.effects?.reportNativeEffects?.({
           runId: input.runId,
           generation: input.nativeGeneration!,
           state: 'settled',
@@ -234,18 +234,18 @@ export function workflowAdapter(agentId: RuntimeAgentId, state: WorkflowNativeSt
       if (!interrupted && phase) {
         if (phase.stage === 'plan') {
           if (state.unselectedPlan)
-            input.recordWorkflowPlan?.({
+            input.host?.workflow?.recordPlan?.({
               nativeId: `unselected-${input.runId}`,
               text: state.unselectedPlan,
             })
-          input.recordWorkflowPlan?.({
+          input.host?.workflow?.recordPlan?.({
             nativeId: `plan-${input.runId}`,
             text:
               state.planText ?? 'Complete accepted plan: preserve the original cancellation scope.',
           })
         } else if (phase.stage === 'collaborate') {
           if (state.planText) {
-            input.recordWorkflowPlan?.({
+            input.host?.workflow?.recordPlan?.({
               nativeId: `plan-${input.runId}`,
               text: state.planText,
             })
@@ -257,9 +257,9 @@ export function workflowAdapter(agentId: RuntimeAgentId, state: WorkflowNativeSt
           phase.stage === 'reply' &&
           !collaborationPlanMode(phase, input.promptEnvelope.collaborationAuthorization)
         )
-          input.recordWorkflowInputResult?.(state.replyOutcome ?? { outcome: 'processed' })
+          input.host?.workflow?.recordInputResult?.(state.replyOutcome ?? { outcome: 'processed' })
         else if (phase.stage === 'plan_review' || phase.stage === 'code_review')
-          input.recordWorkflowReview?.(state.reviews.shift() ?? { verdict: 'accepted' })
+          input.host?.workflow?.recordReview?.(state.reviews.shift() ?? { verdict: 'accepted' })
       }
       yield {
         type: 'text.completed',
@@ -281,7 +281,7 @@ export function workflowAdapter(agentId: RuntimeAgentId, state: WorkflowNativeSt
       ) {
         const document = phase.planReference?.document
         if (!document) throw Error('Missing retained original plan')
-        input.recordWorkflowPlanRetained?.({
+        input.host?.workflow?.recordPlanRetained?.({
           nativeId: `retained-${input.runId}`,
           confirmation: 'native_root_settled_v1',
           sha256: document.sha256,
@@ -289,7 +289,7 @@ export function workflowAdapter(agentId: RuntimeAgentId, state: WorkflowNativeSt
           chars: document.chars,
         })
       }
-      input.reportNativeEffects?.({
+      input.host?.effects?.reportNativeEffects?.({
         runId: input.runId,
         generation: input.nativeGeneration!,
         state: 'settled',

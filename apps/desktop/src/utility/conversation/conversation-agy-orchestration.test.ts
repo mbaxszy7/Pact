@@ -232,9 +232,9 @@ function createMockAdapter(agentId: RuntimeAgentId) {
       }
       const nativeSessionId =
         input.nativeSessionId ?? `${agentId}-sid-${input.sessionId.slice(0, 8)}`
-      input.recordDispatch?.('possibly_sent', nativeSessionId)
+      input.host?.lifecycle?.recordDispatch?.('possibly_sent', nativeSessionId)
       yield { agentId, type: 'session.started', nativeSessionId }
-      input.recordDispatch?.('accepted', nativeSessionId)
+      input.host?.lifecycle?.recordDispatch?.('accepted', nativeSessionId)
       yield { agentId, type: 'turn.started', turnId: input.runId }
 
       if (harness.waitOnAgent === agentId) {
@@ -277,7 +277,7 @@ function createMockAdapter(agentId: RuntimeAgentId) {
         text: `${agentId} response to ${input.promptEnvelope.message.content}`,
       }
       yield { agentId, type: 'turn.completed', turnId: input.runId, outcome: 'completed' }
-      input.reportNativeEffects?.({
+      input.host?.effects?.reportNativeEffects?.({
         runId: input.runId,
         generation: String(input.nativeGeneration ?? 1),
         state: 'settled',
@@ -1719,8 +1719,8 @@ describe('Module 5 Conversation 3-Agent & Antigravity Orchestration', () => {
     const agyExecUuid = '00000000-0000-4000-8000-0000000000a1'
     const { AgentExecutionError } = await import('./agent-execution-error.js')
     harness.nextRunBehavior = (_agentId, input) => {
-      input.recordDispatch?.('rejected', input.nativeSessionId, agyExecUuid)
-      input.reportNativeEffects?.({
+      input.host?.lifecycle?.recordDispatch?.('rejected', input.nativeSessionId, agyExecUuid)
+      input.host?.effects?.reportNativeEffects?.({
         runId: input.runId,
         generation: String(input.nativeGeneration ?? 1),
         state: 'settled',
@@ -1756,8 +1756,8 @@ describe('Module 5 Conversation 3-Agent & Antigravity Orchestration', () => {
 
     // Repeat for authentication_required before Turn submission
     harness.nextRunBehavior = (_agentId, input) => {
-      input.recordDispatch?.('rejected', input.nativeSessionId, agyExecUuid)
-      input.reportNativeEffects?.({
+      input.host?.lifecycle?.recordDispatch?.('rejected', input.nativeSessionId, agyExecUuid)
+      input.host?.effects?.reportNativeEffects?.({
         runId: input.runId,
         generation: String(input.nativeGeneration ?? 1),
         state: 'settled',
@@ -2290,14 +2290,34 @@ describe('Module 5 Conversation 3-Agent & Antigravity Orchestration', () => {
           effort: null,
           permissionMode: 'ask',
           peerAssistanceAllowed: true,
-          readCollaborationSourcePart: () => {
-            sourceReaderCalls += 1
-            return {
-              source: 'inputs',
-              offset: 0,
-              nextOffset: null,
-              text: 'Frozen collaboration source page',
-            }
+          host: {
+            workflow: {
+              sourceReader: {
+                identity: { runId, grant: grantId },
+                supportedForms: ['legacy'],
+                navigation: () => ({ runId, grant: grantId, source: 'inputs', offset: 0 }),
+                read: () => {
+                  sourceReaderCalls += 1
+                  return {
+                    submitted: 'legacy',
+                    request: { runId, grant: grantId, source: 'inputs', offset: 0 },
+                    page: {
+                      source: 'inputs',
+                      offset: 0,
+                      nextOffset: null,
+                      text: 'Frozen collaboration source page',
+                      binding: {
+                        submitted: 'legacy',
+                        callerRunId: runId,
+                        grantSha256: createHash('sha256').update(grantId).digest('hex'),
+                        referenceSha256: null,
+                      },
+                    },
+                  }
+                },
+                retire: () => undefined,
+              },
+            },
           },
           promptEnvelope: {
             version: 'pact-agent-prompt-v1',
@@ -3336,9 +3356,9 @@ describe('Module 5 Conversation 3-Agent & Antigravity Orchestration', () => {
           agentId === 'agy'
             ? '00000000-0000-4000-8000-0000000000a1'
             : '00000000-0000-4000-8000-0000000000c2'
-        input.recordDispatch?.('possibly_sent', nativeSessionId, executorId)
+        input.host?.lifecycle?.recordDispatch?.('possibly_sent', nativeSessionId, executorId)
         yield { agentId, type: 'session.started', nativeSessionId }
-        input.recordDispatch?.('accepted', nativeSessionId, executorId)
+        input.host?.lifecycle?.recordDispatch?.('accepted', nativeSessionId, executorId)
         yield { agentId, type: 'turn.started', turnId: input.runId }
         nextStageHook?.(stage, input)
         yield {
@@ -3349,7 +3369,7 @@ describe('Module 5 Conversation 3-Agent & Antigravity Orchestration', () => {
           text: `Completed ${stage ?? 'turn'}.`,
         }
         const activeRun = repo.findRun(input.runId)
-        input.recordNativeEvidence?.({
+        input.host?.lifecycle?.recordNativeEvidence?.({
           kind: 'ended',
           source: 'live_terminal',
           outcome: 'completed',
@@ -3370,7 +3390,7 @@ describe('Module 5 Conversation 3-Agent & Antigravity Orchestration', () => {
           },
         })
         yield { agentId, type: 'turn.completed', turnId: input.runId, outcome: 'completed' }
-        input.reportNativeEffects?.({
+        input.host?.effects?.reportNativeEffects?.({
           runId: input.runId,
           generation: String(input.nativeGeneration ?? 1),
           state: 'settled',
@@ -3380,9 +3400,9 @@ describe('Module 5 Conversation 3-Agent & Antigravity Orchestration', () => {
     }
     harness.nextRunGenerator = makeStageGenerator((stage, input) => {
       if (stage === 'plan') {
-        input.recordWorkflowPlan?.({ nativeId: 'plan-q-1', text: '# Plan Q\n1. Build Q' })
+        input.host?.workflow?.recordPlan?.({ nativeId: 'plan-q-1', text: '# Plan Q\n1. Build Q' })
       } else if (stage === 'plan_review') {
-        input.recordWorkflowReview?.({ verdict: 'accepted' })
+        input.host?.workflow?.recordReview?.({ verdict: 'accepted' })
       }
     })
     const startRes = await f.sendMessage(f.sessionId, '/plan Design module Q')
@@ -3618,9 +3638,9 @@ describe('Module 5 Conversation 3-Agent & Antigravity Orchestration', () => {
       const nativeSessionId = randomUUID()
       const turnId = `exec-partial-${randomUUID()}`
       const executorId = '00000000-0000-4000-8000-0000000000a1'
-      input.recordDispatch?.('possibly_sent', nativeSessionId, executorId)
+      input.host?.lifecycle?.recordDispatch?.('possibly_sent', nativeSessionId, executorId)
       yield { type: 'session.started', agentId: 'agy', nativeSessionId }
-      input.recordDispatch?.('accepted', nativeSessionId, executorId)
+      input.host?.lifecycle?.recordDispatch?.('accepted', nativeSessionId, executorId)
       yield { type: 'turn.started', agentId: 'agy', turnId }
       yield {
         type: 'text.delta',
@@ -3634,7 +3654,7 @@ describe('Module 5 Conversation 3-Agent & Antigravity Orchestration', () => {
       // matching AgyAgentAdapter's unresolved pre-bind output settlement.
       yield { type: 'turn.completed', agentId: 'agy', turnId, outcome: 'failed' }
       const activeRun = repo.findRun(input.runId)
-      input.recordNativeEvidence?.({
+      input.host?.lifecycle?.recordNativeEvidence?.({
         kind: 'ended',
         source: 'live_terminal',
         outcome: 'completed',
@@ -3654,7 +3674,7 @@ describe('Module 5 Conversation 3-Agent & Antigravity Orchestration', () => {
           completeness: 'partial',
         },
       })
-      input.reportNativeEffects?.({
+      input.host?.effects?.reportNativeEffects?.({
         runId: input.runId,
         generation: String(input.nativeGeneration ?? 1),
         state: 'unknown',
@@ -3701,7 +3721,7 @@ describe('Module 5 Conversation 3-Agent & Antigravity Orchestration', () => {
     const executorId = '00000000-0000-4000-8000-0000000000a1'
 
     harness.nextRunGenerator = async function* (_agentId, input) {
-      input.recordDispatch?.('possibly_sent', nativeSessionId, executorId)
+      input.host?.lifecycle?.recordDispatch?.('possibly_sent', nativeSessionId, executorId)
       yield { type: 'session.started', agentId: 'agy', nativeSessionId }
       throw new AgentExecutionError(
         'response_too_large',

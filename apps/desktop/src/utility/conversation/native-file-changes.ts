@@ -1319,40 +1319,37 @@ export class AgyRoundEffectsTracker {
 }
 
 export async function anchorNativeFileBeforeEdit(
-  input: AgentRunInput,
+  input: Pick<AgentRunInput, 'host'>,
   path: string,
   signal: AbortSignal,
 ): Promise<void> {
   if (!path || path.length > 4096) return
   try {
-    await input.anchorFileBeforeEdit?.(path, signal)
+    await input.host?.effects?.anchorFileBeforeEdit?.(path, signal)
   } catch {
     /* Pre-touch anchoring is passive and must never block or fail a native tool. */
   }
 }
 
 export function nativeEffectsUncertain(
-  input: Pick<AgentRunInput, 'recordUncertainEffects'>,
+  input: Pick<AgentRunInput, 'host'>,
   reason: string,
   scope: 'unlisted' | 'recorded_files' = 'unlisted',
 ): void {
   try {
-    input.recordUncertainEffects?.(reason, scope)
+    input.host?.effects?.recordUncertainEffects?.(reason, scope)
   } catch {
     /* Observation never changes a native operation's result. */
   }
 }
 
 export function nativeFileChangesSettled(
-  input: Pick<
-    AgentRunInput,
-    'runId' | 'nativeGeneration' | 'reportNativeEffects' | 'recordUncertainEffects'
-  >,
+  input: Pick<AgentRunInput, 'runId' | 'nativeGeneration' | 'host'>,
   state: 'settled' | 'unknown' = 'settled',
   reason?: string,
 ): void {
   try {
-    input.reportNativeEffects?.({
+    input.host?.effects?.reportNativeEffects?.({
       runId: input.runId,
       generation: input.nativeGeneration ?? input.runId,
       state,
@@ -1366,7 +1363,7 @@ export function nativeFileChangesSettled(
   }
 }
 export async function recordNativeChanges(
-  input: Pick<AgentRunInput, 'recordFileChange' | 'recordUncertainEffects'>,
+  input: Pick<AgentRunInput, 'host'>,
   result: NativeChanges,
   signal: AbortSignal,
 ): Promise<void> {
@@ -1379,7 +1376,7 @@ export async function recordNativeChanges(
   for (const change of result.changes) {
     try {
       // oxlint-disable-next-line no-await-in-loop -- Native evidence is recorded in operation order.
-      await input.recordFileChange?.(change, signal)
+      await input.host?.effects?.recordFileChange?.(change, signal)
     } catch {
       nativeEffectsUncertain(
         input,

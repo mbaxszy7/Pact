@@ -104,7 +104,10 @@ describe('Claude plan submission diagnostics', () => {
       receiptId = randomUUID()
     const path = join(profile, 'private-path-not-for-diagnostics.md')
     const operation = { file_path: path, content: 'private-plan-body-not-for-diagnostics' }
-    const recordPlan = vi.fn<NonNullable<AgentRunInput['recordWorkflowPlan']>>()
+    const recordPlan =
+      vi.fn<
+        NonNullable<NonNullable<NonNullable<AgentRunInput['host']>['workflow']>['recordPlan']>
+      >()
     const transcript = join(project, `${input.nativeSessionId}.jsonl`)
     const append = async (record: Record<string, unknown>) =>
       appendFile(
@@ -144,7 +147,16 @@ describe('Claude plan submission diagnostics', () => {
       },
     }
     if (mode !== 'missing_history') await append(writeRecord)
-    const f = cancellationFixture(undefined, { ...input, recordWorkflowPlan: recordPlan })
+    const f = cancellationFixture(undefined, {
+      ...input,
+      host: {
+        ...input.host,
+        workflow: {
+          ...input.host?.workflow,
+          recordPlan: recordPlan,
+        },
+      },
+    })
     try {
       await f.ready()
       const hook = {
@@ -718,32 +730,40 @@ it.each([false, true])(
           collaboration: repo.collaborationPromptState(repo.collaboration(sessionId)!),
           collaborationAuthorization: repo.collaborationTurnAuthorization(run.id)!,
         },
-        recordExecutor: (id) => {
-          repo.recordExecutor(run.id, id)
-        },
-        recordDispatch: (phase, id, executor) => {
-          repo.recordDispatch(run.id, phase, id, executor)
-        },
-        recordWorkflowPlan: (plan) => {
-          capturedPlans.push(plan.text)
-          repo.recordWorkflowPlan(run.id, plan)
-        },
-        recordWorkflowPlanRetained: (plan) => repo.recordWorkflowPlanRetained(run.id, plan),
-        recordWorkflowPlanUnavailable: () => {
-          if (rejectInvalidation) throw new Error('Controlled late plan invalidation failure')
-          repo.recordWorkflowPlanUnavailable(run.id)
-        },
-        recordOutputFailure: () =>
-          repo.recordOutputFailure(run.id, {
-            kind: 'protocol_error',
-            message: 'Plan capture failed',
-          }),
-        recordNativeEvidence: (evidence) => {
-          repo.recordNativeEvidence(evidence, 'retry')
-        },
-        reportNativeEffects: (report) => {
-          repo.recordNativeEffects(run.id, report.state, report.reason)
-          if (report.state === 'settled') repo.reconcileCompletedCollaboration(run.id)
+        host: {
+          lifecycle: {
+            recordExecutor: (id) => {
+              repo.recordExecutor(run.id, id)
+            },
+            recordDispatch: (phase, id, executor) => {
+              repo.recordDispatch(run.id, phase, id, executor)
+            },
+            recordOutputFailure: () =>
+              repo.recordOutputFailure(run.id, {
+                kind: 'protocol_error',
+                message: 'Plan capture failed',
+              }),
+            recordNativeEvidence: (evidence) => {
+              repo.recordNativeEvidence(evidence, 'retry')
+            },
+          },
+          effects: {
+            reportNativeEffects: (report) => {
+              repo.recordNativeEffects(run.id, report.state, report.reason)
+              if (report.state === 'settled') repo.reconcileCompletedCollaboration(run.id)
+            },
+          },
+          workflow: {
+            recordPlan: (plan) => {
+              capturedPlans.push(plan.text)
+              repo.recordWorkflowPlan(run.id, plan)
+            },
+            recordPlanRetained: (plan) => repo.recordWorkflowPlanRetained(run.id, plan),
+            recordPlanUnavailable: () => {
+              if (rejectInvalidation) throw new Error('Controlled late plan invalidation failure')
+              repo.recordWorkflowPlanUnavailable(run.id)
+            },
+          },
         },
       },
       (event) => {
@@ -944,20 +964,39 @@ describe('Claude terminated plan authentication', () => {
       }
       let availablePlan: { nativeId: string; text: string } | undefined,
         failStore = false
-      const plan = vi.fn<NonNullable<AgentRunInput['recordWorkflowPlan']>>((value) => {
+      const plan = vi.fn<
+        NonNullable<NonNullable<NonNullable<AgentRunInput['host']>['workflow']>['recordPlan']>
+      >((value) => {
         availablePlan = value
       })
-      const unavailable = vi.fn<NonNullable<AgentRunInput['recordWorkflowPlanUnavailable']>>(() => {
+      const unavailable = vi.fn<
+        NonNullable<
+          NonNullable<NonNullable<AgentRunInput['host']>['workflow']>['recordPlanUnavailable']
+        >
+      >(() => {
         if (failStore) throw new Error('Controlled unavailable source storage failure')
         availablePlan = undefined
       })
-      const retain = vi.fn<NonNullable<AgentRunInput['recordWorkflowPlanRetained']>>(() => {
+      const retain = vi.fn<
+        NonNullable<
+          NonNullable<NonNullable<AgentRunInput['host']>['workflow']>['recordPlanRetained']
+        >
+      >(() => {
         if (mode === 'retained_recording_failure')
           throw new Error('Controlled retained source storage failure')
       })
-      const sourceFailure = vi.fn<NonNullable<AgentRunInput['recordOutputFailure']>>()
+      const sourceFailure =
+        vi.fn<
+          NonNullable<
+            NonNullable<NonNullable<AgentRunInput['host']>['lifecycle']>['recordOutputFailure']
+          >
+        >()
       const settled = Promise.withResolvers<void>()
-      const reports = vi.fn<NonNullable<AgentRunInput['reportNativeEffects']>>((report) => {
+      const reports = vi.fn<
+        NonNullable<
+          NonNullable<NonNullable<AgentRunInput['host']>['effects']>['reportNativeEffects']
+        >
+      >((report) => {
         if (report.state !== 'pending') settled.resolve()
       })
       // oxlint-disable-next-line typescript/unbound-method -- Forward the real method with its original instance through call(this).
@@ -973,11 +1012,23 @@ describe('Claude terminated plan authentication', () => {
         undefined,
         {
           ...input,
-          recordWorkflowPlan: plan,
-          recordWorkflowPlanUnavailable: unavailable,
-          recordWorkflowPlanRetained: retain,
-          recordOutputFailure: sourceFailure,
-          reportNativeEffects: reports,
+          host: {
+            ...input.host,
+            lifecycle: {
+              ...input.host?.lifecycle,
+              recordOutputFailure: sourceFailure,
+            },
+            effects: {
+              ...input.host?.effects,
+              reportNativeEffects: reports,
+            },
+            workflow: {
+              ...input.host?.workflow,
+              recordPlan: plan,
+              recordPlanUnavailable: unavailable,
+              recordPlanRetained: retain,
+            },
+          },
         },
         undefined,
         true,
@@ -1240,12 +1291,25 @@ describe('Claude Agent lifecycle', () => {
       const controller = new AbortController()
       const deliverResult = Promise.withResolvers<void>()
       const consumeSteer = Promise.withResolvers<void>()
-      const evidence = vi.fn<NonNullable<AgentRunInput['recordNativeEvidence']>>()
-      const failure = vi.fn<NonNullable<AgentRunInput['recordOutputFailure']>>()
+      const evidence =
+        vi.fn<
+          NonNullable<
+            NonNullable<NonNullable<AgentRunInput['host']>['lifecycle']>['recordNativeEvidence']
+          >
+        >()
+      const failure =
+        vi.fn<
+          NonNullable<
+            NonNullable<NonNullable<AgentRunInput['host']>['lifecycle']>['recordOutputFailure']
+          >
+        >()
       failure.mockImplementation(() => {
         if (publicationFails) throw new NativeCapacityError('Fixture output publication failed.')
       })
-      const workflowPlan = vi.fn<NonNullable<AgentRunInput['recordWorkflowPlan']>>()
+      const workflowPlan =
+        vi.fn<
+          NonNullable<NonNullable<NonNullable<AgentRunInput['host']>['workflow']>['recordPlan']>
+        >()
       const consumption = vi.fn<(inputId: string) => void>()
       let reachedEof = false
       let inputDrain: Promise<void> | undefined
@@ -1336,9 +1400,15 @@ describe('Claude Agent lifecycle', () => {
         for await (const event of adapter.run(
           {
             ...input,
-            recordNativeEvidence: evidence,
-            recordOutputFailure: failure,
-            recordWorkflowPlan: workflowPlan,
+            host: {
+              lifecycle: {
+                recordNativeEvidence: evidence,
+                recordOutputFailure: failure,
+              },
+              workflow: {
+                recordPlan: workflowPlan,
+              },
+            },
           },
           controller.signal,
         )) {
@@ -1456,8 +1526,18 @@ describe('Claude Agent lifecycle', () => {
       const overflow = Promise.withResolvers<void>(),
         deliverCarrier = Promise.withResolvers<void>()
       const rootPrompt = Promise.withResolvers<void>()
-      const evidence = vi.fn<NonNullable<AgentRunInput['recordNativeEvidence']>>()
-      const failure = vi.fn<NonNullable<AgentRunInput['recordOutputFailure']>>()
+      const evidence =
+        vi.fn<
+          NonNullable<
+            NonNullable<NonNullable<AgentRunInput['host']>['lifecycle']>['recordNativeEvidence']
+          >
+        >()
+      const failure =
+        vi.fn<
+          NonNullable<
+            NonNullable<NonNullable<AgentRunInput['host']>['lifecycle']>['recordOutputFailure']
+          >
+        >()
       const consumption = vi.fn<(inputId: string) => void>()
       const prompts: SDKUserMessage[] = []
       let reachedEof = false,
@@ -1548,8 +1628,14 @@ describe('Claude Agent lifecycle', () => {
         for await (const event of adapter.run(
           {
             ...input,
-            recordNativeEvidence: evidence,
-            recordOutputFailure: failure,
+            host: {
+              ...input.host,
+              lifecycle: {
+                ...input.host?.lifecycle,
+                recordNativeEvidence: evidence,
+                recordOutputFailure: failure,
+              },
+            },
           },
           new AbortController().signal,
         ))
@@ -1604,8 +1690,18 @@ describe('Claude Agent lifecycle', () => {
     'keeps the exact native ending independent of empty items or projection overflow=%s',
     async (overflow) => {
       const input = runInput(),
-        evidence = vi.fn<NonNullable<AgentRunInput['recordNativeEvidence']>>()
-      const failure = vi.fn<NonNullable<AgentRunInput['recordOutputFailure']>>()
+        evidence =
+          vi.fn<
+            NonNullable<
+              NonNullable<NonNullable<AgentRunInput['host']>['lifecycle']>['recordNativeEvidence']
+            >
+          >()
+      const failure =
+        vi.fn<
+          NonNullable<
+            NonNullable<NonNullable<AgentRunInput['host']>['lifecycle']>['recordOutputFailure']
+          >
+        >()
       const query = ((request: { prompt: AsyncIterable<SDKUserMessage> }) => ({
         async *[Symbol.asyncIterator]() {
           const prompt = await request.prompt[Symbol.asyncIterator]().next()
@@ -1643,7 +1739,17 @@ describe('Claude Agent lifecycle', () => {
       try {
         const outcome = (async () => {
           for await (const event of adapter.run(
-            { ...input, recordNativeEvidence: evidence, recordOutputFailure: failure },
+            {
+              ...input,
+              host: {
+                ...input.host,
+                lifecycle: {
+                  ...input.host?.lifecycle,
+                  recordNativeEvidence: evidence,
+                  recordOutputFailure: failure,
+                },
+              },
+            },
             new AbortController().signal,
           ))
             events.push(event.type)
@@ -1681,7 +1787,10 @@ describe('Claude Agent lifecycle', () => {
       answer: 'Literal prose',
       result: { plan: 'Not a native plan' },
     })
-    const record = vi.fn<NonNullable<AgentRunInput['recordWorkflowPlan']>>()
+    const record =
+      vi.fn<
+        NonNullable<NonNullable<NonNullable<AgentRunInput['host']>['workflow']>['recordPlan']>
+      >()
     const query = vi.fn(
       fakeQuery([
         {
@@ -1705,13 +1814,43 @@ describe('Claude Agent lifecycle', () => {
         {
           ...input,
           nativeSessionId: 'claude-native-plan',
-          recordWorkflowPlan: record,
-          readCollaborationSourcePart: () => ({
-            source: 'document',
-            offset: 0,
-            text: 'Complete source',
-            nextOffset: null,
-          }),
+          host: {
+            workflow: {
+              recordPlan: record,
+              sourceReader: {
+                identity: input.promptEnvelope.sourceGrant!,
+                supportedForms: ['legacy'],
+                navigation: (target) => ({
+                  ...input.promptEnvelope.sourceGrant!,
+                  ...target,
+                  offset: 0,
+                }),
+                read: () => ({
+                  submitted: 'legacy',
+                  request: {
+                    ...input.promptEnvelope.sourceGrant!,
+                    source: 'document',
+                    offset: 0,
+                  },
+                  page: {
+                    source: 'document',
+                    offset: 0,
+                    text: 'Complete source',
+                    nextOffset: null,
+                    binding: {
+                      submitted: 'legacy',
+                      callerRunId: input.promptEnvelope.sourceGrant!.runId,
+                      grantSha256: createHash('sha256')
+                        .update(input.promptEnvelope.sourceGrant!.grant)
+                        .digest('hex'),
+                      referenceSha256: null,
+                    },
+                  },
+                }),
+                retire: () => undefined,
+              },
+            },
+          },
         },
         new AbortController().signal,
       ))
@@ -1938,7 +2077,12 @@ describe('Claude Agent lifecycle', () => {
     }> = []
     const nativeInputs: SDKUserMessage[] = []
     const ninthAccepted = Promise.withResolvers<void>()
-    const evidence = vi.fn<NonNullable<AgentRunInput['recordNativeEvidence']>>()
+    const evidence =
+      vi.fn<
+        NonNullable<
+          NonNullable<NonNullable<AgentRunInput['host']>['lifecycle']>['recordNativeEvidence']
+        >
+      >()
     const queryFactory = vi.fn((request: Parameters<typeof sdkQuery>[0]) => {
       const child = Object.assign(new EventEmitter(), {
         stdin: new PassThrough(),
@@ -2015,8 +2159,12 @@ describe('Claude Agent lifecycle', () => {
             runId,
             sessionId,
             nativeSessionId,
-            recordNativeEvidence: evidence,
             promptEnvelope: { ...runInput().promptEnvelope, sessionId },
+            host: {
+              lifecycle: {
+                recordNativeEvidence: evidence,
+              },
+            },
           },
           controller.signal,
         ))
@@ -2233,25 +2381,41 @@ describe('Claude Agent lifecycle', () => {
 
   it('does not confuse a post-interruption observation failure with the SDK actor-exit error', async () => {
     const changed = vi
-      .fn<NonNullable<AgentRunInput['backgroundWorkChanged']>>()
+      .fn<
+        NonNullable<
+          NonNullable<NonNullable<AgentRunInput['host']>['effects']>['backgroundWorkChanged']
+        >
+      >()
       .mockImplementationOnce(() => {})
       .mockImplementationOnce(() => {
         throw new Error('Controlled work projection failure')
       })
-    const f = cancellationFixture(undefined, { backgroundWorkChanged: changed }, undefined, false, [
+    const f = cancellationFixture(
+      undefined,
       {
-        type: 'system',
-        subtype: 'hook_started',
-        session_id: runInput().nativeSessionId,
-        hook_id: 'work',
-      } as SDKMessage,
-      {
-        type: 'system',
-        subtype: 'hook_response',
-        session_id: runInput().nativeSessionId,
-        hook_id: 'work',
-      } as SDKMessage,
-    ])
+        host: {
+          effects: {
+            backgroundWorkChanged: changed,
+          },
+        },
+      },
+      undefined,
+      false,
+      [
+        {
+          type: 'system',
+          subtype: 'hook_started',
+          session_id: runInput().nativeSessionId,
+          hook_id: 'work',
+        } as SDKMessage,
+        {
+          type: 'system',
+          subtype: 'hook_response',
+          session_id: runInput().nativeSessionId,
+          hook_id: 'work',
+        } as SDKMessage,
+      ],
+    )
     try {
       await f.ready()
       f.controller.abort()
@@ -2301,14 +2465,21 @@ describe('Claude Agent lifecycle', () => {
   it('retains an exited and drained query until its accepted file evidence is durable, then reports its generation once', async () => {
     const recorded = Promise.withResolvers<void>()
     let observationSignal: AbortSignal | undefined
-    const recordFileChange = vi.fn<NonNullable<AgentRunInput['recordFileChange']>>(
-      (_change, signal) => {
-        observationSignal = signal
-        return recorded.promise
-      },
-    )
+    const recordFileChange = vi.fn<
+      NonNullable<NonNullable<NonNullable<AgentRunInput['host']>['effects']>['recordFileChange']>
+    >((_change, signal) => {
+      observationSignal = signal
+      return recorded.promise
+    })
     const generation = 'native-generation-7'
-    const f = cancellationFixture(undefined, { nativeGeneration: generation, recordFileChange })
+    const f = cancellationFixture(undefined, {
+      nativeGeneration: generation,
+      host: {
+        effects: {
+          recordFileChange,
+        },
+      },
+    })
     let hookWork: Promise<unknown> | undefined
     try {
       await f.ready()
@@ -2394,8 +2565,21 @@ describe('Claude Agent lifecycle', () => {
   })
   it('closes unconsumed input on cancellation without submitting a User message, dispatching or interrupting', async () => {
     const inputGate = Promise.withResolvers<void>()
-    const dispatch = vi.fn<NonNullable<AgentRunInput['recordDispatch']>>()
-    const f = cancellationFixture(undefined, { recordDispatch: dispatch }, inputGate.promise)
+    const dispatch =
+      vi.fn<
+        NonNullable<NonNullable<NonNullable<AgentRunInput['host']>['lifecycle']>['recordDispatch']>
+      >()
+    const f = cancellationFixture(
+      undefined,
+      {
+        host: {
+          lifecycle: {
+            recordDispatch: dispatch,
+          },
+        },
+      },
+      inputGate.promise,
+    )
     try {
       await vi.waitFor(() => expect(f.readCount()).toBe(1))
       expect(f.prompts).toEqual([])
@@ -2980,7 +3164,14 @@ describe('Claude Agent lifecycle', () => {
       })
       try {
         for await (const event of adapter.run(
-          { ...runInput(), reportNativeEffects: report },
+          {
+            ...runInput(),
+            host: {
+              effects: {
+                reportNativeEffects: report,
+              },
+            },
+          },
           new AbortController().signal,
         ))
           void event
@@ -3003,11 +3194,37 @@ describe('Claude Agent lifecycle', () => {
     'keeps background report attribution and native drain separate from root body failure: %s',
     async (mode) => {
       const input = { ...runInput(), bindingGeneration: 7 }
-      const evidence = vi.fn<NonNullable<AgentRunInput['recordNativeEvidence']>>()
-      const outputFailure = vi.fn<NonNullable<AgentRunInput['recordOutputFailure']>>()
-      const report = vi.fn<NonNullable<AgentRunInput['recordBackgroundReport']>>(async () => {})
-      const unavailable = vi.fn<NonNullable<AgentRunInput['recordBackgroundReportUnavailable']>>()
-      const effects = vi.fn<NonNullable<AgentRunInput['reportNativeEffects']>>()
+      const evidence =
+        vi.fn<
+          NonNullable<
+            NonNullable<NonNullable<AgentRunInput['host']>['lifecycle']>['recordNativeEvidence']
+          >
+        >()
+      const outputFailure =
+        vi.fn<
+          NonNullable<
+            NonNullable<NonNullable<AgentRunInput['host']>['lifecycle']>['recordOutputFailure']
+          >
+        >()
+      const report = vi.fn<
+        NonNullable<
+          NonNullable<NonNullable<AgentRunInput['host']>['effects']>['recordBackgroundReport']
+        >
+      >(async () => {})
+      const unavailable =
+        vi.fn<
+          NonNullable<
+            NonNullable<
+              NonNullable<AgentRunInput['host']>['effects']
+            >['recordBackgroundReportUnavailable']
+          >
+        >()
+      const effects =
+        vi.fn<
+          NonNullable<
+            NonNullable<NonNullable<AgentRunInput['host']>['effects']>['reportNativeEffects']
+          >
+        >()
       const earlier = mode === 'earlier-body' || mode === 'unconfirmed-identity'
       const assistant = (id: string, text: string, echo = false): SDKMessage =>
         ({
@@ -3083,11 +3300,20 @@ describe('Claude Agent lifecycle', () => {
           for await (const event of adapter.run(
             {
               ...input,
-              recordNativeEvidence: evidence,
-              recordOutputFailure: outputFailure,
-              recordBackgroundReport: report,
-              recordBackgroundReportUnavailable: unavailable,
-              reportNativeEffects: effects,
+              host: {
+                ...input.host,
+                lifecycle: {
+                  ...input.host?.lifecycle,
+                  recordNativeEvidence: evidence,
+                  recordOutputFailure: outputFailure,
+                },
+                effects: {
+                  ...input.host?.effects,
+                  recordBackgroundReport: report,
+                  recordBackgroundReportUnavailable: unavailable,
+                  reportNativeEffects: effects,
+                },
+              },
             },
             new AbortController().signal,
           ))
@@ -3139,8 +3365,20 @@ describe('Claude Agent lifecycle', () => {
       reportStored = Promise.withResolvers<void>()
     const reportEntered = Promise.withResolvers<void>(),
       allowEof = Promise.withResolvers<void>()
-    const effects = vi.fn<NonNullable<AgentRunInput['reportNativeEffects']>>()
-    const unavailable = vi.fn<NonNullable<AgentRunInput['recordBackgroundReportUnavailable']>>()
+    const effects =
+      vi.fn<
+        NonNullable<
+          NonNullable<NonNullable<AgentRunInput['host']>['effects']>['reportNativeEffects']
+        >
+      >()
+    const unavailable =
+      vi.fn<
+        NonNullable<
+          NonNullable<
+            NonNullable<AgentRunInput['host']>['effects']
+          >['recordBackgroundReportUnavailable']
+        >
+      >()
     const waitForRootOutput = vi.fn(() => rootStored.promise)
     let readReport = false,
       reportDrained = false,
@@ -3206,7 +3444,11 @@ describe('Claude Agent lifecycle', () => {
         return reserve.call(this, bytes)
       })
     const held = () => [...owners].reduce((total, owner) => total + owner.bytes, 0)
-    const report = vi.fn<NonNullable<AgentRunInput['recordBackgroundReport']>>(async (value) => {
+    const report = vi.fn<
+      NonNullable<
+        NonNullable<NonNullable<AgentRunInput['host']>['effects']>['recordBackgroundReport']
+      >
+    >(async (value) => {
       expect(value.text.length).toBe(reportText.length)
       expect(createHash('sha256').update(value.text).digest('hex')).toBe(
         createHash('sha256').update(reportText).digest('hex'),
@@ -3218,10 +3460,19 @@ describe('Claude Agent lifecycle', () => {
       for await (const event of adapter.run(
         {
           ...input,
-          waitForRootOutput,
-          recordBackgroundReport: report,
-          recordBackgroundReportUnavailable: unavailable,
-          reportNativeEffects: effects,
+          host: {
+            ...input.host,
+            lifecycle: {
+              ...input.host?.lifecycle,
+              waitForRootOutput,
+            },
+            effects: {
+              ...input.host?.effects,
+              recordBackgroundReport: report,
+              recordBackgroundReportUnavailable: unavailable,
+              reportNativeEffects: effects,
+            },
+          },
         },
         new AbortController().signal,
       ))
@@ -3291,11 +3542,37 @@ describe('Claude Agent lifecycle', () => {
         },
       }
       const failedFrameId = randomUUID()
-      const report = vi.fn<NonNullable<AgentRunInput['recordBackgroundReport']>>(async () => {})
-      const unavailable = vi.fn<NonNullable<AgentRunInput['recordBackgroundReportUnavailable']>>()
-      const outputFailure = vi.fn<NonNullable<AgentRunInput['recordOutputFailure']>>()
-      const effects = vi.fn<NonNullable<AgentRunInput['reportNativeEffects']>>()
-      const evidence = vi.fn<NonNullable<AgentRunInput['recordNativeEvidence']>>()
+      const report = vi.fn<
+        NonNullable<
+          NonNullable<NonNullable<AgentRunInput['host']>['effects']>['recordBackgroundReport']
+        >
+      >(async () => {})
+      const unavailable =
+        vi.fn<
+          NonNullable<
+            NonNullable<
+              NonNullable<AgentRunInput['host']>['effects']
+            >['recordBackgroundReportUnavailable']
+          >
+        >()
+      const outputFailure =
+        vi.fn<
+          NonNullable<
+            NonNullable<NonNullable<AgentRunInput['host']>['lifecycle']>['recordOutputFailure']
+          >
+        >()
+      const effects =
+        vi.fn<
+          NonNullable<
+            NonNullable<NonNullable<AgentRunInput['host']>['effects']>['reportNativeEffects']
+          >
+        >()
+      const evidence =
+        vi.fn<
+          NonNullable<
+            NonNullable<NonNullable<AgentRunInput['host']>['lifecycle']>['recordNativeEvidence']
+          >
+        >()
       const adapter = new ClaudeAgentAdapter('/fake/claude', {
         getSessionInfo: vi.fn() as never,
         query: fakeQuery([
@@ -3356,11 +3633,20 @@ describe('Claude Agent lifecycle', () => {
         for await (const event of adapter.run(
           {
             ...input,
-            recordBackgroundReport: report,
-            recordBackgroundReportUnavailable: unavailable,
-            recordOutputFailure: outputFailure,
-            reportNativeEffects: effects,
-            recordNativeEvidence: evidence,
+            host: {
+              ...input.host,
+              lifecycle: {
+                ...input.host?.lifecycle,
+                recordOutputFailure: outputFailure,
+                recordNativeEvidence: evidence,
+              },
+              effects: {
+                ...input.host?.effects,
+                recordBackgroundReport: report,
+                recordBackgroundReportUnavailable: unavailable,
+                reportNativeEffects: effects,
+              },
+            },
           },
           new AbortController().signal,
         ))
@@ -3412,7 +3698,12 @@ describe('Claude Agent lifecycle', () => {
     'shares the Hook and task observation budget: $kind $budget overflow=$overflow',
     async ({ kind, budget, overflow }) => {
       const input = runInput(),
-        effects = vi.fn<NonNullable<AgentRunInput['reportNativeEffects']>>()
+        effects =
+          vi.fn<
+            NonNullable<
+              NonNullable<NonNullable<AgentRunInput['host']>['effects']>['reportNativeEffects']
+            >
+          >()
       const hooks = Array.from(
         { length: budget === 'items' ? 32 : 11 },
         (_, index) => `h${index}-${budget === 'bytes' ? '界'.repeat(1000) : 'hook'}`,
@@ -3455,7 +3746,16 @@ describe('Claude Agent lifecycle', () => {
       })
       try {
         for await (const event of adapter.run(
-          { ...input, reportNativeEffects: effects },
+          {
+            ...input,
+            host: {
+              ...input.host,
+              effects: {
+                ...input.host?.effects,
+                reportNativeEffects: effects,
+              },
+            },
+          },
           new AbortController().signal,
         ))
           void event
@@ -3478,7 +3778,12 @@ describe('Claude Agent lifecycle', () => {
       const input = runInput(),
         drain = Promise.withResolvers<void>()
       const stopTask = vi.fn(async () => {})
-      const effects = vi.fn<NonNullable<AgentRunInput['reportNativeEffects']>>()
+      const effects =
+        vi.fn<
+          NonNullable<
+            NonNullable<NonNullable<AgentRunInput['host']>['effects']>['reportNativeEffects']
+          >
+        >()
       const query = ((request: { prompt: AsyncIterable<SDKUserMessage> }) => ({
         async *[Symbol.asyncIterator]() {
           await request.prompt[Symbol.asyncIterator]().next()
@@ -3521,7 +3826,16 @@ describe('Claude Agent lifecycle', () => {
       })
       try {
         for await (const event of adapter.run(
-          { ...input, reportNativeEffects: effects },
+          {
+            ...input,
+            host: {
+              ...input.host,
+              effects: {
+                ...input.host?.effects,
+                reportNativeEffects: effects,
+              },
+            },
+          },
           new AbortController().signal,
         ))
           void event
@@ -3584,7 +3898,14 @@ describe('Claude Agent lifecycle', () => {
       })
       try {
         for await (const event of adapter.run(
-          { ...runInput(), reportNativeEffects: report },
+          {
+            ...runInput(),
+            host: {
+              effects: {
+                reportNativeEffects: report,
+              },
+            },
+          },
           new AbortController().signal,
         ))
           void event
@@ -3639,7 +3960,14 @@ describe('Claude Agent lifecycle', () => {
       })
       try {
         for await (const event of adapter.run(
-          { ...runInput(), reportNativeEffects: report },
+          {
+            ...runInput(),
+            host: {
+              effects: {
+                reportNativeEffects: report,
+              },
+            },
+          },
           new AbortController().signal,
         ))
           void event
@@ -3814,7 +4142,7 @@ async function savedClaudeAnswerFixture() {
   }
 }
 
-function runInput() {
+function runInput(): AgentRunInput & { nativeSessionId: string } {
   return {
     runId: 'e847391a-8b6a-4f0c-91c9-fd72b9c3a70d',
     sessionId: 'session-1',
@@ -3919,7 +4247,21 @@ function cancellationFixture(
   })
   const consume = (async () => {
     for await (const event of adapter.run(
-      { ...runInput(), recordNativeEvidence: evidence, reportNativeEffects: report, ...input },
+      {
+        ...runInput(),
+        ...input,
+        host: {
+          ...input.host,
+          lifecycle: {
+            recordNativeEvidence: evidence,
+            ...input.host?.lifecycle,
+          },
+          effects: {
+            reportNativeEffects: report,
+            ...input.host?.effects,
+          },
+        },
+      },
       controller.signal,
     ))
       void event
@@ -3970,12 +4312,21 @@ it.each([
         options: [{ label: 'Current request' }, { label: 'All pending requests' }],
       },
     ]
-    const record = vi.fn<NonNullable<AgentRunInput['recordWorkflowInputResult']>>()
+    const record =
+      vi.fn<
+        NonNullable<
+          NonNullable<NonNullable<AgentRunInput['host']>['workflow']>['recordInputResult']
+        >
+      >()
     const f = await nativeRetentionFixture({
       runId: input.runId,
       sessionId: input.sessionId,
       promptEnvelope: input.promptEnvelope,
-      recordWorkflowInputResult: record,
+      host: {
+        workflow: {
+          recordInputResult: record,
+        },
+      },
     })
     try {
       const call = async (outcome: 'processed' | 'needs_user') => {
@@ -4104,21 +4455,25 @@ async function nativeRetentionFixture(
   let closed = false,
     wake: (() => void) | undefined,
     captured: Parameters<typeof sdkQuery>[0] | undefined
-  const record = vi.fn<NonNullable<AgentRunInput['recordWorkflowPlanRetained']>>(
-    overrides.recordWorkflowPlanRetained,
-  )
-  const unavailable = vi.fn<NonNullable<AgentRunInput['recordWorkflowPlanUnavailable']>>(
-    overrides.recordWorkflowPlanUnavailable,
-  )
-  const evidence = vi.fn<NonNullable<AgentRunInput['recordNativeEvidence']>>(
-    overrides.recordNativeEvidence,
-  )
-  const outputFailure = vi.fn<NonNullable<AgentRunInput['recordOutputFailure']>>(
-    overrides.recordOutputFailure,
-  )
-  const report = vi.fn<NonNullable<AgentRunInput['reportNativeEffects']>>(
-    overrides.reportNativeEffects,
-  )
+  const record = vi.fn<
+    NonNullable<NonNullable<NonNullable<AgentRunInput['host']>['workflow']>['recordPlanRetained']>
+  >(overrides.host?.workflow?.recordPlanRetained)
+  const unavailable = vi.fn<
+    NonNullable<
+      NonNullable<NonNullable<AgentRunInput['host']>['workflow']>['recordPlanUnavailable']
+    >
+  >(overrides.host?.workflow?.recordPlanUnavailable)
+  const evidence = vi.fn<
+    NonNullable<
+      NonNullable<NonNullable<AgentRunInput['host']>['lifecycle']>['recordNativeEvidence']
+    >
+  >(overrides.host?.lifecycle?.recordNativeEvidence)
+  const outputFailure = vi.fn<
+    NonNullable<NonNullable<NonNullable<AgentRunInput['host']>['lifecycle']>['recordOutputFailure']>
+  >(overrides.host?.lifecycle?.recordOutputFailure)
+  const report = vi.fn<
+    NonNullable<NonNullable<NonNullable<AgentRunInput['host']>['effects']>['reportNativeEffects']>
+  >(overrides.host?.effects?.reportNativeEffects)
   const query = ((request: Parameters<typeof sdkQuery>[0]) => {
     captured = request
     request.options!.spawnClaudeCodeProcess!({
@@ -4174,11 +4529,23 @@ async function nativeRetentionFixture(
     for await (const event of adapter.run(
       {
         ...input,
-        recordWorkflowPlanRetained: record,
-        recordWorkflowPlanUnavailable: unavailable,
-        recordNativeEvidence: evidence,
-        recordOutputFailure: outputFailure,
-        reportNativeEffects: report,
+        host: {
+          ...input.host,
+          lifecycle: {
+            ...input.host?.lifecycle,
+            recordNativeEvidence: evidence,
+            recordOutputFailure: outputFailure,
+          },
+          effects: {
+            ...input.host?.effects,
+            reportNativeEffects: report,
+          },
+          workflow: {
+            ...input.host?.workflow,
+            recordPlanRetained: record,
+            recordPlanUnavailable: unavailable,
+          },
+        },
       },
       controller.signal,
     ))
@@ -4602,7 +4969,9 @@ it('registers the complete strict source schema on the actual SDK before native 
       chars: text.length,
     }
   const reference = { ...identity, source: 'document' as const, document, offset: 0 }
-  const read = vi.fn<NonNullable<AgentRunInput['collaborationSourceReader']>['read']>((raw) => {
+  const read = vi.fn<
+    NonNullable<NonNullable<NonNullable<AgentRunInput['host']>['workflow']>['sourceReader']>['read']
+  >((raw) => {
     expect(raw).toEqual(reference)
     return {
       submitted: 'legacy',
@@ -4625,14 +4994,15 @@ it('registers the complete strict source schema on the actual SDK before native 
   const f = cancellationFixture(undefined, {
     ...input,
     promptEnvelope: { ...input.promptEnvelope, sourceGrant: identity },
-    readCollaborationSourcePart: () => {
-      throw Error('The borrowed owner handles source requests')
-    },
-    collaborationSourceReader: {
-      identity,
-      read,
-      navigation: () => reference,
-      retire: () => undefined,
+    host: {
+      workflow: {
+        sourceReader: {
+          identity,
+          read,
+          navigation: () => reference,
+          retire: () => undefined,
+        },
+      },
     },
   })
   try {
@@ -4710,15 +5080,17 @@ it('encodes Claude Steer with exact legacy arguments and keeps ordinary root ref
     rootPrompt = Promise.withResolvers<void>(),
     finish = Promise.withResolvers<void>(),
     started = Promise.withResolvers<void>()
-  const navigation = vi.fn<NonNullable<AgentRunInput['collaborationSourceReader']>['navigation']>(
-    (target, form) => {
-      if (target.batchId === nextBatch && form !== 'legacy')
-        throw Error('Prepared Batch is not reference-authorized')
-      return form === 'sourceReference'
-        ? { sourceReference: 'controlled-root-reference', offset: 0 }
-        : { ...target, runId: input.runId, grant, offset: 0 }
-    },
-  )
+  const navigation = vi.fn<
+    NonNullable<
+      NonNullable<NonNullable<AgentRunInput['host']>['workflow']>['sourceReader']
+    >['navigation']
+  >((target, form) => {
+    if (target.batchId === nextBatch && form !== 'legacy')
+      throw Error('Prepared Batch is not reference-authorized')
+    return form === 'sourceReference'
+      ? { sourceReference: 'controlled-root-reference', offset: 0 }
+      : { ...target, runId: input.runId, grant, offset: 0 }
+  })
   let drain: Promise<void> | undefined
   const query = ((request: Parameters<typeof sdkQuery>[0]) => {
     if (typeof request.prompt === 'string') throw Error('Expected native streaming input')
@@ -4800,13 +5172,19 @@ it('encodes Claude Steer with exact legacy arguments and keeps ordinary root ref
         bindingGeneration: 1,
         peerAssistanceAllowed: false,
         promptEnvelope: envelope,
-        collaborationSourceReader: {
-          identity: { runId: input.runId, grant },
-          navigation,
-          read: () => {
-            throw Error('Encoding fixture does not read sources')
+        host: {
+          ...input.host,
+          workflow: {
+            ...input.host?.workflow,
+            sourceReader: {
+              identity: { runId: input.runId, grant },
+              navigation,
+              read: () => {
+                throw Error('Encoding fixture does not read sources')
+              },
+              retire: () => undefined,
+            },
           },
-          retire: () => undefined,
         },
       },
       controller.signal,
@@ -5111,7 +5489,11 @@ it('roundtrips actual immutable current and historical Sources through SDK and n
         message: { id: started.userMessageId, content },
         comments: [],
       },
-      collaborationSourceReader: reader,
+      host: {
+        workflow: {
+          sourceReader: reader,
+        },
+      },
     }
     fixture = cancellationFixture(undefined, input)
     await fixture.ready()

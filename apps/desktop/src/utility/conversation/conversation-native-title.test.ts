@@ -64,7 +64,7 @@ class NativeFixture {
   }
   async *run(input: AgentRunInput): AsyncIterable<NormalizedAgentEvent> {
     native.runs += 1
-    input.recordExecutor?.(this.executorId)
+    input.host?.lifecycle?.recordExecutor?.(this.executorId)
     const nativeSessionId = input.nativeSessionId ?? `${this.id}:${input.sessionId}`
     yield { agentId: this.id, type: 'session.started', nativeSessionId }
     if (this.id === 'codex') native.beforeFirstTitleWrites.push(native.writes.length)
@@ -74,7 +74,7 @@ class NativeFixture {
         : (native.names.get(nativeSessionId) ?? native.runTitle)
     if (title) {
       const logical = title.startsWith('[Pact] ') ? undefined : title
-      input.observeNativeTitle?.(nativeSessionId, logical)
+      input.host?.lifecycle?.observeNativeTitle?.(nativeSessionId, logical)
       if (logical) yield { agentId: this.id, type: 'session.title.updated', title: logical }
     }
     yield { agentId: this.id, type: 'turn.started', turnId: input.runId }
@@ -96,7 +96,7 @@ class NativeFixture {
     yield { agentId: this.id, type: 'turn.completed', turnId: input.runId, outcome: 'completed' }
     // Optional title work has its own owner; this completed mock has no remaining business work.
     if (!native.liveBackground)
-      input.reportNativeEffects?.({
+      input.host?.effects?.reportNativeEffects?.({
         runId: input.runId,
         generation: input.nativeGeneration!,
         state: 'settled',

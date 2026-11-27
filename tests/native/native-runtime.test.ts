@@ -1157,11 +1157,15 @@ it('real Codex Steer incorporates the exact client UUID in its original Turn and
         message: { id: randomUUID(), content: 'NATIVE_INITIAL_INPUT. Do not use tools.' },
         comments: [],
       },
-      recordInputConsumption: (id, identity) => {
-        expect(id).toBe(inputId)
-        expect(identity.nativeSessionId).toBe(nativeSessionId)
-        expect(identity.executorId).toEqual(expect.any(String))
-        consumed.push(id)
+      host: {
+        lifecycle: {
+          recordInputConsumption: (id, identity) => {
+            expect(id).toBe(inputId)
+            expect(identity.nativeSessionId).toBe(nativeSessionId)
+            expect(identity.executorId).toEqual(expect.any(String))
+            consumed.push(id)
+          },
+        },
       },
     }
     const completed = (async () => {
