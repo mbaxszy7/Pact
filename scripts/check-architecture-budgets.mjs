@@ -15,7 +15,6 @@ export const MAX_PRODUCTION_FILE_LINES = 2500
  */
 export const LEGACY_FILE_LINE_RATCHET = Object.freeze({
   'apps/desktop/src/utility/conversation/agy-agent-adapter.ts': 8170,
-  'apps/desktop/src/utility/conversation/conversation.ts': 11530,
   'apps/desktop/src/utility/conversation/codex-agent-adapter.ts': 7417,
   'apps/desktop/src/utility/conversation/claude-agent-adapter.ts': 5919,
   'apps/desktop/src/renderer/src/components/conversation/useConversation.ts': 4662,

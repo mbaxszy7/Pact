@@ -2670,7 +2670,11 @@ describe('Module 5 Conversation 3-Agent & Antigravity Orchestration', () => {
         }
       },
     }
-    Reflect.set(f.flow, 'agyForkFiles', fakeSharedForkFiles)
+    const flowCore: unknown = Reflect.get(f.flow, 'core')
+    if (typeof flowCore !== 'object' || flowCore === null) {
+      throw new Error('Expected ConversationRuntimeCore on Conversation')
+    }
+    Reflect.set(flowCore, 'agyForkFiles', fakeSharedForkFiles)
 
     const sendRes = await f.sendMessage(f.sessionId, 'Trigger agy adapter & pool creation')
     expect(sendRes.ok).toBe(true)
@@ -2711,7 +2715,7 @@ describe('Module 5 Conversation 3-Agent & Antigravity Orchestration', () => {
     })
 
     // Spy on base shutdown resource (notificationProjector) to ensure completed base shutdown does NOT replay on retry
-    const rawProjector: unknown = Reflect.get(f.flow, 'notificationProjector')
+    const rawProjector: unknown = Reflect.get(flowCore, 'notificationProjector')
     if (typeof rawProjector !== 'object' || rawProjector === null) {
       throw new Error('Expected notificationProjector object')
     }
@@ -2726,7 +2730,7 @@ describe('Module 5 Conversation 3-Agent & Antigravity Orchestration', () => {
     })
 
     const getPoolMap = (): Map<unknown, unknown> => {
-      const m: unknown = Reflect.get(f.flow, 'agyConnectionPools')
+      const m: unknown = Reflect.get(flowCore, 'agyConnectionPools')
       if (!(m instanceof Map)) throw new Error('Expected agyConnectionPools Map')
       return m
     }
@@ -2738,7 +2742,7 @@ describe('Module 5 Conversation 3-Agent & Antigravity Orchestration', () => {
     expect(forkDisposeCalls).toBe(1)
     expect(poolDisposeCalls).toBe(1)
     expect(projectorDisposeCalls).toBe(1)
-    expect(Reflect.get(f.flow, 'agyForkFiles')).toBe(fakeSharedForkFiles)
+    expect(Reflect.get(flowCore, 'agyForkFiles')).toBe(fakeSharedForkFiles)
     expect(getPoolMap().size).toBe(1)
 
     // Second dispose() retries ONLY pending agyForkFiles + failed pool and succeeds cleanly without replaying base shutdown
@@ -2746,7 +2750,7 @@ describe('Module 5 Conversation 3-Agent & Antigravity Orchestration', () => {
     expect(forkDisposeCalls).toBe(2)
     expect(poolDisposeCalls).toBe(2)
     expect(projectorDisposeCalls).toBe(1)
-    expect(Reflect.get(f.flow, 'agyForkFiles')).toBeUndefined()
+    expect(Reflect.get(flowCore, 'agyForkFiles')).toBeUndefined()
     expect(getPoolMap().size).toBe(0)
   })
 
@@ -2806,7 +2810,11 @@ describe('Module 5 Conversation 3-Agent & Antigravity Orchestration', () => {
         if (pool instanceof AgyAcpConnectionPool) createdPools.push(pool)
       }
 
-      const rawPoolMap: unknown = Reflect.get(f.flow, 'agyConnectionPools')
+      const flowCore: unknown = Reflect.get(f.flow, 'core')
+      if (typeof flowCore !== 'object' || flowCore === null) {
+        throw new Error('Expected ConversationRuntimeCore on Conversation')
+      }
+      const rawPoolMap: unknown = Reflect.get(flowCore, 'agyConnectionPools')
       if (!(rawPoolMap instanceof Map)) throw new Error('Expected agyConnectionPools Map')
       const poolMap = rawPoolMap
       expect(poolMap.size).toBe(8)
@@ -3192,14 +3200,18 @@ describe('Module 5 Conversation 3-Agent & Antigravity Orchestration', () => {
     vi.spyOn(repo, 'readOpenPlanPublishIntentText').mockReturnValue(
       '# Long ID Open Plan\nVerified.',
     )
-    const rawResolver: unknown = Reflect.get(f.flow, 'resolveColdOpenPlanIntent')
+    const flowCore: unknown = Reflect.get(f.flow, 'core')
+    if (typeof flowCore !== 'object' || flowCore === null) {
+      throw new Error('Expected ConversationRuntimeCore on Conversation')
+    }
+    const rawResolver: unknown = Reflect.get(flowCore, 'resolveColdOpenPlanIntent')
     if (typeof rawResolver !== 'function') {
-      throw new Error('Expected resolveColdOpenPlanIntent method on Conversation')
+      throw new Error('Expected resolveColdOpenPlanIntent method on ConversationRuntimeCore')
     }
 
     // Empty tokens -> MUST return planUnavailable (NO weak intents.length === 1 fallback)!
     expect(
-      Reflect.apply(rawResolver, f.flow, [
+      Reflect.apply(rawResolver, flowCore, [
         openRunId,
         {
           executionId: 'exec-long-1',
@@ -3213,7 +3225,7 @@ describe('Module 5 Conversation 3-Agent & Antigravity Orchestration', () => {
 
     // Matching raw long toolCallId -> matches bounded callKey AND returns exact canonical nativePlanId!
     expect(
-      Reflect.apply(rawResolver, f.flow, [
+      Reflect.apply(rawResolver, flowCore, [
         openRunId,
         {
           executionId: 'exec-long-1',
@@ -3437,12 +3449,16 @@ describe('Module 5 Conversation 3-Agent & Antigravity Orchestration', () => {
     const boundedProgressToken = encodeBoundedOpenPlanProgressToken(longProgressToken)
     const canonicalNativePlanId = buildBoundedNativePlanId(nativeSessionId, longCallId)
 
-    const rawResolver: unknown = Reflect.get(f.flow, 'resolveColdOpenPlanIntent')
+    const flowCore: unknown = Reflect.get(f.flow, 'core')
+    if (typeof flowCore !== 'object' || flowCore === null) {
+      throw new Error('Expected ConversationRuntimeCore on Conversation')
+    }
+    const rawResolver: unknown = Reflect.get(flowCore, 'resolveColdOpenPlanIntent')
     if (typeof rawResolver !== 'function') {
-      throw new Error('Expected resolveColdOpenPlanIntent method on Conversation')
+      throw new Error('Expected resolveColdOpenPlanIntent method on ConversationRuntimeCore')
     }
     const callResolver = (terminalState: Record<string, unknown>) =>
-      Reflect.apply(rawResolver, f.flow, [openRunId, terminalState, nativeSessionId])
+      Reflect.apply(rawResolver, flowCore, [openRunId, terminalState, nativeSessionId])
 
     const intentsSpy = vi.spyOn(repo, 'workflowOpenPlanPublishIntents')
     const readTextSpy = vi.spyOn(repo, 'readOpenPlanPublishIntentText')
