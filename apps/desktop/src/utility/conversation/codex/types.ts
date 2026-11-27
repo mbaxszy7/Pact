@@ -1,6 +1,6 @@
 import type { ChildProcessWithoutNullStreams } from 'node:child_process'
 
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { basename } from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
 
@@ -20,6 +20,7 @@ import type {
   NativeEvidenceIdentity,
   NativeProbeResult,
   NormalizedAgentEvent,
+  RunEffectiveExecutionSettings,
   RuntimeAgentId,
   SessionPermissionMode,
 } from '@pact/contracts'
@@ -42,7 +43,21 @@ import type { PactPeerToolServer } from '../pact-peer-tool-server'
 
 import { AgentActivityDetail } from '../agent-activity-detail'
 import { AgentAnswerAssembler } from '../agent-answer-assembler'
-import { AgentExecutionError, classifyAgentError } from '../agent-execution-error'
+import {
+  AgentExecutionError,
+  classifyAgentError,
+  isCodexArchivedSessionRejection,
+  NativeThreadArchivedError,
+  NativeThreadOccupiedError,
+} from '../agent-execution-error'
+import {
+  collaborationInstructions,
+  collaborationPlanMode,
+  frozenSourceInstructions,
+} from '../collaboration-prompt'
+import { cutoffSourceNavigator } from '../frozen-source-reader'
+import { codexPromptInput } from '../native-image-content'
+import { freezeNativeJsonFrame } from '../native-json-encoder'
 
 export interface CodexSettingsBarrier {
   readonly executorId: string
@@ -353,6 +368,32 @@ export interface EarlyNativeFact {
   bytes: number
   heldBytes: number
   reservation: NativeMemoryReservation
+  rootStartupCandidate?: boolean | undefined
+}
+
+export const CODEX_MAX_PENDING_RECORDINGS = 64
+export const CODEX_MAX_PENDING_RECORDING_BYTES = 8 * 1024 * 1024
+export const CODEX_MAX_REASONING_ITEMS = 64
+export const CODEX_MAX_REASONING_PREFIX_BYTES = 2 * 1024 * 1024
+
+/** Connection-level notifications carry no thread/turn/child context and must never enter per-Run early buffers (S3-F1). */
+export function isCodexConnectionScopedNotification(method: unknown, params: object): boolean {
+  if (method === 'skills/changed') return true
+  if (method === 'thread/started') return false
+  const hasThread =
+    Reflect.get(params, 'threadId') != null || Reflect.get(params, 'conversationId') != null
+  const hasTurn = Reflect.get(params, 'turnId') != null || Reflect.get(params, 'turn') != null
+  return !hasThread && !hasTurn
+}
+
+/** Strict classifier for confirmed missing Codex thread/rollout on `thread/resume` (S3-F7). */
+export function isCodexMissingThreadError(rawMessage: string, rpcCode?: unknown): boolean {
+  if (rpcCode === -32_601 || /\bmethod\s+not\s+found\b/iu.test(rawMessage)) {
+    return false
+  }
+  return /no rollout found|unknown thread|missing thread|thread\b[^\n]*\b(?:not found|does not exist|missing)|rollout\b[^\n]*\b(?:not found|does not exist|missing)|session\b[^\n]*\b(?:not found|does not exist)|conversation\b[^\n]*\bnot found/iu.test(
+    rawMessage,
+  )
 }
 
 export interface NativeBackground {
@@ -385,12 +426,15 @@ export interface NativeBackground {
   turns: Map<string, string>
   turnIds: Set<string>
   recordings: Set<Promise<void>>
+  recordingBytes: number
   recordingTail: Promise<void>
   // Current foreground Root only, <=64 identities / 64 KiB. Abort transfers
   // this selection to one bounded cancellation, never adding later work.
   foregroundCommands: Map<string, string | undefined>
   foregroundCommandBytes: number
   cancellationPending: boolean
+  stopRequested?: boolean | undefined
+  rootInterruptAttempted?: boolean | undefined
   /** One exact child Stop in flight; the native observer owns its terminal fact. */
   interruptingChild?: { threadId: string; turnId: string; terminal: boolean } | undefined
   connection?: CodexAppServerConnection
@@ -1207,4 +1251,287 @@ export function cleanTitle(value: unknown): string | undefined {
   if (plain.startsWith('[Pact] ')) return undefined
   const title = plain.slice(0, 120)
   return title || undefined
+}
+
+/**
+ * Bounded per-Turn reasoning summary prefix tracker (S3-Advisory).
+ * Clears `pendingPrefix` immediately on first non-empty emission and bounds
+ * incomplete reasoning items (`CODEX_MAX_REASONING_ITEMS`) and cumulative
+ * buffered prefix bytes (`CODEX_MAX_REASONING_PREFIX_BYTES`).
+ */
+export class CodexReasoningSummaryTracker {
+  private readonly states = new Map<string, { pendingPrefix: string; emitted: boolean }>()
+  private prefixBytes = 0
+
+  pushDelta(
+    itemId: string,
+    delta: string,
+  ): { kind: 'emit'; text: string } | { kind: 'buffered' } | { kind: 'overflow'; error: Error } {
+    const existing = this.states.get(itemId)
+    const state = existing ?? { pendingPrefix: '', emitted: false }
+    if (!state.emitted && !delta.trim()) {
+      const deltaBytes = Buffer.byteLength(delta, 'utf8')
+      if (
+        (!existing && this.states.size >= CODEX_MAX_REASONING_ITEMS) ||
+        this.prefixBytes + deltaBytes > CODEX_MAX_REASONING_PREFIX_BYTES
+      ) {
+        return {
+          kind: 'overflow',
+          error: new AgentExecutionError(
+            'response_too_large',
+            'Codex reasoning summary exceeded its working-memory budget.',
+            false,
+          ),
+        }
+      }
+      state.pendingPrefix += delta
+      this.prefixBytes += deltaBytes
+      this.states.set(itemId, state)
+      return { kind: 'buffered' }
+    }
+    if (!state.emitted) {
+      const combined = `${state.pendingPrefix}${delta}`
+      if (state.pendingPrefix.length > 0) {
+        this.prefixBytes = Math.max(
+          0,
+          this.prefixBytes - Buffer.byteLength(state.pendingPrefix, 'utf8'),
+        )
+        state.pendingPrefix = ''
+      }
+      state.emitted = true
+      if (existing || this.states.size < CODEX_MAX_REASONING_ITEMS) {
+        this.states.set(itemId, state)
+      }
+      return { kind: 'emit', text: combined }
+    }
+    return delta ? { kind: 'emit', text: delta } : { kind: 'buffered' }
+  }
+
+  complete(itemId: string): void {
+    const prev = this.states.get(itemId)
+    if (prev?.pendingPrefix) {
+      this.prefixBytes = Math.max(
+        0,
+        this.prefixBytes - Buffer.byteLength(prev.pendingPrefix, 'utf8'),
+      )
+    }
+    this.states.delete(itemId)
+  }
+}
+
+export function buildCodexStartupRequest(
+  input: AgentRunInput,
+  toolConfig: { config: object; nativePolicy: object },
+): { method: 'thread/resume' | 'thread/start'; params: Record<string, unknown> } {
+  if (input.nativeSessionId) {
+    return {
+      method: 'thread/resume',
+      params: {
+        threadId: input.nativeSessionId,
+        excludeTurns: true,
+        cwd: input.cwd,
+        config: toolConfig.config,
+        ...(input.model ? { model: input.model } : {}),
+      },
+    }
+  }
+  return {
+    method: 'thread/start',
+    params: {
+      cwd: input.cwd,
+      ephemeral: false,
+      allowProviderModelFallback: false,
+      config: toolConfig.config,
+      ...(input.permissionMode && input.permissionMode !== 'native' ? toolConfig.nativePolicy : {}),
+      ...(input.model ? { model: input.model } : {}),
+    },
+  }
+}
+
+/**
+ * Classify `thread/resume` RPC rejection (S3-F7): map ONLY confirmed missing
+ * thread/rollout rejections to `context_resume_failed`; JSON-RPC `Method not found`
+ * (-32601) and other RPC errors preserve the original binding.
+ */
+export function classifyCodexStartupRejection(
+  rpcError: unknown,
+  nativeSessionId: string | undefined,
+): Error {
+  if (!nativeSessionId) return classifyCodexRpcError(rpcError, 'Codex rejected thread/start.')
+  const rpcCode =
+    rpcError && typeof rpcError === 'object' && !Array.isArray(rpcError)
+      ? Reflect.get(rpcError, 'code')
+      : undefined
+  if (
+    rpcCode === -32_600 &&
+    rpcError &&
+    typeof rpcError === 'object' &&
+    !Array.isArray(rpcError) &&
+    Reflect.get(rpcError, 'message') === `thread ${nativeSessionId} already has an active writer`
+  )
+    return new NativeThreadOccupiedError()
+  if (isCodexArchivedSessionRejection(rpcError, nativeSessionId))
+    return new NativeThreadArchivedError(
+      formatCodexRpcErrorMessage(
+        rpcError,
+        `thread ${nativeSessionId} is archived`,
+        'Codex thread/resume rejected: ',
+      ),
+    )
+  const rawRpcMessage = extractCodexRpcErrorMessage(rpcError) ?? ''
+  if (rpcCode === -32_601 || /\bmethod\s+not\s+found\b/iu.test(rawRpcMessage)) {
+    return new AgentExecutionError(
+      'protocol_error',
+      formatCodexRpcErrorMessage(
+        rpcError,
+        'Codex does not support thread/resume.',
+        'Codex thread/resume rejected: ',
+      ),
+      false,
+    )
+  }
+  if (!isCodexMissingThreadError(rawRpcMessage, rpcCode))
+    return classifyCodexRpcError(
+      rpcError,
+      'Codex rejected thread/resume.',
+      'Codex thread/resume rejected: ',
+    )
+  return new AgentExecutionError(
+    'context_resume_failed',
+    formatCodexRpcErrorMessage(
+      rpcError,
+      'Saved native session was not found.',
+      'Codex thread/resume could not find the saved native session: ',
+    ),
+    false,
+  )
+}
+
+export function buildCodexRecoveryConfiguration(
+  input: AgentRunInput,
+  resolvedModel: unknown,
+  resolvedEffort: unknown,
+  appliedPolicy: object,
+): { model: string; effort: string | null; policy: object } | undefined {
+  // Absent reasoningEffort is unknown. It must not become a known-null
+  // default merely because the display configuration accepts null.
+  const effectiveEffort = input.effort ?? resolvedEffort
+  if (
+    input.host?.recovery &&
+    typeof resolvedModel === 'string' &&
+    resolvedModel.length > 0 &&
+    resolvedModel.length <= 160 &&
+    (effectiveEffort === null ||
+      (typeof effectiveEffort === 'string' &&
+        effectiveEffort.length > 0 &&
+        effectiveEffort.length <= 80)) &&
+    freezeNativeJsonFrame(appliedPolicy) <= 64 * 1024
+  ) {
+    return { model: resolvedModel, effort: effectiveEffort, policy: appliedPolicy }
+  }
+  return undefined
+}
+
+export function buildCodexRecoverySettings(
+  input: AgentRunInput,
+  recoveryConfiguration: { model: string; effort: string | null; policy: object },
+  modeModel: string,
+  serviceTier: 'fast' | 'priority' | 'default' | undefined,
+  workflow: AgentRunInput['promptEnvelope']['collaboration'],
+): RunEffectiveExecutionSettings | undefined {
+  if (!serviceTier) return undefined
+  const applied = {
+    model: recoveryConfiguration.model,
+    modelSelection: modeModel,
+    effort: input.effort ?? recoveryConfiguration.effort,
+    speed: serviceTier === 'priority' ? ('fast' as const) : ('standard' as const),
+    policy: recoveryConfiguration.policy,
+    collaborationMode: collaborationPlanMode(
+      workflow,
+      input.promptEnvelope.collaborationAuthorization,
+    )
+      ? 'plan'
+      : 'default',
+  }
+  return {
+    version: 1,
+    provider: 'codex',
+    model: applied.model,
+    effort: { known: true, value: applied.effort },
+    speed: applied.speed,
+    permissionMode: input.permissionMode ?? 'native',
+    configurationSha256: createHash('sha256')
+      .update(
+        JSON.stringify(applied, (_key, value: unknown) =>
+          value && typeof value === 'object' && !Array.isArray(value)
+            ? Object.fromEntries(Object.entries(value).toSorted(([a], [b]) => a.localeCompare(b)))
+            : value,
+        ),
+      )
+      .digest('hex'),
+    provenance: 'codex_thread_configuration',
+  }
+}
+
+export function buildCodexTurnStartParams(params: {
+  threadId: string
+  input: AgentRunInput
+  workflow: AgentRunInput['promptEnvelope']['collaboration']
+  authorization: AgentRunInput['promptEnvelope']['collaborationAuthorization']
+  sourceReader: NonNullable<NonNullable<AgentRunInput['host']>['workflow']>['sourceReader']
+  sourceReadForm: AgentSourceReadForm
+  withSourceCallable: (text: string) => string
+  phasePolicy: object | undefined
+  modeModel: string
+  modeEffort: string | null | undefined
+  serviceTier: 'fast' | 'priority' | 'default' | undefined
+}): Record<string, unknown> {
+  const {
+    threadId,
+    input,
+    workflow,
+    authorization,
+    sourceReader,
+    sourceReadForm,
+    withSourceCallable,
+    phasePolicy,
+    modeModel,
+    modeEffort,
+    serviceTier,
+  } = params
+  return {
+    threadId,
+    clientUserMessageId: input.runId,
+    input: [
+      ...(workflow || sourceReader
+        ? [
+            {
+              type: 'text',
+              text: withSourceCallable(
+                workflow
+                  ? collaborationInstructions(workflow, authorization)
+                  : frozenSourceInstructions,
+              ),
+            },
+          ]
+        : []),
+      ...codexPromptInput(
+        input.promptEnvelope,
+        sourceReader ? (target) => sourceReader.navigation(target, sourceReadForm) : undefined,
+        cutoffSourceNavigator(sourceReader, sourceReadForm),
+      ),
+    ],
+    ...(workflow ? phasePolicy : {}),
+    ...(input.model ? { model: input.model } : {}),
+    ...(input.effort ? { effort: input.effort } : {}),
+    collaborationMode: {
+      mode: collaborationPlanMode(workflow, authorization) ? 'plan' : 'default',
+      settings: {
+        model: modeModel,
+        reasoning_effort: input.effort ?? modeEffort ?? null,
+        developer_instructions: null,
+      },
+    },
+    ...(serviceTier ? { serviceTierForTurn: serviceTier } : {}),
+  }
 }

@@ -71,6 +71,7 @@ interface PendingRequest {
   startedAt: number
   resolve: ((message: object) => void) | undefined
   reject: ((error: Error) => void) | undefined
+  onLateReply?: ((message: object) => void) | undefined
   timeout: ReturnType<typeof setTimeout> | undefined
   pauseCleanup?: (() => void) | undefined
   signal?: AbortSignal | undefined
@@ -300,6 +301,7 @@ export class CodexAppServerConnection {
       signal?: AbortSignal | undefined
       onDispatch?: (() => void) | undefined
       canDispatch?: (() => boolean) | undefined
+      onLateReply?: ((message: object) => void) | undefined
     },
   ): CodexRequestOperation {
     if (options.signal?.aborted) {
@@ -359,6 +361,7 @@ export class CodexAppServerConnection {
         },
         resolve,
         reject,
+        onLateReply: options.onLateReply,
         timeout: undefined,
         signal: options.signal,
         logicalSettled: false,
@@ -446,6 +449,15 @@ export class CodexAppServerConnection {
       )
     this.backgroundListeners.add(listener)
     return () => this.backgroundListeners.delete(listener)
+  }
+
+  /** Inspect already-queued notifications in strict arrival order without removing them. */
+  forEachQueuedNotification(visitor: (message: object) => void): void {
+    for (let index = this.notificationHead; index < this.notificationQueue.length; index += 1) {
+      const queued = this.notificationQueue[index]
+      if (!queued) continue
+      visitor(queued.message)
+    }
   }
 
   /** Recheck bounded queued facts after a read-only probe proves a lost-ACK Turn identity. */
@@ -753,6 +765,15 @@ export class CodexAppServerConnection {
     if (!pending) return
     if (message) pending.replied = true
     if (pending.logicalSettled) {
+      const lateHandler = message ? pending.onLateReply : undefined
+      pending.onLateReply = undefined
+      if (lateHandler && message) {
+        try {
+          lateHandler(message)
+        } catch {
+          // Isolate late-reply callback errors so physical completion still resolves cleanly.
+        }
+      }
       this.completePhysicalRequest(id, pending)
       return
     }
@@ -826,6 +847,7 @@ export class CodexAppServerConnection {
     if (!pending.logicalSettled || !pending.writeJoined || (!pending.replied && pending.dispatched))
       return
     if (this.pendingRequests.get(id) !== pending) return
+    pending.onLateReply = undefined
     this.pendingRequests.delete(id)
     pending.physicalResolve(pending.replied ? 'reply' : 'not_sent')
     this.updateStdoutPause()
@@ -1061,6 +1083,7 @@ export class CodexAppServerConnection {
     this.frameDeadline = undefined
     for (const id of this.pendingRequests.keys())
       this.settleRequest(id, error, undefined, failureSource)
+    for (const pending of this.pendingRequests.values()) pending.onLateReply = undefined
     this.settleNotificationWaiter(error)
     for (let index = this.outboundHead; index < this.outboundQueue.length; index += 1) {
       const frame = this.outboundQueue[index]

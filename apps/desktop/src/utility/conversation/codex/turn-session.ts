@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
 
 import type { AgentRunInput } from '@pact/agent-runtime'
@@ -7,7 +6,6 @@ import type {
   CollaborationRetainedPlan,
   CollaborationReviewObservation,
   NormalizedAgentEvent,
-  RunEffectiveExecutionSettings,
   RuntimeAgentId,
 } from '@pact/contracts'
 
@@ -30,44 +28,44 @@ import { AgentAnswerAssembler } from '../agent-answer-assembler'
 import {
   AgentExecutionError,
   classifyAgentError,
-  isCodexArchivedSessionRejection,
   NativeCapacityError,
   NativeInputWithheldError,
-  NativeThreadArchivedError,
-  NativeThreadOccupiedError,
 } from '../agent-execution-error'
 import { mergeWorkflowInput, mergeWorkflowReview } from '../collaboration-answer'
 import {
   collaborationInputResultAllowed,
-  collaborationInstructions,
   collaborationPlanMode,
   collaborationReadOnly,
   collaborationReviewMode,
-  frozenSourceInstructions,
 } from '../collaboration-prompt'
-import { cutoffSourceNavigator } from '../frozen-source-reader'
 import {
   codexFileChanges,
   nativeEffectsUncertain,
   nativeFileChangesSettled,
   recordNativeChanges,
 } from '../native-file-changes'
-import { codexPromptInput } from '../native-image-content'
 import { freezeNativeJsonFrame } from '../native-json-encoder'
 import { NativeWorkingMemory } from '../native-working-memory'
 import {
+  CODEX_MAX_PENDING_RECORDINGS,
+  CODEX_MAX_PENDING_RECORDING_BYTES,
   CODEX_STOP_COMMANDS,
   CODEX_STOP_IDENTITY_BYTES,
   CODEX_THREAD_RPC_TIMEOUT_MS,
   CODEX_TURN_ACCEPT_TIMEOUT_MS,
+  CodexReasoningSummaryTracker,
   acceptsCodexReroute,
+  buildCodexRecoveryConfiguration,
+  buildCodexRecoverySettings,
+  buildCodexStartupRequest,
+  buildCodexTurnStartParams,
   cacheApprovalItem,
   classifyCodexRpcError,
+  classifyCodexStartupRejection,
   cleanTitle,
   confirmPermissionMode,
   describeTool,
-  extractCodexRpcErrorMessage,
-  formatCodexRpcErrorMessage,
+  isCodexConnectionScopedNotification,
   isPeerTool,
   observeThreadTitle,
   peerProposal,
@@ -222,10 +220,13 @@ export class CodexTurnSession {
       turnIds: new Set(),
       steerInputIds: new Set(),
       recordings: new Set(),
+      recordingBytes: 0,
       recordingTail: Promise.resolve(),
       foregroundCommands: new Map(),
       foregroundCommandBytes: 0,
       cancellationPending: false,
+      stopRequested: false,
+      rootInterruptAttempted: false,
       unknown: false,
       closed: false,
     }
@@ -235,6 +236,7 @@ export class CodexTurnSession {
     let stoppedCommands: Map<string, string | undefined> | undefined
     const freezeForegroundCommands = (): void => {
       this.kernel.requestAbort()
+      background.stopRequested = true
       if (background.closed || stoppedCommands) return
       if (sourceGrant) this.runtime.peerToolServer.retireSourceReader(sourceGrant)
       stoppedCommands = background.rootTerminal ? new Map() : background.foregroundCommands
@@ -418,9 +420,38 @@ export class CodexTurnSession {
       }
       void this.kernel.settle()
     }
-    const reasoningSummaryStates = new Map<string, { pendingPrefix: string; emitted: boolean }>()
+    const reasoningSummaries = new CodexReasoningSummaryTracker()
     const observed = new WeakSet<object>()
     let replaying = false
+    const releaseRootStartupEarly = (): void => {
+      if (!background.early.length) return
+      const kept: EarlyNativeFact[] = []
+      let keptBytes = 0
+      for (const entry of background.early) {
+        if (entry.rootStartupCandidate) {
+          entry.reservation.release()
+        } else {
+          kept.push(entry)
+          keptBytes += entry.bytes
+        }
+      }
+      background.early = kept
+      background.earlyBytes = keptBytes
+      if (!background.early.length) {
+        clearTimeout(background.earlyTimer)
+        background.earlyTimer = undefined
+      }
+    }
+    const markRootNotStartedIfUnsent = (targetThreadId?: string): void => {
+      if (background.rootNotStarted) return
+      background.rootNotStarted = true
+      releaseRootStartupEarly()
+      this.kernel.recordDispatch(
+        'rejected',
+        targetThreadId ?? threadId ?? input.nativeSessionId,
+        connection?.executorId,
+      )
+    }
     const reportUnknown = (
       reason: string,
       scope: 'unlisted' | 'recorded_files' = 'unlisted',
@@ -462,20 +493,31 @@ export class CodexTurnSession {
     }
     const bufferEarly = (event: object, retained?: EarlyNativeFact): boolean => {
       const params = Reflect.get(event, 'params')
+      if (
+        params &&
+        typeof params === 'object' &&
+        isCodexConnectionScopedNotification(Reflect.get(event, 'method'), params)
+      ) {
+        return false
+      }
       const child =
         params && typeof params === 'object' ? Reflect.get(params, 'threadId') : undefined
-      if (
-        !background.spawns.size &&
-        !(
-          !background.foregroundReleased &&
-          threadStartupDispatched &&
-          !background.primaryThreadId &&
-          ['hook/started', 'hook/completed'].includes(String(Reflect.get(event, 'method')))
-        ) &&
-        !(!background.foregroundReleased && delivery.phase === 'possibly_delivered') &&
-        !(typeof child === 'string' && background.parents.has(child))
+      const isChildOrSpawn = Boolean(
+        background.spawns.size || (typeof child === 'string' && background.parents.has(child)),
       )
-        return false
+      const isStartupHookWindow =
+        !background.foregroundReleased &&
+        threadStartupDispatched &&
+        !background.primaryThreadId &&
+        ['hook/started', 'hook/completed'].includes(String(Reflect.get(event, 'method')))
+      const isPossiblyDeliveredWindow =
+        !background.foregroundReleased &&
+        delivery.phase === 'possibly_delivered' &&
+        !background.primaryTurnId
+      if (!isChildOrSpawn && !isStartupHookWindow && !isPossiblyDeliveredWindow) return false
+      const rootStartupCandidate =
+        retained?.rootStartupCandidate ??
+        (!isChildOrSpawn && (isStartupHookWindow || isPossiblyDeliveredWindow))
       let reservation = retained?.reservation
       try {
         const heldBytes = retained?.heldBytes ?? freezeNativeJsonFrame(event)
@@ -492,7 +534,9 @@ export class CodexTurnSession {
           return true
         }
         reservation.resize(heldBytes)
-        background.early.push(retained ?? { event, bytes, heldBytes, reservation })
+        background.early.push(
+          retained ?? { event, bytes, heldBytes, reservation, rootStartupCandidate },
+        )
         background.earlyBytes += bytes
       } catch {
         reservation?.release()
@@ -530,8 +574,29 @@ export class CodexTurnSession {
               const entry = queued[index]!
               queued[index] = undefined
               try {
-                if (!handleOwnedNativeEvent(entry.event)) bufferEarly(entry.event, entry)
-                else progressed = true
+                if (!handleOwnedNativeEvent(entry.event)) {
+                  const rebuffered = bufferEarly(entry.event, entry)
+                  if (
+                    !rebuffered &&
+                    entry.rootStartupCandidate &&
+                    background.primaryTurnId &&
+                    connection?.isOpen &&
+                    Object.hasOwn(entry.event, 'id') &&
+                    typeof Reflect.get(entry.event, 'method') === 'string'
+                  ) {
+                    const requestId = Reflect.get(entry.event, 'id')
+                    if (typeof requestId === 'string' || typeof requestId === 'number') {
+                      void connection
+                        .respondError(
+                          requestId,
+                          'This native request does not belong to the active Turn.',
+                        )
+                        .catch(() => undefined)
+                    }
+                  }
+                } else {
+                  progressed = true
+                }
               } finally {
                 if (!background.early.includes(entry)) entry.reservation.release()
               }
@@ -556,6 +621,7 @@ export class CodexTurnSession {
       const eventParams = Reflect.get(event, 'params')
       if (!eventParams || typeof eventParams !== 'object') return false
       const eventMethod = Reflect.get(event, 'method')
+      if (isCodexConnectionScopedNotification(eventMethod, eventParams)) return false
       const startedThread =
         eventMethod === 'thread/started' ? Reflect.get(eventParams, 'thread') : undefined
       const suppliedThread =
@@ -618,6 +684,34 @@ export class CodexTurnSession {
       const eventTurnId =
         Reflect.get(eventParams, 'turnId') ??
         (eventTurn && typeof eventTurn === 'object' ? Reflect.get(eventTurn, 'id') : undefined)
+      // S3-F2: A root userMessage carrying our exact clientUserMessageId (input.runId) is
+      // cryptographic/ID proof of root Turn ownership even before turn/start ACK arrives.
+      if (
+        root &&
+        !background.primaryTurnId &&
+        delivery.phase === 'possibly_delivered' &&
+        typeof eventTurnId === 'string' &&
+        eventTurnId.length > 0 &&
+        eventTurnId.length <= 1024 &&
+        (eventMethod === 'item/started' || eventMethod === 'item/completed')
+      ) {
+        const item = Reflect.get(eventParams, 'item')
+        if (
+          item &&
+          typeof item === 'object' &&
+          Reflect.get(item, 'type') === 'userMessage' &&
+          Reflect.get(item, 'clientId') === input.runId
+        ) {
+          turnId = eventTurnId
+          background.primaryTurnId = eventTurnId
+          if (!replaying) {
+            replayEarly()
+            nativeConnection.forEachQueuedNotification((queued) => {
+              handleOwnedNativeEvent(queued)
+            })
+          }
+        }
+      }
       const ownedTurn = root
         ? typeof background.primaryTurnId === 'string' && eventTurnId === background.primaryTurnId
         : typeof eventTurnId === 'string' &&
@@ -660,10 +754,14 @@ export class CodexTurnSession {
         background.turnIds.add(JSON.stringify([eventThread, eventTurnId]))
         background.threads.add(eventThread)
       }
+      const isChildTurnScopedServerRequest =
+        !root && Object.hasOwn(event, 'id') && typeof eventTurnId === 'string'
       if (
         eventMethod !== 'turn/started' &&
         typeof eventMethod === 'string' &&
-        (eventMethod.startsWith('item/') || eventMethod === 'turn/completed') &&
+        (eventMethod.startsWith('item/') ||
+          eventMethod === 'turn/completed' ||
+          isChildTurnScopedServerRequest) &&
         !ownedTurn
       ) {
         if (root) return false
@@ -753,7 +851,9 @@ export class CodexTurnSession {
           return background.operations.has(opKey) || approvalItems.has(opKey)
         })()
       if (root && !ownedTurn && !matchedDetachedLegacyRootRequest) return false
-      if (observed.has(event)) return !root || background.foregroundReleased || detachedRoot
+      // S3-F1: Pre-terminal queued foreground items already captured by the observer must still
+      // flow to the active foreground consumer even if turn/completed arrived ahead on the wire.
+      if (observed.has(event)) return !root || background.foregroundReleased
       observed.add(event)
       if (
         root &&
@@ -890,14 +990,6 @@ export class CodexTurnSession {
             this.kernel.recordTerminal(status)
             if (sourceGrant) this.runtime.peerToolServer.retireSourceReader(sourceGrant)
             const settleTerminal = (): void => {
-              // Native termination is independent of carrier persistence or display.
-              this.runtime.recordTerminal(
-                input,
-                background.primaryThreadId!,
-                background.primaryTurnId!,
-                status,
-                { outputId: answer.outputId, text: '' },
-              )
               if (!projectionFailure)
                 this.runtime.recordTerminal(
                   input,
@@ -948,6 +1040,16 @@ export class CodexTurnSession {
               }
             }
             if (background.steering && background.steeringDone) {
+              // S3-F6: Persist compact terminal identity & outcome immediately on verified
+              // turn/completed while Steer RPC is still in flight; defer only the
+              // Steer-dependent final answer/workflow snapshot behind `steeringDone`.
+              this.runtime.recordTerminal(
+                input,
+                background.primaryThreadId!,
+                background.primaryTurnId!,
+                status,
+                { outputId: answer.outputId, text: '' },
+              )
               const settling = background.steeringDone
                 .then(settleTerminal)
                 .catch((error: unknown) => {
@@ -961,7 +1063,18 @@ export class CodexTurnSession {
                 background.interactions.delete(settling)
                 maybeSettle()
               })
-            } else settleTerminal()
+            } else {
+              if (projectionFailure) {
+                this.runtime.recordTerminal(
+                  input,
+                  background.primaryThreadId!,
+                  background.primaryTurnId!,
+                  status,
+                  { outputId: answer.outputId, text: '' },
+                )
+              }
+              settleTerminal()
+            }
           }
         } else if (background.turns.get(eventThread) === eventTurnId) {
           const interrupting = background.interruptingChild,
@@ -1089,7 +1202,7 @@ export class CodexTurnSession {
         }
       }
       if (Object.hasOwn(event, 'id') && typeof eventMethod === 'string') {
-        if (root && !background.foregroundReleased && !detachedRoot) return false
+        if (root && !background.foregroundReleased && !detachedRoot && !replaying) return false
         if (background.interactions.size >= 8) {
           reportUnknown('Native interactions exceeded their bounded request owner.')
           const requestId = Reflect.get(event, 'id')
@@ -1102,6 +1215,10 @@ export class CodexTurnSession {
               .catch(() => undefined)
           return true
         }
+        const interactionSignal =
+          root && !background.foregroundReleased && !detachedRoot
+            ? foregroundInteractionSignal
+            : background.observation.signal
         const interaction = this.runtime.connections
           .relayPermission(
             nativeConnection,
@@ -1115,7 +1232,7 @@ export class CodexTurnSession {
               : typeof eventTurnId === 'string'
                 ? eventTurnId
                 : background.turns.get(eventThread),
-            background.observation.signal,
+            interactionSignal,
             handledRequests,
             approvalItems,
           )
@@ -1125,32 +1242,37 @@ export class CodexTurnSession {
           background.interactions.delete(interaction)
           maybeSettle()
         })
+        if (root && replaying) return true
       }
       if (eventMethod === 'item/completed') {
         const item = Reflect.get(eventParams, 'item')
         if (item && typeof item === 'object' && Reflect.get(item, 'type') === 'fileChange') {
-          if (background.recordings.size >= 8) {
-            // Preserve active foreground root facts via the foreground fallback instead of dropping them.
-            if (!root || background.foregroundReleased || detachedRoot) {
-              fileChangeRecordings.set(item, Promise.resolve())
-              reportUnknown(
-                'Native background evidence exceeded its bounded recording queue.',
-                'recorded_files',
-              )
-            }
+          const evidence = codexFileChanges(item, input.cwd)
+          const nativeId = Reflect.get(item, 'id')
+          evidence.changes = evidence.changes.map((change, index) => ({
+            ...change,
+            ...(typeof nativeId === 'string'
+              ? {
+                  operationId: root
+                    ? `${nativeId}:${index}`
+                    : `${eventThread}:${nativeId}:${index}`,
+                }
+              : { unavailableReason: 'The native operation identity was unavailable.' }),
+          }))
+          const evidenceBytes = Buffer.byteLength(JSON.stringify(evidence), 'utf8')
+          // S3-F3: Single bounded sequential FIFO queue for ALL owned fileChange recordings;
+          // overflow immediately fails closed (`recorded_files` uncertain) with no foreground drop path.
+          if (
+            background.recordings.size >= CODEX_MAX_PENDING_RECORDINGS ||
+            background.recordingBytes + evidenceBytes > CODEX_MAX_PENDING_RECORDING_BYTES
+          ) {
+            fileChangeRecordings.set(item, Promise.resolve())
+            reportUnknown(
+              'Native file evidence exceeded its bounded recording queue.',
+              'recorded_files',
+            )
           } else {
-            const evidence = codexFileChanges(item, input.cwd)
-            const nativeId = Reflect.get(item, 'id')
-            evidence.changes = evidence.changes.map((change, index) => ({
-              ...change,
-              ...(typeof nativeId === 'string'
-                ? {
-                    operationId: root
-                      ? `${nativeId}:${index}`
-                      : `${eventThread}:${nativeId}:${index}`,
-                  }
-                : { unavailableReason: 'The native operation identity was unavailable.' }),
-            }))
+            background.recordingBytes += evidenceBytes
             const recording = background.recordingTail.then(() =>
               recordNativeChanges(input, evidence, background.observation.signal),
             )
@@ -1159,6 +1281,7 @@ export class CodexTurnSession {
             fileChangeRecordings.set(item, recording)
             void recording.finally(() => {
               background.recordings.delete(recording)
+              background.recordingBytes = Math.max(0, background.recordingBytes - evidenceBytes)
               maybeSettle()
             })
           }
@@ -1314,10 +1437,13 @@ export class CodexTurnSession {
         provisionalThreadId ??= nativeThread
         const requestedTurn = Reflect.get(params, 'turnId')
         if (delivery.phase !== 'before_dispatch' && typeof requestedTurn === 'string') {
-          if (turnId && turnId !== requestedTurn) return false
-          // A native request can precede the Turn ACK. That ACK must confirm
-          // this exact identity before it can own subsequent stream events.
-          turnId ??= requestedTurn
+          // S3-F2: Never adopt an unconfirmed pre-ACK Turn ID as root `turnId` (it may belong
+          // to an older unretired Turn on the same thread). Buffer pre-ACK candidates until
+          // `turn/start` ACK (or matching `clientUserMessageId`) confirms exact root ownership.
+          if (!turnId) {
+            return bufferEarly(request)
+          }
+          if (turnId !== requestedTurn) return false
         }
         if (background.interactions.size >= 8) {
           reportUnknown('Native interactions exceeded their bounded request owner.')
@@ -1370,75 +1496,29 @@ export class CodexTurnSession {
             signal,
           )
         }
-        threadStartupDispatched = true
-        const message = await connection.request(
-          input.nativeSessionId ? 'thread/resume' : 'thread/start',
-          input.nativeSessionId
-            ? {
-                threadId: input.nativeSessionId,
-                excludeTurns: true,
-                cwd: input.cwd,
-                config: toolConfig.config,
-                ...(input.model ? { model: input.model } : {}),
-              }
-            : {
-                cwd: input.cwd,
-                ephemeral: false,
-                allowProviderModelFallback: false,
-                config: toolConfig.config,
-                ...(input.permissionMode && input.permissionMode !== 'native'
-                  ? toolConfig.nativePolicy
-                  : {}),
-                ...(input.model ? { model: input.model } : {}),
-              },
-          { timeoutMs: CODEX_THREAD_RPC_TIMEOUT_MS, signal },
-        )
+        const startupRequest = buildCodexStartupRequest(input, toolConfig)
+        const startupOp = connection.requestOwned(startupRequest.method, startupRequest.params, {
+          timeoutMs: CODEX_THREAD_RPC_TIMEOUT_MS,
+          signal,
+        })
+        threadStartupDispatched = startupOp.requestId !== null
+        void startupOp.physicalCompletion
+          .then((completion) => {
+            if (completion === 'not_sent') {
+              markRootNotStartedIfUnsent(input.nativeSessionId)
+              maybeSettle()
+            }
+            return undefined
+          })
+          .catch(() => undefined)
+        const message = await startupOp.result
         threadStartupCompleted = true
         const rpcError = Reflect.get(message, 'error')
         if (rpcError) {
           // An explicit startup rejection proves no Turn was submitted. This is
           // not a completed Turn; outstanding startup interactions still drain.
-          background.rootNotStarted = true
-          this.kernel.recordDispatch('rejected', input.nativeSessionId, connection.executorId)
-          if (input.nativeSessionId) {
-            if (
-              typeof rpcError === 'object' &&
-              !Array.isArray(rpcError) &&
-              Reflect.get(rpcError, 'code') === -32600 &&
-              Reflect.get(rpcError, 'message') ===
-                `thread ${input.nativeSessionId} already has an active writer`
-            )
-              throw new NativeThreadOccupiedError()
-            if (isCodexArchivedSessionRejection(rpcError, input.nativeSessionId))
-              throw new NativeThreadArchivedError(
-                formatCodexRpcErrorMessage(
-                  rpcError,
-                  `thread ${input.nativeSessionId} is archived`,
-                  'Codex thread/resume rejected: ',
-                ),
-              )
-            const rawRpcMessage = extractCodexRpcErrorMessage(rpcError) ?? ''
-            if (
-              !/not found|does not exist|unknown thread|missing thread|no rollout found/iu.test(
-                rawRpcMessage,
-              )
-            )
-              throw classifyCodexRpcError(
-                rpcError,
-                'Codex rejected thread/resume.',
-                'Codex thread/resume rejected: ',
-              )
-            throw new AgentExecutionError(
-              'context_resume_failed',
-              formatCodexRpcErrorMessage(
-                rpcError,
-                'Saved native session was not found.',
-                'Codex thread/resume could not find the saved native session: ',
-              ),
-              false,
-            )
-          }
-          throw classifyCodexRpcError(rpcError, 'Codex rejected thread/start.')
+          markRootNotStartedIfUnsent(input.nativeSessionId)
+          throw classifyCodexStartupRejection(rpcError, input.nativeSessionId)
         }
         const result = Reflect.get(message, 'result')
         const thread = result && typeof result === 'object' ? Reflect.get(result, 'thread') : null
@@ -1452,10 +1532,10 @@ export class CodexTurnSession {
           throw new AgentExecutionError('protocol_error', 'Codex returned no Thread ID.', false)
         }
         if (input.nativeSessionId && input.nativeSessionId !== resolvedThreadId) {
-          background.rootNotStarted = true
-          this.kernel.recordDispatch('rejected', input.nativeSessionId, nativeConnection.executorId)
+          markRootNotStartedIfUnsent(input.nativeSessionId)
+          // S3-F7: Thread ID mismatch is a protocol contradiction, NOT proof the saved thread is missing.
           throw new AgentExecutionError(
-            'context_resume_failed',
+            'protocol_error',
             'Codex resumed a different native Thread. The original binding was preserved.',
             false,
           )
@@ -1498,25 +1578,12 @@ export class CodexTurnSession {
           resolvedThreadId,
           priorConfig ? { ...priorConfig, peerTargetAgentId: expectedPeerTarget } : undefined,
         )
-        // Absent reasoningEffort is unknown. It must not become a known-null
-        // default merely because the display configuration accepts null.
-        const effectiveEffort = input.effort ?? resolvedEffort
-        if (
-          input.host?.recovery &&
-          typeof resolvedModel === 'string' &&
-          resolvedModel.length > 0 &&
-          resolvedModel.length <= 160 &&
-          (effectiveEffort === null ||
-            (typeof effectiveEffort === 'string' &&
-              effectiveEffort.length > 0 &&
-              effectiveEffort.length <= 80)) &&
-          freezeNativeJsonFrame(appliedPolicy) <= 64 * 1024
+        recoveryConfiguration = buildCodexRecoveryConfiguration(
+          input,
+          resolvedModel,
+          resolvedEffort,
+          appliedPolicy,
         )
-          recoveryConfiguration = {
-            model: resolvedModel,
-            effort: effectiveEffort,
-            policy: appliedPolicy,
-          }
         if (typeof resolvedModel === 'string' && resolvedModel) {
           const configuration = resolveCodexThreadConfiguration(input, {
             model: resolvedModel,
@@ -1569,42 +1636,18 @@ export class CodexTurnSession {
         signal,
         acceptanceDeadline,
       )
-      let recoverySettings: RunEffectiveExecutionSettings | undefined
-      if (input.host?.recovery && recoveryConfiguration && speed.serviceTier) {
-        const applied = {
-          model: recoveryConfiguration.model,
-          modelSelection: modeModel,
-          effort: input.effort ?? recoveryConfiguration.effort,
-          speed: speed.serviceTier === 'priority' ? ('fast' as const) : ('standard' as const),
-          policy: recoveryConfiguration.policy,
-          collaborationMode: collaborationPlanMode(
-            workflow,
-            input.promptEnvelope.collaborationAuthorization,
-          )
-            ? 'plan'
-            : 'default',
-        }
-        recoverySettings = {
-          version: 1,
-          provider: 'codex',
-          model: applied.model,
-          effort: { known: true, value: applied.effort },
-          speed: applied.speed,
-          permissionMode: input.permissionMode ?? 'native',
-          configurationSha256: createHash('sha256')
-            .update(
-              JSON.stringify(applied, (_key, value: unknown) =>
-                value && typeof value === 'object' && !Array.isArray(value)
-                  ? Object.fromEntries(
-                      Object.entries(value).toSorted(([a], [b]) => a.localeCompare(b)),
-                    )
-                  : value,
-              ),
+      const recoverySettings =
+        input.host?.recovery && recoveryConfiguration
+          ? buildCodexRecoverySettings(
+              input,
+              recoveryConfiguration,
+              modeModel,
+              speed.serviceTier,
+              workflow,
             )
-            .digest('hex'),
-          provenance: 'codex_thread_configuration',
-        }
-        input.host?.recovery.recordEffectiveSettings(recoverySettings, {
+          : undefined
+      if (recoverySettings && input.host?.recovery) {
+        input.host.recovery.recordEffectiveSettings(recoverySettings, {
           executorId: connection.executorId,
           nativeSessionId: threadId,
         })
@@ -1618,88 +1661,107 @@ export class CodexTurnSession {
           'The native execution settings could not be confirmed unchanged. The replacement input was withheld.',
         )
       await this.runtime.connections.awaitSettingsBarrier(connection, threadId, signal)
-      rootTurnRequested = true
-      const rootOperation = connection.requestOwned(
-        'turn/start',
-        {
-          threadId,
-          clientUserMessageId: input.runId,
-          input: [
-            ...(workflow || input.host?.workflow?.sourceReader
-              ? [
-                  {
-                    type: 'text',
-                    text: this.runtime.withSourceCallable(
-                      workflow
-                        ? collaborationInstructions(
-                            workflow,
-                            input.promptEnvelope.collaborationAuthorization,
-                          )
-                        : frozenSourceInstructions,
-                    ),
-                  },
-                ]
-              : []),
-            ...codexPromptInput(
-              input.promptEnvelope,
-              (() => {
-                const reader = input.host?.workflow?.sourceReader
-                return reader
-                  ? (target) => reader.navigation(target, background.sourceReadForm ?? 'legacy')
-                  : undefined
-              })(),
-              cutoffSourceNavigator(
-                input.host?.workflow?.sourceReader,
-                background.sourceReadForm ?? 'legacy',
-              ),
-            ),
-          ],
-          ...(workflow ? phasePolicy : {}),
-          ...(input.model ? { model: input.model } : {}),
-          ...(input.effort ? { effort: input.effort } : {}),
-          collaborationMode: {
-            mode: collaborationPlanMode(workflow, input.promptEnvelope.collaborationAuthorization)
-              ? 'plan'
-              : 'default',
-            settings: {
-              model: modeModel,
-              reasoning_effort: input.effort ?? modeConfiguration?.effort ?? null,
-              developer_instructions: null,
-            },
-          },
-          ...(speed.serviceTier ? { serviceTierForTurn: speed.serviceTier } : {}),
-        },
-        {
-          timeoutMs: Math.max(1, acceptanceDeadline - Date.now()),
-          signal,
-          canDispatch: input.host?.recovery?.expected
-            ? () => {
-                if (input.host?.recovery?.canDispatch?.() === true) return true
-                inputWithheldError = new NativeInputWithheldError(
-                  'The replacement authority changed before native input delivery.',
-                )
-                background.rootNotStarted = true
-                background.rootInputWithheld = true
-                this.kernel.recordDispatch('rejected', threadId, nativeConnection.executorId)
-                return false
-              }
-            : undefined,
-          onDispatch: () => {
-            try {
-              this.kernel.recordDispatch('possibly_sent', threadId, nativeConnection.executorId)
-            } catch (error) {
-              if (error instanceof NativeInputWithheldError) {
-                inputWithheldError = error
-                background.rootNotStarted = true
-                background.rootInputWithheld = true
-                this.kernel.recordDispatch('rejected', threadId, nativeConnection.executorId)
-              }
-              throw error
+      // S3-F5: Construct complete turn/start params BEFORE calling requestOwned / setting
+      // rootTurnRequested so a retired FrozenSourceReader throw never strands an unsent observer.
+      const turnStartParams = buildCodexTurnStartParams({
+        threadId,
+        input,
+        workflow,
+        authorization: input.promptEnvelope.collaborationAuthorization,
+        sourceReader: input.host?.workflow?.sourceReader,
+        sourceReadForm: background.sourceReadForm ?? 'legacy',
+        withSourceCallable: (text) => this.runtime.withSourceCallable(text),
+        phasePolicy,
+        modeModel,
+        modeEffort: modeConfiguration?.effort,
+        serviceTier: speed.serviceTier,
+      })
+      const rootOperation = connection.requestOwned('turn/start', turnStartParams, {
+        timeoutMs: Math.max(1, acceptanceDeadline - Date.now()),
+        signal,
+        canDispatch: input.host?.recovery?.expected
+          ? () => {
+              if (input.host?.recovery?.canDispatch?.() === true) return true
+              inputWithheldError = new NativeInputWithheldError(
+                'The replacement authority changed before native input delivery.',
+              )
+              background.rootInputWithheld = true
+              markRootNotStartedIfUnsent(threadId)
+              return false
             }
-            delivery.phase = 'possibly_delivered'
-          },
+          : undefined,
+        onDispatch: () => {
+          try {
+            this.kernel.recordDispatch('possibly_sent', threadId, nativeConnection.executorId)
+          } catch (error) {
+            if (error instanceof NativeInputWithheldError) {
+              inputWithheldError = error
+              background.rootInputWithheld = true
+              markRootNotStartedIfUnsent(threadId)
+            }
+            throw error
+          }
+          delivery.phase = 'possibly_delivered'
         },
-      )
+        // S3-F4: If Stop aborted foreground after write and before ACK, handle the late ACK on
+        // the original requestId to bind the real Turn, replay queued frames, and send one bounded
+        // `turn/interrupt` if the Turn has not already reached exact terminal.
+        onLateReply: (lateMessage) => {
+          if (background.closed || background.rootNotStarted) return
+          if (Reflect.get(lateMessage, 'error')) {
+            markRootNotStartedIfUnsent(threadId)
+            maybeSettle()
+            return
+          }
+          const lateResult = Reflect.get(lateMessage, 'result')
+          const lateTurn =
+            lateResult && typeof lateResult === 'object' ? Reflect.get(lateResult, 'turn') : null
+          const lateTurnId =
+            lateTurn && typeof lateTurn === 'object' ? Reflect.get(lateTurn, 'id') : undefined
+          if (typeof lateTurnId !== 'string' || !lateTurnId || lateTurnId.length > 1024) return
+          if (!background.primaryTurnId) {
+            turnId = lateTurnId
+            background.primaryTurnId = lateTurnId
+          } else if (background.primaryTurnId !== lateTurnId) {
+            return
+          }
+          replayEarly()
+          nativeConnection.replayBackgroundNotifications()
+          if (
+            background.stopRequested &&
+            !background.rootTerminal &&
+            !background.rootInterruptAttempted &&
+            nativeConnection.isOpen &&
+            threadId
+          ) {
+            background.rootInterruptAttempted = true
+            const interruptWork = this.runtime.connections
+              .interruptForegroundCommands(
+                background,
+                nativeConnection,
+                threadId,
+                lateTurnId,
+                new Map(),
+                undefined,
+                false,
+              )
+              .catch(() => {
+                if (!background.rootTerminal) {
+                  reportUnknown(
+                    'Codex interruption after late Turn ACK could not be confirmed. Native observation remains active.',
+                  )
+                }
+              })
+            background.interactions.add(interruptWork)
+            void interruptWork.finally(() => {
+              background.interactions.delete(interruptWork)
+              maybeSettle()
+            })
+          }
+          maybeSettle()
+        },
+      })
+      rootTurnRequested = rootOperation.requestId !== null
       {
         const recovery = input.host?.recovery
         const identity = { executorId: connection.executorId, nativeSessionId: threadId }
@@ -1709,8 +1771,7 @@ export class CodexTurnSession {
         void rootOperation.physicalCompletion
           .then((completion) => {
             if (completion === 'not_sent') {
-              background.rootNotStarted = true
-              this.kernel.recordDispatch('rejected', threadId, identity.executorId)
+              markRootNotStartedIfUnsent(threadId)
               if (recovery && requestId !== null) {
                 recovery.recordConfirmedUnsent(
                   { kind: 'codex_root_frame_not_written', requestId },
@@ -1727,8 +1788,7 @@ export class CodexTurnSession {
       const turnRpcError = Reflect.get(turnResponse, 'error')
       if (turnRpcError) {
         delivery.phase = 'before_dispatch'
-        background.rootNotStarted = true
-        this.kernel.recordDispatch('rejected', threadId, connection.executorId)
+        markRootNotStartedIfUnsent(threadId)
         throw classifyCodexRpcError(turnRpcError, 'Codex rejected turn/start.')
       }
       const turnResult = Reflect.get(turnResponse, 'result')
@@ -1738,15 +1798,25 @@ export class CodexTurnSession {
       if (typeof resolvedTurnId !== 'string') {
         throw new AgentExecutionError('protocol_error', 'Codex returned no Turn ID.', false)
       }
-      if (turnId && turnId !== resolvedTurnId)
+      if (turnId && turnId !== resolvedTurnId) {
+        turnId = undefined
+        background.primaryTurnId = undefined
         throw new AgentExecutionError(
           'protocol_error',
-          'Codex acknowledged a different Turn from its native permission request.',
+          'Codex acknowledged a different Turn from its confirmed user message identity.',
           false,
         )
+      }
       turnId = resolvedTurnId
       background.primaryTurnId = turnId
-      if (sourceGrant && background.sourceReadForm === 'nativeRoot')
+      // S3-F1: Replay buffered early facts AND capture already-queued notifications belonging
+      // to this Turn BEFORE yielding `run.speed.resolved` so pre-ACK answer items are captured
+      // in arrival order before any `turn/completed` can arrive during the yield pause.
+      replayEarly()
+      connection.forEachQueuedNotification((queued) => {
+        handleOwnedNativeEvent(queued)
+      })
+      if (sourceGrant && background.sourceReadForm === 'nativeRoot' && !background.rootTerminal)
         this.runtime.peerToolServer.bindNativeSourceRoot(
           sourceGrant,
           { executorId: connection.executorId, threadId, turnId },
@@ -1810,7 +1880,19 @@ export class CodexTurnSession {
             }
           }
         }
-        if (background.steering && background.steeringDone) {
+        // The cached connection can still deliver notifications from an earlier Turn or missing threadId.
+        // Filter strict (threadId, turnId) ownership BEFORE awaiting steeringDone or projecting (S3-F2/S3-F6).
+        const notificationThreadId =
+          Reflect.get(params, 'threadId') ?? Reflect.get(params, 'conversationId')
+        const notificationTurn = Reflect.get(params, 'turn')
+        const notificationTurnId =
+          Reflect.get(params, 'turnId') ??
+          (notificationTurn && typeof notificationTurn === 'object'
+            ? Reflect.get(notificationTurn, 'id')
+            : undefined)
+        const isCurrentRootMessage =
+          notificationThreadId === threadId && notificationTurnId === turnId
+        if (background.steering && background.steeringDone && isCurrentRootMessage) {
           const item = Reflect.get(params, 'item')
           if (
             method === 'turn/completed' ||
@@ -1824,9 +1906,6 @@ export class CodexTurnSession {
             await background.steeringDone
         }
         if (handleOwnedNativeEvent(message)) continue
-        // The cached connection can still deliver notifications from an earlier Turn.
-        // Filter before progress accounting or stream coalescing; the ACK owns identity.
-        const notificationThreadId = Reflect.get(params, 'threadId')
         if (typeof notificationThreadId === 'string' && notificationThreadId !== threadId) {
           const requestId = Reflect.get(message, 'id')
           if (typeof requestId === 'string' || typeof requestId === 'number')
@@ -1834,12 +1913,6 @@ export class CodexTurnSession {
             await connection.respondError(requestId, 'This native thread is not owned by the Run.')
           continue
         }
-        const notificationTurn = Reflect.get(params, 'turn')
-        const notificationTurnId =
-          Reflect.get(params, 'turnId') ??
-          (notificationTurn && typeof notificationTurn === 'object'
-            ? Reflect.get(notificationTurn, 'id')
-            : undefined)
         if (
           method === 'error' &&
           (notificationThreadId !== threadId || notificationTurnId !== turnId)
@@ -1864,7 +1937,7 @@ export class CodexTurnSession {
         }
         if (
           (method.startsWith('item/') || method === 'turn/completed') &&
-          notificationTurnId !== turnId
+          (notificationThreadId !== threadId || notificationTurnId !== turnId)
         )
           continue
         if (typeof notificationTurnId === 'string' && notificationTurnId !== turnId) continue
@@ -1930,30 +2003,16 @@ export class CodexTurnSession {
           const delta = Reflect.get(params, 'delta')
           const itemId = Reflect.get(params, 'itemId')
           if (turnId && typeof itemId === 'string' && typeof delta === 'string') {
-            const state = reasoningSummaryStates.get(itemId) ?? {
-              pendingPrefix: '',
-              emitted: false,
-            }
-            if (!state.emitted && !delta.trim()) {
-              state.pendingPrefix += delta
-              reasoningSummaryStates.set(itemId, state)
-            } else if (!state.emitted) {
-              state.emitted = true
-              reasoningSummaryStates.set(itemId, state)
+            const outcome = reasoningSummaries.pushDelta(itemId, delta)
+            if (outcome.kind === 'overflow') {
+              failProjection(outcome.error)
+            } else if (outcome.kind === 'emit') {
               yield {
                 agentId: 'codex',
                 type: 'reasoning.summary.delta',
                 turnId,
                 activityId: itemId,
-                text: `${state.pendingPrefix}${delta}`,
-              }
-            } else if (delta) {
-              yield {
-                agentId: 'codex',
-                type: 'reasoning.summary.delta',
-                turnId,
-                activityId: itemId,
-                text: delta,
+                text: outcome.text,
               }
             }
           }
@@ -1992,7 +2051,7 @@ export class CodexTurnSession {
           } else if (Reflect.get(item, 'type') === 'reasoning') {
             const itemId = Reflect.get(item, 'id')
             const text = reasoningSummary(item)
-            if (typeof itemId === 'string') reasoningSummaryStates.delete(itemId)
+            if (typeof itemId === 'string') reasoningSummaries.complete(itemId)
             if (typeof itemId === 'string' && text) {
               yield {
                 agentId: 'codex',
@@ -2076,17 +2135,6 @@ export class CodexTurnSession {
               if (pendingRecording) {
                 // oxlint-disable-next-line no-await-in-loop -- Preserve applied native operation order.
                 await pendingRecording
-              } else {
-                const evidence = codexFileChanges(item, input.cwd)
-                const nativeId = Reflect.get(item, 'id')
-                evidence.changes = evidence.changes.map((change, index) => ({
-                  ...change,
-                  ...(typeof nativeId === 'string'
-                    ? { operationId: `${nativeId}:${index}` }
-                    : { unavailableReason: 'The native operation identity was unavailable.' }),
-                }))
-                // oxlint-disable-next-line no-await-in-loop -- Preserve applied native operation order.
-                await recordNativeChanges(input, evidence, background.observation.signal)
               }
             } else if (
               [
@@ -2262,12 +2310,7 @@ export class CodexTurnSession {
           ).data ?? 'other',
       })
       if (!threadStartupDispatched || (threadStartupCompleted && !rootTurnRequested)) {
-        background.rootNotStarted = true
-        this.kernel.recordDispatch(
-          'rejected',
-          threadId ?? input.nativeSessionId,
-          connection?.executorId,
-        )
+        markRootNotStartedIfUnsent()
       }
       if (!background.rootTerminal && !background.rootNotStarted && threadId)
         input.host?.lifecycle?.recordNativeEvidence?.({
@@ -2328,6 +2371,7 @@ export class CodexTurnSession {
           }
         }
         if (!background.rootTerminal || remainingCommands.size > 0) {
+          background.rootInterruptAttempted = true
           try {
             await this.runtime.connections.interruptForegroundCommands(
               background,
@@ -2339,9 +2383,16 @@ export class CodexTurnSession {
               background.rootTerminal,
             )
           } catch {
-            reportUnknown(
-              'Codex interruption could not be confirmed. Native observation remains active.',
+            // S3-F4: If exact root terminal already arrived and every stopped command has drained,
+            // an "already finished" turn/interrupt rejection does not introduce an observation gap.
+            const hasStillOpenStoppedCommands = [...remainingCommands.keys()].some((id) =>
+              background.operations.has(JSON.stringify([threadId, turnId, id])),
             )
+            if (!background.rootTerminal || hasStillOpenStoppedCommands) {
+              reportUnknown(
+                'Codex interruption could not be confirmed. Native observation remains active.',
+              )
+            }
           }
         }
       }
@@ -2349,12 +2400,7 @@ export class CodexTurnSession {
       background.cancellationPending = false
       this.runtime.running = false
       if (!threadStartupDispatched || (threadStartupCompleted && !rootTurnRequested)) {
-        background.rootNotStarted = true
-        this.kernel.recordDispatch(
-          'rejected',
-          threadId ?? input.nativeSessionId,
-          connection?.executorId,
-        )
+        markRootNotStartedIfUnsent()
       }
       if (!connection?.isOpen) {
         if (!background.rootNotStarted) background.unknown = true
