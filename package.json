@@ -6,9 +6,10 @@
   "license": "MIT",
   "type": "module",
   "scripts": {
+    "arch:check": "node scripts/check-architecture-budgets.mjs",
     "bench:catalog": "vitest bench --mode benchmark --run packages/persistence/src/session-repository.test.ts -t CatalogBenchmark --reporter=verbose",
     "build": "pnpm -r --if-present build",
-    "check": "pnpm docs:check && pnpm format:check && pnpm lint && pnpm db:check && pnpm typecheck && pnpm test",
+    "check": "pnpm docs:check && pnpm arch:check && pnpm format:check && pnpm lint && pnpm db:check && pnpm typecheck && pnpm test",
     "db:check": "pnpm --filter @pact/persistence db:check",
     "db:generate": "pnpm --filter @pact/persistence db:generate",
     "db:migrate:dev": "pnpm --filter @pact/persistence db:migrate:dev",
