@@ -1012,7 +1012,7 @@ export async function buildAdapters(root: string): Promise<AdapterBundle> {
       `export {AgyAgentAdapter} from ${JSON.stringify(join(desktopRoot, 'src/utility/conversation/agy-agent-adapter.ts'))};`,
       `export {AgyAcpConnection, AgyAcpConnectionPool} from ${JSON.stringify(join(desktopRoot, 'src/utility/conversation/agy-acp-connection.ts'))};`,
       `export {NativeForkFiles} from ${JSON.stringify(join(desktopRoot, 'src/utility/conversation/native-fork-files.ts'))};`,
-      `export {createAgyNativeStorageClient} from ${JSON.stringify(join(desktopRoot, 'src/utility/conversation/conversation.ts'))};`,
+      `export {createAgyNativeStorageClient} from ${JSON.stringify(join(desktopRoot, 'src/utility/conversation/agy/native-storage-client.ts'))};`,
       `export * as agyNativeStorage from ${JSON.stringify(join(desktopRoot, 'src/utility/conversation/agy-native-storage.ts'))};`,
       `export {configureAgyStorageChildScriptForTesting, getNodeAgyStorageChildStatsForTesting} from ${JSON.stringify(join(desktopRoot, 'src/utility/conversation/agy-storage-runner.ts'))};`,
       `export {getAgySqliteFileModuleIdentity, getOpenAgySqliteViewCountForTesting, openAnchoredLockedSqliteView} from ${JSON.stringify(join(desktopRoot, 'src/utility/conversation/agy-sqlite-file.ts'))};`,

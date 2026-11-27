@@ -14,12 +14,10 @@ export const MAX_PRODUCTION_FILE_LINES = 2500
  *   its entry MUST be removed from this ratchet immediately.
  */
 export const LEGACY_FILE_LINE_RATCHET = Object.freeze({
-  'apps/desktop/src/utility/conversation/agy-agent-adapter.ts': 13902,
-  'apps/desktop/src/utility/conversation/conversation.ts': 12275,
-  'apps/desktop/src/utility/conversation/agy-native-storage.ts': 9909,
+  'apps/desktop/src/utility/conversation/agy-agent-adapter.ts': 8170,
+  'apps/desktop/src/utility/conversation/conversation.ts': 11530,
   'apps/desktop/src/utility/conversation/codex-agent-adapter.ts': 7417,
   'apps/desktop/src/utility/conversation/claude-agent-adapter.ts': 5919,
-  'apps/desktop/src/utility/conversation/agy-acp-connection.ts': 4808,
   'apps/desktop/src/renderer/src/components/conversation/useConversation.ts': 4662,
   'packages/contracts/src/index.ts': 4470,
   'apps/desktop/src/renderer/src/components/conversation/ConversationView.tsx': 4199,

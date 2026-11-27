@@ -39,10 +39,10 @@ import {
 } from './agy-native-storage.js'
 import { configureAgyStorageChildScriptForTesting } from './agy-storage-runner.js'
 import {
-  Conversation,
   createAgyNativeStorageClient,
   resolveEffectiveAgyAppDataDir,
-} from './conversation.js'
+} from './agy/native-storage-client.js'
+import { Conversation } from './conversation.js'
 import { NativeForkFiles } from './native-fork-files.js'
 import { nativeWorkerFixture } from './native-workers-fixture.test-support.js'
 
