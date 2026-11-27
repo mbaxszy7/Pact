@@ -51,6 +51,7 @@ export interface ActiveExecution {
   run: AgentRun
   protectedAgentId?: RuntimeAgentId | undefined
   deliveryPossible: boolean
+  enteredNativeAdapter?: boolean | undefined
   cancelledByUser?: boolean | undefined
   abortController: AbortController
   streamBuffer?: AgentStreamBuffer | undefined

@@ -1,11 +1,6 @@
 import { isDeepStrictEqual } from 'node:util'
 
-import type {
-  AgentCollaborationSourceReader,
-  AgentPromptImage,
-  AgentRunInput,
-  AgentSourceReadForm,
-} from '@pact/agent-runtime'
+import type { AgentRunInput } from '@pact/agent-runtime'
 import type {
   CollaborationInputObservation,
   CollaborationReviewObservation,
@@ -14,11 +9,7 @@ import type {
   SessionPermissionMode,
 } from '@pact/contracts'
 
-import {
-  agentPromptImageGroups,
-  RunLifecycleKernel,
-  validateSourceGrant,
-} from '@pact/agent-runtime'
+import { RunLifecycleKernel, validateSourceGrant } from '@pact/agent-runtime'
 import {
   buildBoundedNativePlanId,
   collaborationAskMode,
@@ -47,22 +38,15 @@ import {
   createAgyRootFrameNotWrittenProof,
 } from '../agy-acp-connection'
 import { mergeWorkflowInput, mergeWorkflowReview } from '../collaboration-answer'
-import {
-  buildSourceInstructions,
-  collaborationInstructions,
-  collaborationReadOnly,
-} from '../collaboration-prompt'
-import { cutoffSourceNavigator } from '../frozen-source-reader'
+import { collaborationReadOnly } from '../collaboration-prompt'
 import {
   AgyRoundEffectsTracker,
   nativeEffectsUncertain,
   nativeFileChangesSettled,
   recordNativeChanges,
 } from '../native-file-changes'
-import { agyPromptInput, nativeImagePreparationBytes } from '../native-image-content'
 import { NativePermissionWait } from '../native-permission-wait'
 import { bindAgySkillSelections } from '../native-skill-catalog'
-import { PEER_ASSISTANCE_INSTRUCTIONS } from '../peer-assistance-policy'
 import {
   computeRetainedPlanTextBytes,
   formatAgyRpcErrorMessage,
@@ -74,8 +58,10 @@ import { AgyRunMcpServer } from './peer-mcp-server'
 import {
   agyElicitationRequest,
   buildAgyPermissionCard,
+  buildAgyTurnSystemAppend,
   findRejectOnceOptionId,
   parseAcpSessionDescriptor,
+  prepareAgyTurnPromptBlocks,
 } from './permission-and-elicitation'
 import { AgyTurnBackgroundObserver } from './turn-background-observer'
 import { AgyTurnFrameAdmitter } from './turn-frame-admitter'
@@ -85,8 +71,6 @@ import {
   AGY_MAX_PRE_PROMPT_REPLAY_TOOL_IDS,
   AGY_MAX_TOOL_STATE_BYTES,
   AGY_PHYSICAL_SETTLEMENT_GRACE_MS,
-  AGY_PLAN_SUBMISSION_INSTRUCTIONS,
-  AGY_READ_ONLY_STAGE_INSTRUCTIONS,
   AGY_SESSION_METADATA_UPDATES,
   asString,
   awaitPhysicalCompletionBounded,
@@ -176,6 +160,7 @@ export class AgyTurnSession {
     let brainPlanReadbackRequired = false
     let brainPlanCaptureFailed = false
     let unresolvedPreBindOutput = false
+    let foregroundDeltaDropped = false
 
     let sourceRetired = false
     const retireSourceReader = (): void => {
@@ -391,76 +376,130 @@ export class AgyTurnSession {
         return finalizationPromise
       }
       finalizationPromise = (async () => {
-        if (cancelGraceTimer !== undefined) {
-          clearTimeout(cancelGraceTimer)
-          cancelGraceTimer = undefined
-        }
-        promptRpcAbort.abort()
-        await stopPrePromptDrain?.(false).catch(() => undefined)
-        stopStreamPump?.()
-        commitMinimalLiveTerminalFallback()
-        foregroundReleased = true
-        if (options.emergency || emergencyCleanedUp) {
-          rootTerminal = true
-        }
-        if (activeRun) {
-          activeRun.foregroundReleased = true
-          if (options.emergency || emergencyCleanedUp) {
-            activeRun.rootTerminal = true
+        try {
+          if (cancelGraceTimer !== undefined) {
+            clearTimeout(cancelGraceTimer)
+            cancelGraceTimer = undefined
           }
-          this.runtime.projector.notifyRootExecutionWaiters(activeRun)
-        }
-        if (
-          (options.emergency || emergencyCleanedUp) &&
-          !unknownEffectsReported &&
-          !isConfirmedZeroBytesSent()
-        ) {
-          reportUnknown(
-            'Antigravity adapter disposed before native Turn cleanup could be confirmed.',
-          )
-        }
-        this.runtime.invalidateNonTerminalEvidence(input.runId, resolvedSessionId)
-        // Root Turn has ended: unconditionally revoke and close MCP server synchronously before releasing its reservation.
-        mcpServer.revokeRun()
-        await mcpServer.close().catch(() => undefined)
-        cleanupForegroundResources?.()
-        mcpCorrelationMemoryReservation?.release()
-        mcpCorrelationMemoryReservation = undefined
-        publishedPlanMemoryReservation?.release()
-        publishedPlanMemoryReservation = undefined
-        promptMemoryReservation?.release()
-        promptMemoryReservation = undefined
-        toolStateMemoryReservation?.release()
-        toolStateMemoryReservation = undefined
-        pendingEventsMemoryReservation?.release()
-        pendingEventsMemoryReservation = undefined
-        stagedPreBindMemoryReservation?.release()
-        stagedPreBindMemoryReservation = undefined
-        foreignExecIdsMemoryReservation?.release()
-        foreignExecIdsMemoryReservation = undefined
-        for (const ctrl of interactionControllers) ctrl.abort()
-        interactionControllers.clear()
-        tools.clear()
-        approvedBrainPlanCalls.clear()
-        if (!options.emergency && !emergencyCleanedUp) {
-          await closeZeroInputSessionOnce().catch(() => undefined)
-        }
-        serverRequestOwner?.dispose()
-        serverRequestOwner = undefined
-        if (
-          !options.emergency &&
-          !emergencyCleanedUp &&
-          !this.runtime.disposed &&
-          activeRun &&
-          activeRun.activeBackgroundTasks.size > 0
-        ) {
-          const retainedRun = activeRun
-          const retainedLease = lease
-          lease = undefined
-          let retainedCleaned = false
-          const cleanupRetained = (): void => {
-            if (retainedCleaned) return
-            retainedCleaned = true
+          promptRpcAbort.abort()
+          await stopPrePromptDrain?.(false).catch(() => undefined)
+          stopStreamPump?.()
+          commitMinimalLiveTerminalFallback()
+          foregroundReleased = true
+          if (options.emergency || emergencyCleanedUp) {
+            rootTerminal = true
+          }
+          if (activeRun) {
+            activeRun.foregroundReleased = true
+            if (options.emergency || emergencyCleanedUp) {
+              activeRun.rootTerminal = true
+            }
+            this.runtime.projector.notifyRootExecutionWaiters(activeRun)
+          }
+          if (
+            (options.emergency || emergencyCleanedUp) &&
+            !unknownEffectsReported &&
+            !isConfirmedZeroBytesSent()
+          ) {
+            reportUnknown(
+              'Antigravity adapter disposed before native Turn cleanup could be confirmed.',
+            )
+          }
+          this.runtime.invalidateNonTerminalEvidence(input.runId, resolvedSessionId)
+          // Root Turn has ended: unconditionally revoke and close MCP server synchronously before releasing its reservation.
+          mcpServer.revokeRun()
+          await mcpServer.close().catch(() => undefined)
+          cleanupForegroundResources?.()
+          mcpCorrelationMemoryReservation?.release()
+          mcpCorrelationMemoryReservation = undefined
+          publishedPlanMemoryReservation?.release()
+          publishedPlanMemoryReservation = undefined
+          promptMemoryReservation?.release()
+          promptMemoryReservation = undefined
+          toolStateMemoryReservation?.release()
+          toolStateMemoryReservation = undefined
+          pendingEventsMemoryReservation?.release()
+          pendingEventsMemoryReservation = undefined
+          stagedPreBindMemoryReservation?.release()
+          stagedPreBindMemoryReservation = undefined
+          foreignExecIdsMemoryReservation?.release()
+          foreignExecIdsMemoryReservation = undefined
+          for (const ctrl of interactionControllers) ctrl.abort()
+          interactionControllers.clear()
+          tools.clear()
+          approvedBrainPlanCalls.clear()
+          if (!options.emergency && !emergencyCleanedUp) {
+            await closeZeroInputSessionOnce().catch(() => undefined)
+          }
+          serverRequestOwner?.dispose()
+          serverRequestOwner = undefined
+          if (
+            !options.emergency &&
+            !emergencyCleanedUp &&
+            !this.runtime.disposed &&
+            activeRun &&
+            activeRun.activeBackgroundTasks.size > 0
+          ) {
+            const retainedRun = activeRun
+            const retainedLease = lease
+            lease = undefined
+            let retainedCleaned = false
+            const cleanupRetained = (): void => {
+              if (retainedCleaned) return
+              retainedCleaned = true
+              backgroundObserver?.unsubscribe()
+              foregroundDedupMemoryReservation?.release()
+              foregroundDedupMemoryReservation = undefined
+              postCutoffBgMemoryReservation?.release()
+              postCutoffBgMemoryReservation = undefined
+              retireSourceReader()
+              observation.abort()
+              this.runtime.activeRuns.delete(input.runId)
+              retainedLease?.release()
+            }
+            try {
+              handoffOrderedStreamToBackground?.(cleanupRetained)
+            } catch {
+              reportUnknown(
+                'Antigravity background observer handoff exceeded connection listener capacity.',
+              )
+              sessionStream?.close()
+              sessionStream = undefined
+              cleanupRetained()
+            }
+            sessionStream?.close()
+            sessionStream = undefined
+            if (
+              !retainedCleaned &&
+              (retainedRun.observation.signal.aborted ||
+                this.runtime.disposed ||
+                emergencyCleanedUp)
+            ) {
+              backgroundObserver?.closeRetainedBackground({
+                reason: 'disposed',
+                emergency: emergencyCleanedUp || this.runtime.disposed,
+              })
+              cleanupRetained()
+            } else if (!retainedCleaned) {
+              retainedRun.observation.signal.addEventListener(
+                'abort',
+                () => {
+                  backgroundObserver?.closeRetainedBackground({
+                    reason: 'disposed',
+                    emergency: true,
+                  })
+                  cleanupRetained()
+                },
+                { once: true },
+              )
+            }
+          } else {
+            sessionStream?.close()
+            sessionStream = undefined
+            backgroundObserver?.closeRetainedBackground({
+              reason: 'disposed',
+              emergency: options.emergency || emergencyCleanedUp,
+            })
             backgroundObserver?.unsubscribe()
             foregroundDedupMemoryReservation?.release()
             foregroundDedupMemoryReservation = undefined
@@ -468,64 +507,23 @@ export class AgyTurnSession {
             postCutoffBgMemoryReservation = undefined
             retireSourceReader()
             observation.abort()
-            this.runtime.activeRuns.delete(input.runId)
-            retainedLease?.release()
+            if (activeRun) this.runtime.activeRuns.delete(input.runId)
+            lease?.release()
+            lease = undefined
           }
-          handoffOrderedStreamToBackground?.(cleanupRetained)
-          sessionStream?.close()
-          sessionStream = undefined
-          if (
-            retainedRun.observation.signal.aborted ||
-            this.runtime.disposed ||
-            emergencyCleanedUp
-          ) {
-            backgroundObserver?.closeRetainedBackground({
-              reason: 'disposed',
-              emergency: emergencyCleanedUp || this.runtime.disposed,
-            })
-            cleanupRetained()
-          } else {
-            retainedRun.observation.signal.addEventListener(
-              'abort',
-              () => {
-                backgroundObserver?.closeRetainedBackground({
-                  reason: 'disposed',
-                  emergency: true,
-                })
-                cleanupRetained()
-              },
-              { once: true },
-            )
-          }
-        } else {
-          sessionStream?.close()
-          sessionStream = undefined
-          backgroundObserver?.closeRetainedBackground({
-            reason: 'disposed',
-            emergency: options.emergency || emergencyCleanedUp,
+          await this.kernel.settle({
+            retainBackgroundObservation: Boolean(
+              activeRun &&
+              activeRun.activeBackgroundTasks.size > 0 &&
+              !options.emergency &&
+              !emergencyCleanedUp &&
+              !this.runtime.disposed,
+            ),
           })
-          backgroundObserver?.unsubscribe()
-          foregroundDedupMemoryReservation?.release()
-          foregroundDedupMemoryReservation = undefined
-          postCutoffBgMemoryReservation?.release()
-          postCutoffBgMemoryReservation = undefined
-          retireSourceReader()
-          observation.abort()
-          if (activeRun) this.runtime.activeRuns.delete(input.runId)
-          lease?.release()
-          lease = undefined
+        } finally {
+          this.runtime.ownedRunHandles.delete(runHandle)
+          runFinalizer.resolve()
         }
-        await this.kernel.settle({
-          retainBackgroundObservation: Boolean(
-            activeRun &&
-            activeRun.activeBackgroundTasks.size > 0 &&
-            !options.emergency &&
-            !emergencyCleanedUp &&
-            !this.runtime.disposed,
-          ),
-        })
-        this.runtime.ownedRunHandles.delete(runHandle)
-        runFinalizer.resolve()
       })()
       return finalizationPromise
     }
@@ -583,32 +581,13 @@ export class AgyTurnSession {
 
       const mcpDescriptor = mcpServer.hasTools ? await mcpServer.start() : undefined
 
-      const systemAppendParts: string[] = []
-      if (workflow) {
-        systemAppendParts.push(
-          collaborationInstructions(workflow, authorization, mcpServer.sourceCapability),
-        )
-        if (readOnlyStage) {
-          systemAppendParts.push(AGY_READ_ONLY_STAGE_INSTRUCTIONS)
-        }
-        if (planModeStage) {
-          systemAppendParts.push(AGY_PLAN_SUBMISSION_INSTRUCTIONS)
-        }
-      } else {
-        if (mcpServer.allowedToolNames.has('request_peer_assistance')) {
-          systemAppendParts.push(PEER_ASSISTANCE_INSTRUCTIONS)
-        }
-        if (mcpServer.allowedToolNames.has('read_collaboration_source')) {
-          systemAppendParts.push(buildSourceInstructions(mcpServer.sourceCapability))
-        }
-      }
-      if (mcpServer.hasTools) {
-        systemAppendParts.push(mcpServer.formatToolUsageInstructions())
-      }
-      const systemAppend = systemAppendParts.filter(Boolean).join('\n\n')
-      const systemPromptMeta = systemAppend
-        ? { _meta: { antigravity: { systemPrompt: { append: systemAppend } } } }
-        : {}
+      const { systemAppend, systemPromptMeta } = buildAgyTurnSystemAppend({
+        workflow,
+        authorization,
+        readOnlyStage,
+        planModeStage,
+        mcpServer,
+      })
 
       lease = await this.runtime.pool.acquire({
         cwd: input.cwd,
@@ -1242,33 +1221,8 @@ export class AgyTurnSession {
       }
 
       // Prepare prompt content with Cutoff serialization & verified ACP images.
-      const images: AgentPromptImage[] = []
       const currentEnvelope =
         input.host?.lifecycle?.currentPromptEnvelope?.() ?? input.promptEnvelope
-      const sourceForm: AgentSourceReadForm | undefined = mcpServer.sourceCapability.sourceReference
-        ? 'sourceReference'
-        : mcpServer.sourceCapability.nativeRoot
-          ? 'nativeRoot'
-          : mcpServer.sourceCapability.legacy
-            ? 'legacy'
-            : undefined
-      const sourceReader = input.host?.workflow?.sourceReader
-      const navigate =
-        sourceReader && sourceForm !== undefined
-          ? (target: Parameters<AgentCollaborationSourceReader['navigation']>[0]) =>
-              sourceReader.navigation(target, sourceForm)
-          : undefined
-      const navigateCutoff =
-        sourceForm !== undefined ? cutoffSourceNavigator(sourceReader, sourceForm) : undefined
-
-      for (const group of agentPromptImageGroups(currentEnvelope)) {
-        images.push(...group.images)
-      }
-      promptMemoryReservation = connection.reserveWorkingMemory(
-        64 * 1024 +
-          Buffer.byteLength(systemAppend, 'utf8') * 2 +
-          nativeImagePreparationBytes(images),
-      )
       toolStateMemoryReservation = connection.reserveWorkingMemory(0)
       foregroundDedupMemoryReservation = connection.reserveWorkingMemory(0)
       mcpCorrelationMemoryReservation = connection.reserveWorkingMemory(0)
@@ -1276,26 +1230,18 @@ export class AgyTurnSession {
       stagedPreBindMemoryReservation = connection.reserveWorkingMemory(0)
       foreignExecIdsMemoryReservation = connection.reserveWorkingMemory(0)
       postCutoffBgMemoryReservation = connection.reserveWorkingMemory(0)
-      const promptBlocks = await agyPromptInput(
+      const { promptBlocks, expectedFullPromptText } = await prepareAgyTurnPromptBlocks({
         currentEnvelope,
+        runId: input.runId,
         runSignal,
-        navigate,
-        navigateCutoff,
-        {
-          pactRunId: input.runId,
+        workflow,
+        systemAppend,
+        mcpServer,
+        sourceReader: input.host?.workflow?.sourceReader,
+        reservePromptMemory: (bytes) => {
+          promptMemoryReservation = connection.reserveWorkingMemory(bytes)
         },
-      )
-      if (workflow && systemAppend && promptBlocks[0]?.type === 'text') {
-        promptBlocks[0] = {
-          type: 'text',
-          text: `Pact host instructions for this turn:\n${systemAppend}\n\n${promptBlocks[0].text}`,
-        }
-      }
-      const expectedFullPromptText = promptBlocks
-        .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
-        .map((block) => block.text)
-        .join('\n')
-        .trim()
+      })
 
       const turnEpoch = this.runtime.nextTurnEpoch++
       const roundTracker = new AgyRoundEffectsTracker(
@@ -1344,6 +1290,7 @@ export class AgyTurnSession {
         rootExecutionWaiters: new Set(),
         activeBackgroundTasks: new Set(),
         backgroundTaskAliases: new Map(),
+        launchedCompletedToolCallIds: new Set(),
         backgroundUnconfirmed: false,
         observation,
         retireSourceReader,
@@ -1573,7 +1520,15 @@ export class AgyTurnSession {
               }
               // Drain staged pre-bind frames synchronously BEFORE opening post-cutoff background
               // routing so task aliases and foreground dedup IDs exist before any background frame.
-              drainStagedPreBindIntoQueue?.()
+              // Isolate hard-cap overflow so promptCutoffSeq and liveTerminalOutcome always commit.
+              try {
+                drainStagedPreBindIntoQueue?.()
+              } catch {
+                unresolvedPreBindOutput = true
+                reportUnknown(
+                  'Antigravity staged pre-bind drain exceeded pending event queue capacity; output completeness cannot be confirmed.',
+                )
+              }
               if (acceptRootTurn()) {
                 pushPendingEvent({ agentId: 'agy', type: 'turn.started', turnId: input.runId })
               }
@@ -1801,6 +1756,9 @@ export class AgyTurnSession {
             acceptRootTurn()
           },
           canAdmitForegroundDelta: () => this.kernel.canAdmitEffect('stream_delta'),
+          onForegroundDeltaDropped: () => {
+            foregroundDeltaDropped = true
+          },
           reportUnknown,
           observeFiles,
           signal,
@@ -2091,7 +2049,6 @@ export class AgyTurnSession {
           if (physical === 'not_sent') {
             rootConfirmedNotSent = true
             rootFirstByteWritten = false
-            this.kernel.recordDispatch('rejected', resolvedSessionId, activeExecutorId)
             if (input.host?.recovery && appliedSettings) {
               const unsent = createAgyRootFrameNotWrittenProof({
                 runId: input.runId,
@@ -2110,6 +2067,12 @@ export class AgyTurnSession {
                   nativeSessionId: resolvedSessionId,
                 })
               }
+            }
+            try {
+              this.kernel.recordDispatch('rejected', resolvedSessionId, activeExecutorId)
+            } catch {
+              // Keep confirmed-unsent recovery proof and withheld error classification intact
+              // even if the host dispatch callback itself threw.
             }
             if (rootWithheldByGuard) {
               throw new NativeInputWithheldError(
@@ -2275,8 +2238,9 @@ export class AgyTurnSession {
         await input.host?.lifecycle?.waitForRootOutput?.()
         await observer.awaitTail()
 
+        const incompleteVisiblePrefix = unresolvedPreBindOutput || foregroundDeltaDropped
         const finalSnapshot = answer.finalize()
-        if (finalSnapshot !== undefined && !unresolvedPreBindOutput) {
+        if (finalSnapshot !== undefined && !incompleteVisiblePrefix) {
           yield {
             agentId: 'agy',
             type: 'text.completed',
@@ -2320,7 +2284,7 @@ export class AgyTurnSession {
         }
 
         // Promote collaboration artifacts ONLY after normal root completion & settlement (`B6`).
-        if (outcome === 'completed' && !unknownEffectsReported && !unresolvedPreBindOutput) {
+        if (outcome === 'completed' && !unknownEffectsReported && !incompleteVisiblePrefix) {
           if (planModeStage) {
             if (
               !hasUnresolvedBrainPlanWrite() &&
@@ -2376,24 +2340,24 @@ export class AgyTurnSession {
 
         const settledPlan = latestBrainPlanCandidate ?? publishedOpenPlan
         const outputCompleteness: 'complete' | 'partial' =
-          outcome === 'completed' && !unresolvedPreBindOutput ? 'complete' : 'partial'
+          outcome === 'completed' && !incompleteVisiblePrefix ? 'complete' : 'partial'
         const terminalEvidence: Parameters<AgyAdapterRuntime['recordEvidence']>[3] = {
           kind: 'ended',
           source: 'live_terminal',
           outcome,
-          ...(answer.text || (outcome === 'completed' && !unresolvedPreBindOutput && settledPlan)
+          ...(answer.text || (outcome === 'completed' && !incompleteVisiblePrefix && settledPlan)
             ? {
                 output: {
                   outputId: answer.outputId,
                   text: answer.text,
                   completeness: outputCompleteness,
-                  ...(outcome === 'completed' && !unresolvedPreBindOutput && settledPlan
+                  ...(outcome === 'completed' && !incompleteVisiblePrefix && settledPlan
                     ? { plan: settledPlan }
                     : {}),
-                  ...(outcome === 'completed' && !unresolvedPreBindOutput && reviewResult
+                  ...(outcome === 'completed' && !incompleteVisiblePrefix && reviewResult
                     ? { reviewVerdict: reviewResult.verdict, reviewResult }
                     : {}),
-                  ...(outcome === 'completed' && !unresolvedPreBindOutput && inputResult
+                  ...(outcome === 'completed' && !incompleteVisiblePrefix && inputResult
                     ? { inputOutcome: inputResult.outcome, inputResult }
                     : {}),
                 },
@@ -2401,49 +2365,51 @@ export class AgyTurnSession {
             : {}),
         }
 
-        if (unresolvedPreBindOutput && outcome === 'completed') {
-          // When unresolved substantive pre-bind frames remain after emitting a visible prefix,
-          // emit `turn.completed { outcome: 'failed' }` (without `text.completed`) so SQLite marks
-          // the truncated prefix `incomplete`, then record the independently verified native
-          // outcome with `completeness: 'partial'` so `nativeOutcome` stays preserved.
-          yield {
-            agentId: 'agy',
-            type: 'turn.completed',
-            turnId: input.runId,
-            outcome: 'failed',
-          }
-          liveTerminalCommitted = true
-          this.runtime.recordEvidence(
-            input,
-            resolvedSessionId,
-            activeExecutorId,
-            terminalEvidence,
-            activeRun.nativeTurnId,
-          )
-        } else {
-          liveTerminalCommitted = true
-          this.runtime.recordEvidence(
-            input,
-            resolvedSessionId,
-            activeExecutorId,
-            terminalEvidence,
-            activeRun.nativeTurnId,
-          )
+        if (!liveTerminalCommitted && !foregroundReleased) {
+          if (incompleteVisiblePrefix && outcome === 'completed') {
+            // When unresolved substantive pre-bind frames or Stop-frozen foreground deltas remain
+            // after emitting a visible prefix, emit `turn.completed { outcome: 'failed' }` (without
+            // `text.completed`) so SQLite marks the truncated prefix `incomplete`, then record the
+            // independently verified native outcome with `completeness: 'partial'`.
+            yield {
+              agentId: 'agy',
+              type: 'turn.completed',
+              turnId: input.runId,
+              outcome: 'failed',
+            }
+            liveTerminalCommitted = true
+            this.runtime.recordEvidence(
+              input,
+              resolvedSessionId,
+              activeExecutorId,
+              terminalEvidence,
+              activeRun.nativeTurnId,
+            )
+          } else {
+            liveTerminalCommitted = true
+            this.runtime.recordEvidence(
+              input,
+              resolvedSessionId,
+              activeExecutorId,
+              terminalEvidence,
+              activeRun.nativeTurnId,
+            )
 
-          if (
-            !unknownEffectsReported &&
-            !unresolvedPreBindOutput &&
-            !activeRun.backgroundUnconfirmed &&
-            activeRun.activeBackgroundTasks.size === 0
-          ) {
-            nativeFileChangesSettled(input, 'settled', 'native_work_drained')
-          }
+            if (
+              !unknownEffectsReported &&
+              !incompleteVisiblePrefix &&
+              !activeRun.backgroundUnconfirmed &&
+              activeRun.activeBackgroundTasks.size === 0
+            ) {
+              nativeFileChangesSettled(input, 'settled', 'native_work_drained')
+            }
 
-          yield {
-            agentId: 'agy',
-            type: 'turn.completed',
-            turnId: input.runId,
-            outcome,
+            yield {
+              agentId: 'agy',
+              type: 'turn.completed',
+              turnId: input.runId,
+              outcome,
+            }
           }
         }
       } finally {

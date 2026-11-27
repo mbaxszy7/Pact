@@ -304,6 +304,15 @@ export class AgyTurnBackgroundObserver {
           asString(update.taskId ?? update.backgroundTaskId) ??
           (rawOutput ? asString(rawOutput.taskId ?? rawOutput.backgroundTaskId) : undefined)
         const toolCallId = asString(update.toolCallId ?? update.id)
+        // Do not intercept another Run's session/load replay of this Run's already-completed launch call.
+        if (
+          sessionUpdate === 'tool_call_update' &&
+          update.outOfTurn !== true &&
+          toolCallId !== undefined &&
+          trackedRun.launchedCompletedToolCallIds.has(toolCallId)
+        ) {
+          return false
+        }
         const execId = ownership.executionId
         const explicitlyOwnedByOldRun =
           (taskId !== undefined &&

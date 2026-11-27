@@ -638,6 +638,7 @@ export class AgyNotificationProjector {
     onObservedBackgroundTask: () => void
     onAcceptTurn: () => void
     canAdmitForegroundDelta: () => boolean
+    onForegroundDeltaDropped?: () => void
     reportUnknown: (reason: string) => void
     observeFiles: (evidence: NativeChanges) => void
     signal: AbortSignal
@@ -835,10 +836,14 @@ export class AgyNotificationProjector {
       }
 
       if (sessionUpdate === 'agent_message_chunk') {
-        if (context.receivedAfterPromptReply || !context.canAdmitForegroundDelta()) return
+        if (context.receivedAfterPromptReply) return
         const content = isPlainObject(update.content) ? update.content : undefined
         const text = content && content.type === 'text' ? asString(content.text) : undefined
         if (!text) return
+        if (!context.canAdmitForegroundDelta()) {
+          context.onForegroundDeltaDropped?.()
+          return
+        }
         const itemId = `msg:${context.getMessageIndex()}`
         const delta = context.answer.append(itemId, text)
         if (delta) {
@@ -1699,6 +1704,9 @@ export class AgyNotificationProjector {
         activeRun.backgroundTaskAliases.set(spawnedTaskId, canonicalKey)
       }
     }
+    if (status === 'completed' && activeRun.launchedCompletedToolCallIds.size < 256) {
+      activeRun.launchedCompletedToolCallIds.add(toolCallId)
+    }
     if (changed) {
       input.host?.effects?.backgroundWorkChanged?.()
     }
@@ -1895,9 +1903,17 @@ export class AgyNotificationProjector {
     } finally {
       // Settle tracked background task completion states; AgyTurnBackgroundObserver drains
       // any queued reports before reporting settled and releasing observer ownership/lease.
+      // Never let a non-out-of-turn replay of a completed background-task launch call settle
+      // the still-running background task (e.g., when another Run runs session/load).
+      const isReplayOfCompletedLaunchCall =
+        sessionUpdate === 'tool_call_update' &&
+        toolCallId !== undefined &&
+        activeRun.launchedCompletedToolCallIds.has(toolCallId) &&
+        !record.outOfTurn
       const isTerminalTaskUpdate =
         sessionUpdate === 'background_task_completed' ||
         (sessionUpdate === 'tool_call_update' &&
+          !isReplayOfCompletedLaunchCall &&
           (status === 'completed' || status === 'failed' || status === 'cancelled'))
       if (isTerminalTaskUpdate) {
         this.settleBackgroundTaskByAlias(activeRun, input, [taskId, toolCallId])

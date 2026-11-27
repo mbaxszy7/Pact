@@ -6599,4 +6599,182 @@ describe('Wave 6A Codex TurnSession adversarial regressions', () => {
       await adapter.dispose()
     }
   })
+
+  it('Opus B1/B2: released pre-ACK Run A (primaryTurnId undefined) does not steal Run B turnless elicitation or title updates', async () => {
+    let runAUserInputs = 0
+    let runBUserInputs = 0
+    let turnStartCount = 0
+    let pushNotify!: (message: object) => void
+    const turnAStarted = Promise.withResolvers<void>()
+    const elicBResponded = Promise.withResolvers<void>()
+
+    const adapter = new CodexAgentAdapter('/fake/codex', () => {
+      const child = fakeCodexProcess(
+        (request, respond, notify) => {
+          pushNotify = notify
+          const id = Reflect.get(request, 'id')
+          const method = String(Reflect.get(request, 'method'))
+          if (method === 'initialize') {
+            respond({ id, result: { userAgent: 'codex_cli_rs/0.163.0' } })
+          } else if (method === 'turn/start') {
+            turnStartCount += 1
+            if (turnStartCount === 1) {
+              // Hold Turn A ACK indefinitely while caller aborts -> primaryTurnId stays undefined!
+              turnAStarted.resolve()
+              return
+            }
+            const turnId = 'turn-b-after-preack'
+            respond({ id, result: { turn: { id: turnId } } })
+            notify({
+              method: 'thread/name/updated',
+              params: { threadId: 'th-preack-iso', threadName: 'Run B Title' },
+            })
+            notify({
+              method: 'turn/completed',
+              params: { threadId: 'th-preack-iso', turn: { id: turnId, status: 'completed' } },
+            })
+          }
+        },
+        (request, respond, notify) => {
+          pushNotify = notify
+          const id = Reflect.get(request, 'id')
+          const method = Reflect.get(request, 'method')
+          if (id === 'elic-b-preack') {
+            elicBResponded.resolve()
+            return true
+          }
+          if (method === 'thread/start') {
+            respond({
+              id,
+              result: {
+                model: 'gpt-5.4',
+                reasoningEffort: 'high',
+                approvalPolicy: 'on-request',
+                approvalsReviewer: 'user',
+                sandbox: { type: 'workspaceWrite', writableRoots: [] },
+                thread: { id: 'th-preack-iso' },
+              },
+            })
+            return true
+          }
+          if (method === 'thread/resume') {
+            notify({
+              id: 'elic-b-preack',
+              method: 'mcpServer/elicitation/request',
+              params: {
+                threadId: 'th-preack-iso',
+                serverName: 'docs-mcp',
+                mode: 'url',
+                elicitationId: 'elic-b-2',
+                url: 'https://example.invalid/preack',
+                message: 'Run B startup confirm',
+              },
+            })
+            void elicBResponded.promise.then(() => {
+              respond({
+                id,
+                result: {
+                  model: 'gpt-5.4',
+                  reasoningEffort: 'high',
+                  approvalPolicy: 'on-request',
+                  approvalsReviewer: 'user',
+                  sandbox: { type: 'workspaceWrite', writableRoots: [] },
+                  thread: { id: 'th-preack-iso' },
+                },
+              })
+              return undefined
+            })
+            return true
+          }
+          return false
+        },
+      )
+      return {
+        child,
+        close: async () => {
+          child.emit('exit', 0, null)
+          child.emit('close', 0, null)
+        },
+      }
+    })
+
+    try {
+      const abortA = new AbortController()
+      const runAId = randomUUID()
+      const runAPromise = (async () => {
+        const events: NormalizedAgentEvent[] = []
+        for await (const ev of adapter.run(
+          {
+            runId: runAId,
+            sessionId: randomUUID(),
+            cwd: '/project',
+            model: 'gpt-5.4',
+            effort: 'high',
+            promptEnvelope: {
+              version: 'pact-agent-prompt-v1',
+              sessionId: randomUUID(),
+              message: { id: randomUUID(), content: 'Run A pre-ACK stop' },
+              comments: [],
+            },
+            host: {
+              interactions: {
+                requestUserInput: async () => {
+                  runAUserInputs += 1
+                  return { action: 'accept' }
+                },
+              },
+            },
+          },
+          abortA.signal,
+        )) {
+          events.push(ev)
+        }
+        return events
+      })()
+      await turnAStarted.promise
+      abortA.abort()
+      await expect(runAPromise).rejects.toThrow(/confirm its final state/u)
+      expect(adapter.hasActiveBackgroundWork(runAId)).toBe(true)
+
+      const runBEvents: NormalizedAgentEvent[] = []
+      for await (const ev of adapter.run(
+        {
+          runId: randomUUID(),
+          sessionId: randomUUID(),
+          nativeSessionId: 'th-preack-iso',
+          cwd: '/project',
+          model: 'gpt-5.4',
+          effort: 'high',
+          promptEnvelope: {
+            version: 'pact-agent-prompt-v1',
+            sessionId: randomUUID(),
+            message: { id: randomUUID(), content: 'Run B on same thread' },
+            comments: [],
+          },
+          host: {
+            interactions: {
+              requestUserInput: async () => {
+                runBUserInputs += 1
+                return { action: 'accept' }
+              },
+            },
+          },
+        },
+        new AbortController().signal,
+      )) {
+        runBEvents.push(ev)
+      }
+
+      void pushNotify
+      expect(runAUserInputs).toBe(0)
+      expect(runBUserInputs).toBe(1)
+      expect(runBEvents).toContainEqual({
+        agentId: 'codex',
+        type: 'session.title.updated',
+        title: 'Run B Title',
+      })
+    } finally {
+      await adapter.dispose()
+    }
+  })
 })

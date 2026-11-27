@@ -22738,5 +22738,262 @@ describe('AgyAgentAdapter Wave-6 audit regressions', () => {
     } finally {
       await adapter3.dispose()
     }
+
+    // 4. Stop freezing a late pre-reply agent_message_chunk marks truncated output partial (never complete) when native replies end_turn (Opus M1).
+    const harness4 = createAcpHarness()
+    let prompt4Id: unknown
+    const firstChunkDelivered = Promise.withResolvers<void>()
+    harness4.onClientFrame((frame) => {
+      if (frame.method === 'initialize') {
+        harness4.sendToClient({ jsonrpc: '2.0', id: frame.id, result: { protocolVersion: 1 } })
+      } else if (frame.method === 'session/new') {
+        harness4.sendToClient({
+          jsonrpc: '2.0',
+          id: frame.id,
+          result: {
+            sessionId: nativeSessionId,
+            configOptions: [
+              { id: 'model', currentValue: 'gemini-4-carbon' },
+              { id: 'thought_level', currentValue: 'high' },
+            ],
+          },
+        })
+      } else if (
+        frame.method === 'session/set_mode' ||
+        frame.method === 'session/set_config_option'
+      ) {
+        harness4.sendToClient({
+          jsonrpc: '2.0',
+          id: frame.id,
+          result: {
+            configOptions: [
+              { id: 'model', currentValue: 'gemini-4-carbon' },
+              { id: 'thought_level', currentValue: 'high' },
+            ],
+          },
+        })
+      } else if (frame.method === 'session/prompt') {
+        prompt4Id = frame.id
+        harness4.sendToClient({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: nativeSessionId,
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: 'Prefix before Stop. ' },
+            },
+          },
+        })
+      } else if (frame.method === 'session/cancel') {
+        void firstChunkDelivered.promise.then(() => {
+          harness4.sendToClient({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: nativeSessionId,
+              update: {
+                sessionUpdate: 'agent_message_chunk',
+                content: { type: 'text', text: 'Dropped suffix after Stop.' },
+              },
+            },
+          })
+          harness4.sendToClient({
+            jsonrpc: '2.0',
+            id: prompt4Id,
+            result: { stopReason: 'end_turn' },
+          })
+          return undefined
+        })
+      }
+    })
+    const m1Evidence: unknown[] = []
+    const adapter4 = new AgyAgentAdapter({
+      appDataDir,
+      processFactory: () => harness4.child,
+      storageClient: {
+        readTrajectoryIdentity: async () => ({
+          status: 'ok',
+          trajectoryId: randomUUID(),
+          stepCount: 1,
+        }),
+      },
+    })
+    try {
+      const stopController = new AbortController()
+      const m1Events: NormalizedAgentEvent[] = []
+      const stream4 = adapter4.run(
+        makeBaseRunInput(cwd, {
+          host: {
+            lifecycle: {
+              recordNativeEvidence: (ev) => {
+                m1Evidence.push(ev)
+              },
+            },
+          },
+        }),
+        stopController.signal,
+      )
+      for await (const ev of stream4) {
+        m1Events.push(ev)
+        if (ev.type === 'text.delta' && !stopController.signal.aborted) {
+          stopController.abort()
+          firstChunkDelivered.resolve()
+        }
+      }
+      expect(
+        m1Events.some((ev) => ev.type === 'text.delta' && ev.text.includes('Dropped suffix')),
+      ).toBe(false)
+      expect(m1Events.some((ev) => ev.type === 'text.completed')).toBe(false)
+      expect(m1Events).toContainEqual(
+        expect.objectContaining({ type: 'turn.completed', outcome: 'failed' }),
+      )
+      expect(m1Evidence).toContainEqual(
+        expect.objectContaining({
+          kind: 'ended',
+          source: 'live_terminal',
+          outcome: 'completed',
+          output: expect.objectContaining({ completeness: 'partial' }),
+        }),
+      )
+    } finally {
+      await adapter4.dispose()
+    }
+
+    // 5. Run B's session/load replay of Run A's completed daemon launch tool_call_update MUST NOT settle Run A's background task (Opus M2).
+    const harness5 = createAcpHarness()
+    let prompt5Count = 0
+    harness5.onClientFrame((frame) => {
+      if (frame.method === 'initialize') {
+        harness5.sendToClient({ jsonrpc: '2.0', id: frame.id, result: { protocolVersion: 1 } })
+      } else if (frame.method === 'session/new') {
+        harness5.sendToClient({
+          jsonrpc: '2.0',
+          id: frame.id,
+          result: {
+            sessionId: nativeSessionId,
+            configOptions: [
+              { id: 'model', currentValue: 'gemini-4-carbon' },
+              { id: 'thought_level', currentValue: 'high' },
+            ],
+          },
+        })
+      } else if (frame.method === 'session/load') {
+        // Replay Run A's historical completed launch call WITHOUT outOfTurn: true!
+        harness5.sendToClient({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: nativeSessionId,
+            update: {
+              sessionUpdate: 'tool_call_update',
+              toolCallId: 'tc-daemon-launch-1',
+              name: 'run_command',
+              status: 'completed',
+              args: { IsDaemon: true, CommandLine: 'npm run dev' },
+              rawOutput: { taskId: 'bg-daemon-task-1' },
+              _meta: { execution_id: 'exec-run-a' },
+            },
+          },
+        })
+        harness5.sendToClient({
+          jsonrpc: '2.0',
+          id: frame.id,
+          result: {
+            sessionId: nativeSessionId,
+            configOptions: [
+              { id: 'model', currentValue: 'gemini-4-carbon' },
+              { id: 'thought_level', currentValue: 'high' },
+            ],
+          },
+        })
+      } else if (
+        frame.method === 'session/set_mode' ||
+        frame.method === 'session/set_config_option'
+      ) {
+        harness5.sendToClient({
+          jsonrpc: '2.0',
+          id: frame.id,
+          result: {
+            configOptions: [
+              { id: 'model', currentValue: 'gemini-4-carbon' },
+              { id: 'thought_level', currentValue: 'high' },
+            ],
+          },
+        })
+      } else if (frame.method === 'session/prompt') {
+        prompt5Count += 1
+        if (prompt5Count === 1) {
+          harness5.sendToClient({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: nativeSessionId,
+              update: {
+                sessionUpdate: 'tool_call_update',
+                toolCallId: 'tc-daemon-launch-1',
+                name: 'run_command',
+                status: 'completed',
+                args: { IsDaemon: true, CommandLine: 'npm run dev' },
+                rawOutput: { taskId: 'bg-daemon-task-1' },
+                _meta: { execution_id: 'exec-run-a' },
+              },
+            },
+          })
+          harness5.sendToClient({
+            jsonrpc: '2.0',
+            id: frame.id,
+            result: { stopReason: 'end_turn', execution_id: 'exec-run-a' },
+          })
+        } else {
+          harness5.sendToClient({
+            jsonrpc: '2.0',
+            id: frame.id,
+            result: { stopReason: 'end_turn', execution_id: 'exec-run-b' },
+          })
+        }
+      }
+    })
+    const adapter5 = new AgyAgentAdapter({
+      appDataDir,
+      processFactory: () => harness5.child,
+      storageClient: {
+        readTrajectoryIdentity: async () => ({
+          status: 'ok',
+          trajectoryId: randomUUID(),
+          stepCount: 5,
+        }),
+      },
+    })
+    try {
+      const runAId = randomUUID()
+      await collectEvents(
+        adapter5.run(makeBaseRunInput(cwd, { runId: runAId }), new AbortController().signal),
+      )
+      expect(adapter5.hasActiveBackgroundWork(runAId)).toBe(true)
+
+      await collectEvents(
+        adapter5.run(makeBaseRunInput(cwd, { nativeSessionId }), new AbortController().signal),
+      )
+      // Run B's session/load replay MUST NOT have settled Run A's still-running daemon!
+      expect(adapter5.hasActiveBackgroundWork(runAId)).toBe(true)
+
+      // Genuine background_task_completed settles Run A cleanly.
+      harness5.sendToClient({
+        jsonrpc: '2.0',
+        method: 'session/update',
+        params: {
+          sessionId: nativeSessionId,
+          update: {
+            sessionUpdate: 'background_task_completed',
+            taskId: 'bg-daemon-task-1',
+            _meta: { execution_id: 'exec-run-a' },
+          },
+        },
+      })
+      await waitUntilCondition(() => !adapter5.hasActiveBackgroundWork(runAId))
+    } finally {
+      await adapter5.dispose()
+    }
   })
 })

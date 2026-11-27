@@ -130,20 +130,30 @@ export class RunExecutor {
       })
       // oxlint-disable-next-line typescript/no-misused-promises -- Promise.finally awaits asynchronous resource cleanup on both settlement paths.
       .finally(async () => {
+        let drainError: unknown
         try {
           const owner = this.core.nativeObservations.get(execution.run.id)
-          if (owner) await owner.archiver.drain()
+          if (owner) {
+            try {
+              await owner.archiver.drain()
+            } catch (error: unknown) {
+              drainError = error
+            }
+          }
           if (owner && !owner.adapter.hasActiveBackgroundWork?.(execution.run.id)) {
             if (execution.streamBuffer && !execution.streamBuffer.flush()) {
-              throw new Error('The last foreground output could not be committed.')
+              drainError ??= new Error('The last foreground output could not be committed.')
             }
             if (
               owner.archiver.archiveBuffer &&
               (!owner.archiver.archiveBuffer.flush() || !owner.archiver.archiveBuffer.dispose())
             ) {
-              throw new Error('The late native output could not be committed.')
+              drainError ??= new Error('The late native output could not be committed.')
             }
-            this.settleOrphanedPendingEffects(execution.run.id, execution.deliveryPossible)
+            this.settleOrphanedPendingEffects(
+              execution.run.id,
+              Boolean(execution.enteredNativeAdapter) || execution.deliveryPossible,
+            )
             this.core.retireStreamTrace(owner, execution.streamBuffer)
             owner.sourceReader?.retire()
             this.core.recovery.clearBackgroundStop(owner)
@@ -152,6 +162,7 @@ export class RunExecutor {
           await this.finalizeWorkspaceChanges(execution.run.id)
           const settled = this.core.conversations.reconcileCompletedCollaboration(execution.run.id)
           if (settled) this.core.publish(settled)
+          if (drainError !== undefined) throw drainError
         } finally {
           execution.streamBuffer?.dispose()
           execution.streamBuffer = undefined
@@ -1242,6 +1253,7 @@ export class RunExecutor {
       if (!this.ownsExecution(execution, run.id)) return
       this.core.publish(this.core.conversations.recordNativeEffects(run.id, 'pending'))
       enteredNativeAdapter = true
+      execution.enteredNativeAdapter = true
 
       for await (const event of adapter.run(runInput, signal)) {
         if (this.core.disposed) return

@@ -1,18 +1,38 @@
 import { randomUUID } from 'node:crypto'
 import { basename, isAbsolute, relative } from 'node:path'
 
+import type {
+  AgentCollaborationSourceReader,
+  AgentPromptEnvelope,
+  AgentPromptImage,
+  AgentSourceReadForm,
+} from '@pact/agent-runtime'
+import type {
+  CollaborationTask,
+  CollaborationTurnAuthorization,
+  NativeInputField,
+  NativePermissionRequest,
+  NativeUserInputRequest,
+} from '@pact/contracts'
+
+import { agentPromptImageGroups } from '@pact/agent-runtime'
 import {
   nativeInputDetailsSchema,
   nativeInputValueSchema,
   nativePermissionRequestSchema,
-  type NativeInputField,
-  type NativePermissionRequest,
-  type NativeUserInputRequest,
 } from '@pact/contracts'
 
+import type { AgyRunMcpServer } from './peer-mcp-server'
+
 import { AgentExecutionError } from '../agent-execution-error'
+import { buildSourceInstructions, collaborationInstructions } from '../collaboration-prompt'
+import { cutoffSourceNavigator } from '../frozen-source-reader'
+import { agyPromptInput, nativeImagePreparationBytes } from '../native-image-content'
 import { nativeApprovalDisplayFits, safeNativePermissionText } from '../native-permission-wait'
+import { PEER_ASSISTANCE_INSTRUCTIONS } from '../peer-assistance-policy'
 import {
+  AGY_PLAN_SUBMISSION_INSTRUCTIONS,
+  AGY_READ_ONLY_STAGE_INSTRUCTIONS,
   asString,
   isPlainObject,
   type AcpConfigOptionEntry,
@@ -426,4 +446,106 @@ export function agyElicitationRequest(params: Record<string, unknown>): NativeUs
     ...publicDetails,
     requestedSchema: schema,
   }
+}
+
+export function buildAgyTurnSystemAppend(params: {
+  readonly workflow: CollaborationTask | undefined
+  readonly authorization: CollaborationTurnAuthorization | undefined
+  readonly readOnlyStage: boolean
+  readonly planModeStage: boolean
+  readonly mcpServer: AgyRunMcpServer
+}): {
+  readonly systemAppend: string
+  readonly systemPromptMeta: Record<string, unknown>
+} {
+  const { workflow, authorization, readOnlyStage, planModeStage, mcpServer } = params
+  const systemAppendParts: string[] = []
+  if (workflow) {
+    systemAppendParts.push(
+      collaborationInstructions(workflow, authorization, mcpServer.sourceCapability),
+    )
+    if (readOnlyStage) {
+      systemAppendParts.push(AGY_READ_ONLY_STAGE_INSTRUCTIONS)
+    }
+    if (planModeStage) {
+      systemAppendParts.push(AGY_PLAN_SUBMISSION_INSTRUCTIONS)
+    }
+  } else {
+    if (mcpServer.allowedToolNames.has('request_peer_assistance')) {
+      systemAppendParts.push(PEER_ASSISTANCE_INSTRUCTIONS)
+    }
+    if (mcpServer.allowedToolNames.has('read_collaboration_source')) {
+      systemAppendParts.push(buildSourceInstructions(mcpServer.sourceCapability))
+    }
+  }
+  if (mcpServer.hasTools) {
+    systemAppendParts.push(mcpServer.formatToolUsageInstructions())
+  }
+  const systemAppend = systemAppendParts.filter(Boolean).join('\n\n')
+  const systemPromptMeta = systemAppend
+    ? { _meta: { antigravity: { systemPrompt: { append: systemAppend } } } }
+    : {}
+  return { systemAppend, systemPromptMeta }
+}
+
+export async function prepareAgyTurnPromptBlocks(params: {
+  readonly currentEnvelope: AgentPromptEnvelope
+  readonly runId: string
+  readonly runSignal: AbortSignal
+  readonly workflow: CollaborationTask | undefined
+  readonly systemAppend: string
+  readonly mcpServer: AgyRunMcpServer
+  readonly sourceReader: AgentCollaborationSourceReader | undefined
+  readonly reservePromptMemory: (bytes: number) => void
+}): Promise<{
+  readonly promptBlocks: Awaited<ReturnType<typeof agyPromptInput>>
+  readonly expectedFullPromptText: string
+}> {
+  const {
+    currentEnvelope,
+    runId,
+    runSignal,
+    workflow,
+    systemAppend,
+    mcpServer,
+    sourceReader,
+    reservePromptMemory,
+  } = params
+  const images: AgentPromptImage[] = []
+  const sourceForm: AgentSourceReadForm | undefined = mcpServer.sourceCapability.sourceReference
+    ? 'sourceReference'
+    : mcpServer.sourceCapability.nativeRoot
+      ? 'nativeRoot'
+      : mcpServer.sourceCapability.legacy
+        ? 'legacy'
+        : undefined
+  const navigate =
+    sourceReader && sourceForm !== undefined
+      ? (target: Parameters<AgentCollaborationSourceReader['navigation']>[0]) =>
+          sourceReader.navigation(target, sourceForm)
+      : undefined
+  const navigateCutoff =
+    sourceForm !== undefined ? cutoffSourceNavigator(sourceReader, sourceForm) : undefined
+
+  for (const group of agentPromptImageGroups(currentEnvelope)) {
+    images.push(...group.images)
+  }
+  reservePromptMemory(
+    64 * 1024 + Buffer.byteLength(systemAppend, 'utf8') * 2 + nativeImagePreparationBytes(images),
+  )
+  const promptBlocks = await agyPromptInput(currentEnvelope, runSignal, navigate, navigateCutoff, {
+    pactRunId: runId,
+  })
+  if (workflow && systemAppend && promptBlocks[0]?.type === 'text') {
+    promptBlocks[0] = {
+      type: 'text',
+      text: `Pact host instructions for this turn:\n${systemAppend}\n\n${promptBlocks[0].text}`,
+    }
+  }
+  const expectedFullPromptText = promptBlocks
+    .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
+    .map((block) => block.text)
+    .join('\n')
+    .trim()
+  return { promptBlocks, expectedFullPromptText }
 }

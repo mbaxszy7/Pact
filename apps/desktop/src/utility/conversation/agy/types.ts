@@ -434,6 +434,7 @@ export interface ActiveAgyRun {
   readonly rootExecutionWaiters: Set<() => void>
   readonly activeBackgroundTasks: Set<string>
   readonly backgroundTaskAliases: Map<string, string>
+  readonly launchedCompletedToolCallIds: Set<string>
   backgroundUnconfirmed: boolean
   readonly observation: AbortController
   readonly retireSourceReader: (() => void) | undefined

@@ -467,11 +467,12 @@ export class CodexTurnSession {
       if (
         !background.spawns.size &&
         !(
+          !background.foregroundReleased &&
           threadStartupDispatched &&
           !background.primaryThreadId &&
           ['hook/started', 'hook/completed'].includes(String(Reflect.get(event, 'method')))
         ) &&
-        delivery.phase !== 'possibly_delivered' &&
+        !(!background.foregroundReleased && delivery.phase === 'possibly_delivered') &&
         !(typeof child === 'string' && background.parents.has(child))
       )
         return false
@@ -618,7 +619,7 @@ export class CodexTurnSession {
         Reflect.get(eventParams, 'turnId') ??
         (eventTurn && typeof eventTurn === 'object' ? Reflect.get(eventTurn, 'id') : undefined)
       const ownedTurn = root
-        ? eventTurnId === background.primaryTurnId
+        ? typeof background.primaryTurnId === 'string' && eventTurnId === background.primaryTurnId
         : typeof eventTurnId === 'string' &&
           background.turnIds.has(JSON.stringify([eventThread, eventTurnId]))
       if (root && typeof eventTurnId === 'string' && eventTurnId !== background.primaryTurnId) {
@@ -1129,11 +1130,14 @@ export class CodexTurnSession {
         const item = Reflect.get(eventParams, 'item')
         if (item && typeof item === 'object' && Reflect.get(item, 'type') === 'fileChange') {
           if (background.recordings.size >= 8) {
-            fileChangeRecordings.set(item, Promise.resolve())
-            reportUnknown(
-              'Native background evidence exceeded its bounded recording queue.',
-              'recorded_files',
-            )
+            // Preserve active foreground root facts via the foreground fallback instead of dropping them.
+            if (!root || background.foregroundReleased || detachedRoot) {
+              fileChangeRecordings.set(item, Promise.resolve())
+              reportUnknown(
+                'Native background evidence exceeded its bounded recording queue.',
+                'recorded_files',
+              )
+            }
           } else {
             const evidence = codexFileChanges(item, input.cwd)
             const nativeId = Reflect.get(item, 'id')
