@@ -764,15 +764,13 @@ export class RunExecutor {
       }
       archiver.flush()
       const disposedOk = archiver.dispose()
-      if (!disposedOk || archiver.outputFailure || archiver.failureRecordingError !== undefined) {
+      const unrecordedFailure =
+        archiver.failureRecordingError ?? owner.backgroundReportRecordingError
+      if (!disposedOk || archiver.outputFailure || unrecordedFailure !== undefined) {
         this.core.workspaceChanges?.observeUncertainEffects(run.id)
       }
-      if (archiver.failureRecordingError !== undefined) {
-        this.core.recordUnrecordedArchiveFailure(
-          run.id,
-          run.sessionId,
-          archiver.failureRecordingError,
-        )
+      if (unrecordedFailure !== undefined) {
+        this.core.recordUnrecordedArchiveFailure(run.id, run.sessionId, unrecordedFailure)
         recordDiagnostic({
           operation: 'native_check',
           phase: 'failed',
@@ -782,7 +780,7 @@ export class RunExecutor {
           runId: run.id,
           agentId: run.agentId,
           runtimeBoundary: 'archive',
-          code: classifyAgentError(archiver.failureRecordingError).kind,
+          code: classifyAgentError(unrecordedFailure).kind,
         })
       }
       owner.observationController.abort()
@@ -1163,12 +1161,24 @@ export class RunExecutor {
               return
             }
             const task = (async () => {
-              const recordUnavailableBestEffort = (): void => {
+              const recordUnavailableBestEffort = (
+                sourceError?: unknown,
+              ): { ok: true } | { ok: false; error: unknown } => {
                 try {
                   const patch = this.core.conversations.recordBackgroundReportUnavailable(report)
                   if (patch && stillOwned()) this.core.publish(patch)
-                } catch {
-                  // Repository may be closed or conflict-locked; failure flag remains latched.
+                  return { ok: true }
+                } catch (unavailableError) {
+                  if (
+                    sourceError instanceof RunOperationConflictError &&
+                    unavailableError instanceof RunOperationConflictError
+                  ) {
+                    return { ok: true }
+                  }
+                  owner.backgroundReportRecordingError ??= unavailableError
+                  this.core.workspaceChanges?.observeUncertainEffects(run.id)
+                  this.core.recordUnrecordedArchiveFailure(run.id, run.sessionId, unavailableError)
+                  return { ok: false, error: unavailableError }
                 }
               }
               try {
@@ -1178,7 +1188,6 @@ export class RunExecutor {
                   await archiver.archiveTail.catch(() => undefined)
                 }
                 if (owner.observationController.signal.aborted || !canDrainObservation()) {
-                  owner.backgroundReportFailed = true
                   recordUnavailableBestEffort()
                   return
                 }
@@ -1189,10 +1198,7 @@ export class RunExecutor {
                 )
                 if (patch && stillOwned()) this.core.publish(patch)
               } catch (error) {
-                owner.backgroundReportFailed = true
-                if (!(error instanceof RunOperationConflictError)) {
-                  recordUnavailableBestEffort()
-                }
+                const unavailable = recordUnavailableBestEffort(error)
                 if (!this.core.disposed) {
                   recordDiagnostic({
                     operation: 'native_check',
@@ -1205,6 +1211,9 @@ export class RunExecutor {
                     runtimeBoundary: 'archive',
                     code: classifyAgentError(error).kind,
                   })
+                }
+                if (!unavailable.ok && !this.core.disposed && !this.core.drainingForClose) {
+                  throw unavailable.error
                 }
               }
             })()
@@ -1279,19 +1288,33 @@ export class RunExecutor {
             // so SQLite never shows clean `settled` with zero persistence-failure evidence.
             let effectiveState = report.state
             let effectiveReason = report.reason
-            if (report.state === 'settled' && owner.archiver.failureRecordingError !== undefined) {
-              try {
-                const failure =
-                  owner.archiver.outputFailure ??
-                  classifyAgentError(owner.archiver.failureRecordingError)
-                this.core.publish(this.core.conversations.recordOutputFailure(run.id, failure))
-                owner.archiver.clearFailureRecordingError()
-                this.core.unrecordedArchiveFailures.delete(run.id)
-              } catch {
+            if (report.state === 'settled') {
+              if (owner.archiver.failureRecordingError !== undefined) {
+                try {
+                  const failure =
+                    owner.archiver.outputFailure ??
+                    classifyAgentError(owner.archiver.failureRecordingError)
+                  this.core.publish(this.core.conversations.recordOutputFailure(run.id, failure))
+                  if (this.core.conversations.findRun(run.id)?.dispatchPhase === 'ended') {
+                    this.core.publish(
+                      this.core.conversations.settleKnownNativeEnding(run.id, failure),
+                    )
+                  }
+                  owner.archiver.clearFailureRecordingError()
+                  if (owner.backgroundReportRecordingError === undefined) {
+                    this.core.unrecordedArchiveFailures.delete(run.id)
+                  }
+                } catch {
+                  effectiveState = 'unknown'
+                  effectiveReason =
+                    owner.archiver.outputFailure?.message ??
+                    'Output archive failure could not be recorded before native effects settled.'
+                }
+              }
+              if (owner.backgroundReportRecordingError !== undefined) {
                 effectiveState = 'unknown'
                 effectiveReason =
-                  owner.archiver.outputFailure?.message ??
-                  'Output archive failure could not be recorded before native effects settled.'
+                  'Background report failure could not be recorded before native effects settled.'
               }
             }
             if (owner.backgroundStop && effectiveState !== 'pending') {
@@ -1472,7 +1495,13 @@ export class RunExecutor {
         this.core.runtimePreparation.invalidateAgentReadiness(run.agentId)
       }
       if (failure.kind === 'response_too_large') archiver.markAborted(error)
-      this.core.conversations.finishCollaboration(run.id, false, failure.message)
+      const saved = this.core.conversations.findRun(run.id)
+      // R2-A3: When native terminal `ended` is already durable, defer collaboration settlement
+      // until after `archiver.drain()` so an archived completed snapshot is not prematurely
+      // locked to `interrupted` or stamped with `pact.output_unavailable`.
+      if (saved?.dispatchPhase !== 'ended') {
+        this.core.conversations.finishCollaboration(run.id, false, failure.message)
+      }
       recordDiagnostic({
         operation: 'send',
         scope: 'run',
@@ -1490,7 +1519,6 @@ export class RunExecutor {
           ).data ?? 'other',
         durationMs: Date.now() - diagnosticStartedAt,
       })
-      const saved = this.core.conversations.findRun(run.id)
       if (!enteredNativeAdapter && (execution.cancelledByUser || saved?.status === 'interrupted')) {
         if (saved?.nativeEffectsState === 'pending') {
           this.core.publish(
@@ -1504,10 +1532,26 @@ export class RunExecutor {
         return
       }
       if (saved?.dispatchPhase === 'ended') {
-        this.core.publish(this.core.conversations.settleKnownNativeEnding(run.id, failure))
+        try {
+          await archiver.drain()
+        } catch {
+          // Output archive failure is already latched on `archiver`.
+        }
+        const drainedSaved = this.core.conversations.findRun(run.id)
+        const completedWithAnswer =
+          drainedSaved?.nativeOutcome === 'completed' &&
+          !archiver.outputFailure &&
+          this.core.conversations.hasCompleteResponse(run.id)
+        this.core.publish(
+          completedWithAnswer
+            ? this.core.conversations.settleKnownNativeEnding(run.id)
+            : this.core.conversations.settleKnownNativeEnding(
+                run.id,
+                archiver.outputFailure ?? failure,
+              ),
+        )
         const completedReceipt = archiver.completedNativeReceipt
         if (completedReceipt) {
-          await archiver.drain()
           this.reconcileOwnedCompletedCollaboration(run.id, completedReceipt)
         }
       } else if (saved?.dispatchPhase === 'rejected' || saved?.dispatchPhase === 'not_sent') {

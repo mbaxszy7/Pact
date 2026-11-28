@@ -1546,3 +1546,280 @@ it('A-F6 & A-Advisory2: preserves pending/complete background report on shutdown
     await f4.dispose()
   }
 })
+
+it('Carbon R2-A1 & R2-A3: lone-surrogate background report degrades with patch, unrecorded background error blocks settled/archive/quit/dispose, and >64 KiB archived answer drains before settleKnownNativeEnding', async () => {
+  // 1. R2-A1 Branch A: Lone UTF-16 surrogate in background report publishes unavailable patch + contentRevision=1
+  const f1 = await fixture('claude')
+  try {
+    let savedInput1: AgentRunInput | undefined
+    let savedExec1 = ''
+    let savedSid1 = ''
+    native.customRun = async function* (agentId, executorId, input) {
+      savedInput1 = input
+      savedExec1 = executorId
+      savedSid1 = `native:${input.sessionId}`
+      input.host?.lifecycle?.recordExecutor?.(executorId)
+      input.host?.lifecycle?.recordDispatch?.('possibly_sent', savedSid1, executorId)
+      yield { type: 'session.started', agentId, nativeSessionId: savedSid1 }
+      input.host?.lifecycle?.recordDispatch?.('accepted', savedSid1, executorId)
+      yield { type: 'turn.started', agentId, turnId: `turn:${input.runId}` }
+      native.background.add(input.runId)
+      yield {
+        type: 'text.completed',
+        agentId,
+        turnId: `turn:${input.runId}`,
+        outputId: 'answer',
+        text: 'Root answer',
+      }
+      yield { type: 'turn.completed', agentId, turnId: `turn:${input.runId}`, outcome: 'completed' }
+    }
+    const patches: Array<{ messages: Array<{ state: string; revision: number }> }> = []
+    const unsub = f1.flow.subscribe((p) => {
+      patches.push({
+        messages: (p.messages ?? []).map((entry) => ({
+          state: entry.message.state,
+          revision: entry.message.contentRevision,
+        })),
+      })
+    })
+    try {
+      const drafts = f1.db.conversationRepository.readPage({
+        scope: 'drafts',
+        sessionId: f1.sessionId,
+      })
+      if (drafts.scope !== 'drafts') throw new Error('Missing drafts')
+      const sent = await f1.flow.send({
+        sessionId: f1.sessionId,
+        clientMessageId: randomUUID(),
+        content: 'Lone surrogate background report test',
+        expectedCommentsRevision: drafts.commentsRevision,
+        commentIds: [],
+        route: { type: 'agent', agentId: 'claude' },
+      })
+      if (!sent.ok) throw new Error('Expected send to succeed')
+      const runId = sent.value.runs[0]!.id
+      await vi.waitFor(() => expect(f1.flow.diagnostics().activeExecutions).toBe(0))
+      await savedInput1!.host!.effects!.recordBackgroundReport!({
+        agentId: 'claude',
+        runId,
+        nativeSessionId: savedSid1,
+        nativeTurnId: `turn:${runId}`,
+        bindingGeneration: savedInput1!.bindingGeneration!,
+        executorId: savedExec1,
+        frameId: randomUUID(),
+        nativeMessageId: 'bg-lone-surrogate',
+        text: 'bad\uD800surrogate',
+      })
+      const unavail = f1.db.drizzle
+        .select()
+        .from(agentEventJournal)
+        .where(eq(agentEventJournal.runId, runId))
+        .all()
+        .filter((e) => e.eventType === 'background.report_unavailable')
+      expect(unavail).toHaveLength(1)
+      const bgRow = f1.db.drizzle
+        .select()
+        .from(conversationMessages)
+        .where(eq(conversationMessages.sessionId, f1.sessionId))
+        .all()
+        .find(
+          (m) =>
+            m.runId === null &&
+            m.role === 'assistant' &&
+            m.state === 'incomplete' &&
+            m.contentRevision >= 1,
+        )
+      expect(bgRow).toBeDefined()
+      expect(
+        patches.some((p) => p.messages.some((m) => m.state === 'incomplete' && m.revision >= 1)),
+      ).toBe(true)
+      native.background.delete(runId)
+    } finally {
+      unsub()
+    }
+  } finally {
+    await f1.dispose()
+  }
+
+  // 2. R2-A1 Branch B: Unrecorded background report failure propagates, blocks settled/archive/quit/dispose
+  const f2 = await fixture('claude')
+  try {
+    let savedInput2: AgentRunInput | undefined
+    let savedExec2 = ''
+    let savedSid2 = ''
+    native.customRun = async function* (agentId, executorId, input) {
+      savedInput2 = input
+      savedExec2 = executorId
+      savedSid2 = `native:${input.sessionId}`
+      input.host?.lifecycle?.recordExecutor?.(executorId)
+      input.host?.lifecycle?.recordDispatch?.('possibly_sent', savedSid2, executorId)
+      yield { type: 'session.started', agentId, nativeSessionId: savedSid2 }
+      input.host?.lifecycle?.recordDispatch?.('accepted', savedSid2, executorId)
+      yield { type: 'turn.started', agentId, turnId: `turn:${input.runId}` }
+      native.background.add(input.runId)
+      yield {
+        type: 'text.completed',
+        agentId,
+        turnId: `turn:${input.runId}`,
+        outputId: 'answer',
+        text: 'Root done',
+      }
+      yield { type: 'turn.completed', agentId, turnId: `turn:${input.runId}`, outcome: 'completed' }
+    }
+    const drafts2 = f2.db.conversationRepository.readPage({
+      scope: 'drafts',
+      sessionId: f2.sessionId,
+    })
+    if (drafts2.scope !== 'drafts') throw new Error('Missing drafts')
+    const sent2 = await f2.flow.send({
+      sessionId: f2.sessionId,
+      clientMessageId: randomUUID(),
+      content: 'Unrecorded background failure test',
+      expectedCommentsRevision: drafts2.commentsRevision,
+      commentIds: [],
+      route: { type: 'agent', agentId: 'claude' },
+    })
+    if (!sent2.ok) throw new Error('Expected send to succeed')
+    const runId2 = sent2.value.runs[0]!.id
+    await vi.waitFor(() => expect(f2.flow.diagnostics().activeExecutions).toBe(0))
+    const bgSpy = vi
+      .spyOn(f2.db.conversationRepository, 'recordBackgroundReport')
+      .mockRejectedValue(new Error('SQLITE_FULL: database or disk is full'))
+    const unavailSpy = vi
+      .spyOn(f2.db.conversationRepository, 'recordBackgroundReportUnavailable')
+      .mockImplementation(() => {
+        throw new Error('SQLITE_FULL: database or disk is full')
+      })
+    try {
+      await expect(
+        savedInput2!.host!.effects!.recordBackgroundReport!({
+          agentId: 'claude',
+          runId: runId2,
+          nativeSessionId: savedSid2,
+          nativeTurnId: `turn:${runId2}`,
+          bindingGeneration: savedInput2!.bindingGeneration!,
+          executorId: savedExec2,
+          frameId: randomUUID(),
+          nativeMessageId: 'bg-sqlite-full',
+          text: 'Will fail to persist',
+        }),
+      ).rejects.toThrow(/SQLITE_FULL/u)
+      native.background.delete(runId2)
+      savedInput2!.host!.effects!.reportNativeEffects!({
+        runId: runId2,
+        generation: savedInput2!.nativeGeneration!,
+        state: 'settled',
+      })
+      expect(f2.db.conversationRepository.findRun(runId2)?.nativeEffectsState).toBe('unknown')
+      const preview = f2.flow.prepareWorkspaceArchive({
+        operationId: randomUUID(),
+        scope: { kind: 'session', sessionId: f2.sessionId },
+      })
+      expect(preview.ok && Boolean(preview.value.blockedReason)).toBe(true)
+      const quitPrep = f2.flow.prepareNativeQuit({ operationId: randomUUID() })
+      expect(quitPrep.ok && quitPrep.value.state).toBe('confirmation_required')
+      await expect(f2.flow.dispose({ flushDeadlineAt: Date.now() + 2000 })).rejects.toThrow(
+        /could not finish all output commits/u,
+      )
+    } finally {
+      bgSpy.mockRestore()
+      unavailSpy.mockRestore()
+    }
+  } finally {
+    await f2.dispose().catch(() => undefined)
+  }
+
+  // 3. R2-A3: >64 KiB archived answer + foreground interrupt after ended(completed) drains before settleKnownNativeEnding
+  // with zero pact.output_unavailable and no premature finishCollaboration(runId, false).
+  const f3 = await fixture('codex')
+  try {
+    const largeAnswer = 'Archived authoritative answer body. '.repeat(2100) // > 70 KiB
+    const finishSpy = vi.spyOn(f3.db.conversationRepository, 'finishCollaboration')
+    native.customRun = async function* (agentId, executorId, input) {
+      const nativeSid = `native:${input.sessionId}`
+      input.host?.lifecycle?.recordExecutor?.(executorId)
+      input.host?.lifecycle?.recordDispatch?.('possibly_sent', nativeSid, executorId)
+      yield { type: 'session.started', agentId, nativeSessionId: nativeSid }
+      input.host?.lifecycle?.recordDispatch?.('accepted', nativeSid, executorId)
+      yield { type: 'turn.started', agentId, turnId: `turn:${input.runId}` }
+      yield {
+        type: 'text.delta',
+        agentId,
+        turnId: `turn:${input.runId}`,
+        outputId: 'answer',
+        text: 'Prefix ',
+      }
+      input.host?.lifecycle?.recordNativeEvidence?.({
+        kind: 'ended',
+        source: 'live_terminal',
+        outcome: 'completed',
+        identity: {
+          sessionId: input.sessionId,
+          agentId,
+          runId: input.runId,
+          requestId: input.runId,
+          nativeSessionId: nativeSid,
+          nativeTurnId: `turn:${input.runId}`,
+          bindingGeneration: input.bindingGeneration!,
+          executorId,
+        },
+      })
+      // Hand off >64 KiB complete answer + turn.completed via archive channel, then throw interrupted on foreground!
+      input.host?.effects?.recordArchivedEvent?.({
+        type: 'text.completed',
+        agentId,
+        turnId: `turn:${input.runId}`,
+        outputId: 'answer',
+        text: largeAnswer,
+      })
+      input.host?.effects?.recordArchivedEvent?.({
+        type: 'turn.completed',
+        agentId,
+        turnId: `turn:${input.runId}`,
+        outcome: 'completed',
+      })
+      throw new DOMException('The user stopped foreground streaming.', 'AbortError')
+    }
+    const drafts3 = f3.db.conversationRepository.readPage({
+      scope: 'drafts',
+      sessionId: f3.sessionId,
+    })
+    if (drafts3.scope !== 'drafts') throw new Error('Missing drafts')
+    const sent3 = await f3.flow.send({
+      sessionId: f3.sessionId,
+      clientMessageId: randomUUID(),
+      content: 'Large archived snapshot after foreground interrupt',
+      expectedCommentsRevision: drafts3.commentsRevision,
+      commentIds: [],
+      route: { type: 'agent', agentId: 'codex' },
+    })
+    if (!sent3.ok) throw new Error('Expected send to succeed')
+    const runId3 = sent3.value.runs[0]!.id
+    await vi.waitFor(() => expect(f3.flow.diagnostics().activeExecutions).toBe(0))
+    const finalRun = f3.db.conversationRepository.findRun(runId3)
+    expect(finalRun?.status).toBe('completed')
+    expect(finalRun?.failureKind).toBeUndefined()
+    const unavailableOutput = f3.db.drizzle
+      .select()
+      .from(agentEventJournal)
+      .where(eq(agentEventJournal.runId, runId3))
+      .all()
+      .filter((e) => e.eventType === 'pact.output_unavailable')
+    expect(unavailableOutput).toHaveLength(0)
+    // Must NEVER have invoked finishCollaboration(runId3, false, ...) prematurely!
+    const prematureFalse = finishSpy.mock.calls.filter((call) => call[0] === runId3 && !call[1])
+    expect(prematureFalse).toHaveLength(0)
+    const page3 = f3.db.conversationRepository.readPage({
+      scope: 'messages',
+      sessionId: f3.sessionId,
+    })
+    expect(page3.scope).toBe('messages')
+    if (page3.scope !== 'messages') throw new Error('expected messages page')
+    const visibleAssistant = page3.messages.filter((m) => m.message.role === 'assistant')
+    expect(visibleAssistant).toHaveLength(1)
+    expect(visibleAssistant[0]?.message.state).toBe('complete')
+    finishSpy.mockRestore()
+  } finally {
+    await f3.dispose()
+  }
+})

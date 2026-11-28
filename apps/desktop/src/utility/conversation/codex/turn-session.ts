@@ -430,17 +430,30 @@ export class CodexTurnSession {
     let rootTerminalOutcome: 'completed' | 'failed' | 'interrupted' | undefined
     let foregroundTurnCompletedYielded = false
     let archivedTurnCompletedEmitted = false
+    const rejectServerRequest = (req: object, message: string): void => {
+      if (!connection?.isOpen) return
+      const reqId = Reflect.get(req, 'id')
+      if (typeof reqId === 'string' || typeof reqId === 'number')
+        void connection.respondError(reqId, message).catch(() => undefined)
+    }
     const releaseRootStartupEarly = (releaseUnboundStartupHooks = false): void => {
       if (!background.early.length) return
       const kept: EarlyNativeFact[] = []
       let keptBytes = 0
       for (const entry of background.early) {
-        // A-F4 & Carbon A-5: Drop root-Turn startup candidates on rejection; also release
-        // unbound startup hooks when thread startup itself failed without binding a thread.
         if (
           entry.candidateKind === 'root_turn' ||
           (releaseUnboundStartupHooks && entry.candidateKind === 'startup_hook')
         ) {
+          if (
+            entry.candidateKind === 'root_turn' &&
+            Object.hasOwn(entry.event, 'id') &&
+            typeof Reflect.get(entry.event, 'method') === 'string'
+          )
+            rejectServerRequest(
+              entry.event,
+              'This native request belonged to a Turn that did not start.',
+            )
           entry.reservation.release()
         } else {
           kept.push(entry)
@@ -574,6 +587,7 @@ export class CodexTurnSession {
         threadStartupDispatched &&
         !background.primaryThreadId &&
         !background.rootNotStarted &&
+        !(typeof child === 'string' && input.nativeSessionId && child !== input.nativeSessionId) &&
         ['hook/started', 'hook/completed'].includes(String(Reflect.get(event, 'method')))
       const isPossiblyDeliveredWindow =
         (!background.foregroundReleased &&
@@ -650,15 +664,10 @@ export class CodexTurnSession {
                     Object.hasOwn(entry.event, 'id') &&
                     typeof Reflect.get(entry.event, 'method') === 'string'
                   ) {
-                    const requestId = Reflect.get(entry.event, 'id')
-                    if (typeof requestId === 'string' || typeof requestId === 'number') {
-                      void connection
-                        .respondError(
-                          requestId,
-                          'This native request does not belong to the active Turn.',
-                        )
-                        .catch(() => undefined)
-                    }
+                    rejectServerRequest(
+                      entry.event,
+                      'This native request does not belong to the active Turn.',
+                    )
                   }
                 } else {
                   progressed = true
@@ -1462,27 +1471,20 @@ export class CodexTurnSession {
         if (
           !params ||
           typeof params !== 'object' ||
-          Reflect.get(params, 'threadId') !== (threadId ?? provisionalThreadId)
+          Reflect.get(params, 'threadId') !==
+            (threadId ?? provisionalThreadId ?? input.nativeSessionId)
         )
           return false
         const item = Reflect.get(params, 'item')
-        if (item && typeof item === 'object') {
-          if (Reflect.get(event, 'method') === 'item/started')
-            cacheApprovalItem(
-              approvalItems,
-              item,
-              Reflect.get(params, 'threadId'),
-              Reflect.get(params, 'turnId'),
-            )
-        }
+        if (item && typeof item === 'object' && Reflect.get(event, 'method') === 'item/started')
+          cacheApprovalItem(
+            approvalItems,
+            item,
+            Reflect.get(params, 'threadId'),
+            Reflect.get(params, 'turnId'),
+          )
         return false
       })
-      const rejectServerRequest = (req: object, message: string): void => {
-        const requestId = Reflect.get(req, 'id')
-        if (typeof requestId === 'string' || typeof requestId === 'number') {
-          void nativeConnection.respondError(requestId, message).catch(() => undefined)
-        }
-      }
       releaseNativeRequests = nativeConnection.subscribeServerRequests((request) => {
         if (handleOwnedNativeEvent(request)) return true
         const method = Reflect.get(request, 'method'),
@@ -1491,6 +1493,7 @@ export class CodexTurnSession {
         const nativeThread =
           Reflect.get(params, 'threadId') ?? Reflect.get(params, 'conversationId')
         const requestedTurn = Reflect.get(params, 'turnId')
+        const expectedThread = threadId ?? provisionalThreadId ?? input.nativeSessionId
         if (
           !threadStartupDispatched ||
           background.closed ||
@@ -1500,7 +1503,7 @@ export class CodexTurnSession {
           typeof nativeThread !== 'string' ||
           !nativeThread ||
           nativeThread.length > 1024 ||
-          ((threadId ?? provisionalThreadId) && nativeThread !== (threadId ?? provisionalThreadId))
+          (expectedThread && nativeThread !== expectedThread)
         )
           return false
         if (

@@ -1893,4 +1893,85 @@ describe('CodexTurnSession Astra Shard 3 audit regressions', () => {
       expect((caught as AgentExecutionError).message).toContain('Upstream gateway 503')
     }
   })
+
+  it('Carbon R2-A2: thread/resume filters foreign-thread server requests before response without poisoning provisionalThreadId', async () => {
+    let userInputCalls = 0
+    let permissionCalls = 0
+    const harness = createFakeCodexProcess((request, respond, notify) => {
+      if (request.method === 'thread/resume') {
+        // Before thread/resume responds, foreign-thread turn-less elicitation & execCommandApproval arrive!
+        notify({
+          id: 'foreign-elic-r2a2',
+          method: 'mcpServer/elicitation/request',
+          params: {
+            threadId: 'th-foreign-r2a2',
+            mode: 'form',
+            message: 'Foreign thread prompt',
+            requestedSchema: {
+              type: 'object',
+              properties: { key: { type: 'string' } },
+            },
+          },
+        })
+        notify({
+          id: 'foreign-exec-r2a2',
+          method: 'execCommandApproval',
+          params: {
+            conversationId: 'th-foreign-r2a2',
+            command: ['echo', 'foreign'],
+          },
+        })
+        respond({ id: request.id, result: defaultThreadStartResult('th-saved-r2a2') })
+      } else if (request.method === 'turn/start') {
+        respond({ id: request.id, result: { turn: { id: 'turn-r2a2' } } })
+        notify({
+          method: 'item/completed',
+          params: {
+            threadId: 'th-saved-r2a2',
+            turnId: 'turn-r2a2',
+            item: { id: 'ans-r2a2', type: 'agentMessage', text: 'Resumed cleanly' },
+          },
+        })
+        notify({
+          method: 'turn/completed',
+          params: {
+            threadId: 'th-saved-r2a2',
+            turn: { id: 'turn-r2a2', status: 'completed' },
+          },
+        })
+      }
+    })
+    const adapter = new CodexAgentAdapter('/fake/codex', () => harness.child)
+    openAdapters.push(adapter)
+    const events: NormalizedAgentEvent[] = []
+    for await (const ev of adapter.run(
+      baseRunInput({
+        nativeSessionId: 'th-saved-r2a2',
+        host: {
+          interactions: {
+            requestUserInput: async () => {
+              userInputCalls += 1
+              return { action: 'accept', values: { key: 'nope' } }
+            },
+            requestPermission: async () => {
+              permissionCalls += 1
+              return 'accept'
+            },
+          },
+        },
+      }),
+      new AbortController().signal,
+    )) {
+      events.push(ev)
+    }
+    expect(userInputCalls).toBe(0)
+    expect(permissionCalls).toBe(0)
+    // This resuming TurnSession must NOT have claimed/answered or polluted provisionalThreadId with th-foreign-r2a2!
+    expect(events).toContainEqual(
+      expect.objectContaining({ type: 'text.completed', text: 'Resumed cleanly' }),
+    )
+    expect(events).toContainEqual(
+      expect.objectContaining({ type: 'turn.completed', outcome: 'completed' }),
+    )
+  })
 })

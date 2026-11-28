@@ -306,8 +306,12 @@ export class ArchiveAndQuitCoordinator {
       for (const entry of this.core.unrecordedArchiveFailures.values())
         identities.add(entry.sessionId)
       for (const owner of this.core.nativeObservations.values()) {
-        if (owner.archiver.failureRecordingError !== undefined)
+        if (
+          owner.archiver.failureRecordingError !== undefined ||
+          owner.backgroundReportRecordingError !== undefined
+        ) {
           identities.add(owner.archiver.sessionId)
+        }
       }
       const unsettled = this.core.conversations.nativeQuitUnsettled([...identities])
       const activeCount =
@@ -474,7 +478,11 @@ export class ArchiveAndQuitCoordinator {
       if (belongs(entry.sessionId)) return true
     }
     for (const owner of this.core.nativeObservations.values()) {
-      if (owner.archiver.failureRecordingError !== undefined && belongs(owner.archiver.sessionId)) {
+      if (
+        (owner.archiver.failureRecordingError !== undefined ||
+          owner.backgroundReportRecordingError !== undefined) &&
+        belongs(owner.archiver.sessionId)
+      ) {
         return true
       }
     }
@@ -1159,7 +1167,10 @@ export class ArchiveAndQuitCoordinator {
     }
     for (const owner of this.core.nativeObservations.values()) {
       try {
-        if (owner.archiver.failureRecordingError !== undefined || owner.backgroundReportFailed) {
+        if (
+          owner.archiver.failureRecordingError !== undefined ||
+          owner.backgroundReportRecordingError !== undefined
+        ) {
           flushed = false
         }
         if (owner.archiver.archiveBuffer && !owner.archiver.archiveBuffer.dispose()) flushed = false
@@ -1247,7 +1258,10 @@ export class ArchiveAndQuitCoordinator {
       flushed = false
     }
     for (const owner of this.core.nativeObservations.values()) {
-      if (owner.archiver.failureRecordingError !== undefined || owner.backgroundReportFailed) {
+      if (
+        owner.archiver.failureRecordingError !== undefined ||
+        owner.backgroundReportRecordingError !== undefined
+      ) {
         flushed = false
       }
     }

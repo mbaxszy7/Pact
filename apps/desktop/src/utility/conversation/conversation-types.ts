@@ -201,7 +201,7 @@ export interface NativeObservation {
   foregroundExited: boolean
   observationController: AbortController
   backgroundReportTasks?: Set<Promise<void>> | undefined
-  backgroundReportFailed?: boolean | undefined
+  backgroundReportRecordingError?: unknown
   release?: (() => void) | undefined
   backgroundStop?:
     | {

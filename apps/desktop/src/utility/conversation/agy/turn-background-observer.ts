@@ -496,21 +496,19 @@ export interface AgyTurnCancelHost {
   readonly getResolvedSessionId: () => string | undefined
   readonly getActiveExecutorId: () => string
   readonly getConnection: () => AgyAcpConnection | undefined
-  readonly hasActiveLease: () => boolean
+  readonly isPromptPhysicalSettled: () => boolean
   readonly hasServerPromptReply: () => boolean
   readonly isCancelEligible: () => boolean
   readonly isTurnClosedForCancel: () => boolean
 }
 
-/** Idempotent per-Turn cancellation controller with first-byte `canDispatch` fence (Carbon B-4). */
+/** Idempotent per-Turn cancellation controller with first-byte `canDispatch` fence (Carbon B-4 / R2-B1). */
 export class AgyTurnCancelController {
   private sent = false
 
   constructor(private readonly host: AgyTurnCancelHost) {}
 
   requestCancel(options?: {
-    readonly allowDisposed?: boolean | undefined
-    readonly signal?: AbortSignal | undefined
     readonly onError?: (() => void) | undefined
   }): Promise<void> | undefined {
     const activeRun = this.host.getActiveRun()
@@ -520,27 +518,23 @@ export class AgyTurnCancelController {
     if (this.sent || !this.host.isCancelEligible() || !resolvedSessionId || !connection?.isOpen) {
       return undefined
     }
-    const allowDisposed = options?.allowDisposed === true
+    // Single-connection OutboundFrameQueue is strictly FIFO, so Run 1's session/cancel precedes any
+    // subsequent Run 2 frame on the same lease. Fence first-byte dispatch solely on whether this
+    // promptOp has not yet physically settled or received a server reply (never on UI signal/disposed).
     const canDispatch = (): boolean =>
-      allowDisposed
-        ? connection.isOpen && !this.host.hasServerPromptReply() && this.host.hasActiveLease()
-        : connection.isOpen &&
-          !this.host.isTurnClosedForCancel() &&
-          (!activeRun || (!activeRun.rootTerminal && !activeRun.promptRpcCompleted)) &&
-          !this.host.runtime.disposed &&
-          (!activeRun || this.host.runtime.activeRuns.get(this.host.input.runId) === activeRun)
+      connection.isOpen && !this.host.isPromptPhysicalSettled() && !this.host.hasServerPromptReply()
     if (!canDispatch()) return undefined
     this.sent = true
     return connection
-      .notify(
-        'session/cancel',
-        { sessionId: resolvedSessionId },
-        {
-          ...(options?.signal ? { signal: options.signal } : {}),
-          canDispatch,
-        },
-      )
+      .notify('session/cancel', { sessionId: resolvedSessionId }, { canDispatch })
       .catch((err: unknown) => {
+        if (
+          this.host.isTurnClosedForCancel() ||
+          this.host.isPromptPhysicalSettled() ||
+          this.host.hasServerPromptReply()
+        ) {
+          return
+        }
         recordDiagnostic({
           operation: 'native_check',
           phase: 'failed',

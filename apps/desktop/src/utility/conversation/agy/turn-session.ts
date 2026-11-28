@@ -317,6 +317,7 @@ export class AgyTurnSession {
       },
     })
 
+    let promptPhysicalSettled = false
     const cancelController = new AgyTurnCancelController({
       runtime: this.runtime,
       input,
@@ -324,7 +325,7 @@ export class AgyTurnSession {
       getResolvedSessionId: () => resolvedSessionId,
       getActiveExecutorId: () => activeExecutorId,
       getConnection: () => lease?.connection,
-      hasActiveLease: () => lease !== undefined,
+      isPromptPhysicalSettled: () => promptPhysicalSettled,
       hasServerPromptReply: () => promptRpcResolvedResponseRef !== undefined,
       isCancelEligible: () =>
         rootFirstByteWritten && !promptSettled && !promptRpcCompleted && !rootTerminal,
@@ -362,7 +363,16 @@ export class AgyTurnSession {
       isRootTerminal: () => rootTerminal,
       isReplayingHistory: () => replayingHistory,
       getPromptCutoffSeq: () => promptCutoffSeq,
-      onRequestTurnCancel: (cancelSignal) => requestTurnCancel({ signal: cancelSignal }),
+      onRequestTurnCancel: () =>
+        requestTurnCancel({
+          onError: () => {
+            if (!rootTerminal) {
+              reportUnknown(
+                'Native Antigravity cancellation could not be confirmed; observation remains active.',
+              )
+            }
+          },
+        }),
       pushPendingEvent: (ev) => pushPendingEventForRouter?.(ev),
     })
     const interactionControllers = interactionRouter.interactionControllers
@@ -748,7 +758,7 @@ export class AgyTurnSession {
           clearTimeout(cancelGraceTimer)
           cancelGraceTimer = undefined
         }
-        void requestTurnCancel({ allowDisposed: true })
+        void requestTurnCancel()
         promptRpcAbort.abort()
       },
       closeZeroInputSession: (deadlineAt?: number): Promise<void> =>
@@ -1440,6 +1450,10 @@ export class AgyTurnSession {
           promptMemoryReservation?.release()
           promptMemoryReservation = undefined
         },
+      })
+      void promptOp.physicalOutcome.then(() => {
+        promptPhysicalSettled = true
+        return undefined
       })
 
       let promptResponse: object | undefined

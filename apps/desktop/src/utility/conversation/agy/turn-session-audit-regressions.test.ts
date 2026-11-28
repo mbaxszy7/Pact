@@ -3895,4 +3895,332 @@ describe('Final Astra Audit Antigravity regressions (B-F1..B-F12)', () => {
       }
     }
   })
+
+  it('Carbon R2-B1: backpressured session/cancel dispatches across dispose/abort/agy-cancel while fencing post-abort replies without false unknown', async () => {
+    const { cwd, appDataDir } = await createEnv()
+
+    // Chain A1: Paused stdin + adapter.dispose() (no server reply) MUST still write 1 session/cancel when stdin resumes!
+    {
+      const harness = createAcpHarness({ highWaterMark: 16 })
+      const sid = randomUUID()
+      const promptSeen = Promise.withResolvers<unknown>()
+      const blockerSeen = Promise.withResolvers<void>()
+      harness.onClientFrame((frame) => {
+        if (frame.method === 'initialize') {
+          harness.sendToClient({ jsonrpc: '2.0', id: frame.id, result: { protocolVersion: 1 } })
+        } else if (frame.method === 'session/new') {
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            id: frame.id,
+            result: { sessionId: sid, configOptions: defaultConfigOptions() },
+          })
+        } else if (
+          frame.method === 'session/set_mode' ||
+          frame.method === 'session/set_config_option'
+        ) {
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            id: frame.id,
+            result: { configOptions: defaultConfigOptions() },
+          })
+        } else if (frame.method === 'session/prompt') {
+          promptSeen.resolve(frame.id)
+        } else if (frame.id === 'blk-r2b1-a1') {
+          blockerSeen.resolve()
+        }
+      })
+      const sharedPool = new AgyAcpConnectionPool({
+        executablePath: 'agy',
+        processFactory: () => harness.child,
+      })
+      const adapter = new AgyAgentAdapter({ appDataDir, connectionPool: sharedPool })
+      const run = collectEvents(adapter.run(makeRunInput(cwd), new AbortController().signal)).catch(
+        () => [],
+      )
+      try {
+        await promptSeen.promise
+        harness.pauseStdin()
+        harness.sendToClient({
+          jsonrpc: '2.0',
+          id: 'blk-r2b1-a1',
+          method: 'session/request_permission',
+          params: {
+            sessionId: sid,
+            toolCall: { toolCallId: 'tc-blk-a1', name: 'run_command', title: 'Blocker' },
+            options: [{ optionId: 'reject_once', name: 'Deny', kind: 'reject_once' }],
+            _meta: { sessionId: 'sess-other-a1' },
+          },
+        })
+        await blockerSeen.promise
+        const disposePromise = adapter.dispose({ flushDeadlineAt: Date.now() + 2_000 })
+        await new Promise((r) => setTimeout(r, 25))
+        harness.resumeStdin()
+        await disposePromise
+        await run
+        expect(harness.notifications.filter((n) => n.method === 'session/cancel')).toHaveLength(1)
+      } finally {
+        harness.resumeStdin()
+        await adapter.dispose()
+        await sharedPool.dispose()
+      }
+    }
+
+    // Chain A2: Paused stdin + adapter.dispose() where server replies on stdout AFTER promptRpcAbort -> 0 session/cancel!
+    {
+      const harness = createAcpHarness({ highWaterMark: 16 })
+      const sid = randomUUID()
+      const promptSeen = Promise.withResolvers<unknown>()
+      const blockerSeen = Promise.withResolvers<void>()
+      harness.onClientFrame((frame) => {
+        if (frame.method === 'initialize') {
+          harness.sendToClient({ jsonrpc: '2.0', id: frame.id, result: { protocolVersion: 1 } })
+        } else if (frame.method === 'session/new') {
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            id: frame.id,
+            result: { sessionId: sid, configOptions: defaultConfigOptions() },
+          })
+        } else if (
+          frame.method === 'session/set_mode' ||
+          frame.method === 'session/set_config_option'
+        ) {
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            id: frame.id,
+            result: { configOptions: defaultConfigOptions() },
+          })
+        } else if (frame.method === 'session/prompt') {
+          promptSeen.resolve(frame.id)
+        } else if (frame.id === 'blk-r2b1-a2') {
+          blockerSeen.resolve()
+        }
+      })
+      const sharedPool = new AgyAcpConnectionPool({
+        executablePath: 'agy',
+        processFactory: () => harness.child,
+      })
+      const adapter = new AgyAgentAdapter({ appDataDir, connectionPool: sharedPool })
+      const run = collectEvents(adapter.run(makeRunInput(cwd), new AbortController().signal)).catch(
+        () => [],
+      )
+      try {
+        const promptId = await promptSeen.promise
+        harness.pauseStdin()
+        harness.sendToClient({
+          jsonrpc: '2.0',
+          id: 'blk-r2b1-a2',
+          method: 'session/request_permission',
+          params: {
+            sessionId: sid,
+            toolCall: { toolCallId: 'tc-blk-a2', name: 'run_command', title: 'Blocker' },
+            options: [{ optionId: 'reject_once', name: 'Deny', kind: 'reject_once' }],
+            _meta: { sessionId: 'sess-other-a2' },
+          },
+        })
+        await blockerSeen.promise
+        const disposePromise = adapter.dispose({ flushDeadlineAt: Date.now() + 2_000 })
+        await new Promise((r) => setTimeout(r, 20))
+        // Server reply arrives on stdout AFTER promptRpcAbort ran, BEFORE stdin resumes -> physicalOutcome settles!
+        harness.sendToClient({
+          jsonrpc: '2.0',
+          id: promptId,
+          result: { stopReason: 'end_turn' },
+        })
+        await new Promise((r) => setTimeout(r, 20))
+        harness.resumeStdin()
+        await disposePromise
+        await run
+        expect(harness.notifications.filter((n) => n.method === 'session/cancel')).toHaveLength(0)
+      } finally {
+        harness.resumeStdin()
+        await adapter.dispose()
+        await sharedPool.dispose()
+      }
+    }
+
+    // Chain B & C: Paused stdin + 'agy-cancel' followed by abort() + dispose() -> still writes 1 session/cancel!
+    {
+      const harness = createAcpHarness({ highWaterMark: 16 })
+      const sid = randomUUID()
+      const permStarted = Promise.withResolvers<void>()
+      const releasePerm = Promise.withResolvers<string>()
+      const blockerSeen = Promise.withResolvers<void>()
+      harness.onClientFrame((frame) => {
+        if (frame.method === 'initialize') {
+          harness.sendToClient({ jsonrpc: '2.0', id: frame.id, result: { protocolVersion: 1 } })
+        } else if (frame.method === 'session/new') {
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            id: frame.id,
+            result: { sessionId: sid, configOptions: defaultConfigOptions() },
+          })
+        } else if (
+          frame.method === 'session/set_mode' ||
+          frame.method === 'session/set_config_option'
+        ) {
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            id: frame.id,
+            result: { configOptions: defaultConfigOptions() },
+          })
+        } else if (frame.method === 'session/prompt') {
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            id: 'perm-r2b1-c',
+            method: 'session/request_permission',
+            params: {
+              sessionId: sid,
+              toolCall: { toolCallId: 'tc-r2b1-c', name: 'run_command', title: 'Run' },
+              options: [
+                { optionId: 'allow_once', name: 'Allow', kind: 'allow_once' },
+                { optionId: 'reject_once', name: 'Deny', kind: 'reject_once' },
+              ],
+            },
+          })
+        } else if (frame.id === 'blk-r2b1-c') {
+          blockerSeen.resolve()
+        }
+      })
+      const sharedPool = new AgyAcpConnectionPool({
+        executablePath: 'agy',
+        processFactory: () => harness.child,
+      })
+      const adapter = new AgyAgentAdapter({ appDataDir, connectionPool: sharedPool })
+      const abort = new AbortController()
+      const run = collectEvents(
+        adapter.run(
+          makeRunInput(cwd, {
+            host: {
+              interactions: {
+                requestPermission: async () => {
+                  permStarted.resolve()
+                  return releasePerm.promise
+                },
+              },
+            },
+          }),
+          abort.signal,
+        ),
+      ).catch(() => [])
+      try {
+        await permStarted.promise
+        harness.pauseStdin()
+        harness.sendToClient({
+          jsonrpc: '2.0',
+          id: 'blk-r2b1-c',
+          method: 'session/request_permission',
+          params: {
+            sessionId: sid,
+            toolCall: { toolCallId: 'tc-blk-c', name: 'run_command', title: 'Blocker' },
+            options: [{ optionId: 'reject_once', name: 'Deny', kind: 'reject_once' }],
+            _meta: { sessionId: 'sess-other-c' },
+          },
+        })
+        await blockerSeen.promise
+        releasePerm.resolve('agy-cancel')
+        await new Promise((r) => setTimeout(r, 20))
+        abort.abort()
+        const disposePromise = adapter.dispose({ flushDeadlineAt: Date.now() + 2_000 })
+        await new Promise((r) => setTimeout(r, 20))
+        harness.resumeStdin()
+        await disposePromise
+        await run
+        expect(harness.notifications.filter((n) => n.method === 'session/cancel')).toHaveLength(1)
+      } finally {
+        harness.resumeStdin()
+        await adapter.dispose()
+        await sharedPool.dispose()
+      }
+    }
+
+    // Chain D: Paused stdin + abort() + end_turn while waitForRootOutput holds !rootTerminal ->
+    // fenced cancel does NOT reportUnknown; final reportNativeEffects is 'settled'!
+    {
+      const harness = createAcpHarness({ highWaterMark: 16 })
+      const sid = randomUUID()
+      const promptSeen = Promise.withResolvers<unknown>()
+      const blockerSeen = Promise.withResolvers<void>()
+      const waitStarted = Promise.withResolvers<void>()
+      const releaseWait = Promise.withResolvers<void>()
+      harness.onClientFrame((frame) => {
+        if (frame.method === 'initialize') {
+          harness.sendToClient({ jsonrpc: '2.0', id: frame.id, result: { protocolVersion: 1 } })
+        } else if (frame.method === 'session/new') {
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            id: frame.id,
+            result: { sessionId: sid, configOptions: defaultConfigOptions() },
+          })
+        } else if (
+          frame.method === 'session/set_mode' ||
+          frame.method === 'session/set_config_option'
+        ) {
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            id: frame.id,
+            result: { configOptions: defaultConfigOptions() },
+          })
+        } else if (frame.method === 'session/prompt') {
+          promptSeen.resolve(frame.id)
+        } else if (frame.id === 'blk-r2b1-d') {
+          blockerSeen.resolve()
+        }
+      })
+      const adapter = new AgyAgentAdapter({ appDataDir, processFactory: () => harness.child })
+      const abort = new AbortController()
+      const effects: Array<{ state: string }> = []
+      const run = collectEvents(
+        adapter.run(
+          makeRunInput(cwd, {
+            host: {
+              lifecycle: {
+                waitForRootOutput: async () => {
+                  waitStarted.resolve()
+                  await releaseWait.promise
+                },
+              },
+              effects: { reportNativeEffects: (r) => effects.push({ state: r.state }) },
+            },
+          }),
+          abort.signal,
+        ),
+      )
+      try {
+        const promptId = await promptSeen.promise
+        harness.pauseStdin()
+        harness.sendToClient({
+          jsonrpc: '2.0',
+          id: 'blk-r2b1-d',
+          method: 'session/request_permission',
+          params: {
+            sessionId: sid,
+            toolCall: { toolCallId: 'tc-blk-d', name: 'run_command', title: 'Blocker' },
+            options: [{ optionId: 'reject_once', name: 'Deny', kind: 'reject_once' }],
+            _meta: { sessionId: 'sess-other-d' },
+          },
+        })
+        await blockerSeen.promise
+        abort.abort()
+        await new Promise((r) => setTimeout(r, 20))
+        harness.sendToClient({
+          jsonrpc: '2.0',
+          id: promptId,
+          result: { stopReason: 'end_turn', execution_id: 'exec-r2b1-d' },
+        })
+        await waitStarted.promise
+        // Resume stdin WHILE waitForRootOutput is still paused (`rootTerminal === false`)!
+        harness.resumeStdin()
+        await new Promise((r) => setTimeout(r, 30))
+        releaseWait.resolve()
+        await run
+        expect(harness.notifications.filter((n) => n.method === 'session/cancel')).toHaveLength(0)
+        expect(effects.some((e) => e.state === 'unknown')).toBe(false)
+        expect(effects.at(-1)?.state).toBe('settled')
+      } finally {
+        releaseWait.resolve()
+        harness.resumeStdin()
+        await adapter.dispose()
+      }
+    }
+  })
 })
