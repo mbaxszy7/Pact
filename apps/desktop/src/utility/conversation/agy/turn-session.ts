@@ -1,19 +1,10 @@
 import { isDeepStrictEqual } from 'node:util'
 
 import type { AgentRunInput } from '@pact/agent-runtime'
-import type {
-  CollaborationInputObservation,
-  CollaborationReviewObservation,
-  NormalizedAgentEvent,
-  SessionPermissionMode,
-} from '@pact/contracts'
+import type { NormalizedAgentEvent, SessionPermissionMode } from '@pact/contracts'
 
 import { RunLifecycleKernel, validateSourceGrant } from '@pact/agent-runtime'
-import {
-  buildBoundedNativePlanId,
-  collaborationAskMode,
-  collaborationPlanMode,
-} from '@pact/contracts'
+import { collaborationAskMode, collaborationPlanMode } from '@pact/contracts'
 
 import type {
   AgyIngress,
@@ -36,7 +27,6 @@ import {
   AGY_SESSION_LIFECYCLE_RPC_TIMEOUT_MS,
   createAgyRootFrameNotWrittenProof,
 } from '../agy-acp-connection'
-import { mergeWorkflowInput, mergeWorkflowReview } from '../collaboration-answer'
 import { collaborationReadOnly } from '../collaboration-prompt'
 import {
   AgyRoundEffectsTracker,
@@ -46,8 +36,8 @@ import {
 } from '../native-file-changes'
 import { NativePermissionWait } from '../native-permission-wait'
 import { bindAgySkillSelections } from '../native-skill-catalog'
+import { TurnResourceScope } from '../turn-resource-scope'
 import {
-  computeRetainedPlanTextBytes,
   formatAgyRpcErrorMessage,
   parseAgyPromptTerminalReply,
   validateAgyFrame,
@@ -65,6 +55,7 @@ import {
   AgyTurnCancelController,
   AgyTurnEffectsReporter,
 } from './turn-background-observer'
+import { AgyTurnCollaborationTracker } from './turn-collaboration-tracker'
 import {
   AgyPendingEventQueue,
   AgyPrePromptReplayTracker,
@@ -151,16 +142,11 @@ export class AgyTurnSession {
       !readOnlyStage && effectivePermissionMode === 'full' ? 'full' : 'standard'
 
     const tools = new Map<string, AgyToolState>()
-    const approvedBrainPlanCalls = new Map<
-      string,
-      { readonly toolName: string; readonly args: Record<string, unknown> }
-    >()
-    let brainPlanTouched = false
-    const activeBrainPlanOpCallIds = new Set<string>()
-    const hasUnresolvedBrainPlanWrite = (): boolean => activeBrainPlanOpCallIds.size > 0
-    let latestBrainPlanCandidate: { nativeId: string; text: string } | undefined
-    let brainPlanReadbackRequired = false
-    let brainPlanCaptureFailed = false
+    const collaboration = new AgyTurnCollaborationTracker({
+      input,
+      planModeStage,
+      authorization,
+    })
     let unresolvedPreBindOutput = false
     let foregroundDeltaDropped = false
 
@@ -189,6 +175,8 @@ export class AgyTurnSession {
     let onControlSettled: (() => void) | undefined
     let enableEventDiscardMode: (() => void) | undefined
 
+    const foregroundScope = new TurnResourceScope()
+    const retainedScope = new TurnResourceScope()
     let lease: AgyPoolLease | undefined
     let sessionStream: AgyOrderedSessionStream | undefined
     let promptMemoryReservation: NativeMemoryReservation | undefined
@@ -203,7 +191,11 @@ export class AgyTurnSession {
     let serverRequestOwner: AgyServerRequestOwnerHandle | undefined
     let backgroundObserver: AgyTurnBackgroundObserver | undefined
     let activeRun: ActiveAgyRun | undefined
-    let cancelGraceTimer: ReturnType<typeof setTimeout> | undefined
+    let clearCancelGraceTimer: (() => void) | undefined
+    const clearCancelGrace = (): void => {
+      clearCancelGraceTimer?.()
+      clearCancelGraceTimer = undefined
+    }
     let promptSettled = false
     const promptRpcAbort = new AbortController()
     const runDisposeAbort = new AbortController()
@@ -221,7 +213,11 @@ export class AgyTurnSession {
     let finalTerminalEvidenceCommitted = false
     let compactTerminalCommitError: unknown
     let liveTerminalOutcome: 'completed' | 'interrupted' | 'failed' | undefined
-    let controlDrainTimer: ReturnType<typeof setTimeout> | undefined
+    let clearControlDrainTimer: (() => void) | undefined
+    const clearControlDrain = (): void => {
+      clearControlDrainTimer?.()
+      clearControlDrainTimer = undefined
+    }
     let releaseReplayMarker: (() => void) | undefined
     let settlePromptFromResponseRef: ((res: object) => void) | undefined
     let promptRpcResolvedResponseRef: object | undefined
@@ -304,7 +300,7 @@ export class AgyTurnSession {
       peerTargetAgentId: this.runtime.options.peerTargetAgentId,
       sourceGrant: input.promptEnvelope.sourceGrant,
       sourceReader: input.host?.workflow?.sourceReader,
-      isPlanRetentionCurrent: () => !brainPlanTouched && !hasUnresolvedBrainPlanWrite(),
+      isPlanRetentionCurrent: () => collaboration.isPlanRetentionCurrent(),
       recordOpenPlanFinalIntent: input.host?.workflow?.recordOpenPlanFinalIntent,
       reserveCorrelationBytes: (nextBytes) => {
         if (!mcpCorrelationMemoryReservation) return true
@@ -342,12 +338,9 @@ export class AgyTurnSession {
       input,
       mcpServer,
       tools,
-      approvedBrainPlanCalls,
+      approvedBrainPlanCalls: collaboration.approvedBrainPlanCalls,
       onBrainPlanWriteApproved: (toolCallId) => {
-        brainPlanTouched = true
-        if (activeBrainPlanOpCallIds.size < 64) {
-          activeBrainPlanOpCallIds.add(toolCallId)
-        }
+        collaboration.onBrainPlanWriteApproved(toolCallId)
       },
       readOnlyStage,
       planModeStage,
@@ -388,6 +381,16 @@ export class AgyTurnSession {
     const detachActiveRun = (): void => effectsReporter.detachActiveRun()
     const reportSettled = (): void => effectsReporter.reportSettled()
     const reportUnknown = (reason: string): void => effectsReporter.reportUnknown(reason)
+
+    // Register base retained teardown steps in bottom-to-top LIFO order so pool lease release
+    // ALWAYS runs last (after background unsubscribe, reservations, source reader, and observation).
+    retainedScope.add('pool_lease', () => {
+      lease?.release()
+      lease = undefined
+    })
+    retainedScope.add('detach_active_run', () => detachActiveRun())
+    retainedScope.add('observation_abort', () => observation.abort())
+    retainedScope.add('retire_source_reader', () => retireSourceReader())
 
     const recordHostBeforeRootStart = (): void => {
       if (resolvedSessionId && input.host?.recovery) {
@@ -463,14 +466,8 @@ export class AgyTurnSession {
           }
         }
         try {
-          if (cancelGraceTimer !== undefined) {
-            clearTimeout(cancelGraceTimer)
-            cancelGraceTimer = undefined
-          }
-          if (controlDrainTimer !== undefined) {
-            clearTimeout(controlDrainTimer)
-            controlDrainTimer = undefined
-          }
+          clearCancelGrace()
+          clearControlDrain()
           runIsolated(() => releaseReplayMarker?.())
           // B-F5: If transport already received a verified root reply while consumer paused at soft cap,
           // unblock backpressure and settle that reply BEFORE stopping the stream pump and closing stream.
@@ -531,22 +528,16 @@ export class AgyTurnSession {
           runIsolated(() =>
             cleanupForegroundResources?.({ keepForeignExecReservation: retainBackground }),
           )
-          const releaseRes = (res: NativeMemoryReservation | undefined): undefined => {
-            runIsolated(() => res?.release())
-            return undefined
-          }
-          mcpCorrelationMemoryReservation = releaseRes(mcpCorrelationMemoryReservation)
-          publishedPlanMemoryReservation = releaseRes(publishedPlanMemoryReservation)
-          promptMemoryReservation = releaseRes(promptMemoryReservation)
-          toolStateMemoryReservation = releaseRes(toolStateMemoryReservation)
-          pendingEventsMemoryReservation = releaseRes(pendingEventsMemoryReservation)
-          stagedPreBindMemoryReservation = releaseRes(stagedPreBindMemoryReservation)
+          cleanupFailure ??= foregroundScope.dispose()
           if (!retainBackground) {
-            foreignExecIdsMemoryReservation = releaseRes(foreignExecIdsMemoryReservation)
+            runIsolated(() => {
+              foreignExecIdsMemoryReservation?.release()
+              foreignExecIdsMemoryReservation = undefined
+            })
           }
           abortOutstandingInteractions()
           tools.clear()
-          approvedBrainPlanCalls.clear()
+          collaboration.clearApprovedCalls()
           if (!isEmergency) {
             await closeZeroInputSessionOnce().catch(() => undefined)
           }
@@ -556,39 +547,8 @@ export class AgyTurnSession {
           })
           if (retainBackground && activeRun) {
             const retainedRun = activeRun
-            const retainedLease = lease
-            lease = undefined
-            let retainedCleaned = false
             const cleanupRetained = (): void => {
-              if (retainedCleaned) return
-              retainedCleaned = true
-              try {
-                backgroundObserver?.unsubscribe()
-              } catch {
-                // Keep releasing remaining retained resources.
-              }
-              try {
-                foregroundDedupMemoryReservation?.release()
-              } catch {
-                // Keep releasing remaining retained resources.
-              }
-              foregroundDedupMemoryReservation = undefined
-              try {
-                postCutoffBgMemoryReservation?.release()
-              } catch {
-                // Keep releasing remaining retained resources.
-              }
-              postCutoffBgMemoryReservation = undefined
-              try {
-                foreignExecIdsMemoryReservation?.release()
-              } catch {
-                // Keep releasing remaining retained resources.
-              }
-              foreignExecIdsMemoryReservation = undefined
-              retireSourceReader()
-              observation.abort()
-              detachActiveRun()
-              retainedLease?.release()
+              retainedScope.dispose()
             }
             try {
               handoffOrderedStreamToBackground?.(cleanupRetained)
@@ -604,7 +564,7 @@ export class AgyTurnSession {
             sessionStream?.close()
             sessionStream = undefined
             if (
-              !retainedCleaned &&
+              !retainedScope.isDisposed &&
               (retainedRun.observation.signal.aborted ||
                 this.runtime.disposed ||
                 emergencyCleanedUp)
@@ -614,7 +574,7 @@ export class AgyTurnSession {
                 emergency: emergencyCleanedUp || this.runtime.disposed,
               })
               cleanupRetained()
-            } else if (!retainedCleaned) {
+            } else if (!retainedScope.isDisposed) {
               retainedRun.observation.signal.addEventListener(
                 'abort',
                 () => {
@@ -656,16 +616,7 @@ export class AgyTurnSession {
                 emergency: isEmergency,
               }),
             )
-            runIsolated(() => backgroundObserver?.unsubscribe())
-            foregroundDedupMemoryReservation = releaseRes(foregroundDedupMemoryReservation)
-            postCutoffBgMemoryReservation = releaseRes(postCutoffBgMemoryReservation)
-            foreignExecIdsMemoryReservation = releaseRes(foreignExecIdsMemoryReservation)
-            runIsolated(() => retireSourceReader())
-            observation.abort()
-            runIsolated(() => {
-              lease?.release()
-              lease = undefined
-            })
+            cleanupFailure ??= retainedScope.dispose()
           }
           await this.kernel
             .settle({ retainBackgroundObservation: retainBackground })
@@ -711,14 +662,19 @@ export class AgyTurnSession {
         input.host?.effects?.backgroundWorkChanged?.()
         enableEventDiscardMode?.()
         abortOutstandingInteractions()
-        controlDrainTimer = setTimeout(() => {
-          if (!controlDrainActive) return
-          void completeFinalTeardown({
-            emergency: true,
-            unknownReason: 'Antigravity control-drain handoff exceeded its bounded timeout.',
-          }).catch(() => undefined)
-        }, AGY_CONTROL_DRAIN_HANDOFF_MS)
-        controlDrainTimer.unref?.()
+        clearControlDrainTimer = foregroundScope.setTimeout(
+          'control_drain_timer',
+          () => {
+            clearControlDrainTimer = undefined
+            if (!controlDrainActive) return
+            void completeFinalTeardown({
+              emergency: true,
+              unknownReason: 'Antigravity control-drain handoff exceeded its bounded timeout.',
+            }).catch(() => undefined)
+          },
+          AGY_CONTROL_DRAIN_HANDOFF_MS,
+          true,
+        )
         onControlSettled = () => {
           if (!controlDrainActive) return
           void completeFinalTeardown({
@@ -754,10 +710,7 @@ export class AgyTurnSession {
           this.runtime.projector.notifyRootExecutionWaiters(activeRun)
         }
         for (const ctrl of interactionControllers) ctrl.abort()
-        if (cancelGraceTimer !== undefined) {
-          clearTimeout(cancelGraceTimer)
-          cancelGraceTimer = undefined
-        }
+        clearCancelGrace()
         void requestTurnCancel()
         promptRpcAbort.abort()
       },
@@ -805,7 +758,13 @@ export class AgyTurnSession {
       await lease.ensureInitialized(runSignal)
 
       // Event queue fed by ordered server-request interactions (approval / question) and session updates.
-      pendingEventsMemoryReservation = connection.reserveWorkingMemory(0)
+      pendingEventsMemoryReservation = foregroundScope.trackReservation(
+        'pending_events_mem',
+        connection.reserveWorkingMemory(0),
+        () => {
+          pendingEventsMemoryReservation = undefined
+        },
+      )
       const eventQueue = new AgyPendingEventQueue(() => pendingEventsMemoryReservation)
       enableEventDiscardMode = () => {
         eventQueue.enableDiscardMode()
@@ -1179,13 +1138,55 @@ export class AgyTurnSession {
       // Prepare prompt content with Cutoff serialization & verified ACP images.
       const currentEnvelope =
         input.host?.lifecycle?.currentPromptEnvelope?.() ?? input.promptEnvelope
-      toolStateMemoryReservation = connection.reserveWorkingMemory(0)
-      foregroundDedupMemoryReservation = connection.reserveWorkingMemory(0)
-      mcpCorrelationMemoryReservation = connection.reserveWorkingMemory(0)
-      publishedPlanMemoryReservation = connection.reserveWorkingMemory(0)
-      stagedPreBindMemoryReservation = connection.reserveWorkingMemory(0)
-      foreignExecIdsMemoryReservation = connection.reserveWorkingMemory(0)
-      postCutoffBgMemoryReservation = connection.reserveWorkingMemory(0)
+      toolStateMemoryReservation = foregroundScope.trackReservation(
+        'tool_state_mem',
+        connection.reserveWorkingMemory(0),
+        () => {
+          toolStateMemoryReservation = undefined
+        },
+      )
+      foregroundDedupMemoryReservation = retainedScope.trackReservation(
+        'foreground_dedup_mem',
+        connection.reserveWorkingMemory(0),
+        () => {
+          foregroundDedupMemoryReservation = undefined
+        },
+      )
+      mcpCorrelationMemoryReservation = foregroundScope.trackReservation(
+        'mcp_correlation_mem',
+        connection.reserveWorkingMemory(0),
+        () => {
+          mcpCorrelationMemoryReservation = undefined
+        },
+      )
+      publishedPlanMemoryReservation = foregroundScope.trackReservation(
+        'published_plan_mem',
+        connection.reserveWorkingMemory(0),
+        () => {
+          publishedPlanMemoryReservation = undefined
+        },
+      )
+      stagedPreBindMemoryReservation = foregroundScope.trackReservation(
+        'staged_pre_bind_mem',
+        connection.reserveWorkingMemory(0),
+        () => {
+          stagedPreBindMemoryReservation = undefined
+        },
+      )
+      foreignExecIdsMemoryReservation = retainedScope.trackReservation(
+        'foreign_exec_ids_mem',
+        connection.reserveWorkingMemory(0),
+        () => {
+          foreignExecIdsMemoryReservation = undefined
+        },
+      )
+      postCutoffBgMemoryReservation = retainedScope.trackReservation(
+        'post_cutoff_bg_mem',
+        connection.reserveWorkingMemory(0),
+        () => {
+          postCutoffBgMemoryReservation = undefined
+        },
+      )
       const { promptBlocks, expectedFullPromptText } = await prepareAgyTurnPromptBlocks({
         currentEnvelope,
         runId: input.runId,
@@ -1195,7 +1196,13 @@ export class AgyTurnSession {
         mcpServer,
         sourceReader: input.host?.workflow?.sourceReader,
         reservePromptMemory: (bytes) => {
-          promptMemoryReservation = connection.reserveWorkingMemory(bytes)
+          promptMemoryReservation = foregroundScope.trackReservation(
+            'prompt_mem',
+            connection.reserveWorkingMemory(bytes),
+            () => {
+              promptMemoryReservation = undefined
+            },
+          )
         },
       })
 
@@ -1383,6 +1390,7 @@ export class AgyTurnSession {
         getPostCutoffBgReservation: () => postCutoffBgMemoryReservation,
       })
       backgroundObserver = observer
+      retainedScope.add('background_observer_unsubscribe', () => observer.unsubscribe())
 
       // Abort handler: distinguishes pre-write abort (`not_sent`) from post-write `session/cancel`
       // with a bounded settlement window for a real native `{ stopReason: 'cancelled' }` reply.
@@ -1406,15 +1414,22 @@ export class AgyTurnSession {
             }
           },
         })
-        if (cancelGraceTimer === undefined) {
-          cancelGraceTimer = setTimeout(() => {
-            cancelGraceTimer = undefined
-            promptRpcAbort.abort()
-          }, AGY_PHYSICAL_SETTLEMENT_GRACE_MS)
-          cancelGraceTimer.unref?.()
+        if (!clearCancelGraceTimer) {
+          clearCancelGraceTimer = foregroundScope.setTimeout(
+            'cancel_grace_timer',
+            () => {
+              clearCancelGraceTimer = undefined
+              promptRpcAbort.abort()
+            },
+            AGY_PHYSICAL_SETTLEMENT_GRACE_MS,
+            true,
+          )
         }
       }
       signal.addEventListener('abort', onCallerAbort, { once: true })
+      const unregisterCallerAbort = foregroundScope.add('caller_abort_listener', () =>
+        signal.removeEventListener('abort', onCallerAbort),
+      )
       if (signal.aborted) {
         onCallerAbort()
       }
@@ -1534,10 +1549,7 @@ export class AgyTurnSession {
           }
           this.runtime.projector.notifyRootExecutionWaiters(activeRun)
         }
-        if (cancelGraceTimer !== undefined) {
-          clearTimeout(cancelGraceTimer)
-          cancelGraceTimer = undefined
-        }
+        clearCancelGrace()
         notifyEventLoop()
         if (controlDrainActive) {
           onControlSettled?.()
@@ -1557,10 +1569,7 @@ export class AgyTurnSession {
           activeRun.promptReplyReceived = true
           this.runtime.projector.notifyRootExecutionWaiters(activeRun)
         }
-        if (cancelGraceTimer !== undefined) {
-          clearTimeout(cancelGraceTimer)
-          cancelGraceTimer = undefined
-        }
+        clearCancelGrace()
         if (abortPump) pumpAbort.abort()
         else promptRpcAbort.abort()
         notifyEventLoop()
@@ -1578,10 +1587,7 @@ export class AgyTurnSession {
             this.runtime.projector.notifyRootExecutionWaiters(activeRun)
           }
           abortOutstandingInteractions()
-          if (cancelGraceTimer !== undefined) {
-            clearTimeout(cancelGraceTimer)
-            cancelGraceTimer = undefined
-          }
+          clearCancelGrace()
           // If the stream already ended before delivering the reply frame, settle immediately.
           if (streamEnded && !promptSettled) {
             settlePromptFromResponse(res)
@@ -1615,12 +1621,6 @@ export class AgyTurnSession {
       let reasoningBytes = 0
       let currentMessageIndex = 0
       let currentThoughtIndex = 0
-      let reviewResult: CollaborationReviewObservation | undefined
-      let inputResult: CollaborationInputObservation | undefined
-      let planRetained = false
-      let publishedOpenPlan: { nativeId: string; text: string } | undefined
-      let openPlanPublishFailed = false
-      let openPlanUnavailableRecorded = false
       let sessionTitleEmitted = false
 
       const observeFiles = (evidence: Parameters<typeof recordNativeChanges>[1]): void => {
@@ -1659,7 +1659,7 @@ export class AgyTurnSession {
           roundTracker,
           answer,
           tools,
-          approvedBrainPlanCalls,
+          approvedBrainPlanCalls: collaboration.approvedBrainPlanCalls,
           resizeToolStateBytes,
           reasoningItems,
           getReasoningBytes: () => reasoningBytes,
@@ -1675,85 +1675,10 @@ export class AgyTurnSession {
             currentThoughtIndex += 1
           },
           planModeStage,
-          onBrainPlanTouched: () => {
-            brainPlanTouched = true
-          },
-          onBrainPlanOpStarted: (callId) => {
-            // Invalidate any prior Plan candidate as soon as a subsequent Plan mutation begins so
-            // deferred readback or the newer body is always obtained before publication.
-            latestBrainPlanCandidate = undefined
-            const hasOtherActivePlanOp =
-              activeBrainPlanOpCallIds.size > (activeBrainPlanOpCallIds.has(callId) ? 1 : 0)
-            if (hasOtherActivePlanOp) {
-              // Overlapping Phase-1 Plan ops MUST verify final disk body via storage readback.
-              brainPlanReadbackRequired = true
-            }
-            activeBrainPlanOpCallIds.add(callId)
-          },
-          onBrainPlanDeferredReadback: (callId) => {
-            activeBrainPlanOpCallIds.delete(callId)
-            latestBrainPlanCandidate = undefined
-            brainPlanReadbackRequired = true
-          },
-          onBrainPlanCaptured: (callId, candidate) => {
-            activeBrainPlanOpCallIds.delete(callId)
-            if (activeBrainPlanOpCallIds.size === 0 && !brainPlanReadbackRequired) {
-              latestBrainPlanCandidate = candidate
-              brainPlanCaptureFailed = false
-              input.host?.workflow?.recordPlan?.(candidate)
-            } else {
-              // Another concurrent Plan op was in flight or readback was already latched; defer to verified storage readback.
-              brainPlanReadbackRequired = true
-              latestBrainPlanCandidate = undefined
-            }
-          },
-          onBrainPlanCaptureFailed: (callId) => {
-            if (callId !== undefined) activeBrainPlanOpCallIds.delete(callId)
-            brainPlanCaptureFailed = true
-            latestBrainPlanCandidate = undefined
-            input.host?.workflow?.recordPlanUnavailable?.()
-          },
-          onReviewAccepted: (obs) => {
-            reviewResult = mergeWorkflowReview(reviewResult, obs)
-            input.host?.workflow?.recordReview?.(reviewResult)
-          },
-          onInputResultAccepted: (obs) => {
-            inputResult = mergeWorkflowInput(inputResult, obs)
-            input.host?.workflow?.recordInputResult?.(inputResult)
-          },
-          onPlanRetainedAccepted: () => {
-            if (!brainPlanTouched && !hasUnresolvedBrainPlanWrite()) {
-              planRetained = true
-            }
-          },
-          onOpenPlanPublished: (plan) => {
-            try {
-              publishedPlanMemoryReservation?.resize(
-                computeRetainedPlanTextBytes(plan.text) + plan.nativeId.length * 2,
-              )
-              publishedOpenPlan = plan
-              openPlanPublishFailed = false
-              openPlanUnavailableRecorded = false
-              input.host?.workflow?.recordPlan?.(plan)
-            } catch {
-              openPlanPublishFailed = true
-              publishedOpenPlan = undefined
-              if (!openPlanUnavailableRecorded) {
-                openPlanUnavailableRecorded = true
-                input.host?.workflow?.recordPlanUnavailable?.()
-              }
-            } finally {
-              mcpServer.clearPendingTransferredPlanBytes()
-            }
-          },
-          onOpenPlanPublishFailed: () => {
-            openPlanPublishFailed = true
-            publishedOpenPlan = undefined
-            if (!openPlanUnavailableRecorded) {
-              openPlanUnavailableRecorded = true
-              input.host?.workflow?.recordPlanUnavailable?.()
-            }
-          },
+          ...collaboration.projectorCallbacks({
+            mcpServer,
+            getPublishedPlanReservation: () => publishedPlanMemoryReservation,
+          }),
           getSessionTitleEmitted: () => sessionTitleEmitted,
           markSessionTitleEmitted: () => {
             sessionTitleEmitted = true
@@ -2031,10 +1956,8 @@ export class AgyTurnSession {
         rootReleasing = true
         activeRun.rootReleasing = true
         signal.removeEventListener('abort', onCallerAbort)
-        if (cancelGraceTimer !== undefined) {
-          clearTimeout(cancelGraceTimer)
-          cancelGraceTimer = undefined
-        }
+        unregisterCallerAbort()
+        clearCancelGrace()
 
         if (pumpError) {
           promptError = pumpError
@@ -2173,63 +2096,13 @@ export class AgyTurnSession {
         }
         reasoningItems.clear()
 
-        // If a brain plan write was touched and did not capture inline (or readback was latched due to
-        // overlapping ops / deferred edit readback), inspect through the isolated storage client
-        // (NEVER direct Utility `fs.open`!) for the SAME execution.
-        if (
-          planModeStage &&
-          (latestBrainPlanCandidate === undefined || brainPlanReadbackRequired) &&
-          !brainPlanCaptureFailed
-        ) {
-          if (brainPlanTouched && !hasUnresolvedBrainPlanWrite()) {
-            const inspected = this.runtime.options.storageClient?.inspectRun
-              ? await this.runtime.options.storageClient
-                  .inspectRun(
-                    {
-                      appDataDir: this.runtime.primaryAppDataDir,
-                      cwd: lease.canonicalCwd,
-                      nativeSessionId: resolvedSessionId,
-                      nativeTurnId: activeRun.providerExecutionId ?? activeRun.nativeTurnId,
-                      includePlan: true,
-                    },
-                    postReplyCheckSignal,
-                  )
-                  .catch(() => undefined)
-              : await this.runtime
-                  .getOwnedForkFiles()
-                  .inspectAgyRun(
-                    {
-                      cwd: lease.canonicalCwd,
-                      storageRoot: this.runtime.primaryAppDataDir,
-                      nativeSessionId: resolvedSessionId,
-                      nativeTurnId: activeRun.providerExecutionId ?? activeRun.nativeTurnId,
-                      includePlan: true,
-                    },
-                    postReplyCheckSignal,
-                  )
-                  .catch(() => undefined)
-            const terminal = inspected?.exists ? inspected.terminalState : undefined
-            const matchesExecution =
-              terminal !== undefined &&
-              !terminal.planUnavailable &&
-              (activeRun.providerExecutionId === undefined ||
-                terminal.executionId === activeRun.providerExecutionId)
-            if (matchesExecution && terminal.plan?.text.trim()) {
-              latestBrainPlanCandidate = {
-                nativeId:
-                  terminal.plan.nativeId ||
-                  buildBoundedNativePlanId(resolvedSessionId, 'implementation_plan'),
-                text: terminal.plan.text,
-              }
-              brainPlanReadbackRequired = false
-              input.host?.workflow?.recordPlan?.(latestBrainPlanCandidate)
-            } else {
-              brainPlanCaptureFailed = true
-              latestBrainPlanCandidate = undefined
-              input.host?.workflow?.recordPlanUnavailable?.()
-            }
-          }
-        }
+        await collaboration.readbackBrainPlanIfNeeded({
+          runtime: this.runtime,
+          canonicalCwd: lease.canonicalCwd,
+          resolvedSessionId,
+          activeRun,
+          signal: postReplyCheckSignal,
+        })
 
         await recordingTail
         await input.host?.lifecycle?.waitForRootOutput?.()
@@ -2253,7 +2126,8 @@ export class AgyTurnSession {
         activeRun.rootTerminal = true
         this.kernel.recordTerminal(outcome)
 
-        const settledPlan = latestBrainPlanCandidate ?? publishedOpenPlan
+        const { settledPlan, reviewResult, inputResult } =
+          collaboration.getTerminalOutputArtifacts()
         const outputCompleteness: 'complete' | 'partial' =
           outcome === 'completed' && !incompleteVisiblePrefix ? 'complete' : 'partial'
         const terminalEvidence: Parameters<AgyAdapterRuntime['recordEvidence']>[3] = {
@@ -2305,83 +2179,14 @@ export class AgyTurnSession {
           }
         }
 
-        // Record negative plan unavailability OUTSIDE `!unknownEffectsReported` so recovery is never
-        // suppressed when an open-mode final `publish_plan` was acknowledged without confirmed ACP promotion
-        // or when a Phase-1 brain plan write failed.
-        if (outcome === 'completed') {
-          if (planModeStage) {
-            if (
-              hasUnresolvedBrainPlanWrite() ||
-              brainPlanCaptureFailed ||
-              brainPlanReadbackRequired
-            ) {
-              input.host?.workflow?.recordPlanUnavailable?.()
-            }
-          } else if (
-            openPlanPublishFailed ||
-            (mcpServer.hasAcknowledgedFinalOpenPlan && !publishedOpenPlan)
-          ) {
-            if (!openPlanUnavailableRecorded) {
-              openPlanUnavailableRecorded = true
-              input.host?.workflow?.recordPlanUnavailable?.()
-            }
-          }
-        }
-
-        // Promote collaboration artifacts ONLY after normal root completion & settlement (`B6`).
-        if (
-          outcome === 'completed' &&
-          !effectsReporter.isUnknownReported &&
-          !incompleteVisiblePrefix
-        ) {
-          if (planModeStage) {
-            if (
-              !hasUnresolvedBrainPlanWrite() &&
-              !brainPlanCaptureFailed &&
-              !brainPlanReadbackRequired
-            ) {
-              if (latestBrainPlanCandidate) {
-                yield {
-                  agentId: 'agy',
-                  type: 'collaboration.plan',
-                  turnId: input.runId,
-                  nativeId: latestBrainPlanCandidate.nativeId,
-                  text: latestBrainPlanCandidate.text,
-                }
-              } else if (planRetained && authorization?.planReference) {
-                const planDoc = authorization.planReference.document
-                input.host?.workflow?.recordPlanRetained?.({
-                  nativeId: buildBoundedNativePlanId(resolvedSessionId, 'retained'),
-                  sha256: planDoc.sha256,
-                  bytes: planDoc.bytes,
-                  chars: planDoc.chars,
-                  confirmation: 'native_root_settled_v1',
-                })
-              }
-            }
-          } else if (
-            !openPlanPublishFailed &&
-            !(mcpServer.hasAcknowledgedFinalOpenPlan && !publishedOpenPlan) &&
-            publishedOpenPlan
-          ) {
-            yield {
-              agentId: 'agy',
-              type: 'collaboration.plan',
-              turnId: input.runId,
-              nativeId: publishedOpenPlan.nativeId,
-              text: publishedOpenPlan.text,
-            }
-          }
-          if (reviewResult) {
-            yield {
-              agentId: 'agy',
-              type: 'collaboration.review',
-              turnId: input.runId,
-              verdict: reviewResult.verdict,
-              ...(reviewResult.questions ? { questions: reviewResult.questions } : {}),
-            }
-          }
-        }
+        collaboration.recordPlanUnavailabilityIfNeeded({ outcome, mcpServer })
+        yield* collaboration.promoteArtifactsIfEligible({
+          outcome,
+          unknownReported: effectsReporter.isUnknownReported,
+          incompleteVisiblePrefix,
+          resolvedSessionId,
+          mcpServer,
+        })
 
         if (!foregroundReleased) {
           if (incompleteVisiblePrefix && outcome === 'completed') {
@@ -2440,10 +2245,7 @@ export class AgyTurnSession {
         activeRun.rootTerminal = true
         this.runtime.projector.notifyRootExecutionWaiters(activeRun)
       }
-      if (cancelGraceTimer !== undefined) {
-        clearTimeout(cancelGraceTimer)
-        cancelGraceTimer = undefined
-      }
+      clearCancelGrace()
       promptRpcAbort.abort()
       await stopPrePromptDrain?.(false).catch(() => undefined)
       stopStreamPump?.()

@@ -38,35 +38,24 @@ import {
   collaborationReadOnly,
   collaborationReviewMode,
 } from '../collaboration-prompt'
-import {
-  codexFileChanges,
-  nativeEffectsUncertain,
-  nativeFileChangesSettled,
-  recordNativeChanges,
-} from '../native-file-changes'
-import { freezeNativeJsonFrame } from '../native-json-encoder'
+import { nativeEffectsUncertain } from '../native-file-changes'
 import { NativeWorkingMemory } from '../native-working-memory'
+import { TurnResourceScope } from '../turn-resource-scope'
+import { CodexTurnNativeObserver } from './native-event-observer'
 import {
-  CODEX_MAX_PENDING_RECORDINGS,
-  CODEX_MAX_PENDING_RECORDING_BYTES,
-  CODEX_STOP_COMMANDS,
-  CODEX_STOP_IDENTITY_BYTES,
   CODEX_THREAD_RPC_TIMEOUT_MS,
   CODEX_TURN_ACCEPT_TIMEOUT_MS,
   CodexReasoningSummaryTracker,
   acceptsCodexReroute,
-  applyCodexWorkflowMcpToolCall,
   buildCodexRecoveryConfiguration,
   buildCodexRecoverySettings,
   buildCodexStartupRequest,
   buildCodexTurnStartParams,
-  cacheApprovalItem,
   classifyCodexRpcError,
   classifyCodexStartupRejection,
   cleanTitle,
   confirmPermissionMode,
   describeTool,
-  isCodexConnectionScopedNotification,
   isPeerTool,
   observeThreadTitle,
   peerProposal,
@@ -77,9 +66,7 @@ import {
   resolvedModelEvent,
   threadTitle,
   toolFailed,
-  type ApprovalItem,
   type CodexAdapterRuntime,
-  type EarlyNativeFact,
   type NativeBackground,
 } from './types'
 
@@ -245,24 +232,38 @@ export class CodexTurnSession {
       background.foregroundCommandBytes = 0
       background.cancellationPending = true
     }
+    const foregroundScope = new TurnResourceScope()
+    const releaseScope = new TurnResourceScope()
     signal.addEventListener('abort', freezeForegroundCommands, { once: true })
-    const handledRequests = new Set<string>()
-    const approvalItems = new Map<string, ApprovalItem>()
-    const fileChangeRecordings = new WeakMap<object, Promise<void>>()
+    foregroundScope.add('codex_abort_listener', () =>
+      signal.removeEventListener('abort', freezeForegroundCommands),
+    )
     let provisionalThreadId: string | undefined
     let threadStartupDispatched = false
     let threadStartupCompleted = false
     let rootTurnRequested = false
-    let releaseNativeRequests: (() => void) | undefined
-    let releaseApprovalMetadata: (() => void) | undefined
+    let foregroundTurnCompletedYielded = false
     const answer = new AgentAnswerAssembler(input.runId)
-    const planMemory = new NativeWorkingMemory().reserve(0)
+    const planMemory = releaseScope.trackReservation(
+      'plan_memory',
+      new NativeWorkingMemory().reserve(0),
+    )
     let submittedPlan: { nativeId: string; text: string } | undefined
     let retainedPlan: CollaborationRetainedPlan | undefined
     let planOperationObserved = false
     let reviewResult: CollaborationReviewObservation | undefined
     let inputResult: CollaborationInputObservation | undefined
     let projectionFailure: unknown
+    releaseScope.add('answer_and_plan_state', () => {
+      answer.dispose()
+      submittedPlan = undefined
+      retainedPlan = undefined
+    })
+    if (sourceGrant) {
+      releaseScope.add('source_reader', () =>
+        this.runtime.peerToolServer.retireSourceReader(sourceGrant),
+      )
+    }
     const failProjection = (error: unknown): void => {
       if (projectionFailure) return
       const failure = classifyAgentError(error)
@@ -400,13 +401,7 @@ export class CodexTurnSession {
           // completion, answer content and actual effects remain independent.
         }
       }
-      if (sourceGrant) this.runtime.peerToolServer.retireSourceReader(sourceGrant)
-      releaseNativeRequests?.()
-      releaseApprovalMetadata?.()
-      answer.dispose()
-      submittedPlan = undefined
-      retainedPlan = undefined
-      planMemory.release()
+      releaseScope.dispose()
       if (background.unknown) {
         this.kernel.reportNativeEffects('unknown', 'native_observation_released')
       } else {
@@ -422,959 +417,41 @@ export class CodexTurnSession {
       void this.kernel.settle()
     }
     const reasoningSummaries = new CodexReasoningSummaryTracker()
-    const observed = new WeakSet<object>()
-    let replaying = false
-    let handledNativeFactSeq = 0
-    let rootAcceptedPersisted = false
-    let rootRunningEvidencePersisted = false
-    let rootTerminalOutcome: 'completed' | 'failed' | 'interrupted' | undefined
-    let foregroundTurnCompletedYielded = false
-    let archivedTurnCompletedEmitted = false
-    const rejectServerRequest = (req: object, message: string): void => {
-      if (!connection?.isOpen) return
-      const reqId = Reflect.get(req, 'id')
-      if (typeof reqId === 'string' || typeof reqId === 'number')
-        void connection.respondError(reqId, message).catch(() => undefined)
-    }
-    const releaseRootStartupEarly = (releaseUnboundStartupHooks = false): void => {
-      if (!background.early.length) return
-      const kept: EarlyNativeFact[] = []
-      let keptBytes = 0
-      for (const entry of background.early) {
-        if (
-          entry.candidateKind === 'root_turn' ||
-          (releaseUnboundStartupHooks && entry.candidateKind === 'startup_hook')
-        ) {
-          if (
-            entry.candidateKind === 'root_turn' &&
-            Object.hasOwn(entry.event, 'id') &&
-            typeof Reflect.get(entry.event, 'method') === 'string'
-          )
-            rejectServerRequest(
-              entry.event,
-              'This native request belonged to a Turn that did not start.',
-            )
-          entry.reservation.release()
-        } else {
-          kept.push(entry)
-          keptBytes += entry.bytes
-        }
-      }
-      background.early = kept
-      background.earlyBytes = keptBytes
-      if (!background.early.length) {
-        clearTimeout(background.earlyTimer)
-        background.earlyTimer = undefined
-      }
-    }
-    const markRootNotStartedIfUnsent = (targetThreadId?: string): void => {
-      if (background.rootNotStarted) return
-      background.rootNotStarted = true
-      releaseRootStartupEarly(!background.primaryThreadId)
-      this.kernel.recordDispatch(
-        'rejected',
-        targetThreadId ?? threadId ?? input.nativeSessionId,
-        connection?.executorId,
-      )
-    }
-    const emitArchivedTerminalSnapshot = (status: 'completed' | 'failed' | 'interrupted'): void => {
-      if (archivedTurnCompletedEmitted || foregroundTurnCompletedYielded || projectionFailure)
-        return
-      archivedTurnCompletedEmitted = true
-      const text =
-        answer.finalize() ??
-        (status === 'completed' && submittedPlan && !answer.text ? '' : undefined)
-      if (text !== undefined)
-        input.host?.effects?.recordArchivedEvent?.({
-          agentId: 'codex',
-          type: 'text.completed',
-          turnId: background.primaryTurnId!,
-          outputId: answer.outputId,
-          text,
-        })
-      if (status === 'completed') {
-        if (submittedPlan)
-          input.host?.effects?.recordArchivedEvent?.({
-            agentId: 'codex',
-            type: 'collaboration.plan',
-            turnId: background.primaryTurnId!,
-            ...submittedPlan,
-          })
-        if (reviewResult)
-          input.host?.effects?.recordArchivedEvent?.({
-            agentId: 'codex',
-            type: 'collaboration.review',
-            turnId: background.primaryTurnId!,
-            ...reviewResult,
-          })
-      }
-      input.host?.effects?.recordArchivedEvent?.({
-        agentId: 'codex',
-        type: 'turn.completed',
-        turnId: background.primaryTurnId!,
-        outcome: status,
-      })
-    }
-    const reportUnknown = (
-      reason: string,
-      scope: 'unlisted' | 'recorded_files' = 'unlisted',
-      evidence: 'incomplete' | 'awaiting_terminal' = 'incomplete',
-    ): void => {
-      if (evidence === 'incomplete') background.unknown = true
-      nativeEffectsUncertain(input, reason, scope)
-      if (!background.reportedUnknown) {
-        background.reportedUnknown = true
-        nativeFileChangesSettled(
-          input,
-          'unknown',
-          evidence === 'awaiting_terminal'
-            ? 'native_completion_pending'
-            : 'native_work_unconfirmed',
-        )
-      }
-    }
-    let lastBackgroundWork: 'working' | 'stoppable' | undefined
-    const maybeSettle = (): void => {
-      const work = this.runtime.describeBackgroundWork(background)
-      if (work !== lastBackgroundWork) {
-        lastBackgroundWork = work
-        input.host?.effects?.backgroundWorkChanged?.()
-      }
-      if (
-        background.foregroundReleased &&
-        (background.rootTerminal || background.rootNotStarted) &&
-        !background.threads.size &&
-        !background.operations.size &&
-        !background.spawns.size &&
-        !background.interactions.size &&
-        !background.recordings.size &&
-        !background.early.length &&
-        !background.cancellationPending &&
-        !background.untrackedWork
-      )
-        this.runtime.settleNativeBackground(background)
-    }
-    const bufferEarly = (
-      event: object,
-      retained?: EarlyNativeFact,
-      retainRootTurnDuringReplay = false,
-    ): boolean => {
-      const params = Reflect.get(event, 'params')
-      if (
-        params &&
-        typeof params === 'object' &&
-        isCodexConnectionScopedNotification(Reflect.get(event, 'method'), params)
-      ) {
-        return false
-      }
-      const child =
-        params && typeof params === 'object'
-          ? (Reflect.get(params, 'threadId') ?? Reflect.get(params, 'conversationId'))
-          : undefined
-      const isPrimaryThread =
-        typeof child === 'string' &&
-        background.primaryThreadId !== undefined &&
-        child === background.primaryThreadId
-      // Carbon A-5: Never re-buffer a root_turn candidate or primary-thread event as child/spawn
-      // just because pre-ACK `spawnAgent` already populated `background.spawns`.
-      const isChildOrSpawn =
-        retained?.candidateKind !== 'root_turn' &&
-        !isPrimaryThread &&
-        Boolean(
-          background.spawns.size || (typeof child === 'string' && background.parents.has(child)),
-        )
-      const isStartupHookWindow =
-        threadStartupDispatched &&
-        !background.primaryThreadId &&
-        !background.rootNotStarted &&
-        !(typeof child === 'string' && input.nativeSessionId && child !== input.nativeSessionId) &&
-        ['hook/started', 'hook/completed'].includes(String(Reflect.get(event, 'method')))
-      const isPossiblyDeliveredWindow =
-        (!background.foregroundReleased &&
-          delivery.phase === 'possibly_delivered' &&
-          !background.primaryTurnId) ||
-        (retainRootTurnDuringReplay && retained?.candidateKind === 'root_turn')
-      if (!isChildOrSpawn && !isStartupHookWindow && !isPossiblyDeliveredWindow) return false
-      const candidateKind: EarlyNativeFact['candidateKind'] =
-        retained?.candidateKind ??
-        (isChildOrSpawn ? 'child' : isStartupHookWindow ? 'startup_hook' : 'root_turn')
-      let reservation = retained?.reservation
-      try {
-        const heldBytes = retained?.heldBytes ?? freezeNativeJsonFrame(event)
-        // Admission includes the immutable DTO and worst-case UTF-16 escaped JSON counting copy.
-        if (!connection?.isOpen) throw new Error('The early Native fact owner closed.')
-        reservation ??= connection.reserveWorkingMemory(heldBytes * 7 + 4096)
-        const bytes = retained?.bytes ?? Buffer.byteLength(JSON.stringify(event))
-        if (background.early.length >= 128 || background.earlyBytes + bytes > 8 * 1024 * 1024) {
-          reservation.release()
-          background.untrackedWork = true
-          reportUnknown(
-            'Early native child events exceeded the observation budget; complete attribution is unavailable.',
-          )
-          return true
-        }
-        reservation.resize(heldBytes)
-        background.early.push(retained ?? { event, bytes, heldBytes, reservation, candidateKind })
-        background.earlyBytes += bytes
-      } catch {
-        reservation?.release()
-        background.untrackedWork = true
-        reportUnknown(
-          'Early native facts could not be retained within the Connection working budget.',
-        )
-        return true
-      }
-      background.earlyTimer ??= setTimeout(() => {
-        if (background.early.length) background.untrackedWork = true
-        if (background.early.length)
-          reportUnknown(
-            'Early native child events could not be bound to an owned spawn before the deadline.',
-          )
-        for (const entry of background.early) entry.reservation.release()
-        background.early = []
-        background.earlyBytes = 0
-        background.earlyTimer = undefined
-        maybeSettle()
-      }, 30_000)
-      return true
-    }
-    const replayEarly = (evictUnmatchedRootCandidates = false): boolean => {
-      if (replaying || !background.early.length) return false
-      replaying = true
-      let anyProgress = false
-      try {
-        for (let pass = 0; pass < 128 && background.early.length; pass += 1) {
-          const queued: (EarlyNativeFact | undefined)[] = background.early
-          background.early = []
-          background.earlyBytes = 0
-          let progressed = false
-          try {
-            for (let index = 0; index < queued.length; index += 1) {
-              const entry = queued[index]!
-              queued[index] = undefined
-              try {
-                if (!handleOwnedNativeEvent(entry.event)) {
-                  const rebuffered = bufferEarly(entry.event, entry, !evictUnmatchedRootCandidates)
-                  if (
-                    !rebuffered &&
-                    evictUnmatchedRootCandidates &&
-                    entry.candidateKind === 'root_turn' &&
-                    background.primaryTurnId &&
-                    connection?.isOpen &&
-                    Object.hasOwn(entry.event, 'id') &&
-                    typeof Reflect.get(entry.event, 'method') === 'string'
-                  ) {
-                    rejectServerRequest(
-                      entry.event,
-                      'This native request does not belong to the active Turn.',
-                    )
-                  }
-                } else {
-                  progressed = true
-                  anyProgress = true
-                }
-              } finally {
-                if (!background.early.includes(entry)) entry.reservation.release()
-              }
-            }
-          } finally {
-            for (const entry of queued) entry?.reservation.release()
-          }
-          if (!progressed) break
-        }
-      } finally {
-        replaying = false
-        if (!background.early.length) {
-          clearTimeout(background.earlyTimer)
-          background.earlyTimer = undefined
-        }
-      }
-      return anyProgress
-    }
-    const drainPendingOwnedFacts = (evictUnmatchedRootCandidates: boolean): void => {
-      if (replaying || !connection) return
-      // A-F1: Iteratively resolve queued connection FIFO notifications AND buffered early facts
-      // to a fixed point BEFORE evicting unmatched root_turn candidates, so a pre-ACK root
-      // spawnAgent in the connection FIFO registers `background.spawns` before child events replay.
-      for (let pass = 0; pass < 16; pass += 1) {
-        let progressed = false
-        if (background.foregroundReleased) {
-          const beforeSeq = handledNativeFactSeq
-          connection.replayBackgroundNotifications()
-          if (handledNativeFactSeq !== beforeSeq) {
-            progressed = true
-          }
-        } else {
-          connection.forEachQueuedNotification((queued) => {
-            if (!observed.has(queued) && handleOwnedNativeEvent(queued)) {
-              progressed = true
-            }
-          })
-        }
-        if (replayEarly(false)) progressed = true
-        if (!progressed) break
-      }
-      if (evictUnmatchedRootCandidates) {
-        replayEarly(true)
-      }
-    }
-    const maybeInterruptRoot = (
-      commands?: Map<string, string | undefined>,
-      registerAsBackgroundInteraction = true,
-    ): Promise<void> | undefined => {
-      const targetConnection = connection
-      const targetThreadId = threadId ?? background.primaryThreadId
-      const targetTurnId = background.primaryTurnId
-      if (
-        !background.stopRequested ||
-        background.rootInterruptAttempted ||
-        !targetConnection?.isOpen ||
-        !targetThreadId ||
-        !targetTurnId
-      ) {
-        return undefined
-      }
-      const remainingCommands = new Map<string, string | undefined>()
-      for (const [id, handle] of commands ?? []) {
-        if (background.operations.has(JSON.stringify([targetThreadId, targetTurnId, id]))) {
-          remainingCommands.set(id, handle)
-        }
-      }
-      if (background.rootTerminal && remainingCommands.size === 0) return undefined
-      background.rootInterruptAttempted = true
-      const interruptWork = this.runtime.connections
-        .interruptForegroundCommands(
-          background,
-          targetConnection,
-          targetThreadId,
-          targetTurnId,
-          remainingCommands,
-          undefined,
-          background.rootTerminal,
-        )
-        .catch(() => {
-          const hasStillOpenStoppedCommands = [...remainingCommands.keys()].some((id) =>
-            background.operations.has(JSON.stringify([targetThreadId, targetTurnId, id])),
-          )
-          if (!background.rootTerminal || hasStillOpenStoppedCommands) {
-            reportUnknown(
-              'Codex interruption could not be confirmed. Native observation remains active.',
-            )
-          }
-        })
-      if (registerAsBackgroundInteraction) {
-        background.interactions.add(interruptWork)
-        void interruptWork.finally(() => {
-          background.interactions.delete(interruptWork)
-          maybeSettle()
-        })
-      }
-      return interruptWork
-    }
-    const bindRootTurn = (
-      resolvedTurnId: string,
-      source: 'ack' | 'late_ack' | 'user_message',
-    ): boolean => {
-      if (!connection || !threadId) return false
-      if (background.primaryTurnId && background.primaryTurnId !== resolvedTurnId) return false
-      turnId = resolvedTurnId
-      background.primaryTurnId = resolvedTurnId
-      if (!rootAcceptedPersisted) {
-        rootAcceptedPersisted = true
-        this.kernel.recordDispatch('accepted', threadId, connection.executorId)
-      }
-      if (!background.rootTerminal && !rootRunningEvidencePersisted) {
-        rootRunningEvidencePersisted = true
-        input.host?.lifecycle?.recordNativeEvidence?.({
-          kind: 'running',
-          source: 'live_runtime',
-          identity: this.runtime.runIdentity(input, threadId, resolvedTurnId),
-        })
-      }
-      drainPendingOwnedFacts(true)
-      if (background.foregroundReleased && background.stopRequested && !background.rootTerminal) {
-        void maybeInterruptRoot()
-      }
-      if (source !== 'ack') maybeSettle()
-      return true
-    }
-    const handleOwnedNativeEvent = (event: object): boolean => {
-      const nativeConnection = connection
-      if (!nativeConnection || background.closed || background.connection !== nativeConnection)
-        return false
-      const eventParams = Reflect.get(event, 'params')
-      if (!eventParams || typeof eventParams !== 'object') return false
-      const eventMethod = Reflect.get(event, 'method')
-      if (isCodexConnectionScopedNotification(eventMethod, eventParams)) return false
-      const startedThread =
-        eventMethod === 'thread/started' ? Reflect.get(eventParams, 'thread') : undefined
-      const suppliedThread =
-        Reflect.get(eventParams, 'threadId') ?? Reflect.get(eventParams, 'conversationId')
-      const suppliedTurn =
-        Reflect.get(eventParams, 'turnId') ??
-        (Reflect.get(eventParams, 'turn') && typeof Reflect.get(eventParams, 'turn') === 'object'
-          ? Reflect.get(Reflect.get(eventParams, 'turn'), 'id')
-          : undefined)
-      const suppliedChild =
-        startedThread && typeof startedThread === 'object'
-          ? Reflect.get(startedThread, 'id')
-          : suppliedThread
-      if (
-        (typeof suppliedChild === 'string' &&
-          this.runtime.retiredNativeChildren.has(suppliedChild)) ||
-        (typeof suppliedThread === 'string' &&
-          typeof suppliedTurn === 'string' &&
-          this.runtime.retiredNativeTurns.has(JSON.stringify([suppliedThread, suppliedTurn])))
-      ) {
-        const requestId = Reflect.get(event, 'id')
-        if (typeof requestId === 'string' || typeof requestId === 'number')
-          void nativeConnection
-            .respondError(requestId, 'This native request belongs to a retired Run generation.')
-            .catch(() => undefined)
-        return true
-      }
-      if (startedThread && typeof startedThread === 'object') {
-        const parent = Reflect.get(startedThread, 'parentThreadId'),
-          child = Reflect.get(startedThread, 'id')
-        if (
-          typeof child === 'string' &&
-          child.length <= 1024 &&
-          typeof parent === 'string' &&
-          (parent === background.primaryThreadId || background.parents.has(parent)) &&
-          background.spawns.size > 0
-        ) {
-          if (background.parents.size < 64) {
-            background.parents.set(child, parent)
-            background.threads.add(child)
-            handledNativeFactSeq += 1
-            replayEarly()
-          } else {
-            background.untrackedWork = true
-            reportUnknown('Native child ancestry exceeded its bounded observer.')
-          }
-          return true
-        }
-      }
-      const eventThread =
-        Reflect.get(eventParams, 'threadId') ??
-        Reflect.get(eventParams, 'conversationId') ??
-        (startedThread && typeof startedThread === 'object'
-          ? Reflect.get(startedThread, 'id')
-          : undefined)
-      const root = eventThread === background.primaryThreadId
-      const detachedRoot = root && background.rootTerminal && eventMethod !== 'turn/completed'
-      if (typeof eventThread !== 'string' || (!root && !background.parents.has(eventThread)))
-        return replaying ? false : bufferEarly(event)
-      const eventTurn = Reflect.get(eventParams, 'turn')
-      const eventTurnId =
-        Reflect.get(eventParams, 'turnId') ??
-        (eventTurn && typeof eventTurn === 'object' ? Reflect.get(eventTurn, 'id') : undefined)
-      // S3-F2: A root userMessage carrying our exact clientUserMessageId (input.runId) is
-      // cryptographic/ID proof of root Turn ownership even before turn/start ACK arrives.
-      if (
-        root &&
-        !background.primaryTurnId &&
-        delivery.phase === 'possibly_delivered' &&
-        typeof eventTurnId === 'string' &&
-        eventTurnId.length > 0 &&
-        eventTurnId.length <= 1024 &&
-        (eventMethod === 'item/started' || eventMethod === 'item/completed')
-      ) {
-        const item = Reflect.get(eventParams, 'item')
-        if (
-          item &&
-          typeof item === 'object' &&
-          Reflect.get(item, 'type') === 'userMessage' &&
-          Reflect.get(item, 'clientId') === input.runId
-        ) {
-          bindRootTurn(eventTurnId, 'user_message')
-        }
-      }
-      const ownedTurn = root
-        ? typeof background.primaryTurnId === 'string' && eventTurnId === background.primaryTurnId
-        : typeof eventTurnId === 'string' &&
-          background.turnIds.has(JSON.stringify([eventThread, eventTurnId]))
-      if (root && typeof eventTurnId === 'string' && eventTurnId !== background.primaryTurnId) {
-        return false
-      }
-      if (
-        root &&
-        ownedTurn &&
-        typeof eventTurnId === 'string' &&
-        eventMethod === 'item/completed' &&
-        input.host?.lifecycle?.recordInputConsumption
-      ) {
-        const item = Reflect.get(eventParams, 'item')
-        const id =
-          item && typeof item === 'object' && Reflect.get(item, 'type') === 'userMessage'
-            ? Reflect.get(item, 'clientId')
-            : undefined
-        if (typeof id === 'string' && background.steerInputIds.has(id)) {
-          input.host?.lifecycle?.recordInputConsumption?.(id, {
-            nativeSessionId: eventThread,
-            nativeTurnId: eventTurnId,
-            executorId: nativeConnection.executorId,
-          })
-          background.steerInputIds.delete(id)
-          if (background.steeringInput?.id === id) background.steeringInput.consumed = true
-        }
-      }
-      if (eventMethod === 'turn/started' && !root && typeof eventTurnId === 'string') {
-        if (
-          background.turnIds.size >= 256 &&
-          !background.turnIds.has(JSON.stringify([eventThread, eventTurnId]))
-        ) {
-          background.untrackedWork = true
-          reportUnknown('Native child Turn identities exceeded the bounded observer.')
-          return true
-        }
-        background.turns.set(eventThread, eventTurnId)
-        background.turnIds.add(JSON.stringify([eventThread, eventTurnId]))
-        background.threads.add(eventThread)
-        handledNativeFactSeq += 1
-        // A-F1: Immediately replay child requests/items buffered before this child turn/started arrived.
-        replayEarly(false)
-      }
-      const isChildTurnScopedServerRequest =
-        !root && Object.hasOwn(event, 'id') && typeof eventTurnId === 'string'
-      if (
-        eventMethod !== 'turn/started' &&
-        typeof eventMethod === 'string' &&
-        (eventMethod.startsWith('item/') ||
-          eventMethod === 'turn/completed' ||
-          isChildTurnScopedServerRequest) &&
-        !ownedTurn
-      ) {
-        if (root) return false
-        if (!background.turns.has(eventThread) && typeof eventTurnId === 'string')
-          return replaying ? false : bufferEarly(event)
-        const requestId = Reflect.get(event, 'id')
-        if (typeof requestId === 'string' || typeof requestId === 'number')
-          void nativeConnection
-            .respondError(
-              requestId,
-              'This native request does not belong to the registered child Turn.',
-            )
-            .catch(() => undefined)
-        return true
-      }
-      if (eventMethod === 'hook/started' || eventMethod === 'hook/completed') {
-        // Thread-scoped startup Hooks have no Turn ID. An older released Run
-        // may finish its own Hook, but cannot claim a later startup's new Hook.
-        const hook = Reflect.get(eventParams, 'run')
-        const hookId = hook && typeof hook === 'object' ? Reflect.get(hook, 'id') : undefined
-        const nullableTurn = eventTurnId == null ? null : eventTurnId
-        if (nullableTurn !== null && !ownedTurn) return false
-        const validIdentity =
-          typeof hookId === 'string' &&
-          Boolean(hookId) &&
-          hookId.length <= 1024 &&
-          eventThread.length <= 1024 &&
-          (nullableTurn === null ||
-            (typeof nullableTurn === 'string' && nullableTurn.length <= 1024))
-        if (eventMethod === 'hook/completed' && !validIdentity) return false
-        const key = validIdentity
-          ? JSON.stringify(['hook', nativeConnection.executorId, eventThread, nullableTurn, hookId])
-          : ''
-        if (
-          eventMethod === 'hook/started' &&
-          root &&
-          !replaying &&
-          background.foregroundReleased &&
-          nullableTurn === null &&
-          !background.operations.has(key)
-        )
-          return false
-        if (!validIdentity) {
-          background.untrackedWork = true
-          reportUnknown('Native Hook identity exceeded its bounded observer.')
-        } else if (eventMethod === 'hook/started') {
-          const hookBytes = [...background.operations]
-            .filter((value) => value.startsWith('["hook",'))
-            .reduce((sum, value) => sum + Buffer.byteLength(value), 0)
-          if (
-            background.operations.has(key) ||
-            (background.operations.size < 64 && hookBytes + Buffer.byteLength(key) <= 64 * 1024)
-          )
-            background.operations.add(key)
-          else {
-            background.untrackedWork = true
-            reportUnknown('Native Hook work exceeded its bounded operation owner.')
-          }
-          nativeEffectsUncertain(
-            input,
-            'Native hooks may modify files beyond reported operation evidence.',
-          )
-        } else {
-          // A different Run can own a nullable-turn Hook on this Thread.
-          // Leave unmatched completion available to its exact owner.
-          if (!background.operations.has(key)) return false
-          if (
-            ['completed', 'failed', 'blocked', 'stopped'].includes(
-              String(Reflect.get(hook, 'status')),
-            )
-          )
-            background.operations.delete(key)
-        }
-        maybeSettle()
-        return true
-      }
-      const matchedDetachedLegacyRootRequest =
-        root &&
-        !ownedTurn &&
-        eventTurnId == null &&
-        Object.hasOwn(event, 'id') &&
-        typeof eventMethod === 'string' &&
-        (background.foregroundReleased || detachedRoot) &&
-        (() => {
-          const callId = Reflect.get(eventParams, 'itemId') ?? Reflect.get(eventParams, 'callId')
-          if (typeof callId !== 'string' || !callId || !background.primaryTurnId) return false
-          const opKey = JSON.stringify([eventThread, background.primaryTurnId, callId])
-          return background.operations.has(opKey) || approvalItems.has(opKey)
-        })()
-      if (root && !ownedTurn && !matchedDetachedLegacyRootRequest) return false
-      // S3-F1: Pre-terminal queued foreground items already captured by the observer must still
-      // flow to the active foreground consumer even if turn/completed arrived ahead on the wire.
-      if (observed.has(event)) return !root || background.foregroundReleased
-      observed.add(event)
-      handledNativeFactSeq += 1
-      if (
-        root &&
-        ownedTurn &&
-        (eventMethod === 'item/started' || eventMethod === 'item/completed')
-      ) {
-        const item = Reflect.get(eventParams, 'item')
-        if (item && typeof item === 'object' && Reflect.get(item, 'type') === 'plan')
-          observePlanOperation()
-      }
-      if (root && ownedTurn && !background.rootTerminal && eventMethod === 'item/completed') {
-        const item = Reflect.get(eventParams, 'item')
-        if (item && typeof item === 'object') {
-          if (Reflect.get(item, 'type') === 'agentMessage') {
-            const id = Reflect.get(item, 'id'),
-              text = Reflect.get(item, 'text')
-            if (typeof id === 'string' && typeof text === 'string')
-              projectOutput(() => answer.capture(id, text))
-          } else if (Reflect.get(item, 'type') === 'plan') {
-            const id = Reflect.get(item, 'id'),
-              text = Reflect.get(item, 'text')
-            if (
-              typeof id === 'string' &&
-              id.length > 0 &&
-              id.length <= 1024 &&
-              typeof text === 'string' &&
-              text.trim()
-            )
-              capturePlan(id, text)
-          } else {
-            applyCodexWorkflowMcpToolCall({
-              item,
-              runId: input.runId,
-              peerServerName: this.runtime.peerServerName,
-              peerToolServer: this.runtime.peerToolServer,
-              peerReceipt,
-              capturePlan,
-              captureRetainedPlan,
-              captureInputResult,
-              captureReview,
-            })
-          }
-        }
-      }
-      if (eventMethod === 'turn/completed') {
-        if (root) {
-          const status =
-            eventTurn && typeof eventTurn === 'object'
-              ? Reflect.get(eventTurn, 'status')
-              : undefined
-          if (
-            !background.rootTerminal &&
-            (status === 'completed' || status === 'failed' || status === 'interrupted')
-          ) {
-            background.rootTerminal = true
-            rootTerminalOutcome = status
-            this.kernel.recordTerminal(status)
-            if (sourceGrant) this.runtime.peerToolServer.retireSourceReader(sourceGrant)
-            const settleTerminal = (): void => {
-              if (!projectionFailure)
-                this.runtime.recordTerminal(
-                  input,
-                  background.primaryThreadId!,
-                  background.primaryTurnId!,
-                  status,
-                  answer,
-                  status === 'completed'
-                    ? { plan: submittedPlan, reviewResult, inputResult }
-                    : undefined,
-                )
-              if (background.foregroundReleased) {
-                emitArchivedTerminalSnapshot(status)
-              }
-            }
-            if (background.steering && background.steeringDone) {
-              // S3-F6: Persist compact terminal identity & outcome immediately on verified
-              // turn/completed while Steer RPC is still in flight; defer only the
-              // Steer-dependent final answer/workflow snapshot behind `steeringDone`.
-              this.runtime.recordTerminal(
-                input,
-                background.primaryThreadId!,
-                background.primaryTurnId!,
-                status,
-                { outputId: answer.outputId, text: '' },
-              )
-              const settling = background.steeringDone
-                .then(settleTerminal)
-                .catch((error: unknown) => {
-                  projectionFailure = error
-                  reportUnknown(
-                    'Native completion could not be reconciled with its steering receipt.',
-                  )
-                })
-              background.interactions.add(settling)
-              void settling.finally(() => {
-                background.interactions.delete(settling)
-                maybeSettle()
-              })
-            } else {
-              if (projectionFailure) {
-                this.runtime.recordTerminal(
-                  input,
-                  background.primaryThreadId!,
-                  background.primaryTurnId!,
-                  status,
-                  { outputId: answer.outputId, text: '' },
-                )
-              }
-              settleTerminal()
-            }
-          }
-        } else if (background.turns.get(eventThread) === eventTurnId) {
-          const interrupting = background.interruptingChild,
-            status =
-              eventTurn && typeof eventTurn === 'object'
-                ? Reflect.get(eventTurn, 'status')
-                : undefined
-          if (status === 'completed' || status === 'failed' || status === 'interrupted') {
-            if (interrupting?.threadId === eventThread && interrupting.turnId === eventTurnId)
-              interrupting.terminal = true
-            background.threads.delete(eventThread)
-          }
-        }
-      }
-      if (root && background.foregroundReleased && ownedTurn) {
-        if (eventMethod === 'item/agentMessage/delta') {
-          const itemId = Reflect.get(eventParams, 'itemId'),
-            delta = Reflect.get(eventParams, 'delta')
-          if (typeof itemId === 'string' && typeof delta === 'string') {
-            const text = projectOutput(() => answer.append(itemId, delta))
-            if (text !== undefined)
-              input.host?.effects?.recordArchivedEvent?.({
-                agentId: 'codex',
-                type: 'text.delta',
-                turnId: background.primaryTurnId!,
-                outputId: answer.outputId,
-                text,
-              })
-          }
-        } else if (eventMethod === 'item/completed') {
-          const item = Reflect.get(eventParams, 'item')
-          if (item && typeof item === 'object' && Reflect.get(item, 'type') === 'agentMessage') {
-            const itemId = Reflect.get(item, 'id'),
-              text = Reflect.get(item, 'text')
-            if (typeof itemId === 'string' && typeof text === 'string') {
-              const completed = projectOutput(() => answer.complete(itemId, text))
-              if (completed !== undefined)
-                input.host?.effects?.recordArchivedEvent?.({
-                  agentId: 'codex',
-                  type: 'text.completed',
-                  turnId: background.primaryTurnId!,
-                  outputId: answer.outputId,
-                  text: completed,
-                })
-            }
-          }
-        }
-      }
-      if (eventMethod === 'item/started') {
-        const item = Reflect.get(eventParams, 'item')
-        if (item && typeof item === 'object') {
-          cacheApprovalItem(approvalItems, item, eventThread, eventTurnId)
-          const itemId = Reflect.get(item, 'id'),
-            type = Reflect.get(item, 'type')
-          if (
-            root &&
-            ownedTurn &&
-            !detachedRoot &&
-            !signal.aborted &&
-            !background.foregroundReleased &&
-            nativeConnection === this.runtime.connection &&
-            type === 'commandExecution' &&
-            ['agent', 'unifiedExecStartup'].includes(String(Reflect.get(item, 'source')))
-          ) {
-            const processId = Reflect.get(item, 'processId')
-            if (
-              typeof itemId !== 'string' ||
-              !itemId ||
-              Buffer.byteLength(itemId) > 1024 ||
-              (processId != null &&
-                (typeof processId !== 'string' ||
-                  !processId ||
-                  Buffer.byteLength(processId) > 1024))
-            ) {
-              reportUnknown('Native foreground command identity could not be verified.')
-            } else {
-              const handle = typeof processId === 'string' ? processId : undefined
-              const bytes = Buffer.byteLength(JSON.stringify([itemId, handle ?? null]))
-              const previous = background.foregroundCommands.get(itemId)
-              const previousBytes = background.foregroundCommands.has(itemId)
-                ? Buffer.byteLength(JSON.stringify([itemId, previous ?? null]))
-                : 0
-              if (
-                (!background.foregroundCommands.has(itemId) &&
-                  background.foregroundCommands.size >= CODEX_STOP_COMMANDS) ||
-                background.foregroundCommandBytes - previousBytes + bytes >
-                  CODEX_STOP_IDENTITY_BYTES ||
-                (previous !== undefined && handle !== previous)
-              ) {
-                reportUnknown('Native foreground command ownership exceeded its bounded evidence.')
-              } else {
-                background.foregroundCommands.set(itemId, handle)
-                background.foregroundCommandBytes += bytes - previousBytes
-              }
-            }
-          }
-          if (
-            typeof itemId === 'string' &&
-            itemId.length <= 1024 &&
-            typeof eventTurnId === 'string'
-          ) {
-            const key = JSON.stringify([eventThread, eventTurnId, itemId])
-            if (
-              ['commandExecution', 'fileChange', 'mcpToolCall', 'dynamicToolCall'].includes(
-                String(type),
-              )
-            ) {
-              if (background.operations.size < 64) background.operations.add(key)
-              else {
-                background.untrackedWork = true
-                reportUnknown('Native command observation exceeded its bounded item set.')
-              }
-            }
-            if (
-              ['collabAgentToolCall', 'collabToolCall'].includes(String(type)) &&
-              Reflect.get(item, 'tool') === 'spawnAgent'
-            ) {
-              if (background.spawns.size < 64) background.spawns.add(key)
-              else {
-                background.untrackedWork = true
-                reportUnknown('Native spawn observation exceeded its bounded item set.')
-              }
-            }
-          }
-        }
-      }
-      if (Object.hasOwn(event, 'id') && typeof eventMethod === 'string') {
-        if (root && !background.foregroundReleased && !detachedRoot && !replaying) return false
-        if (background.interactions.size >= 8) {
-          reportUnknown('Native interactions exceeded their bounded request owner.')
-          const requestId = Reflect.get(event, 'id')
-          if (typeof requestId === 'string' || typeof requestId === 'number')
-            void nativeConnection
-              .respondError(
-                requestId,
-                'Pact cannot display another native interaction within its request budget. No approval response was sent.',
-              )
-              .catch(() => undefined)
-          return true
-        }
-        const interactionSignal =
-          root && !background.foregroundReleased && !detachedRoot
-            ? foregroundInteractionSignal
-            : background.observation.signal
-        const interaction = this.runtime.connections
-          .relayPermission(
-            nativeConnection,
-            event,
-            eventMethod,
-            eventParams,
-            relayPermissionInputFromRun(input),
-            eventThread,
-            eventThread === background.primaryThreadId
-              ? background.primaryTurnId
-              : typeof eventTurnId === 'string'
-                ? eventTurnId
-                : background.turns.get(eventThread),
-            interactionSignal,
-            handledRequests,
-            approvalItems,
-          )
-          .catch(() => reportUnknown('Native background approval delivery could not be confirmed.'))
-        background.interactions.add(interaction)
-        void interaction.finally(() => {
-          background.interactions.delete(interaction)
-          maybeSettle()
-        })
-        if (root && replaying) return true
-      }
-      if (eventMethod === 'item/completed') {
-        const item = Reflect.get(eventParams, 'item')
-        if (item && typeof item === 'object' && Reflect.get(item, 'type') === 'fileChange') {
-          const evidence = codexFileChanges(item, input.cwd)
-          const nativeId = Reflect.get(item, 'id')
-          evidence.changes = evidence.changes.map((change, index) => ({
-            ...change,
-            ...(typeof nativeId === 'string'
-              ? {
-                  operationId: root
-                    ? `${nativeId}:${index}`
-                    : `${eventThread}:${nativeId}:${index}`,
-                }
-              : { unavailableReason: 'The native operation identity was unavailable.' }),
-          }))
-          const evidenceBytes = Buffer.byteLength(JSON.stringify(evidence), 'utf8')
-          // S3-F3: Single bounded sequential FIFO queue for ALL owned fileChange recordings;
-          // overflow immediately fails closed (`recorded_files` uncertain) with no foreground drop path.
-          if (
-            background.recordings.size >= CODEX_MAX_PENDING_RECORDINGS ||
-            background.recordingBytes + evidenceBytes > CODEX_MAX_PENDING_RECORDING_BYTES
-          ) {
-            fileChangeRecordings.set(item, Promise.resolve())
-            reportUnknown(
-              'Native file evidence exceeded its bounded recording queue.',
-              'recorded_files',
-            )
-          } else {
-            background.recordingBytes += evidenceBytes
-            const recording = background.recordingTail.then(() =>
-              recordNativeChanges(input, evidence, background.observation.signal),
-            )
-            background.recordingTail = recording.catch(() => undefined)
-            background.recordings.add(recording)
-            fileChangeRecordings.set(item, recording)
-            void recording.finally(() => {
-              background.recordings.delete(recording)
-              background.recordingBytes = Math.max(0, background.recordingBytes - evidenceBytes)
-              maybeSettle()
-            })
-          }
-        }
-        if (item && typeof item === 'object')
-          this.runtime.trackNativeBackground(
-            background,
-            item,
-            eventThread,
-            typeof eventTurnId === 'string' ? eventTurnId : undefined,
-          )
-        replayEarly()
-      }
-      maybeSettle()
-      if (!root)
-        nativeEffectsUncertain(
-          input,
-          'Native child/background work may include effects outside recorded file operations.',
-        )
-      return !root || background.foregroundReleased || detachedRoot
-    }
+    const observer = new CodexTurnNativeObserver({
+      runtime: this.runtime,
+      kernel: this.kernel,
+      input,
+      signal,
+      foregroundInteractionSignal,
+      sourceGrant,
+      background,
+      delivery,
+      answer,
+      getConnection: () => connection,
+      getThreadId: () => threadId,
+      getTurnId: () => turnId,
+      setTurnId: (nextTurnId) => {
+        turnId = nextTurnId
+      },
+      getProvisionalThreadId: () => provisionalThreadId,
+      setProvisionalThreadId: (nextThreadId) => {
+        provisionalThreadId = nextThreadId
+      },
+      isThreadStartupDispatched: () => threadStartupDispatched,
+      isForegroundTurnCompletedYielded: () => foregroundTurnCompletedYielded,
+      getPeerReceipt: () => peerReceipt,
+      getProjectionFailure: () => projectionFailure,
+      setProjectionFailure: (err) => {
+        projectionFailure = err
+      },
+      projectOutput,
+      capturePlan,
+      observePlanOperation,
+      captureRetainedPlan,
+      captureReview,
+      captureInputResult,
+      getWorkflowArtifacts: () => ({ submittedPlan, reviewResult, inputResult }),
+    })
 
     try {
       const resolvedPeerCandidate = this.runtime.resolvePeerTarget?.(input.sessionId)
@@ -1436,6 +513,10 @@ export class CodexTurnSession {
           !inputResult &&
           background.interactions.size === 0,
       )
+      const activePeerReceipt = peerReceipt
+      foregroundScope.add('peer_tool_turn', () =>
+        this.runtime.peerToolServer.endTurn(activePeerReceipt),
+      )
       // Loaded Threads ignore resume config: their installed capability URL must stay stable.
       const peerToolUrl = await this.runtime.peerToolServer.start()
       const toolConfig = await this.runtime.connections.pactToolConfig(
@@ -1456,106 +537,7 @@ export class CodexTurnSession {
           }
         : toolConfig.settingsPolicy
       const nativeConnection = connection
-      releaseApprovalMetadata = nativeConnection.subscribeBackground((event) => {
-        // Settings ACK belongs to the current next-task update, not an older Run.
-        if (Reflect.get(event, 'method') === 'thread/settings/updated') return false
-        if (handleOwnedNativeEvent(event)) return true
-        if (
-          background.closed ||
-          background.foregroundReleased ||
-          background.rootTerminal ||
-          background.rootNotStarted
-        )
-          return false
-        const params = Reflect.get(event, 'params')
-        if (
-          !params ||
-          typeof params !== 'object' ||
-          Reflect.get(params, 'threadId') !==
-            (threadId ?? provisionalThreadId ?? input.nativeSessionId)
-        )
-          return false
-        const item = Reflect.get(params, 'item')
-        if (item && typeof item === 'object' && Reflect.get(event, 'method') === 'item/started')
-          cacheApprovalItem(
-            approvalItems,
-            item,
-            Reflect.get(params, 'threadId'),
-            Reflect.get(params, 'turnId'),
-          )
-        return false
-      })
-      releaseNativeRequests = nativeConnection.subscribeServerRequests((request) => {
-        if (handleOwnedNativeEvent(request)) return true
-        const method = Reflect.get(request, 'method'),
-          params = Reflect.get(request, 'params')
-        if (typeof method !== 'string' || !params || typeof params !== 'object') return false
-        const nativeThread =
-          Reflect.get(params, 'threadId') ?? Reflect.get(params, 'conversationId')
-        const requestedTurn = Reflect.get(params, 'turnId')
-        const expectedThread = threadId ?? provisionalThreadId ?? input.nativeSessionId
-        if (
-          !threadStartupDispatched ||
-          background.closed ||
-          background.foregroundReleased ||
-          background.rootTerminal ||
-          background.rootNotStarted ||
-          typeof nativeThread !== 'string' ||
-          !nativeThread ||
-          nativeThread.length > 1024 ||
-          (expectedThread && nativeThread !== expectedThread)
-        )
-          return false
-        if (
-          delivery.phase === 'before_dispatch' &&
-          (method !== 'mcpServer/elicitation/request' || requestedTurn != null)
-        ) {
-          rejectServerRequest(request, 'This native request is not valid before Turn dispatch.')
-          return true
-        }
-        provisionalThreadId ??= nativeThread
-        if (delivery.phase !== 'before_dispatch') {
-          if (!turnId) return bufferEarly(request)
-          if (typeof requestedTurn === 'string' && turnId !== requestedTurn) {
-            rejectServerRequest(request, 'This native request does not belong to the active Turn.')
-            return true
-          }
-        }
-        if (background.interactions.size >= 8) {
-          reportUnknown('Native interactions exceeded their bounded request owner.')
-          rejectServerRequest(
-            request,
-            'Pact cannot display another native interaction within its request budget. No approval response was sent.',
-          )
-          return true
-        }
-        const interaction = this.runtime.connections
-          .relayPermission(
-            nativeConnection,
-            request,
-            method,
-            params,
-            relayPermissionInputFromRun(input),
-            nativeThread,
-            turnId,
-            foregroundInteractionSignal,
-            handledRequests,
-            approvalItems,
-          )
-          .catch(() =>
-            nativeEffectsUncertain(
-              input,
-              'Native interaction response delivery could not be confirmed.',
-            ),
-          )
-
-        background.interactions.add(interaction)
-        void interaction.finally(() => {
-          background.interactions.delete(interaction)
-          maybeSettle()
-        })
-        return true
-      })
+      observer.attachSubscriptions(nativeConnection, releaseScope)
 
       // Native resume preserves the installed stable capability for a loaded Thread.
       {
@@ -1576,8 +558,8 @@ export class CodexTurnSession {
           onLateReply: (lateMessage) => {
             if (background.closed || background.rootNotStarted) return
             if (Reflect.get(lateMessage, 'error')) {
-              markRootNotStartedIfUnsent(input.nativeSessionId)
-              maybeSettle()
+              observer.markRootNotStartedIfUnsent(input.nativeSessionId)
+              observer.maybeSettle()
               return
             }
             const lateResult = Reflect.get(lateMessage, 'result')
@@ -1598,15 +580,15 @@ export class CodexTurnSession {
             ) {
               threadId = lateThreadId
               background.primaryThreadId = lateThreadId
-              drainPendingOwnedFacts(false)
-              markRootNotStartedIfUnsent(lateThreadId)
-              maybeSettle()
+              observer.drainPendingOwnedFacts(false)
+              observer.markRootNotStartedIfUnsent(lateThreadId)
+              observer.maybeSettle()
             } else {
-              reportUnknown(
+              observer.reportUnknown(
                 'Codex late thread startup reply carried an invalid or mismatched thread identity.',
               )
-              markRootNotStartedIfUnsent(input.nativeSessionId)
-              maybeSettle()
+              observer.markRootNotStartedIfUnsent(input.nativeSessionId)
+              observer.maybeSettle()
             }
           },
         })
@@ -1614,8 +596,8 @@ export class CodexTurnSession {
         void startupOp.physicalCompletion
           .then((completion) => {
             if (completion === 'not_sent') {
-              markRootNotStartedIfUnsent(input.nativeSessionId)
-              maybeSettle()
+              observer.markRootNotStartedIfUnsent(input.nativeSessionId)
+              observer.maybeSettle()
             }
             return undefined
           })
@@ -1626,7 +608,7 @@ export class CodexTurnSession {
         if (rpcError) {
           // An explicit startup rejection proves no Turn was submitted. This is
           // not a completed Turn; outstanding startup interactions still drain.
-          markRootNotStartedIfUnsent(input.nativeSessionId)
+          observer.markRootNotStartedIfUnsent(input.nativeSessionId)
           throw classifyCodexStartupRejection(rpcError, input.nativeSessionId)
         }
         const result = Reflect.get(message, 'result')
@@ -1641,7 +623,7 @@ export class CodexTurnSession {
           throw new AgentExecutionError('protocol_error', 'Codex returned no Thread ID.', false)
         }
         if (input.nativeSessionId && input.nativeSessionId !== resolvedThreadId) {
-          markRootNotStartedIfUnsent(input.nativeSessionId)
+          observer.markRootNotStartedIfUnsent(input.nativeSessionId)
           // S3-F7: Thread ID mismatch is a protocol contradiction, NOT proof the saved thread is missing.
           throw new AgentExecutionError(
             'protocol_error',
@@ -1657,7 +639,7 @@ export class CodexTurnSession {
           )
         threadId = resolvedThreadId
         background.primaryThreadId = threadId
-        replayEarly()
+        observer.replayEarly()
         let appliedPolicy: object
         try {
           if (
@@ -1671,7 +653,7 @@ export class CodexTurnSession {
               signal,
               message,
               background,
-              maybeSettle,
+              () => observer.maybeSettle(),
             )
           else {
             confirmPermissionMode(message, input.permissionMode)
@@ -1795,7 +777,7 @@ export class CodexTurnSession {
                 'The replacement authority changed before native input delivery.',
               )
               background.rootInputWithheld = true
-              markRootNotStartedIfUnsent(threadId)
+              observer.markRootNotStartedIfUnsent(threadId)
               return false
             }
           : undefined,
@@ -1806,7 +788,7 @@ export class CodexTurnSession {
             if (error instanceof NativeInputWithheldError) {
               inputWithheldError = error
               background.rootInputWithheld = true
-              markRootNotStartedIfUnsent(threadId)
+              observer.markRootNotStartedIfUnsent(threadId)
             }
             throw error
           }
@@ -1818,8 +800,8 @@ export class CodexTurnSession {
           if (background.closed || background.rootNotStarted) return
           if (Reflect.get(lateMessage, 'error')) {
             if (!background.primaryTurnId) {
-              markRootNotStartedIfUnsent(threadId)
-              maybeSettle()
+              observer.markRootNotStartedIfUnsent(threadId)
+              observer.maybeSettle()
             }
             return
           }
@@ -1829,12 +811,12 @@ export class CodexTurnSession {
           const lateTurnId =
             lateTurn && typeof lateTurn === 'object' ? Reflect.get(lateTurn, 'id') : undefined
           if (typeof lateTurnId !== 'string' || !lateTurnId || lateTurnId.length > 1024) {
-            reportUnknown('Codex late turn/start reply carried an invalid Turn identity.')
-            releaseRootStartupEarly()
-            maybeSettle()
+            observer.reportUnknown('Codex late turn/start reply carried an invalid Turn identity.')
+            observer.releaseRootStartupEarly()
+            observer.maybeSettle()
             return
           }
-          bindRootTurn(lateTurnId, 'late_ack')
+          observer.bindRootTurn(lateTurnId, 'late_ack')
         },
       })
       rootTurnRequested = rootOperation.requestId !== null
@@ -1847,14 +829,14 @@ export class CodexTurnSession {
         void rootOperation.physicalCompletion
           .then((completion) => {
             if (completion === 'not_sent') {
-              markRootNotStartedIfUnsent(threadId)
+              observer.markRootNotStartedIfUnsent(threadId)
               if (recovery && requestId !== null) {
                 recovery.recordConfirmedUnsent(
                   { kind: 'codex_root_frame_not_written', requestId },
                   identity,
                 )
               }
-              maybeSettle()
+              observer.maybeSettle()
             }
             return undefined
           })
@@ -1864,7 +846,7 @@ export class CodexTurnSession {
       const turnRpcError = Reflect.get(turnResponse, 'error')
       if (turnRpcError) {
         delivery.phase = 'before_dispatch'
-        if (!background.primaryTurnId) markRootNotStartedIfUnsent(threadId)
+        if (!background.primaryTurnId) observer.markRootNotStartedIfUnsent(threadId)
         throw classifyCodexRpcError(turnRpcError, 'Codex rejected turn/start.')
       }
       const turnResult = Reflect.get(turnResponse, 'result')
@@ -1874,7 +856,7 @@ export class CodexTurnSession {
       if (typeof resolvedTurnId !== 'string') {
         throw new AgentExecutionError('protocol_error', 'Codex returned no Turn ID.', false)
       }
-      if (!bindRootTurn(resolvedTurnId, 'ack')) {
+      if (!observer.bindRootTurn(resolvedTurnId, 'ack')) {
         turnId = undefined
         background.primaryTurnId = undefined
         throw new AgentExecutionError(
@@ -1964,7 +946,7 @@ export class CodexTurnSession {
             // oxlint-disable-next-line no-await-in-loop -- One same-owner steering RPC has its existing absolute deadline.
             await background.steeringDone
         }
-        if (handleOwnedNativeEvent(message)) continue
+        if (observer.handleOwnedNativeEvent(message)) continue
         if (typeof notificationThreadId === 'string' && notificationThreadId !== threadId) {
           const requestId = Reflect.get(message, 'id')
           if (typeof requestId === 'string' || typeof requestId === 'number')
@@ -2040,7 +1022,7 @@ export class CodexTurnSession {
           const item = Reflect.get(params, 'item')
           if (!turnId || !item || typeof item !== 'object') continue
           const itemId = Reflect.get(item, 'id')
-          cacheApprovalItem(approvalItems, item, threadId, turnId)
+          observer.cacheApprovalItem(item, threadId, turnId)
           if (Reflect.get(item, 'type') === 'reasoning' && typeof itemId === 'string') continue
           if (
             isPeerTool(item, this.runtime.peerServerName) ||
@@ -2199,7 +1181,7 @@ export class CodexTurnSession {
             }
           } else {
             if (Reflect.get(item, 'type') === 'fileChange') {
-              const pendingRecording = fileChangeRecordings.get(item)
+              const pendingRecording = observer.getFileChangeRecording(item)
               if (pendingRecording) {
                 // oxlint-disable-next-line no-await-in-loop -- Preserve applied native operation order.
                 await pendingRecording
@@ -2343,8 +1325,8 @@ export class CodexTurnSession {
             threadId,
             turnId,
             signal,
-            handledRequests,
-            approvalItems,
+            observer.handledRequests,
+            observer.approvalItems,
           )
           if (!background.rootTerminal)
             input.host?.lifecycle?.recordNativeEvidence?.({
@@ -2379,7 +1361,7 @@ export class CodexTurnSession {
           ).data ?? 'other',
       })
       if (!threadStartupDispatched || (threadStartupCompleted && !rootTurnRequested)) {
-        markRootNotStartedIfUnsent()
+        observer.markRootNotStartedIfUnsent()
       }
       if (!background.rootTerminal && !background.rootNotStarted && threadId)
         input.host?.lifecycle?.recordNativeEvidence?.({
@@ -2409,37 +1391,10 @@ export class CodexTurnSession {
       }
       throw failure
     } finally {
-      signal.removeEventListener('abort', freezeForegroundCommands)
+      foregroundScope.dispose()
       background.foregroundReleased = true
-      // A-F5: If verified root terminal arrived before foreground exited (e.g., while paused
-      // on fileChange recording or run.speed.resolved), hand off any undelivered authoritative
-      // answer to RunOutputArchiver BEFORE answer.dispose() runs.
-      if (
-        background.rootTerminal &&
-        rootTerminalOutcome &&
-        !foregroundTurnCompletedYielded &&
-        !archivedTurnCompletedEmitted &&
-        !projectionFailure
-      ) {
-        const outcome = rootTerminalOutcome
-        if (background.steering && background.steeringDone) {
-          const handoff = background.steeringDone
-            .then(() => {
-              emitArchivedTerminalSnapshot(outcome)
-              return undefined
-            })
-            .catch(() => undefined)
-          background.interactions.add(handoff)
-          void handoff.finally(() => {
-            background.interactions.delete(handoff)
-            maybeSettle()
-          })
-        } else {
-          emitArchivedTerminalSnapshot(outcome)
-        }
-      }
+      observer.handoffUndeliveredTerminalSnapshot()
       if (background.closed) answer.dispose()
-      if (peerReceipt) this.runtime.peerToolServer.endTurn(peerReceipt)
       if (
         sourceGrant &&
         (background.rootTerminal ||
@@ -2460,7 +1415,7 @@ export class CodexTurnSession {
           nativeWillRetry: retryNotifications > 0,
           count: retryNotifications + foreignErrorNotifications,
         })
-      const finallyInterrupt = maybeInterruptRoot(stoppedCommands, false)
+      const finallyInterrupt = observer.maybeInterruptRoot(stoppedCommands, false)
       if (finallyInterrupt) {
         await finallyInterrupt
       }
@@ -2468,7 +1423,7 @@ export class CodexTurnSession {
       background.cancellationPending = false
       this.runtime.running = false
       if (!threadStartupDispatched || (threadStartupCompleted && !rootTurnRequested)) {
-        markRootNotStartedIfUnsent()
+        observer.markRootNotStartedIfUnsent()
       }
       if (!connection?.isOpen) {
         if (!background.rootNotStarted) background.unknown = true
@@ -2478,12 +1433,12 @@ export class CodexTurnSession {
         if (!background.rootTerminal && !background.rootNotStarted)
           // The background observer still receives every frame on this live connection.
           // Its later exact terminal and fully drained work can settle this temporary state.
-          reportUnknown(
+          observer.reportUnknown(
             'The foreground ended without proof that native work finished.',
             'unlisted',
             'awaiting_terminal',
           )
-        maybeSettle()
+        observer.maybeSettle()
       }
       if (background.closed) {
         await this.kernel.settle()
