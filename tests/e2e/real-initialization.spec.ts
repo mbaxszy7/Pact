@@ -109,7 +109,7 @@ test(
         checkedState.forkOperation?.sides.find((side) => side.agentId === 'codex')?.nativeSessionId,
       ).toBe(candidate)
       if (!checkedState.forkOperation?.ready) {
-        await ctx.page.getByRole('button', { name: 'Continue initialization', exact: true }).click()
+        await ctx.page.getByRole('button', { name: 'Complete setup', exact: true }).click()
       }
       await expect(ctx.page.getByRole('region', { name: 'Native fork confirmation' })).toHaveCount(
         0,
@@ -230,9 +230,9 @@ test(
       const before = await methods(ctx, 'thread/start')
       await ctx.page.getByRole('button', { name: 'Rebuild…', exact: true }).click()
       await expect(
-        ctx.page.getByText('The previous attempt may already have created a session.', {
-          exact: true,
-        }),
+        ctx.page
+          .getByRole('region', { name: 'Session recovery' })
+          .getByText('A previous attempt may have created a session.'),
       ).toBeVisible()
       expect(await methods(ctx, 'thread/start')).toBe(before)
       await ctx.page.getByRole('button', { name: 'Confirm rebuild', exact: true }).click()

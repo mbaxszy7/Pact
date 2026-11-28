@@ -1,11 +1,24 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { copyFile, mkdtemp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { isAbsolute, join, relative } from 'node:path'
 import { test } from 'node:test'
-import { pathToFileURL } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
+import {
+  agySqliteFileFilename,
+  agySqliteFileResourcePrefix,
+  agySqliteFileSourceHash,
+  computeMachoPreSignatureSha256,
+} from '../apps/desktop/build/agy-sqlite-file-resource.mjs'
+import {
+  TERMINAL_HELPER_PROTOCOL_VERSION,
+  terminalHelperFilename,
+  terminalHelperResourcePrefix,
+  terminalHelperSourceHash,
+} from '../apps/desktop/build/terminal-helper-resource.mjs'
 import { applicationContent, hashFile } from './build-distribution.mjs'
 import { ciEnvironment } from './ci.mjs'
 import {
@@ -20,10 +33,214 @@ import {
 } from './package-smoke.mjs'
 import { run } from './run-e2e.mjs'
 
+const helperDigest = (bytes) => createHash('sha256').update(bytes).digest('hex')
+
+await test('credential cleanup failure cannot certify an otherwise released package fixture', () => {
+  const report = packageSmokeFailureReport({
+    phase: 'cleanup',
+    cleanupFailed: true,
+    cleanupFailureStage: 'credential-store',
+    processes: [],
+    installationCleanupVerified: true,
+    providerCopiesCleanupVerified: true,
+    privateRootCleanupVerified: true,
+    credentialStoreCleanupVerified: false,
+    recoveryPreserved: true,
+  })
+  assert.equal(report.cleanupVerified, false)
+  assert.equal(report.credentialStoreCleanupVerified, false)
+  assert.equal(report.cleanupFailureStage, 'credential-store')
+  assert.equal(report.failureCode, 'CLEANUP_UNCONFIRMED')
+  assert.equal(report.recoveryPreserved, true)
+})
+
+function helperPayload(arch) {
+  // A process-seam fixture, never an executable Windows/installed acceptance claim.
+  const pe = Buffer.alloc(128)
+  pe.write('MZ')
+  pe.writeUInt32LE(64, 60)
+  pe.writeUInt32LE(0x4550, 64)
+  pe.writeUInt16LE(arch === 'arm64' ? 0xaa64 : 0x8664, 68)
+  const metadata = JSON.stringify({
+    version: 1,
+    platform: 'win32',
+    architecture: arch,
+    protocolVersion: 1,
+    sourceSha256: 'c'.repeat(64),
+    executableSha256: helperDigest(pe),
+    executableBytes: pe.length,
+  })
+  const path = `resources/native/owned-process-group-win32-${arch}.exe`
+  const record = {
+    architecture: arch,
+    protocolVersion: 1,
+    sourceSha256: 'c'.repeat(64),
+    executable: { path, sha256: helperDigest(pe), bytes: pe.length },
+    identity: {
+      path: `${path}.json`,
+      sha256: helperDigest(metadata),
+      bytes: Buffer.byteLength(metadata),
+    },
+  }
+  return {
+    pe,
+    metadata,
+    record,
+    entries: [record.executable, record.identity].map((entry) => ({
+      path: entry.path,
+      sha256: entry.sha256,
+      bytes: entry.bytes,
+      type: 'file',
+      mode: 0,
+    })),
+  }
+}
+
+function agySqliteFilePayload(platform, arch) {
+  let bin
+  if (platform === 'darwin') {
+    bin = Buffer.alloc(128)
+    bin.writeUInt32LE(0xfeedfacf, 0)
+    bin.writeUInt32LE(arch === 'arm64' ? 0x0100000c : 0x01000007, 4)
+  } else {
+    const peOffset = 64
+    const optOffset = peOffset + 24
+    const sizeOfOptionalHeader = 240
+    const sectionTableOffset = optOffset + sizeOfOptionalHeader
+    const rawSectionOffset = 512
+    const rawSectionSize = 256
+    const loadConfigRva = 0x2000
+    const loadConfigSize = 160
+    bin = Buffer.alloc(rawSectionOffset + rawSectionSize)
+    bin.write('MZ', 0, 'ascii')
+    bin.writeUInt32LE(peOffset, 60)
+    bin.writeUInt32LE(0x4550, peOffset)
+    bin.writeUInt16LE(arch === 'arm64' ? 0xaa64 : 0x8664, peOffset + 4)
+    bin.writeUInt16LE(1, peOffset + 6)
+    bin.writeUInt16LE(sizeOfOptionalHeader, peOffset + 20)
+    bin.writeUInt16LE(0x2022, peOffset + 22)
+    bin.writeUInt16LE(0x020b, optOffset)
+    bin.writeUInt16LE(0x4160, optOffset + 70)
+    bin.writeUInt32LE(16, optOffset + 108)
+    bin.writeUInt32LE(loadConfigRva, optOffset + 112 + 10 * 8)
+    bin.writeUInt32LE(loadConfigSize, optOffset + 112 + 10 * 8 + 4)
+    bin.write('.rdata\0\0', sectionTableOffset, 'ascii')
+    bin.writeUInt32LE(rawSectionSize, sectionTableOffset + 8)
+    bin.writeUInt32LE(loadConfigRva, sectionTableOffset + 12)
+    bin.writeUInt32LE(rawSectionSize, sectionTableOffset + 16)
+    bin.writeUInt32LE(rawSectionOffset, sectionTableOffset + 20)
+    bin.writeUInt32LE(loadConfigSize, rawSectionOffset)
+    bin.writeUInt32LE(0x00000100, rawSectionOffset + 144)
+  }
+  const sourceSha256 = 'e'.repeat(64)
+  const metadata = JSON.stringify({
+    version: 1,
+    platform,
+    architecture: arch,
+    sourceSha256,
+    binarySha256: helperDigest(bin),
+    binaryBytes: bin.length,
+  })
+  const path = `${agySqliteFileResourcePrefix(platform)}/${agySqliteFileFilename(platform, arch)}`
+  const record = {
+    version: 1,
+    platform,
+    architecture: arch,
+    sourceSha256,
+    binary: { path, sha256: helperDigest(bin), bytes: bin.length },
+    identity: {
+      path: `${path}.json`,
+      sha256: helperDigest(metadata),
+      bytes: Buffer.byteLength(metadata),
+    },
+  }
+  return {
+    bin,
+    metadata,
+    record,
+    entries: [record.binary, record.identity].map((entry) => ({
+      path: entry.path,
+      sha256: entry.sha256,
+      bytes: entry.bytes,
+      type: 'file',
+      mode: platform === 'win32' ? 0 : 0o644,
+    })),
+  }
+}
+
+function terminalHelperPayload(platform, arch) {
+  const filename = terminalHelperFilename(platform, arch)
+  let bin
+  let machoPreSignatureSha256
+  if (platform === 'darwin') {
+    bin = Buffer.alloc(136)
+    bin.writeUInt32LE(0xfeedfacf, 0)
+    bin.writeUInt32LE(arch === 'arm64' ? 0x0100000c : 0x01000007, 4)
+    bin.writeUInt32LE(0x2, 12)
+    bin.writeUInt32LE(2, 16)
+    bin.writeUInt32LE(88, 20)
+    // LC_SEGMENT_64 (0x19, size 72) covering trailing __LINKEDIT [120..136)
+    bin.writeUInt32LE(0x19, 32)
+    bin.writeUInt32LE(72, 36)
+    bin.write('__LINKEDIT\0\0\0\0\0\0', 40, 'ascii')
+    bin.writeBigUInt64LE(120n, 72)
+    bin.writeBigUInt64LE(16n, 80)
+    // LC_CODE_SIGNATURE (0x1d, size 16) at [120..136)
+    bin.writeUInt32LE(0x1d, 104)
+    bin.writeUInt32LE(16, 108)
+    bin.writeUInt32LE(120, 112)
+    bin.writeUInt32LE(16, 116)
+    machoPreSignatureSha256 = computeMachoPreSignatureSha256(bin, arch)
+    assert(machoPreSignatureSha256)
+  } else {
+    const peOffset = 64
+    const optOffset = peOffset + 24
+    bin = Buffer.alloc(256)
+    bin.write('MZ', 0, 'ascii')
+    bin.writeUInt32LE(peOffset, 0x3c)
+    bin.writeUInt32LE(0x00004550, peOffset)
+    bin.writeUInt16LE(arch === 'arm64' ? 0xaa64 : 0x8664, peOffset + 4)
+    bin.writeUInt16LE(0x0002, peOffset + 22)
+    bin.writeUInt16LE(0x020b, optOffset)
+    bin.writeUInt16LE(0x4160, optOffset + 70)
+  }
+  const sourceSha256 = 'e'.repeat(64)
+  const record = {
+    protocolVersion: TERMINAL_HELPER_PROTOCOL_VERSION,
+    platform,
+    arch,
+    filename,
+    sourceSha256,
+    binarySha256: helperDigest(bin),
+    binaryBytes: bin.length,
+    ...(machoPreSignatureSha256 ? { machoPreSignatureSha256 } : {}),
+  }
+  const metadata = JSON.stringify(record)
+  const path = `${terminalHelperResourcePrefix(platform)}/${filename}`
+  return {
+    bin,
+    metadata,
+    path,
+    record,
+    entries: [
+      { path, sha256: helperDigest(bin), bytes: bin.length },
+      { path: `${path}.json`, sha256: helperDigest(metadata), bytes: Buffer.byteLength(metadata) },
+    ].map((entry) => ({
+      path: entry.path,
+      sha256: entry.sha256,
+      bytes: entry.bytes,
+      type: 'file',
+      mode: platform === 'win32' ? 0 : 0o644,
+    })),
+  }
+}
+
 await test('manifest admission preserves local Production identity and rejects mixed profile/channel names', async (context) => {
   const root = await mkdtemp(join(tmpdir(), 'pact-local-manifest-'))
   context.after(() => rm(root, { recursive: true, force: true }))
   const path = join(root, 'distribution-manifest.json')
+  const agy = agySqliteFilePayload(process.platform, process.arch)
+  const terminal = terminalHelperPayload(process.platform, process.arch)
   const manifest = {
     schemaVersion: 1,
     profile: 'production-local',
@@ -35,13 +252,20 @@ await test('manifest admission preserves local Production identity and rejects m
     version: '0.1.0',
     sourceSha: 'a'.repeat(40),
     buildNumber: '1',
+    agySqliteFile: agy.record,
+    terminalHelper: terminal.record,
     application: {
       path: 'application',
       executable: 'Pact',
       contentSha256: 'b'.repeat(64),
-      entries: [],
+      entries: [...agy.entries, ...terminal.entries],
     },
     artifacts: [],
+  }
+  if (process.platform === 'win32') {
+    const helper = helperPayload(process.arch)
+    manifest.windowsOwnedProcess = helper.record
+    manifest.application.entries = [...helper.entries, ...agy.entries, ...terminal.entries]
   }
   await writeFile(path, JSON.stringify(manifest))
   assert.equal((await readDistributionManifest(path)).productName, manifest.productName)
@@ -162,10 +386,24 @@ async function nsisFixture(context, behavior = {}) {
   const installerIcon = await readFile(new URL('../apps/desktop/build/icon.ico', import.meta.url))
   await writeFile(join(payload, 'uninstallerIcon.ico'), installerIcon)
   await writeFile(artifact, 'synthetic installer bytes', { mode: 0o700 })
+  const helper = helperPayload(process.arch)
+  const agy = agySqliteFilePayload('win32', process.arch)
+  const terminal = terminalHelperPayload('win32', process.arch)
+  await mkdir(join(payload, 'resources/native'), { recursive: true })
+  await writeFile(join(payload, helper.record.executable.path), helper.pe)
+  await writeFile(join(payload, helper.record.identity.path), helper.metadata)
+  await writeFile(join(payload, agy.record.binary.path), agy.bin)
+  await writeFile(join(payload, agy.record.identity.path), agy.metadata)
+  await writeFile(join(payload, terminal.path), terminal.bin)
+  await writeFile(join(payload, `${terminal.path}.json`), terminal.metadata)
   const content = await applicationContent(payload, 'win32')
   const manifest = {
     productName: 'Pact Dev',
     platform: 'win32',
+    arch: process.arch,
+    windowsOwnedProcess: helper.record,
+    agySqliteFile: agy.record,
+    terminalHelper: terminal.record,
     application: {
       executable: 'Pact Dev.exe',
       contentSha256: content.sha256,
@@ -213,6 +451,28 @@ async function nsisFixture(context, behavior = {}) {
       await writeFile(
         join(owned, 'installed', 'uninstallerIcon.ico'),
         behavior.corruptIcon ? 'changed installed icon' : installerIcon,
+      )
+      await mkdir(join(owned, 'installed/resources/native'), { recursive: true })
+      await copyFile(
+        join(payload, helper.record.executable.path),
+        join(owned, 'installed', helper.record.executable.path),
+      )
+      await copyFile(
+        join(payload, helper.record.identity.path),
+        join(owned, 'installed', helper.record.identity.path),
+      )
+      await copyFile(
+        join(payload, agy.record.binary.path),
+        join(owned, 'installed', agy.record.binary.path),
+      )
+      await copyFile(
+        join(payload, agy.record.identity.path),
+        join(owned, 'installed', agy.record.identity.path),
+      )
+      await copyFile(join(payload, terminal.path), join(owned, 'installed', terminal.path))
+      await copyFile(
+        join(payload, `${terminal.path}.json`),
+        join(owned, 'installed', `${terminal.path}.json`),
       )
       if (!behavior.installUnconfirmed)
         options.onState({ kind: 'settled', groupGone: true, ownedProcessCount: 0 })
@@ -1066,6 +1326,8 @@ await test('a parsed manifest contributes only validated distribution identity t
     reportPath = join(directory, 'failure.json'),
     secret = 'synthetic-private-package-extension',
     calls = []
+  const agy = agySqliteFilePayload(process.platform, process.arch)
+  const terminal = terminalHelperPayload(process.platform, process.arch)
   await writeFile(
     manifestPath,
     JSON.stringify({
@@ -1078,15 +1340,23 @@ await test('a parsed manifest contributes only validated distribution identity t
       version: '0.1.0',
       sourceSha: 'a'.repeat(40),
       buildNumber: '1',
+      agySqliteFile: agy.record,
+      terminalHelper: terminal.record,
       application: {
         path: 'unpacked',
         executable: 'Pact',
         contentSha256: 'b'.repeat(64),
-        entries: [],
+        entries:
+          process.platform === 'win32'
+            ? [...helperPayload(process.arch).entries, ...agy.entries, ...terminal.entries]
+            : [...agy.entries, ...terminal.entries],
         secret,
       },
       artifacts: [],
       extensions: secret,
+      ...(process.platform === 'win32'
+        ? { windowsOwnedProcess: helperPayload(process.arch).record }
+        : {}),
     }),
   )
   await assert.rejects(
@@ -1105,3 +1375,145 @@ await test('a parsed manifest contributes only validated distribution identity t
   assert.equal(text.includes(secret) || text.includes(directory), false)
   assert.equal(calls.length, 0)
 })
+
+await test('installed payload inspection rejects a helper source identity that differs from the exact content manifest', async (context) => {
+  const root = await mkdtemp(join(tmpdir(), 'pact-installed-helper-'))
+  context.after(() => rm(root, { recursive: true, force: true }))
+  const helper = helperPayload('x64')
+  const agy = agySqliteFilePayload('win32', 'x64')
+  const terminal = terminalHelperPayload('win32', 'x64')
+  await mkdir(join(root, 'resources/native'), { recursive: true })
+  await writeFile(join(root, 'Pact.exe'), 'synthetic application', { mode: 0o700 })
+  await writeFile(join(root, helper.record.executable.path), helper.pe)
+  await writeFile(join(root, helper.record.identity.path), helper.metadata)
+  await writeFile(join(root, agy.record.binary.path), agy.bin)
+  await writeFile(join(root, agy.record.identity.path), agy.metadata)
+  await writeFile(join(root, terminal.path), terminal.bin)
+  await writeFile(join(root, `${terminal.path}.json`), terminal.metadata)
+  const content = await applicationContent(root, 'win32')
+  const manifest = {
+    platform: 'win32',
+    arch: 'x64',
+    windowsOwnedProcess: helper.record,
+    agySqliteFile: agy.record,
+    terminalHelper: terminal.record,
+    application: {
+      executable: 'Pact.exe',
+      contentSha256: content.sha256,
+      entries: content.entries,
+    },
+  }
+  assert.equal(await verifyApplication(root, manifest, false), join(root, 'Pact.exe'))
+  await assert.rejects(
+    verifyApplication(
+      root,
+      { ...manifest, windowsOwnedProcess: { ...helper.record, sourceSha256: 'd'.repeat(64) } },
+      false,
+    ),
+    /target\/source\/protocol/u,
+  )
+  await assert.rejects(
+    verifyApplication(
+      root,
+      { ...manifest, agySqliteFile: { ...agy.record, sourceSha256: 'f'.repeat(64) } },
+      false,
+    ),
+    /target\/source\/version/u,
+  )
+  await assert.rejects(
+    verifyApplication(
+      root,
+      { ...manifest, terminalHelper: { ...terminal.record, sourceSha256: '0'.repeat(64) } },
+      false,
+    ),
+    /Stale terminal helper metadata/u,
+  )
+})
+
+await test(
+  'packaged smoke verifies real host agy-sqlite-file loadability inside an unpacked application bundle',
+  { skip: !['darwin', 'win32'].includes(process.platform) },
+  async (context) => {
+    const root = await mkdtemp(join(tmpdir(), 'pact-installed-agy-load-'))
+    context.after(() => rm(root, { recursive: true, force: true }))
+    const prefix = agySqliteFileResourcePrefix(process.platform)
+    const filename = agySqliteFileFilename(process.platform, process.arch)
+    const terminalFilename = terminalHelperFilename(process.platform, process.arch)
+    const outNative = fileURLToPath(new URL('../apps/desktop/out/native', import.meta.url))
+    const srcBin = join(outNative, filename)
+    const srcMeta = `${srcBin}.json`
+    const srcTerminalBin = join(outNative, terminalFilename)
+    const srcTerminalMeta = `${srcTerminalBin}.json`
+    const targetDir = join(root, prefix)
+    await mkdir(targetDir, { recursive: true })
+    await copyFile(srcBin, join(targetDir, filename))
+    await copyFile(srcMeta, join(targetDir, `${filename}.json`))
+    await copyFile(srcTerminalBin, join(targetDir, terminalFilename))
+    await copyFile(srcTerminalMeta, join(targetDir, `${terminalFilename}.json`))
+    const executableRel = process.platform === 'darwin' ? 'Contents/MacOS/Pact' : 'Pact.exe'
+    await mkdir(join(root, process.platform === 'darwin' ? 'Contents/MacOS' : '.'), {
+      recursive: true,
+    })
+    await writeFile(join(root, executableRel), 'synthetic application', { mode: 0o700 })
+    const binBytes = await readFile(join(targetDir, filename))
+    const metaBytes = await readFile(join(targetDir, `${filename}.json`))
+    const terminalBytes = await readFile(join(targetDir, terminalFilename))
+    const terminalMeta = JSON.parse(
+      await readFile(join(targetDir, `${terminalFilename}.json`), 'utf8'),
+    )
+    const sourceSha256 = await agySqliteFileSourceHash()
+    const terminalSourceSha256 = await terminalHelperSourceHash(process.platform)
+    const agyRecord = {
+      version: 1,
+      platform: process.platform,
+      architecture: process.arch,
+      sourceSha256,
+      binary: {
+        path: `${prefix}/${filename}`,
+        sha256: helperDigest(binBytes),
+        bytes: binBytes.length,
+      },
+      identity: {
+        path: `${prefix}/${filename}.json`,
+        sha256: helperDigest(metaBytes),
+        bytes: metaBytes.length,
+      },
+    }
+    const terminalRecord = {
+      protocolVersion: TERMINAL_HELPER_PROTOCOL_VERSION,
+      platform: process.platform,
+      arch: process.arch,
+      filename: terminalFilename,
+      sourceSha256: terminalSourceSha256,
+      binarySha256: helperDigest(terminalBytes),
+      binaryBytes: terminalBytes.length,
+      ...(process.platform === 'darwin'
+        ? { machoPreSignatureSha256: terminalMeta.machoPreSignatureSha256 }
+        : {}),
+    }
+    let windowsOwnedProcess = null
+    if (process.platform === 'win32') {
+      const helper = helperPayload(process.arch)
+      await writeFile(join(root, helper.record.executable.path), helper.pe)
+      await writeFile(join(root, helper.record.identity.path), helper.metadata)
+      windowsOwnedProcess = helper.record
+    }
+    const content = await applicationContent(root, process.platform)
+    const manifest = {
+      platform: process.platform,
+      arch: process.arch,
+      ...(windowsOwnedProcess ? { windowsOwnedProcess } : {}),
+      agySqliteFile: agyRecord,
+      terminalHelper: terminalRecord,
+      application: {
+        executable: executableRel,
+        contentSha256: content.sha256,
+        entries: content.entries,
+      },
+    }
+    assert.equal(
+      await verifyApplication(root, manifest, false, { verifyNativeLoad: true }),
+      join(root, executableRel),
+    )
+  },
+)

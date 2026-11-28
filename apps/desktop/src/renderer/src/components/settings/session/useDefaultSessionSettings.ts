@@ -1,9 +1,14 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useState } from 'react'
 
-import type { DefaultSessionSettings, DefaultSessionSettingsEditorState } from '@pact/contracts'
+import {
+  resolveActiveAgentPair,
+  type DefaultSessionSettings,
+  type DefaultSessionSettingsEditorState,
+} from '@pact/contracts'
 
 import { defaultSessionSettingsQueryKeys, unwrapRpcResult } from '../../../query-client'
+import { isUnloadedPairCatalog } from './SessionSettingsFields'
 
 interface DefaultSessionSettingsFlow {
   editorState: DefaultSessionSettingsEditorState | undefined
@@ -37,10 +42,21 @@ export function useDefaultSessionSettings(enabled: boolean): DefaultSessionSetti
         setSaveError(result.error.message)
         return false
       }
+      let shouldRefetchCatalogs = false
       queryClient.setQueryData<DefaultSessionSettingsEditorState>(
         defaultSessionSettingsQueryKeys.editor,
-        (current) => (current ? { ...current, current: result.value } : current),
+        (current) => {
+          if (!current) return current
+          const nextPair = resolveActiveAgentPair(result.value.settings)
+          shouldRefetchCatalogs = nextPair.some((agentId) =>
+            isUnloadedPairCatalog(current.modelCatalogs[agentId]),
+          )
+          return { ...current, current: result.value }
+        },
       )
+      if (shouldRefetchCatalogs) {
+        void queryClient.invalidateQueries({ queryKey: defaultSessionSettingsQueryKeys.editor })
+      }
       return true
     } catch {
       setSaveError('Couldn’t save the default settings. Try again.')

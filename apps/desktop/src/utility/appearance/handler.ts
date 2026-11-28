@@ -36,7 +36,7 @@ export function handleAppearanceRequest(
         ok: false,
         error: {
           code: 'CONFLICT',
-          message: `Appearance settings changed at revision ${outcome.currentRevision}; refresh before retrying.`,
+          message: `Appearance settings changed elsewhere (revision ${outcome.currentRevision}). Try again.`,
         },
       }
     }

@@ -38,7 +38,7 @@ function GalleryImage({
       (error: unknown) => {
         if (!controller.signal.aborted)
           setOriginal({
-            error: error instanceof Error ? error.message : 'Image could not load.',
+            error: error instanceof Error ? error.message : 'Couldn’t load image.',
           })
       },
     )
@@ -180,6 +180,7 @@ export function ImageGallery({
       ref={dialog}
       className="pact-image-gallery bg-surface text-primary"
       aria-label="Image preview"
+      closedby="any"
       onCancel={(event) => {
         event.preventDefault()
         onClose()

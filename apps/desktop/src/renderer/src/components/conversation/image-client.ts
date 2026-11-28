@@ -80,9 +80,9 @@ export async function uploadConversationImage(
   signal: AbortSignal,
 ): Promise<ConversationImage> {
   if (!['image/png', 'image/jpeg', 'image/webp'].includes(file.type))
-    throw new Error('Choose a PNG, JPEG or WebP image.')
+    throw new Error('Use a PNG, JPEG, or WebP image.')
   if (file.size > IMAGE_ORIGINAL_WORK_BYTES)
-    throw new Error('This image needs too much memory to prepare. Choose a smaller image.')
+    throw new Error('This image is too large to add. Choose a smaller image.')
   let imageId: string | undefined
   const write = (input: ImageWriteInput) =>
     wait(window.pact.writeConversationImage(input), signal, (reply) => {
@@ -91,8 +91,7 @@ export async function uploadConversationImage(
   try {
     const initial = await write({ type: 'begin', sessionId, clientImageId, name: file.name })
     imageId = initial.imageId
-    if (initial.offset !== 0 || initial.ready)
-      throw new Error('Image preparation returned an invalid source.')
+    if (initial.offset !== 0 || initial.ready) throw new Error('Couldn’t start adding this image.')
     let offset = 0
     while (offset < file.size) {
       cancelled(signal)
@@ -111,7 +110,7 @@ export async function uploadConversationImage(
       })
       offset += bytes.length
       if (state.imageId !== imageId || state.offset !== offset || state.ready)
-        throw new Error('Image preparation did not acknowledge the complete segment.')
+        throw new Error('Couldn’t finish uploading this image.')
     }
     const sealed = await write({ type: 'seal', sessionId, imageId })
     cancelled(signal)
@@ -121,7 +120,7 @@ export async function uploadConversationImage(
       sealed.image.id !== imageId ||
       sealed.offset !== file.size
     )
-      throw new Error('Image preparation did not finish. Your draft was kept.')
+      throw new Error('Couldn’t attach this image. Your draft was kept.')
     return sealed.image
   } catch (error) {
     if (imageId) releaseDraftImage(sessionId, imageId)
@@ -139,9 +138,7 @@ function reservePreview(image: ConversationImage): () => void {
     bytes > IMAGE_PREVIEW_WORK_BYTES ||
     workingBytes + bytes > PREVIEW_APP_BYTES
   )
-    throw new Error(
-      'This image needs too much memory to preview. Close another preview and try again.',
-    )
+    throw new Error('Not enough memory to preview this image. Close another preview and try again.')
   workingBytes += bytes
   let released = false
   return () => {
@@ -184,7 +181,7 @@ async function readOriginal(
       part.nextOffset > bytes.length ||
       part.hasMore !== part.nextOffset < bytes.length
     )
-      throw new Error('The saved image could not be read completely. Try again.')
+      throw new Error('Couldn’t load the full image. Try again.')
     for (let index = 0; index < binary.length; index += 1)
       bytes[offset + index] = binary.charCodeAt(index)
     offset = part.nextOffset
@@ -265,7 +262,7 @@ function acquireThumbnail(key: string): ImageResource | undefined {
 async function thumbnailSlot(signal: AbortSignal): Promise<() => void> {
   // oxlint-disable-next-line no-unmodified-loop-condition -- Other readers release this module-owned semaphore across the awaited capacity signal.
   while (activeThumbnailReads >= 4) {
-    if (thumbnailWaiters.size >= 64) throw new Error('Preview is busy. Click to retry.')
+    if (thumbnailWaiters.size >= 64) throw new Error('Too many previews loading. Click to retry.')
     // oxlint-disable-next-line no-await-in-loop -- Capacity is granted only after another bounded read settles.
     await new Promise<void>((resolve, reject) => {
       const resume = () => {
@@ -315,7 +312,7 @@ export async function loadImageThumbnail(
       ),
     )
     if (first.totalBytes <= 0 || first.totalBytes > 2 * 1024 * 1024)
-      throw new Error('Image thumbnail could not be prepared.')
+      throw new Error('Couldn’t load image thumbnail.')
     const bytes = new Uint8Array(first.totalBytes)
     let part = first,
       offset = 0
@@ -332,7 +329,7 @@ export async function loadImageThumbnail(
         part.nextOffset > bytes.length ||
         part.hasMore !== part.nextOffset < bytes.length
       )
-        throw new Error('Image thumbnail could not be read. Click to retry.')
+        throw new Error('Couldn’t load image thumbnail. Click to retry.')
       for (let index = 0; index < binary.length; index += 1)
         bytes[offset + index] = binary.charCodeAt(index)
       offset = part.nextOffset
@@ -359,7 +356,7 @@ export async function loadImageThumbnail(
       thumbnailBytes + thumbnail.size > THUMBNAIL_CACHE_BYTES
     ) {
       const oldest = [...thumbnailCache.entries()].find(([, value]) => value.readers === 0)
-      if (!oldest) throw new Error('Preview is busy. Close another preview and try again.')
+      if (!oldest) throw new Error('Too many previews open. Close another preview and try again.')
       thumbnailCache.delete(oldest[0])
       thumbnailBytes -= oldest[1].blob.size
     }

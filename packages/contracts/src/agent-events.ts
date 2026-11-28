@@ -11,9 +11,9 @@ export const sessionTitleInputShape = {
 }
 export const sessionTitleInputSchema = z.strictObject(sessionTitleInputShape)
 
-import { collaborationResultSchema } from './collaboration.js'
+import { collaborationReviewVerdictSchema, collaborationQuestionsSchema } from './collaboration.js'
 
-const agentId = z.enum(['claude', 'codex'])
+const agentId = z.enum(['claude', 'codex', 'agy'])
 const opaqueId = z.string().min(1)
 
 // These are Pact facts, not Claude or Codex wire messages. The owning AgentSession
@@ -22,6 +22,22 @@ const agentEvent = { agentId }
 // Codex can supply a native Turn ID; an Adapter assigns a stable Pact Turn ID
 // when its selected provider stream has no equivalent.
 const turnEvent = { ...agentEvent, turnId: opaqueId }
+
+export const nativeBackgroundReportIdentitySchema = z.strictObject({
+  agentId: z.enum(['claude', 'agy']),
+  runId: z.string().uuid(),
+  nativeSessionId: z.string().min(1).max(1024),
+  nativeTurnId: z.string().min(1).max(1024),
+  bindingGeneration: z.number().int().positive(),
+  executorId: z.string().min(1).max(1024),
+  frameId: z.string().uuid(),
+  nativeMessageId: z.string().min(1).max(512),
+})
+export type NativeBackgroundReportIdentity = z.infer<typeof nativeBackgroundReportIdentitySchema>
+export const nativeBackgroundReportSchema = nativeBackgroundReportIdentitySchema.extend({
+  text: z.string().min(1),
+})
+export type NativeBackgroundReport = z.infer<typeof nativeBackgroundReportSchema>
 
 export const normalizedAgentEventSchema = z.discriminatedUnion('type', [
   z.strictObject({
@@ -33,13 +49,15 @@ export const normalizedAgentEventSchema = z.discriminatedUnion('type', [
   }),
   z.strictObject({
     ...turnEvent,
-    type: z.literal('collaboration.result_incomplete'),
-    reason: z.enum(['missing', 'invalid']),
+    type: z.literal('collaboration.plan'),
+    nativeId: z.string().min(1).max(1024),
+    text: z.string(),
   }),
   z.strictObject({
     ...turnEvent,
-    type: z.literal('collaboration.result'),
-    result: collaborationResultSchema,
+    type: z.literal('collaboration.review'),
+    verdict: collaborationReviewVerdictSchema,
+    questions: collaborationQuestionsSchema.optional(),
   }),
   z.strictObject({ ...agentEvent, type: z.literal('session.started'), nativeSessionId: opaqueId }),
   z.strictObject({
@@ -90,7 +108,7 @@ export const normalizedAgentEventSchema = z.discriminatedUnion('type', [
     toolName: z.string().trim().min(1).max(120),
     title: z.string().trim().min(1).max(160),
     detail: z.string().trim().max(500).optional(),
-    outcome: z.enum(['completed', 'failed']),
+    outcome: z.enum(['completed', 'failed', 'interrupted']),
   }),
   z.strictObject({
     ...turnEvent,

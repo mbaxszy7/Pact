@@ -3,7 +3,12 @@ import { request as httpRequest, type ClientRequest } from 'node:http'
 import { setImmediate as immediate } from 'node:timers/promises'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { collaborationSourceReadSchema, type CollaborationSourceReadResult } from '@pact/contracts'
+import {
+  collaborationSourceAnyReadSchema,
+  collaborationSourceReadSchema,
+  type CollaborationSourceReadResult,
+  type CollaborationTask,
+} from '@pact/contracts'
 
 import { planRunInput } from './collaboration-fixture.test-support.js'
 import { PactPeerToolServer } from './pact-peer-tool-server.js'
@@ -64,14 +69,112 @@ afterEach(async () => {
 })
 
 describe('PactPeerToolServer', () => {
-  it.each([
-    'todos',
-    'decisions',
-    'identities',
-    'required_inputs',
-    'handoff_sources',
-    'batch',
-  ] as const)(
+  it.each(['codex', 'claude'] as const)(
+    'validates an empty retention intent for a frozen %s owner without settling it',
+    async (owner) => {
+      const server = new PactPeerToolServer()
+      servers.push(server)
+      const current = planRunInput(owner).promptEnvelope.collaboration!
+      current.planReference = {
+        version: 2,
+        sourceRunId: randomUUID(),
+        sourceMessageId: randomUUID(),
+        document: { id: randomUUID(), sha256: 'a'.repeat(64), bytes: 4, chars: 4 },
+      }
+      current.authorization = { ...current.authorization!, planReference: current.planReference }
+      let unchanged = true
+      const receipt = server.beginTurn(
+        'claude',
+        false,
+        current,
+        false,
+        undefined,
+        undefined,
+        undefined,
+        current.authorization,
+        () => unchanged,
+      )
+      const target = await server.start()
+      const call = async (args: unknown) =>
+        jsonRpcResult(
+          await fetch(target, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              jsonrpc: '2.0',
+              id: 1,
+              method: 'tools/call',
+              params: { name: 'retain_current_plan', arguments: args },
+            }),
+          }).then((response) => response.json()),
+        )
+      const accepted = await call({})
+      expect(accepted.result.isError).toBe(false)
+      expect(accepted.result.structuredContent).toEqual({
+        pactPlanRetention: { accepted: true, receipt: server.capabilityReceipt },
+      })
+      expect((await call({ planId: current.planReference.document.id })).result.isError).toBe(true)
+      expect(server.acceptPlanRetention({}, randomUUID())).toBe(false)
+      unchanged = false
+      expect((await call({})).result.isError).toBe(true)
+      server.endTurn(receipt)
+      expect(server.acceptPlanRetention({}, receipt)).toBe(false)
+      expect((await call({})).result.isError).toBe(true)
+    },
+  )
+  it('advertises flat source arguments and refuses a nested capability envelope before reading', async () => {
+    const server = new PactPeerToolServer()
+    servers.push(server)
+    const target = await server.start(),
+      owner = { runId: randomUUID(), grant: randomUUID() },
+      batchId = randomUUID(),
+      reader = vi.fn<(raw: unknown) => CollaborationSourceReadResult>((raw) => {
+        const request = collaborationSourceReadSchema.parse(raw)
+        return { source: request.source, offset: request.offset, nextOffset: null, text: '{}' }
+      })
+    server.beginTurn('claude', false, undefined, false, reader, owner)
+    const response = await fetch(target, {
+      method: 'POST',
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+    })
+    const listing: unknown = await response.json()
+    if (!listing || typeof listing !== 'object') throw new Error('Missing native tool metadata')
+    const result: unknown = Reflect.get(listing, 'result')
+    const tools: unknown =
+      result && typeof result === 'object' ? Reflect.get(result, 'tools') : null
+    if (!Array.isArray(tools)) throw new Error('Missing native tools')
+    const tool: unknown = tools.find(
+      (value: unknown) =>
+        value &&
+        typeof value === 'object' &&
+        Reflect.get(value, 'name') === 'read_collaboration_source',
+    )
+    if (!tool || typeof tool !== 'object') throw new Error('Missing native source tool')
+    const description: unknown = Reflect.get(tool, 'description')
+    const schema: unknown = Reflect.get(tool, 'inputSchema')
+    const properties: unknown =
+      schema && typeof schema === 'object' ? Reflect.get(schema, 'properties') : null
+    if (typeof description !== 'string' || !properties || typeof properties !== 'object')
+      throw new Error('Incomplete native source argument metadata')
+    for (const name of ['runId', 'grant', 'batchId', 'document', 'offset']) {
+      expect(Object.hasOwn(properties, name)).toBe(true)
+      expect(description).toContain(name)
+    }
+    expect(reader).not.toHaveBeenCalled()
+    const refused = await callSource(target, {
+      source: 'batch',
+      id: batchId,
+      sourceGrant: owner,
+      offset: 0,
+    })
+    expect(refused.value).toMatchObject({ result: { isError: true } })
+    expect(reader).not.toHaveBeenCalled()
+    const accepted = await callSource(target, { ...owner, source: 'batch', batchId, offset: 0 })
+    expect(accepted.value).toMatchObject({ result: { content: [{ type: 'text' }] } })
+    expect(reader).toHaveBeenCalledTimes(1)
+  })
+
+  it.each(['inputs', 'handoff_sources', 'batch'] as const)(
     'reads the frozen %s index when its request also carries a contextual document reference',
     async (source) => {
       const server = new PactPeerToolServer()
@@ -399,5 +502,868 @@ describe('PactPeerToolServer', () => {
     )
     expect(response.result.isError).toBe(true)
     expect(response.result.structuredContent).toBeUndefined()
+  })
+})
+
+function workflowTask(fields: Partial<CollaborationTask> = {}): CollaborationTask {
+  return { ...planRunInput('codex').promptEnvelope.collaboration!, ...fields }
+}
+async function workflowCall(url: string, name: string, args: unknown) {
+  return jsonRpcResult(
+    await fetch(url, {
+      method: 'POST',
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/call',
+        params: { name, arguments: args },
+      }),
+    }).then((response) => response.json()),
+  ).result
+}
+const workflowQuestions = [
+  {
+    prompt: 'Which scope?',
+    selection: 'single' as const,
+    options: [{ label: 'Current' }, { label: 'All' }],
+  },
+]
+
+describe('workflow tool root capabilities', () => {
+  it.each([
+    { primary: 'codex', stage: 'plan_review', reviewer: 'claude' },
+    { primary: 'codex', stage: 'code_review', reviewer: 'codex' },
+    { primary: 'claude', stage: 'plan_review', reviewer: 'codex' },
+    { primary: 'claude', stage: 'code_review', reviewer: 'claude' },
+  ] as const)(
+    'authenticates split $stage by $reviewer for Primary $primary',
+    async ({ primary, stage, reviewer }) => {
+      const server = new PactPeerToolServer()
+      servers.push(server)
+      const url = await server.start()
+      const task = workflowTask({
+        rolePolicy: 'split-stages-v1',
+        owner: primary,
+        reviewer: primary === 'codex' ? 'claude' : 'codex',
+        stage,
+        actor: reviewer,
+      })
+      const receipt = server.beginTurn(reviewer === 'codex' ? 'claude' : 'codex', true, task)
+      expect(server.acceptReview({ verdict: 'accepted' }, receipt)).toEqual({ verdict: 'accepted' })
+      expect(
+        await workflowCall(`${url}/${receipt}`, 'submit_review', { verdict: 'accepted' }),
+      ).toMatchObject({ isError: false })
+      const foreign = server.beginTurn(reviewer, true, {
+        ...task,
+        actor: reviewer === 'codex' ? 'claude' : 'codex',
+      })
+      expect(server.acceptReview({ verdict: 'accepted' }, foreign)).toBeUndefined()
+      expect(
+        await workflowCall(`${url}/${foreign}`, 'submit_review', { verdict: 'accepted' }),
+      ).toMatchObject({ isError: true })
+    },
+  )
+
+  it.each(['plan_review', 'code_review'] as const)(
+    'authenticates %s against the host reviewer and rejects model-supplied authority',
+    async (stage) => {
+      const server = new PactPeerToolServer()
+      servers.push(server)
+      const url = await server.start(),
+        task = workflowTask({ stage, actor: 'claude' }),
+        receipt = server.beginTurn('codex', true, task)
+      const valid = { verdict: 'accepted' }
+      expect(await workflowCall(`${url}/${receipt}`, 'submit_review', valid)).toEqual({
+        isError: false,
+        structuredContent: {
+          pactReview: { verdict: 'accepted', receipt: server.capabilityReceipt },
+        },
+      })
+      for (const authority of [
+        { actor: 'claude' },
+        { stage },
+        { runId: task.runId },
+        { taskId: task.id },
+        { inputSequence: 0 },
+        { receipt },
+      ]) {
+        expect(server.acceptReview({ ...valid, ...authority }, receipt)).toBeUndefined()
+      }
+      expect(await workflowCall(url, 'submit_review', { ...valid, actor: 'claude' })).toEqual({
+        isError: true,
+        structuredContent: undefined,
+      })
+      expect(server.acceptReview(valid, randomUUID())).toBeUndefined()
+      const wrongActor = server.beginTurn('codex', false, { ...task, actor: 'codex' })
+      expect(server.acceptReview(valid, wrongActor)).toBeUndefined()
+      expect((await workflowCall(url, 'submit_review', valid)).isError).toBe(true)
+    },
+  )
+
+  it.each(['plan', 'implement', 'respond', 'repair', 'reply'] as const)(
+    'does not admit a review verdict from %s',
+    async (stage) => {
+      const server = new PactPeerToolServer()
+      servers.push(server)
+      const url = await server.start(),
+        receipt = server.beginTurn('codex', false, workflowTask({ stage, actor: 'claude' }))
+      expect(server.acceptReview({ verdict: 'accepted' }, receipt)).toBeUndefined()
+      expect((await workflowCall(url, 'submit_review', { verdict: 'accepted' })).isError).toBe(true)
+    },
+  )
+
+  it('validates bounded question content and requires questions exactly for needs_user', async () => {
+    const server = new PactPeerToolServer()
+    servers.push(server)
+    const url = await server.start(),
+      receipt = server.beginTurn(
+        'codex',
+        false,
+        workflowTask({ stage: 'plan_review', actor: 'claude' }),
+      )
+    expect(
+      await workflowCall(url, 'submit_review', {
+        verdict: 'needs_user',
+        questions: workflowQuestions,
+      }),
+    ).toEqual({
+      isError: false,
+      structuredContent: {
+        pactReview: {
+          verdict: 'needs_user',
+          questions: workflowQuestions,
+          receipt: server.capabilityReceipt,
+        },
+      },
+    })
+    for (const invalid of [
+      { verdict: 'needs_user' },
+      { verdict: 'accepted', questions: workflowQuestions },
+      { verdict: 'needs_user', questions: [] },
+      {
+        verdict: 'needs_user',
+        questions: Array.from({ length: 4 }, () => ({ ...workflowQuestions[0] })),
+      },
+      { verdict: 'needs_user', questions: [{ ...workflowQuestions[0], prompt: 'x'.repeat(2049) }] },
+      {
+        verdict: 'needs_user',
+        questions: [{ ...workflowQuestions[0], options: [{ label: 'Only option' }] }],
+      },
+      { verdict: 'needs_user', questions: [{ ...workflowQuestions[0], id: 'q1' }] },
+    ])
+      expect(server.acceptReview(invalid, receipt)).toBeUndefined()
+  })
+
+  it('permits planner questions but never a planner claim that input was processed', async () => {
+    const server = new PactPeerToolServer()
+    servers.push(server)
+    const url = await server.start(),
+      receipt = server.beginTurn('claude', false, workflowTask())
+    expect(server.acceptInputResult({ outcome: 'processed' }, receipt)).toBeUndefined()
+    expect((await workflowCall(url, 'submit_input_result', { outcome: 'processed' })).isError).toBe(
+      true,
+    )
+    expect(
+      await workflowCall(url, 'submit_input_result', {
+        outcome: 'needs_user',
+        questions: workflowQuestions,
+      }),
+    ).toEqual({
+      isError: false,
+      structuredContent: {
+        pactInputResult: {
+          outcome: 'needs_user',
+          questions: workflowQuestions,
+          receipt: server.capabilityReceipt,
+        },
+      },
+    })
+    expect(server.acceptInputResult({ outcome: 'needs_user' }, receipt)).toBeUndefined()
+    expect(
+      server.acceptInputResult(
+        { outcome: 'needs_user', questions: workflowQuestions, actor: 'codex' },
+        receipt,
+      ),
+    ).toBeUndefined()
+  })
+
+  it('requires host pending input and a reply stage for processed observations', async () => {
+    const server = new PactPeerToolServer()
+    servers.push(server)
+    const url = await server.start(),
+      inputProcessing = { pending: { inputId: randomUUID(), inputSequence: 1 } },
+      task = workflowTask({
+        kind: 'plan',
+        stage: 'reply',
+        inputSequence: 1,
+        inputProcessing,
+      }),
+      replyAuth = {
+        ...task.authorization!,
+        stage: 'reply' as const,
+        replyMode: 'read_only' as const,
+        inputSequence: 1,
+        inputProcessing,
+      }
+    const receipt = server.beginTurn(
+      'claude',
+      false,
+      task,
+      false,
+      undefined,
+      undefined,
+      undefined,
+      replyAuth,
+    )
+    expect(await workflowCall(url, 'submit_input_result', { outcome: 'processed' })).toEqual({
+      isError: false,
+      structuredContent: {
+        pactInputResult: { outcome: 'processed', receipt: server.capabilityReceipt },
+      },
+    })
+    for (const invalid of [
+      { outcome: 'processed', questions: workflowQuestions },
+      { outcome: 'incomplete' },
+      { outcome: 'processed', runId: task.runId },
+    ])
+      expect(server.acceptInputResult(invalid, receipt)).toBeUndefined()
+    const noPending = server.beginTurn(
+      'claude',
+      false,
+      { ...task, inputProcessing: {} },
+      false,
+      undefined,
+      undefined,
+      undefined,
+      { ...replyAuth, inputProcessing: {} },
+    )
+    expect(server.acceptInputResult({ outcome: 'processed' }, noPending)).toBeUndefined()
+    const notReply = server.beginTurn('claude', false, { ...task, stage: 'implement' })
+    expect(server.acceptInputResult({ outcome: 'processed' }, notReply)).toBeUndefined()
+    expect((await workflowCall(url, 'submit_input_result', { outcome: 'processed' })).isError).toBe(
+      true,
+    )
+  })
+
+  it('accepts explanation_only on a frozen Phase 1 reply and rejects Open Mode or retired outcomes', async () => {
+    const server = new PactPeerToolServer()
+    servers.push(server)
+    const url = await server.start()
+    const inputId = randomUUID()
+    const inputProcessing = { pending: { inputId, inputSequence: 1 } }
+    const task = workflowTask({
+      kind: 'plan',
+      stage: 'reply',
+      inputSequence: 1,
+      inputProcessing,
+    })
+    const bare = server.beginTurn('claude', false, task)
+    expect(
+      await workflowCall(`${url}/${bare}`, 'submit_input_result', { outcome: 'explanation_only' }),
+    ).toMatchObject({
+      isError: true,
+    })
+    const receipt = server.beginTurn(
+      'claude',
+      false,
+      task,
+      false,
+      undefined,
+      undefined,
+      undefined,
+      {
+        ...task.authorization!,
+        stage: 'reply',
+        replyMode: 'read_only',
+        inputSequence: 1,
+        inputProcessing,
+        replyIntentBasis: {
+          kind: 'explanation_only',
+          inputId,
+          inputDigest: 'a'.repeat(64),
+          priorInputSequence: 0,
+          taskRevision: 0,
+          askCheckpoint: {
+            stage: 'plan',
+            actor: 'codex',
+            status: 'waiting',
+            automation: 'paused',
+            pauseReason: 'user',
+            inputBasis: {
+              inputSequence: 0,
+            },
+          },
+        },
+      },
+    )
+    expect(
+      await workflowCall(`${url}/${receipt}`, 'submit_input_result', {
+        outcome: 'explanation_only',
+      }),
+    ).toEqual({
+      isError: false,
+      structuredContent: {
+        pactInputResult: { outcome: 'explanation_only', receipt: server.capabilityReceipt },
+      },
+    })
+    expect(
+      await workflowCall(`${url}/${receipt}`, 'submit_input_result', {
+        outcome: 'repair_role_request',
+      }),
+    ).toMatchObject({ isError: true })
+    expect(
+      await workflowCall(`${url}/${receipt}`, 'submit_input_result', {
+        outcome: 'plan_revision_required',
+      }),
+    ).toMatchObject({ isError: true })
+    const openTask = workflowTask({
+      kind: 'build',
+      openMode: true,
+      stage: 'collaborate',
+      inputSequence: 1,
+      inputProcessing,
+    })
+    const openReceipt = server.beginTurn('claude', false, openTask)
+    expect(
+      server.acceptInputResult(
+        { outcome: 'needs_user', questions: workflowQuestions },
+        openReceipt,
+      ),
+    ).toBeUndefined()
+    expect(
+      await workflowCall(`${url}/${openReceipt}`, 'submit_input_result', { outcome: 'processed' }),
+    ).toMatchObject({ isError: true })
+  })
+
+  it('preserves repeated and conflicting observations for the durable settlement owner instead of consuming a one-shot quota', async () => {
+    const server = new PactPeerToolServer()
+    servers.push(server)
+    const url = await server.start()
+    const receipt = server.beginTurn(
+      'codex',
+      false,
+      workflowTask({ stage: 'plan_review', actor: 'claude' }),
+    )
+    const first = { verdict: 'accepted' },
+      conflict = { verdict: 'changes_requested' }
+    expect(server.acceptReview(first, receipt)).toEqual(first)
+    expect(server.acceptReview(first, receipt)).toEqual(first)
+    expect(server.acceptReview(conflict, receipt)).toEqual(conflict)
+    expect((await workflowCall(url, 'submit_review', conflict)).structuredContent).toEqual({
+      pactReview: { ...conflict, receipt: server.capabilityReceipt },
+    })
+    const replyProcessing = { pending: { inputId: randomUUID(), inputSequence: 1 } }
+    const replyTask = workflowTask({
+      kind: 'plan',
+      stage: 'reply',
+      inputSequence: 1,
+      inputProcessing: replyProcessing,
+    })
+    const reply = server.beginTurn(
+      'claude',
+      false,
+      replyTask,
+      false,
+      undefined,
+      undefined,
+      undefined,
+      {
+        ...replyTask.authorization!,
+        stage: 'reply',
+        replyMode: 'read_only',
+        inputSequence: 1,
+        inputProcessing: replyProcessing,
+      },
+    )
+    expect(server.acceptInputResult({ outcome: 'processed' }, reply)).toEqual({
+      outcome: 'processed',
+    })
+    expect(server.acceptInputResult({ outcome: 'processed' }, reply)).toEqual({
+      outcome: 'processed',
+    })
+    expect(
+      server.acceptInputResult({ outcome: 'needs_user', questions: workflowQuestions }, reply),
+    ).toEqual({ outcome: 'needs_user', questions: workflowQuestions })
+  })
+
+  it('revokes review and input receipts at cancellation, retaining no authority in cached tool names', async () => {
+    const server = new PactPeerToolServer()
+    servers.push(server)
+    const url = await server.start(),
+      first = server.beginTurn(
+        'codex',
+        false,
+        workflowTask({ stage: 'plan_review', actor: 'claude' }),
+      )
+    server.endTurn(first)
+    expect(server.acceptReview({ verdict: 'accepted' }, first)).toBeUndefined()
+    expect((await workflowCall(url, 'submit_review', { verdict: 'accepted' })).isError).toBe(true)
+    expect((await fetch(`${url}/${first}`, { method: 'POST', body: '{}' })).status).toBe(404)
+    const next = server.beginTurn('claude', false, workflowTask())
+    server.endTurn(first)
+    expect(
+      server.acceptInputResult({ outcome: 'needs_user', questions: workflowQuestions }, next),
+    ).toBeDefined()
+    server.endTurn(next)
+    expect(
+      server.acceptInputResult({ outcome: 'needs_user', questions: workflowQuestions }, next),
+    ).toBeUndefined()
+    expect(
+      (
+        await workflowCall(url, 'submit_input_result', {
+          outcome: 'needs_user',
+          questions: workflowQuestions,
+        })
+      ).isError,
+    ).toBe(true)
+  })
+
+  it.each(['submit_review', 'submit_input_result'] as const)(
+    'rejects delayed %s requests after root replacement',
+    async (name) => {
+      const server = new PactPeerToolServer()
+      servers.push(server)
+      const url = await server.start()
+      const task =
+        name === 'submit_review'
+          ? workflowTask({ stage: 'plan_review', actor: 'claude' })
+          : workflowTask()
+      const args =
+        name === 'submit_review'
+          ? { verdict: 'accepted' }
+          : { outcome: 'needs_user', questions: workflowQuestions }
+      server.beginTurn('claude', false, task)
+      const body = JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/call',
+        params: { name, arguments: args },
+      })
+      const requests: ClientRequest[] = []
+      const replies = Array.from(
+        { length: 4 },
+        () =>
+          new Promise<unknown>((resolve, reject) => {
+            const request = httpRequest(
+              url,
+              { method: 'POST', headers: { 'content-length': Buffer.byteLength(body) } },
+              (response) => {
+                let text = ''
+                response.on('data', (chunk: Buffer) => {
+                  text += chunk.toString('utf8')
+                })
+                response.on('end', () => resolve(JSON.parse(text)))
+              },
+            )
+            request.on('error', reject)
+            request.write(body.slice(0, 8))
+            requests.push(request)
+          }),
+      )
+      await immediate()
+      await immediate()
+      expect((await fetch(url, { method: 'POST', body })).status).toBe(429)
+      const current = server.beginTurn('claude', false, task)
+      for (const request of requests) request.end(body.slice(8))
+      expect(
+        (await Promise.all(replies)).map((value) => jsonRpcResult(value).result.isError),
+      ).toEqual([true, true, true, true])
+      expect((await workflowCall(`${url}/${current}`, name, args)).isError).toBe(false)
+    },
+  )
+
+  it.each(['agy', 'claude', 'codex'] as const)(
+    'binds dynamic request_peer_assistance target enum [%s] and rejects inactive 3rd-agent targets',
+    async (expectedTarget) => {
+      const server = new PactPeerToolServer()
+      servers.push(server)
+      const url = await server.start()
+      const receipt = server.beginTurn(expectedTarget, true)
+      const listRes: unknown = await fetch(url, {
+        method: 'POST',
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+      }).then((r) => r.json())
+      const resultObj =
+        typeof listRes === 'object' && listRes !== null ? Reflect.get(listRes, 'result') : undefined
+      const rawTools =
+        typeof resultObj === 'object' && resultObj !== null
+          ? Reflect.get(resultObj, 'tools')
+          : undefined
+      const tools = Array.isArray(rawTools) ? rawTools : []
+      const peerTool: unknown = tools.find(
+        (t): t is Record<string, unknown> =>
+          typeof t === 'object' &&
+          t !== null &&
+          Reflect.get(t, 'name') === 'request_peer_assistance',
+      )
+      const schemaObj =
+        typeof peerTool === 'object' && peerTool !== null
+          ? Reflect.get(peerTool, 'inputSchema')
+          : undefined
+      const propsObj =
+        typeof schemaObj === 'object' && schemaObj !== null
+          ? Reflect.get(schemaObj, 'properties')
+          : undefined
+      const targetProp =
+        typeof propsObj === 'object' && propsObj !== null
+          ? Reflect.get(propsObj, 'target')
+          : undefined
+      const targetEnum =
+        typeof targetProp === 'object' && targetProp !== null
+          ? Reflect.get(targetProp, 'enum')
+          : undefined
+      expect(targetEnum).toEqual([expectedTarget])
+
+      const otherTargets = (['agy', 'claude', 'codex'] as const).filter((a) => a !== expectedTarget)
+      for (const badTarget of otherTargets) {
+        // oxlint-disable-next-line no-await-in-loop -- Sequential tool call validation per inactive target.
+        const rejected = await workflowCall(url, 'request_peer_assistance', {
+          target: badTarget,
+          kind: 'review',
+        })
+        expect(rejected.isError).toBe(true)
+        expect(server.acceptCompleted({ target: badTarget, kind: 'review' }, receipt)).toBe(false)
+      }
+
+      const accepted = await workflowCall(url, 'request_peer_assistance', {
+        target: expectedTarget,
+        kind: 'review',
+      })
+      expect(accepted.isError).toBe(false)
+      expect(server.acceptCompleted({ target: expectedTarget, kind: 'review' }, receipt)).toBe(true)
+    },
+  )
+
+  it('supports all 4 cutoff source parts (catalog, message, comments, comment) over read_collaboration_source', async () => {
+    const server = new PactPeerToolServer()
+    servers.push(server)
+    const url = await server.start()
+    const owner = { runId: randomUUID(), grant: randomUUID() }
+    const cutoffId = randomUUID()
+    const messageId = randomUUID()
+    const commentId = randomUUID()
+    server.beginTurn(
+      'agy',
+      false,
+      undefined,
+      false,
+      (raw) => {
+        const parsed = collaborationSourceAnyReadSchema.parse(raw)
+        if (parsed.source !== 'cutoff') throw new Error('Expected cutoff source')
+        return {
+          source: 'cutoff',
+          offset: parsed.offset,
+          nextOffset: null,
+          text: JSON.stringify({ part: parsed.part }),
+        }
+      },
+      owner,
+    )
+
+    const requests = [
+      { ...owner, source: 'cutoff', cutoffId, part: 'catalog', offset: 0 },
+      { ...owner, source: 'cutoff', cutoffId, part: 'message', messageId, offset: 0 },
+      { ...owner, source: 'cutoff', cutoffId, part: 'comments', messageId, offset: 0 },
+      { ...owner, source: 'cutoff', cutoffId, part: 'comment', commentId, offset: 0 },
+    ]
+    for (const req of requests) {
+      // oxlint-disable-next-line no-await-in-loop -- Verify each cutoff part sequentially.
+      const res = await callSource(url, req)
+      expect(res.value).toMatchObject({
+        result: {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                source: 'cutoff',
+                text: JSON.stringify({ part: req.part }),
+                offset: 0,
+                nextOffset: null,
+              }),
+            },
+          ],
+        },
+      })
+    }
+  })
+
+  it('enforces 4-way Antigravity root authentication, stage-filtered tools/list, exact progressToken confirmation, and immediate endTurn sourceGrant revocation', async () => {
+    const server = new PactPeerToolServer()
+    servers.push(server)
+    const url = await server.start()
+    const owner = { runId: randomUUID(), grant: randomUUID() }
+    const planTask = workflowTask({ stage: 'plan', owner: 'agy', reviewer: 'codex', actor: 'agy' })
+    let current = true
+    const receipt = server.beginTurn(
+      'codex',
+      false,
+      planTask,
+      true,
+      (raw) => {
+        const parsed = collaborationSourceAnyReadSchema.parse(raw)
+        return { source: parsed.source, offset: parsed.offset, nextOffset: null, text: '[]' }
+      },
+      owner,
+      undefined,
+      planTask.authorization,
+    )
+    server.bindAgyNativeRoot(
+      owner,
+      {
+        executorId: 'agy-exec-1',
+        bindingGeneration: 1,
+        nativeSessionId: 'sid-agy-root',
+        trajectoryId: 'traj-root-1',
+      },
+      () => current,
+    )
+
+    // Stage-filtered tools/list in Phase-1 plan mode: exposes read_collaboration_source & publish_session_title, NEVER publish_plan or swap_code_roles!
+    const listRes: unknown = await fetch(`${url}/${receipt}`, {
+      method: 'POST',
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+    }).then((r) => r.json())
+    const listResult =
+      typeof listRes === 'object' && listRes !== null ? Reflect.get(listRes, 'result') : undefined
+    const rawListTools =
+      typeof listResult === 'object' && listResult !== null
+        ? Reflect.get(listResult, 'tools')
+        : undefined
+    const toolNames = (Array.isArray(rawListTools) ? rawListTools : []).flatMap((t) =>
+      typeof t === 'object' && t !== null && typeof Reflect.get(t, 'name') === 'string'
+        ? [String(Reflect.get(t, 'name'))]
+        : [],
+    )
+    expect(toolNames).toEqual(['read_collaboration_source', 'publish_session_title'])
+    expect(toolNames).not.toContain('publish_plan')
+    expect(toolNames).not.toContain('swap_code_roles')
+
+    const callAgy = async (name: string, args: unknown, meta?: unknown) =>
+      jsonRpcResult(
+        await fetch(`${url}/${receipt}`, {
+          method: 'POST',
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: 2,
+            method: 'tools/call',
+            params: { name, arguments: args, ...(meta !== undefined ? { _meta: meta } : {}) },
+          }),
+        }).then((r) => r.json()),
+      )
+
+    // 1. Subagent sharing root_conversation_id MUST be rejected!
+    expect(
+      (
+        await callAgy(
+          'publish_session_title',
+          { title: 'Subagent spoof' },
+          {
+            'antigravity.google/root_conversation_id': 'sid-agy-root',
+            'antigravity.google/conversation_id': 'subagent-child-1',
+            progressToken: 'traj-root-1:0',
+          },
+        )
+      ).result.isError,
+    ).toBe(true)
+
+    // 2. Missing conversation_id MUST be rejected!
+    expect(
+      (
+        await callAgy(
+          'publish_session_title',
+          { title: 'Missing conv' },
+          {
+            'antigravity.google/root_conversation_id': 'sid-agy-root',
+            progressToken: 'traj-root-1:1',
+          },
+        )
+      ).result.isError,
+    ).toBe(true)
+
+    // 3. Wrong trajectoryId in progressToken MUST be rejected!
+    expect(
+      (
+        await callAgy(
+          'publish_session_title',
+          { title: 'Wrong trajectory' },
+          {
+            'antigravity.google/root_conversation_id': 'sid-agy-root',
+            'antigravity.google/conversation_id': 'sid-agy-root',
+            progressToken: 'foreign-traj:2',
+          },
+        )
+      ).result.isError,
+    ).toBe(true)
+
+    // 4. Valid 4-tuple stages outcome, refuses mismatched progressToken fallback, and admits ONLY after exact confirmAgyToolCallCompleted!
+    const validTitleCall = await callAgy(
+      'publish_session_title',
+      { title: 'Verified Agy Title' },
+      {
+        'antigravity.google/root_conversation_id': 'sid-agy-root',
+        'antigravity.google/conversation_id': 'sid-agy-root',
+        progressToken: 'traj-root-1:3',
+      },
+    )
+    expect(validTitleCall.result.isError).toBe(false)
+    expect(server.acceptSessionTitle({ title: 'Verified Agy Title' }, receipt)).toBeUndefined()
+    expect(server.confirmAgyToolCallCompleted('traj-root-1:999', receipt)).toBe(false)
+    expect(server.acceptSessionTitle({ title: 'Verified Agy Title' }, receipt)).toBeUndefined()
+    expect(server.confirmAgyToolCallCompleted('traj-root-1:3', receipt)).toBe(true)
+    expect(server.acceptSessionTitle({ title: 'Verified Agy Title' }, receipt)).toBe(
+      'Verified Agy Title',
+    )
+
+    // 5. Valid source read succeeds during active Turn, and endTurn immediately revokes sourceGrant!
+    const validRead: unknown = await fetch(`${url}/${receipt}`, {
+      method: 'POST',
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 3,
+        method: 'tools/call',
+        params: {
+          name: 'read_collaboration_source',
+          arguments: { ...owner, source: 'inputs', offset: 0 },
+          _meta: {
+            'antigravity.google/root_conversation_id': 'sid-agy-root',
+            'antigravity.google/conversation_id': 'sid-agy-root',
+            progressToken: 'traj-root-1:4',
+          },
+        },
+      }),
+    }).then((r) => r.json())
+    const validReadResult =
+      typeof validRead === 'object' && validRead !== null
+        ? Reflect.get(validRead, 'result')
+        : undefined
+    expect(
+      typeof validReadResult === 'object' && validReadResult !== null
+        ? Reflect.get(validReadResult, 'isError')
+        : undefined,
+    ).toBeUndefined()
+
+    server.endTurn(receipt)
+    expect(server.hasSourceGrant()).toBe(false)
+    current = false
+  })
+
+  it('rejects stale roots, legacy-only conversation_id, unformatted progressTokens, and unconfirmed peer proposals on Antigravity turns', async () => {
+    const server = new PactPeerToolServer()
+    servers.push(server)
+    server.setExpectedTarget('codex')
+    const url = await server.start()
+    const owner = { runId: randomUUID(), grant: randomUUID() }
+    let current = true
+    const receipt = server.beginTurn('codex', true, undefined, true, undefined, owner)
+    server.bindAgyNativeRoot(
+      owner,
+      {
+        executorId: 'agy-exec-2',
+        bindingGeneration: 2,
+        nativeSessionId: 'sid-agy-current',
+        trajectoryId: 'traj-current-2',
+      },
+      () => current,
+    )
+
+    const callTool = async (name: string, args: unknown, meta?: unknown) =>
+      jsonRpcResult(
+        await fetch(`${url}/${receipt}`, {
+          method: 'POST',
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: 10,
+            method: 'tools/call',
+            params: { name, arguments: args, ...(meta !== undefined ? { _meta: meta } : {}) },
+          }),
+        }).then((r) => r.json()),
+      )
+
+    // 1. Stale root_conversation_id rejected
+    expect(
+      (
+        await callTool(
+          'request_peer_assistance',
+          { target: 'codex', kind: 'review', reason: 'Stale root' },
+          {
+            'antigravity.google/root_conversation_id': 'sid-agy-stale',
+            'antigravity.google/conversation_id': 'sid-agy-stale',
+            progressToken: 'traj-current-2:0',
+          },
+        )
+      ).result.isError,
+    ).toBe(true)
+
+    // 2. Legacy conversation_id without antigravity.google/conversation_id rejected
+    expect(
+      (
+        await callTool(
+          'request_peer_assistance',
+          { target: 'codex', kind: 'review', reason: 'Legacy meta only' },
+          {
+            'antigravity.google/root_conversation_id': 'sid-agy-current',
+            conversation_id: 'sid-agy-current',
+            progressToken: 'traj-current-2:1',
+          },
+        )
+      ).result.isError,
+    ).toBe(true)
+
+    // 3. Unformatted progressToken (missing :<stepIndex>) rejected
+    expect(
+      (
+        await callTool(
+          'request_peer_assistance',
+          { target: 'codex', kind: 'review', reason: 'Unformatted token' },
+          {
+            'antigravity.google/root_conversation_id': 'sid-agy-current',
+            'antigravity.google/conversation_id': 'sid-agy-current',
+            progressToken: 'traj-current-2',
+          },
+        )
+      ).result.isError,
+    ).toBe(true)
+
+    // 4. Valid 4-tuple stages peer proposal, but missing completion token withholds acceptance
+    const stagedPeer = await callTool(
+      'request_peer_assistance',
+      { target: 'codex', kind: 'challenge', reason: 'Check concurrency invariants' },
+      {
+        'antigravity.google/root_conversation_id': 'sid-agy-current',
+        'antigravity.google/conversation_id': 'sid-agy-current',
+        progressToken: 'traj-current-2:5',
+      },
+    )
+    expect(stagedPeer.result.isError).toBe(false)
+    expect(
+      server.acceptCompleted(
+        { target: 'codex', kind: 'challenge', reason: 'Check concurrency invariants' },
+        receipt,
+      ),
+    ).toBe(false)
+    expect(server.confirmAgyToolCallCompleted('traj-current-2:5', receipt)).toBe(true)
+    expect(
+      server.acceptCompleted(
+        { target: 'codex', kind: 'challenge', reason: 'Check concurrency invariants' },
+        receipt,
+      ),
+    ).toBe(true)
+
+    // 5. Once root current() flips false, subsequent calls are rejected immediately
+    current = false
+    expect(
+      (
+        await callTool(
+          'publish_session_title',
+          { title: 'Late title' },
+          {
+            'antigravity.google/root_conversation_id': 'sid-agy-current',
+            'antigravity.google/conversation_id': 'sid-agy-current',
+            progressToken: 'traj-current-2:6',
+          },
+        )
+      ).result.isError,
+    ).toBe(true)
+    server.endTurn(receipt)
   })
 })

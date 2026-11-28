@@ -23,7 +23,7 @@ export function assertComposerEditCapacity(
   assertComposerEditLengths(before.length, nextChars, incoming.length, end - start)
   const work = composerEditWorkBytes(before.length, nextChars, incoming.length, end - start)
   if (work + (lines(before) + lines(incoming)) * 128 > COMPOSER_EDIT_WORK_BYTES)
-    throw new Error('This edit needs too much layout work. Your draft was kept.')
+    throw new Error('This change is too large to format here. Your draft was kept.')
 }
 
 function composerEditWorkBytes(
@@ -43,7 +43,7 @@ export function assertComposerEditLengths(
 ): void {
   const work = composerEditWorkBytes(beforeChars, nextChars, incomingChars, deletedChars)
   if (!Number.isSafeInteger(nextChars) || nextChars < 0 || work > COMPOSER_EDIT_WORK_BYTES)
-    throw new Error('This edit needs too much working memory. Your draft was kept.')
+    throw new Error('This change exceeds the editor size limit. Your draft was kept.')
 }
 
 /** Exact JSON string payload bytes, without allocating a complete escaped string or Buffer. */
@@ -72,7 +72,7 @@ export function assertComposerInverseCapacity(deleted: string, inserted: string)
     composerEncodedTextBytes(deleted) + composerEncodedTextBytes(inserted) + 64 * 1024 >
     COMPOSER_HISTORY_BYTES
   )
-    throw new Error('This edit is too large to undo safely. Your draft was kept.')
+    throw new Error('This change is too large to support undo. Your draft was kept.')
 }
 
 /** Range form checks the deleted text before creating an inverse string. */
@@ -87,5 +87,5 @@ export function assertComposerReplacementCapacity(
     composerEncodedTextBytes(before, start, end) + composerEncodedTextBytes(incoming) + 64 * 1024 >
     COMPOSER_HISTORY_BYTES
   )
-    throw new Error('This edit is too large to undo safely. Your draft was kept.')
+    throw new Error('This change is too large to support undo. Your draft was kept.')
 }

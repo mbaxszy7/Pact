@@ -1,0 +1,307 @@
+import { z } from 'zod'
+
+import {
+  collaborationInputBatchReferenceSchema,
+  collaborationPlanReferenceSchema,
+  initialTaskRoleCandidateIdSchema,
+  initialTaskRoleCandidateSchema,
+  pactSkillSchema,
+  taskStageRolesSchema,
+} from './collaboration.js'
+import {
+  DECISION_SOURCES,
+  decisionRecommendationSchema,
+  type DecisionInput,
+} from './decision-runtime.js'
+import {
+  planRevisionGuidanceSchema,
+  planRevisionGuidanceSourceSchema,
+} from './plan-revision-guidance.js'
+
+export const HANDOFF_GUIDANCE_VERSION = 'handoff-guidance-v2'
+export const HANDOFF_GUIDANCE_BYTES = 16 * 1024
+
+const digest = z.string().regex(/^[a-f0-9]{64}$/u)
+
+export const relaySourceRoleSchema = z.enum([
+  'task',
+  'input',
+  'comment',
+  'anchor',
+  'anchor_target',
+  'plan',
+  'review',
+  'prior_review',
+  'owner_response',
+  'execution',
+  'review_scope',
+  'user_decision',
+])
+export type RelaySourceRole = z.infer<typeof relaySourceRoleSchema>
+
+/** Exact host-selected provenance is evidence, never a source-reading grant. */
+export const relaySourceSchema = planRevisionGuidanceSourceSchema.extend({
+  roles: z
+    .array(relaySourceRoleSchema)
+    .min(1)
+    .max(12)
+    .refine((roles) => new Set(roles).size === roles.length, 'Source roles must be unique.'),
+})
+export type RelaySource = z.infer<typeof relaySourceSchema>
+
+export const relayWorkflowBasisV2Schema = z.strictObject({
+  kind: z.literal('workflow'),
+  task: z.strictObject({
+    id: z.string().uuid(),
+    inputSequence: z.number().int().nonnegative(),
+  }),
+  producerRunId: z.string().uuid(),
+  plan: collaborationPlanReferenceSchema.nullable(),
+  input: z.null(),
+})
+
+/** Ordinary input material has no workflow task, producer Run or Plan authority. */
+export const relayBasisV2Schema = z.discriminatedUnion('kind', [
+  relayWorkflowBasisV2Schema,
+  z.strictObject({
+    kind: z.literal('input'),
+    task: z.null(),
+    producerRunId: z.null(),
+    plan: z.null(),
+    input: z.strictObject({
+      clientMessageId: z.string().uuid(),
+      batch: collaborationInputBatchReferenceSchema,
+    }),
+  }),
+])
+export type RelayBasisV2 = z.infer<typeof relayBasisV2Schema>
+
+export const workflowRelayCandidateIdSchema = z.enum([
+  'continue_plan_review',
+  'continue_plan_revision',
+  'continue_code_review',
+  'respond_to_code_review',
+  'repair_code',
+  'supplement_plan',
+  'supplement_code_response',
+])
+export type WorkflowRelayCandidateId = z.infer<typeof workflowRelayCandidateIdSchema>
+
+/** Count parsed v2 JSON, including nullable basis fields, without serializing another copy. */
+function jsonBytesWithinBudget(value: object, limit: number): boolean {
+  let bytes = 0,
+    containers = 0
+  const string = (text: string): void => {
+    bytes += 2
+    for (const character of text) {
+      const code = character.codePointAt(0)!
+      if (code === 34 || code === 92) bytes += 2
+      else if (code < 32) bytes += [8, 9, 10, 12, 13].includes(code) ? 2 : 6
+      else if (code >= 0xd800 && code <= 0xdfff) bytes += 6
+      else bytes += code <= 0x7f ? 1 : code <= 0x7ff ? 2 : code <= 0xffff ? 3 : 4
+      if (bytes > limit) return
+    }
+  }
+  const count = (item: unknown, depth: number): void => {
+    if (bytes > limit) return
+    if (typeof item === 'string') return string(item)
+    if (item === null) {
+      bytes += 4
+      return
+    }
+    if (typeof item === 'number' && Number.isFinite(item)) {
+      bytes += String(item).length
+      return
+    }
+    if (!item || typeof item !== 'object' || depth > 8 || ++containers > 128) {
+      bytes = limit + 1
+      return
+    }
+    bytes += 2
+    if (Array.isArray(item)) {
+      if (item.length > DECISION_SOURCES) {
+        bytes = limit + 1
+        return
+      }
+      for (let index = 0; index < item.length && bytes <= limit; index++) {
+        if (index) bytes++
+        count(item[index], depth + 1)
+      }
+      return
+    }
+    let members = 0
+    for (const [key, member] of Object.entries(item)) {
+      if (member === undefined) continue
+      if (members++) bytes++
+      string(key)
+      bytes++
+      count(member, depth + 1)
+      if (bytes > limit) return
+    }
+  }
+  count(value, 1)
+  return bytes <= limit
+}
+
+/** Adopted workflow focus is immutable evidence; ordinary routing only retains its receipt. */
+export const handoffGuidanceV2Schema = z
+  .strictObject({
+    version: z.literal(HANDOFF_GUIDANCE_VERSION),
+    evaluationId: z.string().uuid(),
+    handoffId: digest,
+    inputSha256: digest,
+    sourceFingerprint: digest,
+    basis: relayWorkflowBasisV2Schema,
+    candidateId: workflowRelayCandidateIdSchema,
+    sources: z.array(relaySourceSchema).min(1).max(DECISION_SOURCES),
+    highlights: decisionRecommendationSchema.shape.highlights.min(1),
+  })
+  .superRefine((value, context) => {
+    const sourceIds = new Set(value.sources.map((source) => source.id))
+    if (sourceIds.size !== value.sources.length)
+      context.addIssue({ code: 'custom', message: 'Guidance source identities must be unique.' })
+    const roles = new Set(value.sources.flatMap((source) => source.roles))
+    if (!roles.has('task'))
+      context.addIssue({ code: 'custom', message: 'Workflow guidance requires a task source.' })
+    if (roles.has('plan') !== (value.basis.plan !== null))
+      context.addIssue({
+        code: 'custom',
+        message: 'Guidance Plan sources must match the presence of its frozen Plan basis.',
+      })
+    if (
+      !decisionRecommendationSchema.safeParse({
+        candidateId: value.candidateId,
+        highlights: value.highlights,
+      }).success
+    )
+      context.addIssue({
+        code: 'custom',
+        message: 'Guidance highlights exceed recommendation rules.',
+      })
+    if (
+      value.highlights.some((highlight) =>
+        highlight.sourceIds.some((sourceId) => !sourceIds.has(sourceId)),
+      )
+    )
+      context.addIssue({ code: 'custom', message: 'Guidance highlights require supplied sources.' })
+    if (!jsonBytesWithinBudget(value, HANDOFF_GUIDANCE_BYTES))
+      context.addIssue({
+        code: 'custom',
+        message: 'The complete guidance exceeds its byte budget.',
+      })
+  })
+export type HandoffGuidanceV2 = z.infer<typeof handoffGuidanceV2Schema>
+
+/** Historical readers preserve v1 validation and reject every unknown guidance version. */
+export const handoffGuidanceSchema = z.union([planRevisionGuidanceSchema, handoffGuidanceV2Schema])
+export type HandoffGuidance = z.infer<typeof handoffGuidanceSchema>
+
+export const routeCandidateIdSchema = z.enum(['route_codex', 'route_claude', 'route_agy'])
+export type RouteCandidateId = z.infer<typeof routeCandidateIdSchema>
+
+export function routeCandidateIdForAgent(agentId: 'claude' | 'codex' | 'agy'): RouteCandidateId {
+  return agentId === 'claude' ? 'route_claude' : agentId === 'codex' ? 'route_codex' : 'route_agy'
+}
+
+export function agentIdForRouteCandidate(
+  candidateId: RouteCandidateId,
+): 'claude' | 'codex' | 'agy' {
+  return candidateId === 'route_claude' ? 'claude' : candidateId === 'route_codex' ? 'codex' : 'agy'
+}
+
+/** Ordinary routing retains only the selected recipient's receipt, never unadopted model prose. */
+export const inputRoutingProposalSchema = z.strictObject({
+  version: z.literal('input-routing-v1'),
+  evaluationId: z.string().uuid(),
+  handoffId: digest,
+  inputSha256: digest,
+  sourceFingerprint: digest,
+  candidateId: routeCandidateIdSchema,
+  configurationGeneration: z.number().int().nonnegative(),
+  configurationFingerprint: digest,
+  deadlineAt: z.number().int().nonnegative(),
+})
+export type InputRoutingProposal = z.infer<typeof inputRoutingProposalSchema>
+
+/** A versioned initial-role selection proof; its scalars match the ordinary routing receipt. */
+export const initialTaskRolesProposalSchema = inputRoutingProposalSchema.extend({
+  version: z.literal('initial-task-roles-v1'),
+  candidateId: initialTaskRoleCandidateIdSchema,
+})
+export type InitialTaskRolesProposal = z.infer<typeof initialTaskRolesProposalSchema>
+
+/** Durable ordinary-Send receipt metadata; no model prose or native credentials. */
+export const preparedInputMetadataSchema = z
+  .strictObject({
+    version: z.literal('prepared-input-v1'),
+    ownerId: z.string().uuid(),
+    requestFingerprint: digest,
+    inputId: z.string().uuid().nullable(),
+    routeSpecified: z.boolean(),
+    defaultAgentId: z.enum(['claude', 'codex', 'agy']),
+    allowedAgentIds: z
+      .array(z.enum(['claude', 'codex', 'agy']))
+      .min(1)
+      .max(2)
+      .refine((ids) => new Set(ids).size === ids.length, 'Allowed Agents must be unique.'),
+    routeIntent: z.literal('implicit'),
+    composerRevision: z.number().int().nonnegative(),
+    settingsRevision: z.number().int().nonnegative(),
+    taskRoles: z
+      .strictObject({
+        kind: pactSkillSchema,
+        primaryAgentId: z.enum(['claude', 'codex', 'agy']),
+        secondaryAgentId: z.enum(['claude', 'codex', 'agy']).optional(),
+        defaults: taskStageRolesSchema.refine((roles) => roles.revision === 0, {
+          message: 'Prepared role defaults always start at revision 0.',
+        }),
+        candidates: z.array(initialTaskRoleCandidateSchema).min(1).max(3),
+      })
+      .refine(
+        (taskRoles) => {
+          const secondary = taskRoles.secondaryAgentId ?? taskRoles.defaults.planReviewer
+          if (taskRoles.primaryAgentId === secondary) return false
+          const pair = new Set([taskRoles.primaryAgentId, secondary])
+          const rolesInPair = (roles: z.infer<typeof taskStageRolesSchema>) =>
+            pair.has(roles.planAuthor) &&
+            pair.has(roles.planReviewer) &&
+            pair.has(roles.codeAuthor) &&
+            pair.has(roles.codeReviewer)
+          if (!rolesInPair(taskRoles.defaults)) return false
+          const ids = new Set<string>()
+          for (const candidate of taskRoles.candidates) {
+            if (ids.has(candidate.id)) return false
+            ids.add(candidate.id)
+            if (!rolesInPair(candidate.roles)) return false
+            if (
+              candidate.id !== `roles_${candidate.roles.planAuthor}_${candidate.roles.codeAuthor}`
+            )
+              return false
+          }
+          return true
+        },
+        { message: 'Prepared task role candidates must belong to the active 2-member Agent pair.' },
+      )
+      .optional(),
+    sourceFingerprint: digest,
+    cancellationReason: z.enum(['cancelled', 'preparation_failed', 'restarted']).optional(),
+  })
+  .refine(
+    (metadata) => {
+      if (!metadata.taskRoles || metadata.allowedAgentIds.length < 2) return true
+      const secondary =
+        metadata.taskRoles.secondaryAgentId ?? metadata.taskRoles.defaults.planReviewer
+      const allowed = new Set(metadata.allowedAgentIds)
+      return allowed.has(metadata.taskRoles.primaryAgentId) && allowed.has(secondary)
+    },
+    { message: 'Prepared task roles must match the allowed active Agent pair.' },
+  )
+export type PreparedInputMetadata = z.infer<typeof preparedInputMetadataSchema>
+
+export type RelayDecisionMaterial = {
+  input: DecisionInput
+  basis: RelayBasisV2
+  sources: RelaySource[]
+  inputSha256: string
+  sourceFingerprint: string
+}

@@ -1,0 +1,1 @@
+CREATE INDEX `relay_decisions_matter_history` ON `relay_decisions` (`session_id`,`matter_key`,`format_version`);

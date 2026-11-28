@@ -38,7 +38,7 @@ export function LargeActivityPreview({
   return (
     <div className="space-y-1.5 text-caption text-secondary">
       <p className="text-tertiary">
-        Work log detail · {Math.ceil(source.bodyBytes / 1024).toLocaleString()} KiB
+        Work log detail · {Math.ceil(source.bodyBytes / 1024).toLocaleString()} KB
       </p>
       <pre
         className={`${complete ? 'max-h-80 overflow-auto' : 'max-h-40 overflow-hidden'} whitespace-pre-wrap break-words rounded-control bg-surface-muted p-2 font-mono text-caption leading-relaxed text-primary`}
@@ -53,7 +53,7 @@ export function LargeActivityPreview({
       ) : null}
       {tooLarge ? (
         <p className="text-tertiary">
-          Too large for inline expansion. The complete detail remains saved locally.
+          Too large to expand here. The full details remain saved locally.
         </p>
       ) : !complete ? (
         <button

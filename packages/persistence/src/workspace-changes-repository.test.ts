@@ -1,3 +1,4 @@
+import { eq } from 'drizzle-orm'
 import { createHash, randomUUID } from 'node:crypto'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -7,13 +8,19 @@ import { describe, expect, it } from 'vitest'
 import type { DefaultSessionSettings, WorkspaceFileChange } from '@pact/contracts'
 
 import { PactDatabase } from './pact-database.js'
+import { workspaceChangeSets } from './schema/index.js'
 
 const migrationsFolder = resolve(import.meta.dirname, '../drizzle')
 const settings: DefaultSessionSettings = {
   primaryAgentId: 'codex',
-  agents: { claude: { model: null, effort: null }, codex: { model: null, effort: null } },
+  secondaryAgentId: 'claude',
+  agents: {
+    claude: { model: null, effort: null },
+    codex: { model: null, effort: null },
+    agy: { model: null, effort: null },
+  },
   maxDiscussionRounds: 6,
-  runningMessagePolicy: 'immediate_safe_point',
+
   maxReviewCycles: 3,
   maxRepairAttempts: 3,
 }
@@ -246,6 +253,122 @@ describe('Workspace change evidence durability', () => {
       )
     } finally {
       f.db.close()
+    }
+  })
+
+  it('retains 0-file uncertain effects rows without scheduling startup changeSet projection', async () => {
+    const f = await fixture()
+    try {
+      f.repo.observeUncertainEffects(f.run.id)
+      const finalized = f.repo.finalize(f.run.id)
+      expect(finalized).toMatchObject({
+        id: f.run.id,
+        state: 'ready',
+        fileCount: 0,
+        effectsUncertain: true,
+      })
+      expect(f.repo.find(f.run.id)).toMatchObject({
+        id: f.run.id,
+        fileCount: 0,
+        effectsUncertain: true,
+      })
+      expect(
+        f.db.drizzle.query.workspaceChangeSets
+          .findFirst({
+            columns: { projectionPending: true },
+            where: (t) => eq(t.id, f.run.id),
+          })
+          .sync()?.projectionPending,
+      ).toBe(false)
+      expect(f.repo.recoverableSets()).toEqual([])
+    } finally {
+      f.db.close()
+    }
+
+    const f2 = await fixture()
+    try {
+      f2.repo.observeUncertainEffects(f2.run.id)
+      const recovered = f2.repo.recoverInterruptedRecording(f2.run.id)
+      expect(recovered).toMatchObject({
+        id: f2.run.id,
+        state: 'mixed',
+        fileCount: 0,
+        effectsUncertain: true,
+      })
+      expect(
+        f2.db.drizzle.query.workspaceChangeSets
+          .findFirst({
+            columns: { projectionPending: true },
+            where: (t) => eq(t.id, f2.run.id),
+          })
+          .sync()?.projectionPending,
+      ).toBe(false)
+      expect(f2.repo.finalize(f2.run.id)).toMatchObject({
+        id: f2.run.id,
+        state: 'mixed',
+        fileCount: 0,
+      })
+      expect(f2.repo.recoverableSets()).toEqual([])
+    } finally {
+      f2.db.close()
+    }
+  })
+
+  it('retracts a previously published summary when net file changes drop to zero and reconciles legacy 0-file pending rows once', async () => {
+    const f = await fixture()
+    try {
+      const first = file('src/retract.ts', 'original', 'edited')
+      record(f, [first])
+      const publishedSummary = f.repo.summary(f.run.id)
+      f.db.conversationRepository.recordWorkspaceChanges(publishedSummary)
+      expect(f.db.conversationRepository.findRun(f.run.id)?.workspaceChanges).toMatchObject({
+        fileCount: 1,
+      })
+
+      // Subsequent edit restores exact original bytes -> net fileCount drops to 0.
+      record(f, [file('src/retract.ts', 'edited', 'original')])
+      const retractedFinal = f.repo.finalize(f.run.id)
+      expect(retractedFinal).toMatchObject({ id: f.run.id, fileCount: 0, state: 'ready' })
+      expect(
+        f.db.drizzle.query.workspaceChangeSets
+          .findFirst({
+            columns: { projectionPending: true },
+            where: (t) => eq(t.id, f.run.id),
+          })
+          .sync()?.projectionPending,
+      ).toBe(true)
+
+      f.db.conversationRepository.recordWorkspaceChanges(retractedFinal)
+      expect(f.db.conversationRepository.findRun(f.run.id)?.workspaceChanges).toBeUndefined()
+      expect(f.repo.recoverableSets()).toEqual([])
+    } finally {
+      f.db.close()
+    }
+
+    // Legacy 0-file row left finalized with projectionPending=true clears pending without creating workspaceChangesJson.
+    const f2 = await fixture()
+    try {
+      f2.repo.observeUncertainEffects(f2.run.id)
+      f2.repo.finalize(f2.run.id)
+      f2.db.drizzle
+        .update(workspaceChangeSets)
+        .set({ projectionPending: true })
+        .where(eq(workspaceChangeSets.id, f2.run.id))
+        .run()
+      expect(f2.repo.recoverableSets().map((s) => s.id)).toContain(f2.run.id)
+      const finalizedLegacy = f2.repo.finalize(f2.run.id)
+      expect(finalizedLegacy).toMatchObject({
+        id: f2.run.id,
+        fileCount: 0,
+        effectsUncertain: true,
+        state: 'ready',
+      })
+      f2.db.conversationRepository.recordWorkspaceChanges(finalizedLegacy)
+      expect(f2.repo.recoverableSets()).toEqual([])
+      expect(f2.db.conversationRepository.findRun(f2.run.id)?.workspaceChanges).toBeUndefined()
+      expect(f2.repo.find(f2.run.id)?.effectsUncertain).toBe(true)
+    } finally {
+      f2.db.close()
     }
   })
 })

@@ -1,5 +1,7 @@
 import { and, desc, eq, isNull, ne, sql } from 'drizzle-orm'
 
+import type { RuntimeAgentId } from '@pact/contracts'
+
 import type { PactDrizzleDatabase } from './drizzle-database.js'
 
 import {
@@ -7,6 +9,7 @@ import {
   nativeAgentContexts,
   nativeRebuildOperations,
   sessionForkOperations,
+  sessionSettingsRevisions,
   nativePresenceMetadata,
   projects,
   sessions,
@@ -26,6 +29,9 @@ const issueRunColumns = {
   nativeEffectsState: agentRuns.nativeEffectsState,
   bindingGeneration: agentRuns.bindingGeneration,
   failureKind: agentRuns.failureKind,
+  nativeSessionId: agentRuns.nativeSessionId,
+  executorId: agentRuns.executorId,
+  controlDisposition: agentRuns.controlDisposition,
 }
 
 function projectNativeIssueRun(
@@ -37,6 +43,8 @@ function projectNativeIssueRun(
         nativeOutcome: row.nativeOutcome ?? undefined,
         nativeEffectsState: row.nativeEffectsState ?? undefined,
         failureKind: row.failureKind ?? undefined,
+        nativeSessionId: row.nativeSessionId ?? undefined,
+        executorId: row.executorId ?? undefined,
       }
     : undefined
 }
@@ -52,10 +60,13 @@ export function nativeSessionIssueMetadata(database: PactDrizzleDatabase, sessio
       state: nativeAgentContexts.state,
       recoveryFailureKind: nativeAgentContexts.recoveryFailureKind,
       recoveryAction: nativeAgentContexts.recoveryAction,
+      permissionRequestsJson: nativeAgentContexts.permissionRequestsJson,
+      lastRunId: nativeAgentContexts.lastRunId,
+      executorId: nativeAgentContexts.executorId,
     })
     .from(nativeAgentContexts)
     .where(eq(nativeAgentContexts.sessionId, sessionId))
-    .limit(2)
+    .limit(3)
     .all()
     .map((row) => ({
       agentId: row.agentId,
@@ -65,8 +76,30 @@ export function nativeSessionIssueMetadata(database: PactDrizzleDatabase, sessio
       state: row.state,
       recoveryFailureKind: row.recoveryFailureKind ?? undefined,
       recoveryAction: row.recoveryAction ?? undefined,
+      hasPendingPermission:
+        row.permissionRequestsJson !== null && row.permissionRequestsJson !== '[]',
+      lastRunId: row.lastRunId ?? undefined,
+      executorId: row.executorId ?? undefined,
     }))
-  const readRun = (agentId: 'claude' | 'codex', generation?: number, unacknowledged = false) =>
+  const activeSettings = database
+    .select({
+      primaryAgentId: sessionSettingsRevisions.primaryAgentId,
+      secondaryAgentId: sessionSettingsRevisions.secondaryAgentId,
+    })
+    .from(sessions)
+    .innerJoin(
+      sessionSettingsRevisions,
+      and(
+        eq(sessionSettingsRevisions.sessionId, sessions.id),
+        eq(sessionSettingsRevisions.revision, sessions.settingsRevision),
+      ),
+    )
+    .where(eq(sessions.id, sessionId))
+    .get()
+  const activeAgents: readonly [RuntimeAgentId, RuntimeAgentId] | undefined = activeSettings
+    ? [activeSettings.primaryAgentId, activeSettings.secondaryAgentId]
+    : undefined
+  const readRun = (agentId: RuntimeAgentId, generation?: number, unacknowledged = false) =>
     database
       .select(issueRunColumns)
       .from(agentRuns)
@@ -89,14 +122,42 @@ export function nativeSessionIssueMetadata(database: PactDrizzleDatabase, sessio
       .orderBy(desc(agentRuns.createdAt), desc(sql`${agentRuns}.rowid`))
       .limit(1)
       .get()
-  const runs = (['codex', 'claude'] as const).map((agentId) => {
+  const runs = (['codex', 'claude', 'agy'] as const).map((agentId) => {
     const context = contexts.find((row) => row.agentId === agentId)
     return projectNativeIssueRun(
       (!context ? readRun(agentId, undefined, true) : undefined) ??
         readRun(agentId, context?.bindingGeneration),
     )
   })
-  const operations = (['codex', 'claude'] as const).flatMap((agentId) => {
+  const cursors = contexts.map((context) => {
+    if (!context.lastRunId || context.bindingGeneration === undefined) return undefined
+    return projectNativeIssueRun(
+      database
+        .select(issueRunColumns)
+        .from(agentRuns)
+        .where(
+          and(
+            eq(agentRuns.id, context.lastRunId),
+            eq(agentRuns.sessionId, sessionId),
+            eq(agentRuns.agentId, context.agentId),
+            eq(agentRuns.nativeSessionId, context.nativeSessionId),
+            eq(agentRuns.bindingGeneration, context.bindingGeneration),
+            ne(agentRuns.controlDisposition, 'abandoned'),
+            isNull(agentRuns.forkSourceRunId),
+            sql`NOT EXISTS (
+              SELECT 1 FROM agent_runs AS later
+              WHERE later.session_id=${sessionId} AND later.agent_id=${context.agentId}
+                AND later.binding_generation=${context.bindingGeneration}
+                AND later.rowid > (SELECT rowid FROM agent_runs WHERE id=${context.lastRunId})
+                AND (later.status NOT IN ('failed','interrupted')
+                  OR later.dispatch_phase NOT IN ('not_sent','rejected'))
+            )`,
+          ),
+        )
+        .get(),
+    )
+  })
+  const operations = (['codex', 'claude', 'agy'] as const).flatMap((agentId) => {
     const row = database
       .select({
         id: nativeRebuildOperations.id,
@@ -127,16 +188,25 @@ export function nativeSessionIssueMetadata(database: PactDrizzleDatabase, sessio
         ]
       : []
   })
-  const incomplete = runs.flatMap((run) =>
-    run?.dispatchPhase === 'ended' &&
-    !database.get(sql`
-    SELECT id FROM conversation_messages WHERE run_id=${run.id} AND role='assistant' AND is_visible=1 AND state='complete' AND length(content)>0 LIMIT 1
-  `)
+  const incomplete = runs.flatMap((run) => {
+    if (run?.dispatchPhase !== 'ended') return []
+    if (run.status === 'interrupted' && run.failureKind === 'user_stopped') {
+      return database.get(sql`
+        SELECT sequence FROM agent_event_journal WHERE run_id=${run.id} AND event_type='pact.output_unavailable' LIMIT 1
+      `)
+        ? [run.id]
+        : []
+    }
+    return !database.get(sql`
+      SELECT id FROM conversation_messages WHERE run_id=${run.id} AND role='assistant' AND is_visible=1 AND state='complete' AND length(content)>0 LIMIT 1
+    `)
       ? [run.id]
-      : [],
-  )
+      : []
+  })
   return {
-    issues: projectSessionIssues(sessionId, contexts, runs, [], incomplete, operations),
+    issues: projectSessionIssues(sessionId, contexts, runs, cursors, incomplete, operations, {
+      activeAgents,
+    }),
     bindings: contexts.length,
   }
 }
@@ -154,7 +224,7 @@ export function refreshNativeSessionMetadata(
   updateSessionNativeMetadata(
     database,
     sessionId,
-    Boolean(fork && (!fork.ready || facts.bindings !== 2)) ||
+    Boolean(fork && (!fork.ready || facts.bindings < 2)) ||
       facts.issues.agents.some((issue) => issue.phase !== 'resolved'),
   )
 }
@@ -169,12 +239,14 @@ export function updateSessionNativeMetadata(
     .select({
       session: {
         projectId: sessions.projectId,
+        parentSessionId: sessions.parentSessionId,
         archivedAt: sessions.archivedAt,
         status: sessions.status,
         workspaceVisible: sessions.workspaceVisible,
         needsAttention: sessions.needsAttention,
       },
       projectArchivedAt: projects.archivedAt,
+      parentArchived: sql<number>`EXISTS (SELECT 1 FROM sessions p WHERE p.id = ${sessions.parentSessionId} AND (p.archived_at IS NOT NULL OR p.status = 'archived'))`,
     })
     .from(sessions)
     .innerJoin(projects, eq(projects.id, sessions.projectId))
@@ -182,7 +254,10 @@ export function updateSessionNativeMetadata(
     .get()
   if (!row) return
   const visible =
-    !row.session.archivedAt && row.session.status !== 'archived' && !row.projectArchivedAt
+    !row.session.archivedAt &&
+    row.session.status !== 'archived' &&
+    !row.projectArchivedAt &&
+    !row.parentArchived
   const attention = needsAttention ?? row.session.needsAttention
   if (visible === row.session.workspaceVisible && attention === row.session.needsAttention) return
   const delta =
@@ -232,6 +307,7 @@ export function updateProjectNativeVisibility(
           eq(sessions.projectId, projectId),
           isNull(sessions.archivedAt),
           sql`${sessions.status} <> 'archived'`,
+          sql`(${sessions.parentSessionId} IS NULL OR NOT EXISTS (SELECT 1 FROM sessions p WHERE p.id = ${sessions.parentSessionId} AND (p.archived_at IS NOT NULL OR p.status = 'archived')))`,
         ),
       )
       .run()

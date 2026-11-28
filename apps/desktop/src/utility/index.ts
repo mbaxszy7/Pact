@@ -1,11 +1,12 @@
 import { randomUUID } from 'node:crypto'
 import { realpath, rm } from 'node:fs/promises'
-import { basename, dirname, isAbsolute } from 'node:path'
+import { basename, dirname, isAbsolute, join } from 'node:path'
 import { monitorEventLoopDelay } from 'node:perf_hooks'
 
 import {
   utilityEventSchema,
   utilityRequestSchema,
+  relayCredentialStoredSchema,
   utilityResponseSchema,
   workspaceStorageRootSchema,
   runtimeStartupFailureSchema,
@@ -17,18 +18,45 @@ import { closeDiagnostics, receiveDiagnostic, recordDiagnostic } from '../diagno
 import { hasLogicalIpcFixtureNonce, LogicalIpcWorkerTraffic } from '../shared/logical-ipc-traffic'
 import { AppUpdates } from './app-updates/app-updates'
 import { handleAppearanceRequest } from './appearance/handler'
+import {
+  configureDefaultAgyStorageTransport,
+  ElectronParentPortAgyStorageTransport,
+} from './conversation/agy-storage-runner'
 import { Conversation } from './conversation/conversation'
 import { ConversationImages } from './conversation/conversation-images'
-import { nativeWorkingMemoryDiagnostics } from './conversation/native-working-memory'
+import {
+  nativeWorkingMemoryCapacities,
+  nativeWorkingMemoryDiagnostics,
+} from './conversation/native-working-memory'
+import { UtilityRelayCredentialClient } from './conversation/relay-credential-client'
 import { DefaultSessionSettings } from './default-session-settings/default-session-settings'
+import { configureOwnedProcessGroups } from './owned-process-group'
 import { ProjectCatalog } from './project-catalog/project-catalog'
 import { ProjectFileReader } from './project-file/project-file-reader'
+import { ProviderUsage } from './provider-usage/provider-usage'
 import { RuntimePreparation } from './runtime-preparation/runtime-preparation'
 import { SessionWorkspace } from './session-workspace/session-workspace'
+import { TerminalManager, type TerminalDisposeSummary } from './terminal/terminal-manager'
 import { UtilityDirectoryFileClient } from './workspace-changes/directory-file-client'
 import { WorkspaceChanges } from './workspace-changes/workspace-changes'
 
 const parentPort = process.parentPort
+
+function isRetryableUnconfirmedProcessError(error: unknown): boolean {
+  let current: unknown = error
+  const seen = new Set<unknown>()
+  while (current && typeof current === 'object' && !seen.has(current)) {
+    seen.add(current)
+    if (
+      Reflect.get(current, 'code') === 'unconfirmed_process' &&
+      Reflect.get(current, 'retryable') === true
+    ) {
+      return true
+    }
+    current = Reflect.get(current, 'cause')
+  }
+  return false
+}
 const databaseFile = process.argv[2]
 const migrationsFolder = process.argv[3]
 const workspaceStorageRoot = workspaceStorageRootSchema.parse(process.argv[5])
@@ -36,6 +64,10 @@ let database: PactDatabase | undefined
 let conversation: Conversation | undefined
 let workspaceChanges: WorkspaceChanges | undefined
 let directoryFiles: UtilityDirectoryFileClient | undefined
+let agyStorageTransportOwner: ElectronParentPortAgyStorageTransport | undefined
+let runtimePreparationOwner: RuntimePreparation | undefined
+let providerUsageOwner: ProviderUsage | undefined
+let terminalManagerOwner: TerminalManager | undefined
 let eventLoopProbe: ReturnType<typeof monitorEventLoopDelay> | undefined
 let resourceHighWater = 0
 let workerTraffic: LogicalIpcWorkerTraffic | undefined
@@ -81,6 +113,7 @@ function performanceSnapshot(
     resourceHighWater,
     resourceCapacityExceeded,
     nativeMemory: nativeWorkingMemoryDiagnostics(),
+    nativeMemoryCapacities: nativeWorkingMemoryCapacities(),
   }
 }
 
@@ -89,6 +122,15 @@ async function bootstrap(
   runtimeMigrationsFolder: string,
   runtimeWorkspaceStorageRoot: string,
 ): Promise<void> {
+  if (process.platform === 'win32') {
+    const windowsBridgeExecutable = process.argv[7]
+    if (!windowsBridgeExecutable || !isAbsolute(windowsBridgeExecutable))
+      throw new Error('Windows native work requires its installed process owner.')
+    configureOwnedProcessGroups({
+      windowsBridgeExecutable,
+      receiptDirectory: join(runtimeWorkspaceStorageRoot, 'native-process-receipts'),
+    })
+  }
   recordDiagnostic({ operation: 'utility', phase: 'started' })
   const measurementRoot = process.env.PACT_E2E_ROOT
   const measurePerformance = Boolean(
@@ -105,7 +147,13 @@ async function bootstrap(
   database = openedDatabase
   if (measurePerformance) {
     workerTraffic = new LogicalIpcWorkerTraffic(
-      ['utility-markdown', 'utility-image', 'utility-native-json', 'utility-native-fork'],
+      [
+        'utility-markdown',
+        'utility-image',
+        'utility-native-json',
+        'utility-native-fork',
+        'utility-terminal',
+      ],
       randomUUID(),
     )
     eventLoopProbe = monitorEventLoopDelay({ resolution: 10 })
@@ -127,7 +175,12 @@ async function bootstrap(
     openedDatabase.conversationRepository.recordWorkspaceChanges(summary)
   }
 
-  const runtimePreparation = new RuntimePreparation(openedDatabase.runtimePreparationRepository)
+  const runtimePreparation = new RuntimePreparation(openedDatabase.runtimePreparationRepository, {
+    discoverShellPath: true,
+  })
+  runtimePreparationOwner = runtimePreparation
+  const providerUsage = new ProviderUsage(runtimePreparation, runtimeWorkspaceStorageRoot)
+  providerUsageOwner = providerUsage
   const defaultSessionSettings = new DefaultSessionSettings(
     runtimePreparation,
     openedDatabase.defaultSessionSettingsRepository,
@@ -136,6 +189,7 @@ async function bootstrap(
   const projectFileReader = new ProjectFileReader(
     openedDatabase.sessionRepository,
     openedDatabase.projectCatalogRepository,
+    (input, signal) => directoryOwner.run(input, signal),
   )
   const sessionWorkspace = new SessionWorkspace(
     openedDatabase.projectCatalogRepository,
@@ -150,6 +204,34 @@ async function bootstrap(
     workerTraffic,
   )
   await images.initialize()
+  const relayCredentialClient = new UtilityRelayCredentialClient(parentPort)
+  const agyStorageTransport = new ElectronParentPortAgyStorageTransport(parentPort)
+  agyStorageTransportOwner = agyStorageTransport
+  configureDefaultAgyStorageTransport(agyStorageTransport)
+  const rawTerminalHelperArg = process.argv[8]
+  const terminalHelperExecutablePath =
+    rawTerminalHelperArg && isAbsolute(rawTerminalHelperArg) ? rawTerminalHelperArg : undefined
+  const terminalManager = new TerminalManager({
+    projectCatalog: openedDatabase.projectCatalogRepository,
+    helperExecutablePath: terminalHelperExecutablePath,
+    traffic: workerTraffic?.collector('utility-terminal'),
+    onOutputEvent: (event) => {
+      try {
+        parentPort.postMessage(utilityEventSchema.parse({ type: 'terminal.output.event', event }))
+      } catch {
+        // Ignore oversized/late output events during teardown.
+      }
+    },
+    onStateEvent: (event) => {
+      try {
+        parentPort.postMessage(utilityEventSchema.parse({ type: 'terminal.state.event', event }))
+      } catch {
+        // Ignore late state events during teardown.
+      }
+    },
+    isQuitSealed: () => Boolean(conversation?.isTerminalQuitSealed()),
+  })
+  terminalManagerOwner = terminalManager
   conversation = new Conversation(
     openedDatabase.conversationRepository,
     openedDatabase.sessionRepository,
@@ -159,7 +241,42 @@ async function bootstrap(
     runtimeDatabaseFile === ':memory:' ? undefined : workspaceOwner,
     images,
     workerTraffic,
+    async (context) => {
+      const stored = openedDatabase.conversationRepository.readRelayCredential()
+      const generation = openedDatabase.conversationRepository.schedulingConfigurationGeneration()
+      if (!stored.ciphertext || context.signal.aborted || Date.now() >= context.deadlineAt)
+        return null
+      const opened = await relayCredentialClient.decrypt(stored.ciphertext, context)
+      if (!opened || context.signal.aborted || Date.now() >= context.deadlineAt) return null
+      const after = openedDatabase.conversationRepository.readRelayCredential()
+      // Any credential, revision or configuration-generation change while decrypting
+      // means this key is not current.
+      if (
+        after.ciphertext !== stored.ciphertext ||
+        after.revision !== stored.revision ||
+        openedDatabase.conversationRepository.schedulingConfigurationGeneration() !== generation
+      )
+        return null
+      // Rotation is authority-neutral but must land on the exact prior ciphertext.
+      if (
+        opened.replacementCiphertext &&
+        !openedDatabase.conversationRepository.rotateRelayCredentialCiphertext(
+          stored.revision,
+          stored.ciphertext,
+          opened.replacementCiphertext,
+        )
+      )
+        return null
+      return opened.key
+    },
+    terminalManager,
   )
+  const unsubscribeScheduling = conversation.subscribeSchedulingChanges(() => {
+    parentPort.postMessage(utilityEventSchema.parse({ type: 'scheduling.changed.event' }))
+  })
+  const unsubscribeNotifications = conversation.subscribeNotifications((event) => {
+    parentPort.postMessage(utilityEventSchema.parse({ type: 'session.notification.event', event }))
+  })
   conversation.subscribe((patch, progress) => {
     parentPort.postMessage(
       utilityEventSchema.parse({ type: 'conversation.patch.event', patch, progress }),
@@ -180,26 +297,212 @@ async function bootstrap(
   let activeRequests = 0
   let resolveIdle: (() => void) | undefined
   let shutdown: Promise<void> | undefined
+  let shutdownBaseDone = false
+  let shutdownCompleted = false
+  let terminalShutdownSummary: TerminalDisposeSummary = {
+    unconfirmedCount: 0,
+  }
+  let permanentShutdownError: Error | undefined
+  let databaseClosed = false
+
+  const finalizeShutdownTeardown = async (): Promise<void> => {
+    if (databaseClosed) return
+    databaseClosed = true
+    agyStorageTransport.dispose()
+    configureDefaultAgyStorageTransport(undefined)
+    directoryOwner.dispose()
+    openedDatabase.close()
+    database = undefined
+    if (runtimeDatabaseFile === ':memory:')
+      await rm(runtimeWorkspaceStorageRoot, { recursive: true, force: true })
+  }
+  const convergeConversationShutdown = async (
+    initialError: unknown,
+    deadlineAt: number | undefined,
+  ): Promise<void> => {
+    if (deadlineAt === undefined || !isRetryableUnconfirmedProcessError(initialError)) {
+      permanentShutdownError = new Error('Conversation cleanup did not finish successfully.', {
+        cause: initialError,
+      })
+      await finalizeShutdownTeardown()
+      throw permanentShutdownError
+    }
+    let lastError: unknown = initialError
+    let permanentCause: unknown
+    let hasPermanentError = false
+    while (Date.now() < deadlineAt) {
+      const waitMs = Math.min(25, Math.max(1, deadlineAt - Date.now()))
+      // oxlint-disable-next-line no-await-in-loop -- Bounded single-shutdown wait for late physical release confirmation before deadlineAt.
+      await new Promise<void>((resolve) => setTimeout(resolve, waitMs))
+      try {
+        // oxlint-disable-next-line no-await-in-loop -- Re-check late physical release convergence under the same shutdown deadline.
+        await conversationOwner.dispose({ flushDeadlineAt: deadlineAt })
+        return
+      } catch (retryError) {
+        if (!isRetryableUnconfirmedProcessError(retryError)) {
+          permanentCause = retryError
+          hasPermanentError = true
+          break
+        }
+        lastError = retryError
+      }
+    }
+    if (hasPermanentError) {
+      permanentShutdownError = new Error('Conversation cleanup did not finish successfully.', {
+        cause: permanentCause,
+      })
+      await finalizeShutdownTeardown()
+      throw permanentShutdownError
+    }
+    // Keep openedDatabase and parentPort storage transport alive when physical release
+    // remains unconfirmed past deadlineAt, without falsely acknowledging flushed.
+    throw lastError
+  }
   // No second request queue: count the async handlers already owned here. Quit
   // has one idle waiter; Main's shutdown deadline bounds its lifetime.
   const runRequest = (work: () => Promise<void>): void => {
     activeRequests += 1
-    void work().finally(() => {
-      activeRequests -= 1
-      if (activeRequests === 0) {
-        resolveIdle?.()
-        resolveIdle = undefined
-      }
-    })
+    void work()
+      .catch(() => {
+        recordDiagnostic({ operation: 'utility', phase: 'failed', level: 'warn' })
+      })
+      .finally(() => {
+        activeRequests -= 1
+        if (activeRequests === 0) {
+          resolveIdle?.()
+          resolveIdle = undefined
+        }
+      })
   }
 
   parentPort.on('message', (event) => {
+    if (relayCredentialClient.consume(event.data)) return
+    if (agyStorageTransport.consume(event.data, event.ports)) return
     if (receiveDiagnostic(event.data)) return
     const request = utilityRequestSchema.safeParse(event.data)
     if (!request.success) return
     if (closing && request.data.type !== 'runtime.shutdown.request') return
 
     switch (request.data.type) {
+      case 'scheduling.state.get.request': {
+        const input = request.data
+        runRequest(async () => {
+          const result = conversationOwner.getSchedulingState(input.input)
+          parentPort.postMessage(
+            utilityResponseSchema.parse({
+              type: 'scheduling.state.response',
+              requestId: input.requestId,
+              result,
+            }),
+          )
+        })
+        return
+      }
+      case 'scheduling.settings.get.request':
+      case 'scheduling.settings.save.request': {
+        const input = request.data
+        runRequest(async () => {
+          const result =
+            input.type === 'scheduling.settings.get.request'
+              ? conversationOwner.getSchedulingSettings()
+              : await conversationOwner.saveSchedulingSettings(input.input)
+          parentPort.postMessage(
+            utilityResponseSchema.parse({
+              type: 'scheduling.settings.response',
+              requestId: input.requestId,
+              result,
+            }),
+          )
+        })
+        return
+      }
+      case 'scheduling.activity.read.request': {
+        parentPort.postMessage(
+          utilityResponseSchema.parse({
+            type: 'scheduling.activity.response',
+            requestId: request.data.requestId,
+            result: conversationOwner.readSchedulingActivity(request.data.input),
+          }),
+        )
+        return
+      }
+      case 'relay.credential.write.request': {
+        const input = request.data
+        runRequest(async () => {
+          const result = await conversationOwner.writeRelayCredential(input.input)
+          parentPort.postMessage(
+            utilityResponseSchema.parse({
+              type: 'relay.credential.write.response',
+              requestId: input.requestId,
+              result,
+            }),
+          )
+        })
+        return
+      }
+      case 'relay.credential.receipt.read.request': {
+        const input = request.data
+        let result: import('@pact/contracts').RpcResult<
+          import('@pact/contracts').RelayCredentialReceipt | null
+        >
+        try {
+          result = {
+            ok: true,
+            value:
+              openedDatabase.conversationRepository.readRelayCredentialReceipt(input.input.nonce) ??
+              null,
+          }
+        } catch {
+          result = {
+            ok: false,
+            error: { code: 'INTERNAL', message: 'The credential receipt could not be read.' },
+          }
+        }
+        parentPort.postMessage(
+          utilityResponseSchema.parse({
+            type: 'relay.credential.receipt.read.response',
+            requestId: input.requestId,
+            result,
+          }),
+        )
+        return
+      }
+      case 'relay.credential.read.request': {
+        const input = request.data
+        let result: import('@pact/contracts').RpcResult<
+          import('@pact/contracts').RelayCredentialStored
+        >
+        try {
+          if (Date.now() >= input.input.deadlineAt)
+            result = {
+              ok: false,
+              error: { code: 'CONFLICT', message: 'The credential read is no longer current.' },
+            }
+          else {
+            const stored = openedDatabase.conversationRepository.readRelayCredential()
+            result =
+              stored.revision !== input.input.expectedRevision
+                ? {
+                    ok: false,
+                    error: { code: 'CONFLICT', message: 'The saved credential changed.' },
+                  }
+                : { ok: true, value: relayCredentialStoredSchema.parse(stored) }
+          }
+        } catch {
+          result = {
+            ok: false,
+            error: { code: 'INTERNAL', message: 'The stored credential could not be read.' },
+          }
+        }
+        parentPort.postMessage(
+          utilityResponseSchema.parse({
+            type: 'relay.credential.read.response',
+            requestId: input.requestId,
+            result,
+          }),
+        )
+        return
+      }
       case 'updates.check.request': {
         const requestId = request.data.requestId
         runRequest(async () => {
@@ -387,27 +690,114 @@ async function bootstrap(
       }
       case 'runtime.shutdown.request': {
         const requestId = request.data.requestId
-        shutdown ??= (async () => {
+        const flushDeadlineAt = request.data.flushDeadlineAt
+        if (shutdownCompleted) {
+          parentPort.postMessage(
+            utilityResponseSchema.parse({
+              type: 'runtime.shutdown.response',
+              requestId,
+              result: {
+                ok: true,
+                value: {
+                  flushed: true,
+                  ...(terminalShutdownSummary.unconfirmedCount > 0
+                    ? {
+                        unconfirmedTerminals: terminalShutdownSummary.unconfirmedCount,
+                      }
+                    : {}),
+                },
+              },
+            }),
+          )
+          return
+        }
+        if (permanentShutdownError) {
+          parentPort.postMessage(
+            utilityResponseSchema.parse({
+              type: 'runtime.shutdown.response',
+              requestId,
+              result: {
+                ok: false,
+                error: { code: 'INTERNAL', message: 'Pact could not finish its shutdown flush.' },
+              },
+            }),
+          )
+          return
+        }
+        const currentAttempt = (shutdown ??= (async () => {
           closing = true
-          await appUpdates.dispose()
-          projectCatalog.dispose()
-          const drainRequests =
-            activeRequests === 0
-              ? Promise.resolve()
-              : new Promise<void>((resolve) => {
-                  resolveIdle = resolve
-                })
-          // Await every request before closing its database, even if one owner's
-          // cleanup fails. A failed owner never produces a successful flush ACK.
-          const results = await Promise.allSettled([
-            conversationOwner.dispose(),
-            defaultSessionSettings.dispose(),
-            drainRequests,
-          ])
+          if (!shutdownBaseDone) {
+            unsubscribeScheduling()
+            unsubscribeNotifications()
+            await appUpdates.dispose()
+            projectCatalog.dispose()
+            const drainRequests =
+              activeRequests === 0
+                ? Promise.resolve()
+                : new Promise<void>((resolve) => {
+                    resolveIdle = resolve
+                  })
+            // Await every request before closing its database, even if one owner's
+            // cleanup fails. A failed owner never produces a successful flush ACK.
+            // Close credential admission before Conversation disposal; the private
+            // consume routes stay alive on parentPort through cleanup.
+            relayCredentialClient.dispose()
+            const [
+              runtimePrepResult,
+              providerUsageResult,
+              conversationResult,
+              defaultSettingsResult,
+              projectFileResult,
+              terminalDisposeResult,
+              drainResult,
+            ] = await Promise.allSettled([
+              runtimePreparation.dispose(flushDeadlineAt),
+              providerUsage.dispose(flushDeadlineAt),
+              flushDeadlineAt === undefined
+                ? conversationOwner.dispose()
+                : conversationOwner.dispose({ flushDeadlineAt }),
+              defaultSessionSettings.dispose(flushDeadlineAt),
+              projectFileReader.dispose(),
+              terminalManager.dispose(flushDeadlineAt),
+              drainRequests,
+            ])
+            if (terminalDisposeResult.status === 'fulfilled') {
+              terminalShutdownSummary = terminalDisposeResult.value
+            }
+            let workspaceError: unknown
+            try {
+              await workspaceOwner.dispose()
+            } catch (error) {
+              workspaceError = error
+            }
+            const nonConversationFailed =
+              workspaceError !== undefined ||
+              runtimePrepResult.status === 'rejected' ||
+              providerUsageResult.status === 'rejected' ||
+              defaultSettingsResult.status === 'rejected' ||
+              projectFileResult.status === 'rejected' ||
+              drainResult.status === 'rejected'
+            if (nonConversationFailed) {
+              permanentShutdownError = new Error(
+                'Conversation cleanup did not finish successfully.',
+              )
+              await finalizeShutdownTeardown()
+              throw permanentShutdownError
+            }
+            shutdownBaseDone = true
+            if (conversationResult.status === 'rejected') {
+              await convergeConversationShutdown(conversationResult.reason, flushDeadlineAt)
+            }
+          } else {
+            try {
+              await (flushDeadlineAt === undefined
+                ? conversationOwner.dispose()
+                : conversationOwner.dispose({ flushDeadlineAt }))
+            } catch (error) {
+              await convergeConversationShutdown(error, flushDeadlineAt)
+            }
+          }
           try {
-            await workspaceOwner.dispose()
-            if (results.some((result) => result.status === 'rejected'))
-              throw new Error('Conversation cleanup did not finish successfully.')
             parentPort.postMessage(
               utilityEventSchema.parse({
                 type: 'native-presence.quit-recent.event',
@@ -416,26 +806,36 @@ async function bootstrap(
               }),
             )
           } finally {
-            directoryOwner.dispose()
-            openedDatabase.close()
-            database = undefined
-            if (runtimeDatabaseFile === ':memory:')
-              await rm(runtimeWorkspaceStorageRoot, { recursive: true, force: true })
+            await finalizeShutdownTeardown()
           }
-        })()
-        void shutdown.then(
+          shutdownCompleted = true
+        })())
+        void currentAttempt.then(
           () => {
             closeDiagnostics()
             parentPort.postMessage(
               utilityResponseSchema.parse({
                 type: 'runtime.shutdown.response',
                 requestId,
-                result: { ok: true, value: { flushed: true } },
+                result: {
+                  ok: true,
+                  value: {
+                    flushed: true,
+                    ...(terminalShutdownSummary.unconfirmedCount > 0
+                      ? {
+                          unconfirmedTerminals: terminalShutdownSummary.unconfirmedCount,
+                        }
+                      : {}),
+                  },
+                },
               }),
             )
             return undefined
           },
           () => {
+            if (shutdown === currentAttempt && !permanentShutdownError && !shutdownCompleted) {
+              shutdown = undefined
+            }
             parentPort.postMessage(
               utilityResponseSchema.parse({
                 type: 'runtime.shutdown.response',
@@ -487,18 +887,25 @@ async function bootstrap(
         )
         return
 
-      case 'runtime-preparation.get.request':
+      case 'runtime-preparation.get.request': {
+        const { input, requestId } = request.data
         runRequest(async () => {
-          const result = await runtimePreparation.inspectReadiness()
+          const result = await runtimePreparation.inspectReadiness(
+            undefined,
+            undefined,
+            undefined,
+            input?.forceRefresh === true ? { forceRefresh: true } : undefined,
+          )
           parentPort.postMessage(
             utilityResponseSchema.parse({
               type: 'runtime-preparation.response',
-              requestId: request.data.requestId,
+              requestId,
               result,
             }),
           )
         })
         return
+      }
 
       case 'runtime-preparation.path.update.request': {
         const { input, requestId } = request.data
@@ -517,8 +924,9 @@ async function bootstrap(
 
       case 'default-session-settings.get.request': {
         const { requestId } = request.data
+        const activePair = request.data.input?.activePair
         runRequest(async () => {
-          const result = await defaultSessionSettings.loadEditorState()
+          const result = await defaultSessionSettings.loadEditorState(undefined, activePair)
           parentPort.postMessage(
             utilityResponseSchema.parse({
               type: 'default-session-settings.get.response',
@@ -537,6 +945,63 @@ async function bootstrap(
           parentPort.postMessage(
             utilityResponseSchema.parse({
               type: 'default-session-settings.save.response',
+              requestId,
+              result,
+            }),
+          )
+        })
+        return
+      }
+
+      case 'provider-usage.get.request': {
+        const { input, requestId } = request.data
+        parentPort.postMessage(
+          utilityResponseSchema.parse({
+            type: 'provider-usage.snapshot.response',
+            requestId,
+            result: providerUsage.read(input.provider),
+          }),
+        )
+        return
+      }
+
+      case 'provider-usage.refresh.request': {
+        const { input, requestId } = request.data
+        runRequest(async () => {
+          const result = await providerUsage.refresh(input)
+          parentPort.postMessage(
+            utilityResponseSchema.parse({
+              type: 'provider-usage.snapshot.response',
+              requestId,
+              result,
+            }),
+          )
+        })
+        return
+      }
+
+      case 'provider-usage.cancel.request': {
+        const { input, requestId } = request.data
+        runRequest(async () => {
+          const result = await providerUsage.cancel(input)
+          parentPort.postMessage(
+            utilityResponseSchema.parse({
+              type: 'provider-usage.cancel.response',
+              requestId,
+              result,
+            }),
+          )
+        })
+        return
+      }
+
+      case 'provider-usage.release-owner.request': {
+        const { input, requestId } = request.data
+        runRequest(async () => {
+          const result = await providerUsage.releaseOwner(input.ownerId)
+          parentPort.postMessage(
+            utilityResponseSchema.parse({
+              type: 'provider-usage.release-owner.response',
               requestId,
               result,
             }),
@@ -645,6 +1110,138 @@ async function bootstrap(
         return
       }
 
+      case 'session-page.get.request': {
+        const { input, requestId } = request.data
+        parentPort.postMessage(
+          utilityResponseSchema.parse({
+            type: 'session-page.response',
+            requestId,
+            result: sessionWorkspace.loadPage(input),
+          }),
+        )
+        return
+      }
+
+      case 'session-groups.get.request': {
+        const { input, requestId } = request.data
+        parentPort.postMessage(
+          utilityResponseSchema.parse({
+            type: 'session-groups.response',
+            requestId,
+            result: sessionWorkspace.loadGroups(input),
+          }),
+        )
+        return
+      }
+
+      case 'session-group.get.request': {
+        const { input, requestId } = request.data
+        parentPort.postMessage(
+          utilityResponseSchema.parse({
+            type: 'session-group.response',
+            requestId,
+            result: sessionWorkspace.loadGroup(input),
+          }),
+        )
+        return
+      }
+
+      case 'session-membership.get.request': {
+        const { input, requestId } = request.data
+        parentPort.postMessage(
+          utilityResponseSchema.parse({
+            type: 'session-membership.response',
+            requestId,
+            result: sessionWorkspace.loadMembership(input),
+          }),
+        )
+        return
+      }
+
+      case 'session-navigation.locate.request': {
+        const { input, requestId } = request.data
+        parentPort.postMessage(
+          utilityResponseSchema.parse({
+            type: 'session-navigation.response',
+            requestId,
+            result: sessionWorkspace.locate(input),
+          }),
+        )
+        return
+      }
+
+      case 'session-creation.state.request': {
+        const { input, requestId } = request.data
+        parentPort.postMessage(
+          utilityResponseSchema.parse({
+            type: 'session-creation-state.response',
+            requestId,
+            result: sessionWorkspace.loadCreationState(input),
+          }),
+        )
+        return
+      }
+
+      case 'session-group.create.request': {
+        const { input, requestId } = request.data
+        parentPort.postMessage(
+          utilityResponseSchema.parse({
+            type: 'session-group-change.response',
+            requestId,
+            result: sessionWorkspace.createGroup(input),
+          }),
+        )
+        return
+      }
+
+      case 'session-group.update.request': {
+        const { input, requestId } = request.data
+        parentPort.postMessage(
+          utilityResponseSchema.parse({
+            type: 'session-group-change.response',
+            requestId,
+            result: sessionWorkspace.updateGroup(input),
+          }),
+        )
+        return
+      }
+
+      case 'session-group.move.request': {
+        const { input, requestId } = request.data
+        parentPort.postMessage(
+          utilityResponseSchema.parse({
+            type: 'session-group-change.response',
+            requestId,
+            result: sessionWorkspace.moveGroup(input),
+          }),
+        )
+        return
+      }
+
+      case 'session-group.dissolve.request': {
+        const { input, requestId } = request.data
+        parentPort.postMessage(
+          utilityResponseSchema.parse({
+            type: 'session-group-change.response',
+            requestId,
+            result: sessionWorkspace.dissolveGroup(input),
+          }),
+        )
+        return
+      }
+
+      case 'session-group.set.request': {
+        const { input, requestId } = request.data
+        parentPort.postMessage(
+          utilityResponseSchema.parse({
+            type: 'session-group-change.response',
+            requestId,
+            result: sessionWorkspace.setGroup(input),
+          }),
+        )
+        return
+      }
+
       case 'session-creation.prepare.request': {
         const { input, requestId } = request.data
         runRequest(async () => {
@@ -652,7 +1249,7 @@ async function bootstrap(
             utilityResponseSchema.parse({
               type: 'session-creation.prepare.response',
               requestId,
-              result: await sessionWorkspace.prepareCreation(input.projectId),
+              result: await sessionWorkspace.prepareCreation(input.projectId, input.activePair),
             }),
           )
         })
@@ -728,6 +1325,18 @@ async function bootstrap(
         return
       }
 
+      case 'session-sidebar-hidden.set.request': {
+        const { input, requestId } = request.data
+        parentPort.postMessage(
+          utilityResponseSchema.parse({
+            type: 'session-catalog.response',
+            requestId,
+            result: sessionWorkspace.setSidebarHidden(input),
+          }),
+        )
+        return
+      }
+
       case 'session-settings.get.request': {
         const { input, requestId } = request.data
         runRequest(async () => {
@@ -745,11 +1354,29 @@ async function bootstrap(
       case 'session-settings.save.request': {
         const { input, requestId } = request.data
         runRequest(async () => {
+          let result = await sessionWorkspace.saveSettings(input)
+          if (result.ok || result.error.code === 'UNCERTAIN') {
+            try {
+              await conversationOwner.reconcileSessionSettingsChanged(input.sessionId)
+            } catch {
+              recordDiagnostic({ operation: 'utility', phase: 'failed', level: 'warn' })
+              if (result.ok) {
+                result = {
+                  ok: false,
+                  error: {
+                    code: 'UNCERTAIN',
+                    message:
+                      'Session settings were saved, but retiring the previous Full access agent process could not be confirmed.',
+                  },
+                }
+              }
+            }
+          }
           parentPort.postMessage(
             utilityResponseSchema.parse({
               type: 'session-settings.save.response',
               requestId,
-              result: await sessionWorkspace.saveSettings(input),
+              result,
             }),
           )
         })
@@ -758,13 +1385,33 @@ async function bootstrap(
 
       case 'session-permission.save.request': {
         const { input, requestId } = request.data
-        parentPort.postMessage(
-          utilityResponseSchema.parse({
-            type: 'session-catalog.response',
-            requestId,
-            result: sessionWorkspace.savePermission(input),
-          }),
-        )
+        runRequest(async () => {
+          let result = sessionWorkspace.savePermission(input)
+          if (result.ok || result.error.code === 'UNCERTAIN') {
+            try {
+              await conversationOwner.reconcileSessionSettingsChanged(input.sessionId)
+            } catch {
+              recordDiagnostic({ operation: 'utility', phase: 'failed', level: 'warn' })
+              if (result.ok) {
+                result = {
+                  ok: false,
+                  error: {
+                    code: 'UNCERTAIN',
+                    message:
+                      'Session permission was saved, but retiring the previous Full access agent process could not be confirmed.',
+                  },
+                }
+              }
+            }
+          }
+          parentPort.postMessage(
+            utilityResponseSchema.parse({
+              type: 'session-catalog.response',
+              requestId,
+              result,
+            }),
+          )
+        })
         return
       }
 
@@ -951,6 +1598,28 @@ async function bootstrap(
         return
       }
 
+      case 'conversation.prepared-input.continue.request': {
+        const { input, requestId } = request.data
+        runRequest(async () => {
+          const result = conversation
+            ? await conversation.continuePreparedInput(input)
+            : {
+                ok: false as const,
+                error: {
+                  code: 'RUNTIME_UNAVAILABLE' as const,
+                  message: 'Conversation runtime is unavailable.',
+                },
+              }
+          parentPort.postMessage(
+            utilityResponseSchema.parse({
+              type: 'conversation.prepared-input.continue.response',
+              requestId,
+              result,
+            }),
+          )
+        })
+        return
+      }
       case 'conversation.send.request': {
         const { input, requestId, ownerKey } = request.data
         runRequest(async () => {
@@ -1034,6 +1703,31 @@ async function bootstrap(
         return
       }
 
+      case 'relay.decision.answer.request':
+      case 'relay.decision.receipt.request': {
+        const operation = request.data
+        runRequest(async () => {
+          const result = conversation
+            ? operation.type === 'relay.decision.answer.request'
+              ? await conversation.answerRelayDecision(operation.input)
+              : conversation.getRelayDecisionReceipt(operation.input)
+            : {
+                ok: false as const,
+                error: {
+                  code: 'RUNTIME_UNAVAILABLE' as const,
+                  message: 'Conversation runtime is unavailable.',
+                },
+              }
+          parentPort.postMessage(
+            utilityResponseSchema.parse({
+              type: 'relay.decision.receipt.response',
+              requestId: operation.requestId,
+              result,
+            }),
+          )
+        })
+        return
+      }
       case 'collaboration.action.request': {
         const { input, requestId } = request.data
         runRequest(async () => {
@@ -1286,6 +1980,169 @@ async function bootstrap(
         return
       }
 
+      case 'side-chat.create.request': {
+        const { input, requestId } = request.data
+        runRequest(async () => {
+          parentPort.postMessage(
+            utilityResponseSchema.parse({
+              type: 'side-chat.create.response',
+              requestId,
+              result: await conversationOwner.createSideChat(input),
+            }),
+          )
+        })
+        return
+      }
+
+      case 'side-chat.create-receipt.request': {
+        const { input, requestId } = request.data
+        runRequest(async () => {
+          parentPort.postMessage(
+            utilityResponseSchema.parse({
+              type: 'side-chat.create-receipt.response',
+              requestId,
+              result: await conversationOwner.readCreateSideChatReceipt(input),
+            }),
+          )
+        })
+        return
+      }
+
+      case 'side-chat.list.request': {
+        const { input, requestId } = request.data
+        runRequest(async () => {
+          parentPort.postMessage(
+            utilityResponseSchema.parse({
+              type: 'side-chat.list.response',
+              requestId,
+              result: await conversationOwner.listSideChats(input),
+            }),
+          )
+        })
+        return
+      }
+
+      case 'side-chat.discard-empty.request': {
+        const { input, requestId } = request.data
+        runRequest(async () => {
+          parentPort.postMessage(
+            utilityResponseSchema.parse({
+              type: 'side-chat.discard-empty.response',
+              requestId,
+              result: await conversationOwner.discardEmptySideChat(input),
+            }),
+          )
+        })
+        return
+      }
+
+      case 'side-chat.sync-main.request': {
+        const { input, ownerKey, requestId } = request.data
+        runRequest(async () => {
+          parentPort.postMessage(
+            utilityResponseSchema.parse({
+              type: 'side-chat.sync-main.response',
+              requestId,
+              result: await conversationOwner.syncSideChatToMain(input, ownerKey),
+            }),
+          )
+        })
+        return
+      }
+
+      case 'side-chat.sync-main-receipt.request': {
+        const { input, requestId } = request.data
+        runRequest(async () => {
+          parentPort.postMessage(
+            utilityResponseSchema.parse({
+              type: 'side-chat.sync-main-receipt.response',
+              requestId,
+              result: await conversationOwner.readSyncSideChatReceipt(input),
+            }),
+          )
+        })
+        return
+      }
+
+      case 'terminal.list.request': {
+        parentPort.postMessage(
+          utilityResponseSchema.parse({
+            type: 'terminal.list.response',
+            requestId: request.data.requestId,
+            result: terminalManager.list(request.data.input),
+          }),
+        )
+        return
+      }
+      case 'terminal.create.request': {
+        const { input, requestId } = request.data
+        runRequest(async () => {
+          const result = closing
+            ? {
+                ok: false as const,
+                error: { code: 'RUNTIME_UNAVAILABLE' as const, message: 'Pact is shutting down.' },
+              }
+            : await terminalManager.create(input)
+          parentPort.postMessage(
+            utilityResponseSchema.parse({ type: 'terminal.create.response', requestId, result }),
+          )
+        })
+        return
+      }
+      case 'terminal.write.request': {
+        parentPort.postMessage(
+          utilityResponseSchema.parse({
+            type: 'terminal.write.response',
+            requestId: request.data.requestId,
+            result: terminalManager.write(request.data.input),
+          }),
+        )
+        return
+      }
+      case 'terminal.resize.request': {
+        const { input, requestId } = request.data
+        runRequest(async () => {
+          const result = await terminalManager.resize(input)
+          parentPort.postMessage(
+            utilityResponseSchema.parse({ type: 'terminal.resize.response', requestId, result }),
+          )
+        })
+        return
+      }
+      case 'terminal.visibility.request': {
+        const { input, requestId } = request.data
+        runRequest(async () => {
+          const result = await terminalManager.setVisibility(input)
+          parentPort.postMessage(
+            utilityResponseSchema.parse({
+              type: 'terminal.visibility.response',
+              requestId,
+              result,
+            }),
+          )
+        })
+        return
+      }
+      case 'terminal.close.request': {
+        const { input, requestId } = request.data
+        runRequest(async () => {
+          const result = await terminalManager.close(input)
+          parentPort.postMessage(
+            utilityResponseSchema.parse({ type: 'terminal.close.response', requestId, result }),
+          )
+        })
+        return
+      }
+      case 'terminal.snapshot.request': {
+        const { input, requestId } = request.data
+        runRequest(async () => {
+          const result = await terminalManager.readSnapshot(input)
+          parentPort.postMessage(
+            utilityResponseSchema.parse({ type: 'terminal.snapshot.response', requestId, result }),
+          )
+        })
+        return
+      }
       case 'appearance.get.request':
       case 'appearance.update.request':
       case 'appearance.reset.request':
@@ -1318,15 +2175,22 @@ process.on('uncaughtExceptionMonitor', (_error, origin) => {
 
 process.once('exit', () => {
   eventLoopProbe?.disable()
+  void terminalManagerOwner?.dispose().catch(() => undefined)
   void conversation?.dispose()
+  void providerUsageOwner?.dispose().catch(() => undefined)
+  void runtimePreparationOwner?.dispose().catch(() => undefined)
   database?.close()
   directoryFiles?.dispose()
+  agyStorageTransportOwner?.dispose()
+  configureDefaultAgyStorageTransport(undefined)
 })
 
 void bootstrap(databaseFile, migrationsFolder, workspaceStorageRoot).catch(
   async (cause: unknown) => {
     eventLoopProbe?.disable()
     directoryFiles?.dispose()
+    agyStorageTransportOwner?.dispose()
+    configureDefaultAgyStorageTransport(undefined)
     const failure = runtimeStartupFailureSchema.parse({
       type: 'runtime.startup-failed.event',
       failureId: randomUUID(),
@@ -1345,7 +2209,10 @@ void bootstrap(databaseFile, migrationsFolder, workspaceStorageRoot).catch(
         : {}),
     })
     recordDiagnostic({ operation: 'utility', phase: 'failed', level: 'error', code: failure.code })
+    await terminalManagerOwner?.dispose().catch(() => undefined)
     await conversation?.dispose()
+    await providerUsageOwner?.dispose().catch(() => undefined)
+    await runtimePreparationOwner?.dispose().catch(() => undefined)
     database?.close()
     // An explicit bounded ACK prevents an immediate exit from dropping the failure message.
     await new Promise<void>((resolveAck) => {

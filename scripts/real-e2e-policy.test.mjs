@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { mkdir, mkdtemp, rm, readFile, writeFile } from 'node:fs/promises'
+import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -8,8 +9,12 @@ import { fileURLToPath } from 'node:url'
 
 import { check } from './check-e2e-coverage.mjs'
 import {
+  AGY_COLLAB_OPT_IN,
+  agyCollaborationGrep,
+  agyCollaborationRealCases,
   realCases,
   coreRealGrep,
+  evaluateAgyCollaborationReport,
   evaluateRealReport,
   realReportMarkdown,
   realCaseRequired,
@@ -19,6 +24,8 @@ import {
 } from './real-e2e-policy.mjs'
 
 const workspace = fileURLToPath(new URL('..', import.meta.url))
+const require = createRequire(import.meta.url)
+const playwrightCli = require.resolve('@playwright/test/cli')
 const compare = (left, right) => left.localeCompare(right)
 const key = (item) => JSON.stringify([item.path, item.title])
 function fixture(suite = 'full') {
@@ -44,12 +51,11 @@ function fixture(suite = 'full') {
     errors: [],
   }
 }
-const first = (report, tier) =>
-  report.suites[0].specs.find(
-    (spec) =>
-      realCases.find((item) => key(item) === JSON.stringify([spec.file, spec.title]))?.tier ===
-      tier,
-  ).tests[0]
+const first = (report, tier, platform = process.platform) =>
+  report.suites[0].specs.find((spec) => {
+    const item = realCases.find((entry) => key(entry) === JSON.stringify([spec.file, spec.title]))
+    return item?.tier === tier && (!item.platforms || item.platforms.includes(platform))
+  }).tests[0]
 const fail = (result, status = 'failed') => {
   result.status = 'unexpected'
   result.results[0].status = status
@@ -59,8 +65,8 @@ await test('actual Playwright discovery is completely classified and core select
   const discover = (args) =>
     JSON.parse(
       execFileSync(
-        'pnpm',
-        ['exec', 'playwright', 'test', '--project=real', '--list', '--reporter=json', ...args],
+        process.execPath,
+        [playwrightCli, 'test', '--project=real', '--list', '--reporter=json', ...args],
         { cwd: workspace, encoding: 'utf8', timeout: 30000, maxBuffer: 8 * 1024 * 1024 },
       ),
     )
@@ -76,7 +82,7 @@ await test('actual Playwright discovery is completely classified and core select
       .toSorted(compare),
   )
   assert.equal(core.size, 1)
-  assert.equal(listed.size - core.size, 62)
+  assert.equal(listed.size - core.size, 80)
   assert.deepEqual(
     realCases.filter((item) => item.tier === 'core').map((item) => item.title),
     ['real @all completes each Agent once and keeps ordered distinct response rows'],
@@ -95,7 +101,7 @@ await test('core success reports every deferred case without claiming a complete
     notRun: 0,
     notApplicable: 0,
   })
-  assert.equal(report.tiers.extended.notRun + report.tiers.extended.notApplicable, 62)
+  assert.equal(report.tiers.extended.notRun + report.tiers.extended.notApplicable, 80)
   assert(
     report.cases
       .filter((item) => item.tier === 'extended')
@@ -107,14 +113,19 @@ await test('core success reports every deferred case without claiming a complete
 })
 
 await test('extended failure remains reported while core passes; explicitly selected full gate fails', () => {
-  const raw = fixture()
-  fail(first(raw, 'extended'))
-  const pr = evaluateRealReport(raw, { suite: 'full', gate: 'core' })
-  assert.equal(pr.gatePassed, true)
-  assert.equal(pr.fullSuitePassed, false)
-  assert.equal(pr.tiers.extended.failed, 1)
-  assert.equal(evaluateRealReport(raw, { suite: 'full', gate: 'full' }).gatePassed, false)
-  assert.equal(evaluateRealReport(fixture(), { suite: 'full' }).fullSuitePassed, true)
+  for (const platform of ['darwin', 'win32']) {
+    const raw = fixture()
+    fail(first(raw, 'extended', platform))
+    const pr = evaluateRealReport(raw, { suite: 'full', gate: 'core', platform })
+    assert.equal(pr.gatePassed, true)
+    assert.equal(pr.fullSuitePassed, false)
+    assert.equal(pr.tiers.extended.failed, 1)
+    assert.equal(
+      evaluateRealReport(raw, { suite: 'full', gate: 'full', platform }).gatePassed,
+      false,
+    )
+    assert.equal(evaluateRealReport(fixture(), { suite: 'full', platform }).fullSuitePassed, true)
+  }
 })
 
 for (const status of ['failed', 'timedOut', 'interrupted', 'skipped'])
@@ -184,7 +195,7 @@ await test('immutable coverage keeps all assertions while requiring only selecte
   const directory = await mkdtemp(join(tmpdir(), 'pact-real-policy-coverage-'))
   try {
     const listed = JSON.parse(
-      execFileSync('pnpm', ['exec', 'playwright', 'test', '--list', '--reporter=json'], {
+      execFileSync(process.execPath, [playwrightCli, 'test', '--list', '--reporter=json'], {
         cwd: workspace,
         encoding: 'utf8',
         timeout: 30000,
@@ -247,12 +258,14 @@ await test('missing, dual and incorrectly reassigned Playwright tier tags cannot
 await test('a macOS-only case is required on macOS and explicitly non-applicable on Windows', () => {
   const raw = fixture()
   const mac = realCases.find((item) => item.platforms)
-  const executed = raw.suites[0].specs.find((item) => item.title === mac.title).tests[0]
-  executed.results[0].status = 'skipped'
-  executed.status = 'skipped'
+  for (const item of realCases.filter((entry) => entry.platforms)) {
+    const executed = raw.suites[0].specs.find((spec) => spec.title === item.title).tests[0]
+    executed.results[0].status = 'skipped'
+    executed.status = 'skipped'
+  }
   const windows = evaluateRealReport(raw, { suite: 'full', platform: 'win32' })
   assert.equal(windows.gatePassed, true)
-  assert.equal(windows.tiers.extended.notApplicable, 1)
+  assert.equal(windows.tiers.extended.notApplicable, 8)
   assert.equal(windows.cases.find((item) => item.title === mac.title).status, 'not-applicable')
   assert.equal(realCaseRequired({ ...mac, project: 'real' }, 'full', 'win32'), false)
   assert.equal(realCaseRequired({ ...mac, project: 'real' }, 'full', 'darwin'), true)
@@ -334,7 +347,7 @@ await test('the reporting entry still lists all cases and fails when CI identity
       (error) => error.status === 1,
     )
     const report = JSON.parse(await readFile(join(directory, 'real-summary.json'), 'utf8'))
-    assert.equal(report.cases.length, 63)
+    assert.equal(report.cases.length, 81)
     assert.equal(report.gatePassed, false)
     assert(report.issues.includes('missing-or-invalid-ci-code-identity'))
   } finally {
@@ -366,7 +379,7 @@ await test('the actual CI reporting entry preserves exact source and run metadat
       },
     )
     const report = JSON.parse(await readFile(join(directory, 'real-summary.json'), 'utf8'))
-    assert.equal(report.cases.length, 63)
+    assert.equal(report.cases.length, 81)
     assert.equal(report.gatePassed, true)
     assert.deepEqual(report.identity, reportIdentity)
     assert.equal(JSON.stringify(report).includes(privateCanary), false)
@@ -413,7 +426,209 @@ await test('CI report entry rejects local or null metadata while preserving ever
     const report = JSON.parse(await readFile(join(directory, 'real-summary.json')))
     assert.equal(report.gatePassed, false)
     assert.equal(report.identity, null)
-    assert.equal(report.cases.length, 63)
+    assert.equal(report.cases.length, 81)
     assert(report.issues.includes('missing-or-invalid-ci-code-identity'))
   }
+})
+
+await test('opt-in extended Antigravity case is deferred when not opted in and strictly evaluated when opted in or executed', () => {
+  const agyCases = realCases.filter((item) => item.optIn === 'PACT_E2E_REAL_AGY')
+  assert.equal(agyCases.length, 2)
+  for (const agy of agyCases) {
+    assert.equal(realCaseRequired({ ...agy, project: 'real' }, 'full', 'darwin', {}), false)
+    assert.equal(
+      realCaseRequired({ ...agy, project: 'real' }, 'full', 'darwin', { PACT_E2E_REAL_AGY: '1' }),
+      true,
+    )
+
+    const skippedWhenUnopted = fixture('full')
+    const agySpec = skippedWhenUnopted.suites[0].specs.find(
+      (spec) => spec.file === agy.path && spec.title === agy.title,
+    )
+    agySpec.tests[0].status = 'skipped'
+    agySpec.tests[0].results[0] = { status: 'skipped', duration: 2 }
+
+    const deferredReport = evaluateRealReport(skippedWhenUnopted, {
+      suite: 'full',
+      gate: 'full',
+      platform: 'darwin',
+      env: {},
+    })
+    const deferredEntry = deferredReport.cases.find(
+      (item) => item.path === agy.path && item.title === agy.title,
+    )
+    assert.equal(deferredEntry.required, false)
+    assert.equal(deferredEntry.status, 'not-run')
+    assert.equal(deferredEntry.failureCategory, 'deferred')
+    assert(deferredEntry.reason.includes('Deferred'))
+    assert.equal(deferredReport.gatePassed, true)
+    assert.equal(deferredReport.fullSuitePassed, false)
+
+    // When opted in via env, a skipped result fails the full gate:
+    const optedInSkipped = evaluateRealReport(skippedWhenUnopted, {
+      suite: 'full',
+      gate: 'full',
+      platform: 'darwin',
+      env: { PACT_E2E_REAL_AGY: '1' },
+    })
+    const optedSkippedEntry = optedInSkipped.cases.find(
+      (item) => item.path === agy.path && item.title === agy.title,
+    )
+    assert.equal(optedSkippedEntry.required, true)
+    assert.equal(optedSkippedEntry.status, 'skipped')
+    assert.equal(optedInSkipped.gatePassed, false)
+
+    // When executed and failed in the report (even without env opt-in), full gate fails strictly:
+    const executedFailure = fixture('full')
+    const failedSpec = executedFailure.suites[0].specs.find(
+      (spec) => spec.file === agy.path && spec.title === agy.title,
+    )
+    fail(failedSpec.tests[0], 'failed')
+    const failedReport = evaluateRealReport(executedFailure, {
+      suite: 'full',
+      gate: 'full',
+      platform: 'darwin',
+      env: {},
+    })
+    const failedEntry = failedReport.cases.find(
+      (item) => item.path === agy.path && item.title === agy.title,
+    )
+    assert.equal(failedEntry.required, true)
+    assert.equal(failedEntry.status, 'failed')
+    assert.equal(failedEntry.failureCategory, 'case-failed')
+    assert.equal(failedReport.gatePassed, false)
+  }
+})
+
+await test('agy collaboration gate requires opt-in, exact registered cases without skips/retries, and rejects unexpected cases', () => {
+  const synthCases = [
+    {
+      path: 'tests/e2e/agy-collaboration-real.spec.ts',
+      title: 'case-a (Primary agy)',
+      tier: 'extended',
+      optIn: AGY_COLLAB_OPT_IN,
+      scenario: 'collaboration',
+    },
+    {
+      path: 'tests/e2e/agy-collaboration-real.spec.ts',
+      title: 'case-b [codex/agy]',
+      tier: 'extended',
+      optIn: AGY_COLLAB_OPT_IN,
+      scenario: 'collaboration',
+    },
+  ]
+  const registeredCollabCases = agyCollaborationRealCases()
+  assert.equal(registeredCollabCases.length, 2)
+  const defaultGrep = new RegExp(agyCollaborationGrep(), 'u')
+  for (const item of registeredCollabCases) {
+    assert.equal(item.path, 'tests/e2e/agy-collaboration-real.spec.ts')
+    const playwrightLabel = ` real ${item.path.replace(/^tests\/e2e\//u, '')} ${item.title} @real @real-extended`
+    assert.match(playwrightLabel, defaultGrep)
+  }
+
+  const grep = new RegExp(agyCollaborationGrep(synthCases), 'u')
+  assert.match(
+    ' real agy-collaboration-real.spec.ts case-a (Primary agy) @real @real-extended',
+    grep,
+  )
+  assert.match('agy-collaboration-real.spec.ts case-b [codex/agy]', grep)
+  assert.doesNotMatch(' real agy-collaboration-real.spec.ts case-a (Primary agy) extra @real', grep)
+  assert.doesNotMatch(' real other.spec.ts case-a (Primary agy) @real', grep)
+  assert.throws(() => agyCollaborationGrep([]), /No real Antigravity collaboration E2E cases/u)
+  assert.deepEqual(agyCollaborationRealCases([]), [])
+
+  const passReport = {
+    errors: [],
+    suites: [
+      {
+        specs: synthCases.map((item) => ({
+          file: item.path,
+          title: item.title,
+          tests: [
+            {
+              projectName: 'real',
+              expectedStatus: 'passed',
+              status: 'expected',
+              results: [{ status: 'passed', duration: 1200 }],
+            },
+          ],
+        })),
+      },
+    ],
+  }
+
+  assert.equal(
+    evaluateAgyCollaborationReport(passReport, {
+      cases: synthCases,
+      platform: 'darwin',
+      env: { [AGY_COLLAB_OPT_IN]: '1' },
+    }).gatePassed,
+    true,
+  )
+  assert.equal(
+    evaluateAgyCollaborationReport(passReport, {
+      cases: synthCases,
+      platform: 'darwin',
+      env: {},
+    }).gatePassed,
+    false,
+  )
+
+  const missingSecond = {
+    errors: [],
+    suites: [{ specs: [passReport.suites[0].specs[0]] }],
+  }
+  assert.equal(
+    evaluateAgyCollaborationReport(missingSecond, {
+      cases: synthCases,
+      platform: 'darwin',
+      env: { [AGY_COLLAB_OPT_IN]: '1' },
+    }).gatePassed,
+    false,
+  )
+
+  const skippedReport = structuredClone(passReport)
+  skippedReport.suites[0].specs[1].tests[0].status = 'skipped'
+  skippedReport.suites[0].specs[1].tests[0].results[0].status = 'skipped'
+  assert.equal(
+    evaluateAgyCollaborationReport(skippedReport, {
+      cases: synthCases,
+      platform: 'darwin',
+      env: { [AGY_COLLAB_OPT_IN]: '1' },
+    }).gatePassed,
+    false,
+  )
+
+  const retriedReport = structuredClone(passReport)
+  retriedReport.suites[0].specs[0].tests[0].results.push({ status: 'passed', duration: 500 })
+  assert.equal(
+    evaluateAgyCollaborationReport(retriedReport, {
+      cases: synthCases,
+      platform: 'darwin',
+      env: { [AGY_COLLAB_OPT_IN]: '1' },
+    }).gatePassed,
+    false,
+  )
+
+  const unexpectedCaseReport = structuredClone(passReport)
+  unexpectedCaseReport.suites[0].specs.push({
+    file: 'tests/e2e/other-real.spec.ts',
+    title: 'unrelated',
+    tests: [
+      {
+        projectName: 'real',
+        expectedStatus: 'passed',
+        status: 'expected',
+        results: [{ status: 'passed', duration: 1 }],
+      },
+    ],
+  })
+  assert.equal(
+    evaluateAgyCollaborationReport(unexpectedCaseReport, {
+      cases: synthCases,
+      platform: 'darwin',
+      env: { [AGY_COLLAB_OPT_IN]: '1' },
+    }).gatePassed,
+    false,
+  )
 })

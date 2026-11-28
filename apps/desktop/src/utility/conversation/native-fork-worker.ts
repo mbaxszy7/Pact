@@ -2,15 +2,17 @@ import type { SessionStore, SessionStoreEntry } from '@anthropic-ai/claude-agent
 
 import { createHash } from 'node:crypto'
 import { constants, type BigIntStats } from 'node:fs'
-import { lstat, open, realpath } from 'node:fs/promises'
+import { link, lstat, open, realpath, unlink, type FileHandle } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { isAbsolute, join, relative } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative } from 'node:path'
 import { parentPort, workerData } from 'node:worker_threads'
 
 import {
   nativeForkBoundarySchema,
   nativeForkWitnessSchema,
-  collaborationAnswerFormatSchema,
+  claudePlanCheckpointSchema,
+  claudePlanCheckpointReplySchema,
+  claudePlanCheckpointWorkingBytes,
 } from '@pact/contracts'
 
 import type {
@@ -18,14 +20,21 @@ import type {
   NativeForkFileResult,
   NativeForkAnswerResult,
   NativeForkHistoryReference,
+  NativeSeedVerificationResult,
+  NativeSessionExistenceResult,
 } from './native-fork-files'
 
+import { ClaudeAnswerAssembler } from './claude-answer-assembler'
 import {
-  projectCollaborationAnswer,
-  readSubmittedCollaborationReport,
-} from './collaboration-answer'
+  ClaudeNativePlan,
+  claudePlanInputFingerprint,
+  claudePlanSubmissionFingerprint,
+  type ClaudePlanBinding,
+} from './claude-native-plan'
+import { projectCollaborationAnswer } from './collaboration-answer'
 import { nativeHistoryImageBytes } from './native-image-content'
 import { measureNativeWorkerReply } from './native-json-encoder'
+import { NATIVE_OWNER_WORKING_BYTES } from './native-working-memory'
 
 const TEXT_BYTES = 8 * 1024 * 1024
 const MAX_BYTES = 32 * 1024 * 1024
@@ -54,7 +63,7 @@ function nativeEntry(value: RecordValue): SessionStoreEntry {
 const claudeAccountingNumber = (value: unknown): value is number =>
   typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1e15
 
-/** Claude 2.1.292 writes this bookkeeping on empty-input Windows resume as well as real Turns. */
+/** Claude writes this bookkeeping on an empty-input resume as well as real Turns. */
 function isClaudeCostState(entry: RecordValue, nativeSessionId: string): boolean {
   const totals = [
     'totalCostUSD',
@@ -109,7 +118,111 @@ function isInput(value: unknown): value is NativeForkFileInput {
   if (
     !isObject(value) ||
     !['claude', 'codex'].includes(String(value.provider)) ||
-    !['prepare', 'fork', 'inspect', 'read', 'read-answer'].includes(String(value.action))
+    !['prepare', 'fork', 'inspect', 'read', 'read-answer', 'verify-seed', 'exists'].includes(
+      String(value.action),
+    )
+  )
+    return false
+  if (value.action === 'exists' && value.provider !== 'claude') return false
+  if (
+    value.planHook !== undefined &&
+    (value.action !== 'read-answer' ||
+      !isObject(value.planHook) ||
+      typeof value.planHook.id !== 'string' ||
+      !value.planHook.id ||
+      value.planHook.id.length > 1024 ||
+      typeof value.planHook.inputFingerprint !== 'string' ||
+      !/^[a-f0-9]{64}$/u.test(value.planHook.inputFingerprint))
+  )
+    return false
+  if (
+    value.terminalPlanSubmission !== undefined &&
+    (value.provider !== 'claude' ||
+      value.action !== 'read-answer' ||
+      value.planHook !== undefined ||
+      value.includePlan === false ||
+      !isObject(value.terminalPlanSubmission) ||
+      typeof value.terminalPlanSubmission.id !== 'string' ||
+      !value.terminalPlanSubmission.id ||
+      value.terminalPlanSubmission.id.length > 1024 ||
+      typeof value.terminalPlanSubmission.promptId !== 'string' ||
+      !uuid.test(value.terminalPlanSubmission.promptId) ||
+      typeof value.terminalPlanSubmission.inputFingerprint !== 'string' ||
+      !/^[a-f0-9]{64}$/u.test(value.terminalPlanSubmission.inputFingerprint))
+  )
+    return false
+  if (
+    value.terminalPlanRetention !== undefined &&
+    (value.provider !== 'claude' ||
+      value.action !== 'read-answer' ||
+      value.planHook !== undefined ||
+      value.terminalPlanSubmission !== undefined ||
+      !isObject(value.terminalPlanRetention) ||
+      typeof value.terminalPlanRetention.id !== 'string' ||
+      !value.terminalPlanRetention.id ||
+      value.terminalPlanRetention.id.length > 1024 ||
+      typeof value.terminalPlanRetention.promptId !== 'string' ||
+      !uuid.test(value.terminalPlanRetention.promptId) ||
+      typeof value.terminalPlanRetention.toolName !== 'string' ||
+      !/^mcp__.+__retain_current_plan$/u.test(value.terminalPlanRetention.toolName) ||
+      value.terminalPlanRetention.toolName.length > 1024 ||
+      typeof value.terminalPlanRetention.inputFingerprint !== 'string' ||
+      !/^[a-f0-9]{64}$/u.test(value.terminalPlanRetention.inputFingerprint))
+  )
+    return false
+  if (value.includePlan !== undefined && typeof value.includePlan !== 'boolean') return false
+  if (
+    value.planCheckpoint !== undefined &&
+    (value.provider !== 'claude' ||
+      value.action !== 'read-answer' ||
+      value.includePlan === false ||
+      value.terminalPlanRetention !== undefined ||
+      !claudePlanCheckpointSchema.safeParse(value.planCheckpoint).success)
+  )
+    return false
+  if (value.planHook && value.includePlan === false) return false
+  if (value.action === 'verify-seed') {
+    if (
+      value.provider !== 'claude' ||
+      typeof value.rejectAdditionalWork !== 'boolean' ||
+      !Array.isArray(value.expectedSeed) ||
+      !value.expectedSeed.length ||
+      value.expectedSeed.length > 4096 ||
+      !value.expectedSeed.every(
+        (entry) =>
+          isObject(entry) &&
+          typeof entry.id === 'string' &&
+          uuid.test(entry.id) &&
+          typeof entry.hash === 'string' &&
+          /^[a-f0-9]{64}$/u.test(entry.hash) &&
+          Number.isSafeInteger(entry.images) &&
+          Number(entry.images) >= 0 &&
+          Number(entry.images) <= 4096,
+      ) ||
+      new Set(value.expectedSeed.map((entry) => entry.id)).size !== value.expectedSeed.length ||
+      Buffer.byteLength(JSON.stringify(value.expectedSeed)) > 1024 * 1024
+    )
+      return false
+  } else if (value.expectedSeed !== undefined || value.rejectAdditionalWork !== undefined)
+    return false
+  if (
+    value.tempStagingDir !== undefined ||
+    value.candidateNativeSessionId !== undefined ||
+    value.awaitCandidateCommit !== undefined ||
+    value.rebuildId !== undefined ||
+    value.sourceHash !== undefined ||
+    value.rebuildChunks !== undefined ||
+    value.rebuildImages !== undefined ||
+    value.expectedSeedHash !== undefined ||
+    value.expectedTrajectoryId !== undefined ||
+    value.expectedPbSha256 !== undefined ||
+    value.expectedPbBytes !== undefined ||
+    value.expectedVerifiedPrefixSha256 !== undefined ||
+    value.expectedVerifiedPrefixBytes !== undefined ||
+    value.expectedRecordCount !== undefined ||
+    value.pbSha256 !== undefined ||
+    value.pbBytes !== undefined ||
+    value.stepCount !== undefined
   )
     return false
   for (const key of ['cwd', 'nativeSessionId'])
@@ -127,7 +240,7 @@ function isInput(value: unknown): value is NativeForkFileInput {
       value.nativeInputIds.length < 1 ||
       value.nativeInputIds.length > 64 ||
       new Set(value.nativeInputIds).size !== value.nativeInputIds.length ||
-      value.nativeInputIds[0] !== value.nativeTurnId ||
+      (value.provider === 'claude' && value.nativeInputIds[0] !== value.nativeTurnId) ||
       !value.nativeInputIds.every(
         (id) =>
           typeof id === 'string' &&
@@ -135,16 +248,6 @@ function isInput(value: unknown): value is NativeForkFileInput {
           id.length <= 1024 &&
           (value.provider !== 'claude' || uuid.test(id)),
       ))
-  )
-    return false
-  if (
-    value.answerFormat !== undefined &&
-    !collaborationAnswerFormatSchema.safeParse(value.answerFormat).success
-  )
-    return false
-  if (
-    (isObject(value.source) && value.source.answerFormat !== value.answerFormat) ||
-    (isObject(value.witness) && value.witness.answerFormat !== value.answerFormat)
   )
     return false
   if (
@@ -209,6 +312,227 @@ function inside(root: string, path: string): boolean {
     !isAbsolute(location)
   )
 }
+function deterministicClaudeForkStagingPath(directory: string, sessionId: string): string {
+  return join(directory, `.pact-fork-${sessionId}.tmp`)
+}
+
+async function readBoundedFileDigestAndValidateJsonl(
+  filePath: string,
+  expected: {
+    readonly dev: bigint
+    readonly ino: bigint
+    readonly size: bigint
+    readonly nlink: bigint
+  },
+  validateJsonl: boolean,
+): Promise<string | undefined> {
+  const handle = await open(filePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
+  try {
+    const opened = await handle.stat({ bigint: true })
+    if (
+      !opened.isFile() ||
+      opened.dev !== expected.dev ||
+      opened.ino !== expected.ino ||
+      opened.size !== expected.size ||
+      opened.nlink !== expected.nlink
+    ) {
+      return undefined
+    }
+    const digest = createHash('sha256')
+    const decoder = validateJsonl ? new TextDecoder('utf-8', { fatal: true }) : undefined
+    const buffer = Buffer.alloc(64 * 1024)
+    let total = 0
+    let textRemainder = ''
+    let parsedLines = 0
+    for (;;) {
+      // oxlint-disable-next-line eslint/no-await-in-loop -- Bounded sequential 64 KiB file stream.
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, null)
+      if (bytesRead === 0) break
+      total += bytesRead
+      if (total > MAX_BYTES || BigInt(total) > expected.size) {
+        return undefined
+      }
+      const slice = buffer.subarray(0, bytesRead)
+      digest.update(slice)
+      if (decoder) {
+        const chunk = decoder.decode(slice, { stream: true })
+        const lines = `${textRemainder}${chunk}`.split('\n')
+        textRemainder = lines.pop() ?? ''
+        for (const rawLine of lines) {
+          const trimmed = rawLine.trim()
+          if (!trimmed) continue
+          try {
+            const parsed: unknown = JSON.parse(trimmed)
+            if (!isObject(parsed)) return undefined
+            parsedLines += 1
+          } catch {
+            return undefined
+          }
+        }
+      }
+    }
+    if (decoder) {
+      const finalChunk = `${textRemainder}${decoder.decode()}`.trim()
+      if (finalChunk.length > 0) {
+        try {
+          const parsed: unknown = JSON.parse(finalChunk)
+          if (!isObject(parsed)) return undefined
+          parsedLines += 1
+        } catch {
+          return undefined
+        }
+      }
+      if (parsedLines === 0) return undefined
+    }
+    const afterRead = await handle.stat({ bigint: true })
+    if (
+      BigInt(total) !== expected.size ||
+      !stable(opened, afterRead) ||
+      afterRead.nlink !== expected.nlink
+    ) {
+      return undefined
+    }
+    return digest.digest('hex')
+  } catch {
+    return undefined
+  } finally {
+    await handle.close().catch(() => undefined)
+  }
+}
+
+/**
+ * Recovers an interrupted atomic no-replace Claude Fork publication where the worker exited after
+ * `link(stagingPath, targetPath)` and before `unlink(stagingPath)`, leaving both entries pointing
+ * to the same inode (`nlink === 2`). Verifies deterministic staging leaf name, verified parent
+ * directory, identical `(dev, ino, size)`, matching SHA-256 content digest, and valid JSONL before
+ * unlinking ONLY the deterministic staging entry so unrelated files are never touched.
+ */
+async function recoverInterruptedClaudeForkStagingLink(
+  targetPath: string,
+  canonicalRoot: string,
+): Promise<BigIntStats | undefined> {
+  const leaf = basename(targetPath)
+  if (!leaf.endsWith('.jsonl')) return undefined
+  const sessionId = leaf.slice(0, -'.jsonl'.length)
+  if (!uuid.test(sessionId)) return undefined
+
+  const dir = dirname(targetPath)
+  let dirHandle: FileHandle | undefined
+  try {
+    const dirStat = await lstat(dir, { bigint: true })
+    if (
+      !dirStat.isDirectory() ||
+      dirStat.isSymbolicLink() ||
+      (await realpath(dir)) !== dir ||
+      !inside(canonicalRoot, dir)
+    ) {
+      return undefined
+    }
+    if (process.platform !== 'win32') {
+      dirHandle = await open(
+        dir,
+        constants.O_RDONLY | (constants.O_DIRECTORY ?? 0) | (constants.O_NOFOLLOW ?? 0),
+      )
+      const pinnedDir = await dirHandle.stat({ bigint: true })
+      if (
+        !pinnedDir.isDirectory() ||
+        pinnedDir.dev !== dirStat.dev ||
+        pinnedDir.ino !== dirStat.ino
+      ) {
+        return undefined
+      }
+    }
+
+    const stagingPath = deterministicClaudeForkStagingPath(dir, sessionId)
+    const targetStat = await lstat(targetPath, { bigint: true })
+    if (
+      !targetStat.isFile() ||
+      targetStat.isSymbolicLink() ||
+      targetStat.nlink !== 2n ||
+      targetStat.size <= 0n ||
+      targetStat.size > BigInt(MAX_BYTES) ||
+      (await realpath(targetPath)) !== targetPath
+    ) {
+      return undefined
+    }
+
+    let stageStat: BigIntStats
+    try {
+      stageStat = await lstat(stagingPath, { bigint: true })
+    } catch {
+      return undefined
+    }
+    if (
+      !stageStat.isFile() ||
+      stageStat.isSymbolicLink() ||
+      stageStat.nlink !== 2n ||
+      stageStat.dev !== targetStat.dev ||
+      stageStat.ino !== targetStat.ino ||
+      stageStat.size !== targetStat.size ||
+      (await realpath(stagingPath)) !== stagingPath
+    ) {
+      return undefined
+    }
+
+    const targetDigest = await readBoundedFileDigestAndValidateJsonl(targetPath, targetStat, true)
+    if (!targetDigest) return undefined
+    const stageDigest = await readBoundedFileDigestAndValidateJsonl(stagingPath, stageStat, false)
+    if (!stageDigest || stageDigest !== targetDigest) return undefined
+
+    // Re-verify parent dir and deterministic staging identity right before unlinking.
+    const dirNow = await lstat(dir, { bigint: true })
+    if (
+      !dirNow.isDirectory() ||
+      dirNow.isSymbolicLink() ||
+      dirNow.dev !== dirStat.dev ||
+      dirNow.ino !== dirStat.ino ||
+      (await realpath(dir)) !== dir
+    ) {
+      return undefined
+    }
+    if (dirHandle) {
+      const pinnedDirNow = await dirHandle.stat({ bigint: true })
+      if (pinnedDirNow.dev !== dirStat.dev || pinnedDirNow.ino !== dirStat.ino) {
+        return undefined
+      }
+    }
+    const stageBeforeUnlink = await lstat(stagingPath, { bigint: true })
+    if (
+      !stageBeforeUnlink.isFile() ||
+      stageBeforeUnlink.isSymbolicLink() ||
+      stageBeforeUnlink.nlink !== 2n ||
+      stageBeforeUnlink.dev !== targetStat.dev ||
+      stageBeforeUnlink.ino !== targetStat.ino ||
+      stageBeforeUnlink.size !== targetStat.size
+    ) {
+      return undefined
+    }
+
+    await unlink(stagingPath)
+    if (dirHandle) {
+      await dirHandle.sync()
+    }
+    const targetAfter = await lstat(targetPath, { bigint: true })
+    if (
+      !targetAfter.isFile() ||
+      targetAfter.isSymbolicLink() ||
+      targetAfter.nlink !== 1n ||
+      targetAfter.dev !== targetStat.dev ||
+      targetAfter.ino !== targetStat.ino ||
+      targetAfter.size !== targetStat.size
+    ) {
+      return undefined
+    }
+    return targetAfter
+  } catch {
+    return undefined
+  } finally {
+    if (dirHandle) {
+      await dirHandle.close().catch(() => undefined)
+    }
+  }
+}
+
 /** Reads a stable ordinary file in fixed chunks. Growth never bypasses the byte ceiling. */
 async function records(
   path: string,
@@ -216,7 +540,6 @@ async function records(
   endBytes?: number,
   maxRecords = MAX_RECORDS,
   captureBoundaries = false,
-  collaborationContent = false,
 ): Promise<{
   entries: RecordValue[]
   rawHash: string
@@ -233,7 +556,13 @@ async function records(
     canonical = await realpath(path)
   if (!inside(canonicalRoot, canonical))
     throw new Error('Native transcript escaped its effective storage root.')
-  const before = await lstat(path, { bigint: true })
+  let before = await lstat(path, { bigint: true })
+  if (before.isFile() && !before.isSymbolicLink() && before.nlink === 2n) {
+    const recovered = await recoverInterruptedClaudeForkStagingLink(canonical, canonicalRoot)
+    if (recovered) {
+      before = recovered
+    }
+  }
   if (
     !before.isFile() ||
     before.isSymbolicLink() ||
@@ -320,7 +649,7 @@ async function records(
         offset = end + 1
       }
     }
-    if (!collaborationContent && total - imageBytes > TEXT_BYTES)
+    if (total - imageBytes > TEXT_BYTES)
       throw new Error(
         'Native text/metadata exceeds its existing 8 MiB budget; no image allowance applies.',
       )
@@ -428,12 +757,18 @@ function normalized(
 }
 async function claude(
   input: NativeForkFileInput,
-): Promise<NativeForkFileResult | NativeForkAnswerResult> {
+): Promise<
+  | NativeForkFileResult
+  | NativeForkAnswerResult
+  | NativeSeedVerificationResult
+  | NativeSessionExistenceResult
+> {
   const { forkSession, getSessionMessages } = await import('@anthropic-ai/claude-agent-sdk')
   if (!uuid.test(input.nativeSessionId)) throw new Error('Invalid Claude Native Session UUID.')
   const root = claudeRoot()
   // SDK asks its store for the exact sanitized project key, including its portable long-path hash.
   let projectDirectory: string | undefined
+  let sessionExists: boolean | undefined
   const load: SessionStore['load'] = async (key) => {
     if (key.subpath || !/^[a-z0-9-]+$/iu.test(key.projectKey) || !uuid.test(key.sessionId))
       throw new Error('Unsupported Native Session store key.')
@@ -449,6 +784,45 @@ async function claude(
     )
       throw new Error('The recorded Claude native Fork path changed.')
     const nativePath = join(projectDirectory, `${key.sessionId}.jsonl`)
+    if (input.action === 'exists') {
+      if (key.sessionId !== input.nativeSessionId)
+        throw new Error('The SDK selected another native Session store.')
+      try {
+        const canonicalRoot = await realpath(root),
+          canonicalProject = await realpath(projectDirectory),
+          canonicalPath = await realpath(nativePath)
+        if (
+          !inside(canonicalRoot, canonicalProject) ||
+          !inside(canonicalProject, canonicalPath) ||
+          canonicalProject !== join(canonicalRoot, key.projectKey) ||
+          canonicalPath !== join(canonicalProject, `${key.sessionId}.jsonl`)
+        )
+          throw new Error('Native transcript escaped its exact project store.')
+        const before = await lstat(nativePath, { bigint: true })
+        if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n)
+          throw new Error('Native transcript is linked or unsupported.')
+        const handle = await open(nativePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
+        try {
+          if (
+            !stable(before, await handle.stat({ bigint: true })) ||
+            !stable(before, await lstat(nativePath, { bigint: true })) ||
+            (await realpath(nativePath)) !== canonicalPath ||
+            (await realpath(root)) !== canonicalRoot ||
+            (await realpath(projectDirectory)) !== canonicalProject
+          )
+            throw new Error('Native transcript identity changed during existence verification.')
+          sessionExists = true
+        } finally {
+          await handle.close()
+        }
+      } catch (error) {
+        if (error instanceof Error && Reflect.get(error, 'code') === 'ENOENT') sessionExists = false
+        else throw error
+      }
+      // Let the pinned SDK select its exact project key through our store.
+      // No transcript entries, custom title, or global index are loaded.
+      return []
+    }
     if (
       input.action === 'read-answer' &&
       ((input.storageRoot && (await realpath(root)) !== input.storageRoot) ||
@@ -494,7 +868,6 @@ async function claude(
           cwd: input.cwd,
           nativeSessionId: input.source.nativeSessionId,
           nativeTurnId: input.source.nativeTurnId,
-          ...(input.source.answerFormat ? { answerFormat: input.source.answerFormat } : {}),
           source: input.source,
         })
         const after = await lstat(originalDirectory, { bigint: true })
@@ -514,9 +887,7 @@ async function claude(
         )
       }
     }
-    return (
-      await records(nativePath, root, undefined, MAX_RECORDS, false, Boolean(input.answerFormat))
-    ).entries.map(nativeEntry)
+    return (await records(nativePath, root, undefined, MAX_RECORDS, false)).entries.map(nativeEntry)
   }
   let sourceEntries: RecordValue[] = []
   const reading: SessionStore = {
@@ -530,21 +901,95 @@ async function claude(
     },
   }
   // Use the SDK's own chain selection; system messages keep compact boundaries intact.
-  await getSessionMessages(input.nativeSessionId, {
+  const selectedMessages = await getSessionMessages(input.nativeSessionId, {
     dir: input.cwd,
     includeSystemMessages: true,
     sessionStore: reading,
   })
+  if (input.action === 'exists') {
+    if (sessionExists === undefined)
+      throw new Error('The SDK did not identify the exact native Session store.')
+    return { nativeSessionId: input.nativeSessionId, exists: sessionExists }
+  }
   const raw = await records(
     join(projectDirectory!, `${input.nativeSessionId}.jsonl`),
     root,
     undefined,
     MAX_RECORDS,
     false,
-    Boolean(input.answerFormat),
   )
   if (hash(raw.entries) !== hash(sourceEntries))
     throw new Error('Native transcript changed between source reads.')
+  if (input.action === 'verify-seed') {
+    const expected = new Map(input.expectedSeed!.map((entry) => [entry.id, entry]))
+    const rawSeedIds = new Set<string>()
+    for (const entry of raw.entries) {
+      const id = entry.uuid
+      if (typeof id !== 'string' || !expected.has(id)) continue
+      if (rawSeedIds.has(id))
+        throw new Error('Native seed readback contained duplicate or foreign identities.')
+      rawSeedIds.add(id)
+    }
+    const seen = new Set<string>()
+    for (const message of selectedMessages) {
+      const receipt = expected.get(message.uuid)
+      if (!receipt) {
+        if (input.rejectAdditionalWork && message.type === 'user')
+          throw new Error(
+            'Additional native user work prevents an initialization-only confirmation.',
+          )
+        if (input.rejectAdditionalWork && message.type === 'assistant') {
+          const value = object(message.message).content
+          if (
+            !Array.isArray(value) ||
+            value.some(
+              (block) =>
+                !isObject(block) ||
+                block.type !== 'text' ||
+                block.text !== 'No response requested.',
+            )
+          )
+            throw new Error(
+              'Additional native assistant work prevents an initialization-only confirmation.',
+            )
+        }
+        continue
+      }
+      if (
+        seen.has(message.uuid) ||
+        message.session_id !== input.nativeSessionId ||
+        message.type !== 'user'
+      )
+        throw new Error('Native seed readback contained duplicate or foreign identities.')
+      const value = object(message.message).content
+      const content =
+        typeof value === 'string'
+          ? value
+          : Array.isArray(value)
+            ? value
+                .filter((block) => isObject(block) && block.type === 'text')
+                .map((block) => block.text)
+                .filter((text): text is string => typeof text === 'string')
+                .join('')
+            : ''
+      if (createHash('sha256').update(content).digest('hex') !== receipt.hash)
+        throw new Error('Native seed readback did not preserve the complete original content.')
+      const blocks = Array.isArray(value) ? value : []
+      const images = blocks.filter((block) => isObject(block) && block.type === 'image')
+      if (
+        images.length !== receipt.images ||
+        images.some(
+          (block) => nativeHistoryImageBytes({ type: 'user', message: { content: [block] } }) === 0,
+        ) ||
+        blocks.some((block) => !isObject(block) || !['text', 'image'].includes(String(block.type)))
+      )
+        throw new Error('Native seed image blocks do not match the complete manifest.')
+      seen.add(message.uuid)
+    }
+    if (seen.size !== expected.size)
+      throw new Error('Claude Code did not persist every full rebuild chunk.')
+    return { nativeSessionId: input.nativeSessionId, seedVerified: true }
+  }
   if (input.action === 'inspect') {
     const witness = input.witness
     if (!witness || witness.nativeSessionId !== input.nativeSessionId || !witness.idMap.length)
@@ -583,17 +1028,10 @@ async function claude(
         ['hook_success', 'hook_additional_context', 'hook_stderr', 'hook_blocking_error'].includes(
           String(entry.attachment.type),
         )
-      const windowsAccounting =
-        process.platform === 'win32' &&
-        type === 'cost-state' &&
-        isClaudeCostState(entry, input.nativeSessionId)
-      if (
-        !harmlessMetadata &&
-        !hookSystem &&
-        !hookProgress &&
-        !hookAttachment &&
-        !windowsAccounting
-      )
+      // Current Claude records standalone cost accounting after the frozen cutoff.
+      // Validated accounting is not a conversation turn on any platform.
+      const costState = type === 'cost-state' && isClaudeCostState(entry, input.nativeSessionId)
+      if (!harmlessMetadata && !hookSystem && !hookProgress && !hookAttachment && !costState)
         throw new Error(
           'The Native Fork candidate contains an additional turn or unsupported context change after its frozen cutoff.',
         )
@@ -685,84 +1123,660 @@ async function claude(
       throw new Error('A consumed Claude Run input is missing from its exact native chain.')
   }
   const selected = main.slice(start + 1, next)
-  // A formal output attachment must belong to this exact User-root chain, rather
-  // than a similarly shaped body or a disconnected transcript branch.
-  let structuredOutput: unknown
-  let belongsToRoot: ((entry: RecordValue) => boolean) | undefined
-  if (input.answerFormat) {
-    const chain = new Map(
-      main
-        .slice(start, next)
-        .flatMap((entry) => (typeof entry.uuid === 'string' ? [[entry.uuid, entry] as const] : [])),
-    )
-    const ancestry = new Map<string, boolean>(nativeInputIds.map((id) => [id, true]))
-    belongsToRoot = (entry: RecordValue): boolean => {
-      const visited = new Set<string>()
-      let cursor: RecordValue | undefined = entry
-      let belongs = false
-      while (cursor) {
-        if (typeof cursor.uuid !== 'string' || visited.has(cursor.uuid)) break
-        const known = ancestry.get(cursor.uuid)
-        if (known !== undefined) {
-          belongs = known
-          break
-        }
-        visited.add(cursor.uuid)
-        cursor = typeof cursor.parentUuid === 'string' ? chain.get(cursor.parentUuid) : undefined
-      }
-      for (const id of visited) ancestry.set(id, belongs)
-      return belongs
-    }
-    structuredOutput = selected.findLast(
-      (entry) =>
-        entry.type === 'attachment' &&
-        isObject(entry.attachment) &&
-        entry.attachment.type === 'structured_output' &&
-        belongsToRoot?.(entry),
-    )?.attachment
-    structuredOutput = isObject(structuredOutput) ? structuredOutput.data : undefined
-  }
-  const answerItems = new Map<string, string>()
-  for (const entry of selected) {
-    if (
-      entry.type !== 'assistant' ||
-      entry.isCompactSummary ||
-      (input.answerFormat && !belongsToRoot?.(entry))
-    )
-      continue
-    const messageValue = object(entry.message),
-      content = messageValue.content
-    if (typeof messageValue.id !== 'string' || !Array.isArray(content))
-      throw new Error('Incomplete native answer.')
-    const text = content
-      .filter((block) => object(block).type === 'text')
-      .map((block) => {
-        const blockText = object(block).text
-        if (typeof blockText !== 'string') throw new Error('Claude native text is incomplete.')
-        return blockText
-      })
-      .join('')
-    if (text) answerItems.set(messageValue.id, text)
-  }
-  const answer = projectCollaborationAnswer(
-    [...answerItems].map(([id, text]) => ({ id, text })),
-    input.answerFormat,
-    structuredOutput ?? null,
+  // Require ancestry to the exact root input for both natural output and metadata.
+  const chain = new Map(
+    main
+      .slice(start, next)
+      .flatMap((entry) => (typeof entry.uuid === 'string' ? [[entry.uuid, entry] as const] : [])),
   )
-  if (input.action === 'read-answer') {
-    const submittedReport = readSubmittedCollaborationReport(structuredOutput, input.answerFormat)
+  const ancestry = new Map<string, boolean>(nativeInputIds.map((id) => [id, true]))
+  const belongsToRoot = (entry: RecordValue): boolean => {
+    const visited = new Set<string>()
+    let cursor: RecordValue | undefined = entry
+    let belongs = false
+    while (cursor) {
+      if (typeof cursor.uuid !== 'string' || visited.has(cursor.uuid)) break
+      const known = ancestry.get(cursor.uuid)
+      if (known !== undefined) {
+        belongs = known
+        break
+      }
+      visited.add(cursor.uuid)
+      cursor = typeof cursor.parentUuid === 'string' ? chain.get(cursor.parentUuid) : undefined
+    }
+    for (const id of visited) ancestry.set(id, belongs)
+    return belongs
+  }
+  const rootEntry = main[start]!
+  if (input.terminalPlanRetention) {
+    const intent = input.terminalPlanRetention
+    if (
+      rootEntry.promptId !== intent.promptId ||
+      intent.inputFingerprint !== claudePlanInputFingerprint(intent.toolName, {})
+    )
+      throw new Error('The terminal retention intent has another prompt or input.')
+    // This proof depends only on the exact current root, never ancestral plan text.
+    const identities = new Set<string>()
+    for (const entry of main.slice(start, next)) {
+      if (typeof entry.uuid !== 'string' || identities.has(entry.uuid))
+        throw new Error('The terminal retention root has missing or duplicate identities.')
+      identities.add(entry.uuid)
+    }
+    const rawStart = sourceEntries.indexOf(rootEntry)
+    const rawEnd = next < main.length ? sourceEntries.indexOf(main[next]!) : sourceEntries.length
+    // Sidechain operations cannot authenticate a root intent or hide a conflicting plan write.
+    for (let index = rawStart + 1; index < rawEnd; index++) {
+      const entry = sourceEntries[index]!
+      if (!isObject(entry.message) || !Array.isArray(entry.message.content)) continue
+      for (const block of entry.message.content) {
+        if (!isObject(block)) continue
+        if (block.type === 'tool_use' && ['Write', 'Edit'].includes(String(block.name)))
+          throw new Error('A current-root operation conflicts with unchanged plan retention.')
+        const retentionOperation =
+          (block.type === 'tool_use' &&
+            (block.id === intent.id || String(block.name).endsWith('__retain_current_plan'))) ||
+          (block.type === 'tool_result' && block.tool_use_id === intent.id)
+        if (
+          retentionOperation &&
+          (entry.isSidechain ||
+            entry.agentId ||
+            entry.parent_tool_use_id ||
+            entry.sessionId !== input.nativeSessionId ||
+            !belongsToRoot(entry))
+        )
+          throw new Error('A retention operation is not from the authenticated root actor.')
+      }
+    }
+    let uses = 0,
+      results = 0
+    for (const entry of selected) {
+      if (entry.isCompactSummary) throw new Error('The terminal retention root is compacted.')
+      if (!belongsToRoot(entry) || entry.sessionId !== input.nativeSessionId)
+        throw new Error('The terminal retention root ancestry is incomplete.')
+      if (entry.type !== 'assistant' && entry.type !== 'user') continue
+      const content = object(entry.message).content
+      if (!Array.isArray(content)) continue
+      for (const block of content) {
+        if (!isObject(block)) throw new Error('The terminal retention content is incomplete.')
+        if (entry.type === 'assistant' && block.type === 'tool_use') {
+          if (['Write', 'Edit', 'ExitPlanMode', 'AskUserQuestion'].includes(String(block.name)))
+            throw new Error('A current-root operation conflicts with unchanged plan retention.')
+          if (block.id === intent.id || String(block.name).endsWith('__retain_current_plan')) {
+            uses++
+            if (
+              block.id !== intent.id ||
+              block.name !== intent.toolName ||
+              !isObject(block.input) ||
+              Object.keys(block.input).length !== 0 ||
+              claudePlanInputFingerprint(block.name, block.input) !== intent.inputFingerprint
+            )
+              throw new Error('The terminal retention operation differs from its host intent.')
+          }
+        } else if (
+          entry.type === 'user' &&
+          block.type === 'tool_result' &&
+          block.tool_use_id === intent.id
+        ) {
+          if (
+            uses !== 1 ||
+            block.is_error === true ||
+            (block.is_error !== undefined && block.is_error !== false)
+          )
+            throw new Error('The terminal retention result is unsuccessful or out of order.')
+          results++
+        }
+      }
+    }
+    if (uses !== 1 || results !== 1)
+      throw new Error('The terminal retention operation or result is missing or duplicated.')
     return {
       nativeSessionId: input.nativeSessionId,
       nativeTurnId: input.nativeTurnId!,
-      ...(answer ? { answer } : {}),
-      ...(submittedReport ? { submittedReport } : {}),
+      terminalPlanRetention: intent,
+      nativeStorageRoot: await realpath(root),
+      nativePath: join(await realpath(projectDirectory!), `${input.nativeSessionId}.jsonl`),
+    }
+  }
+  const sourceWorkingBytes =
+    (raw.rawBytes - raw.imageBytes) * 4 + raw.imageBytes * 2 + raw.rawRecords * 512
+  const checkpointWorkingBytes = input.planCheckpoint
+    ? claudePlanCheckpointWorkingBytes(input.planCheckpoint)
+    : 0
+  let checkpointIndexBytes = 0
+  const reservePlan = (bytes: number): void => {
+    if (
+      !Number.isSafeInteger(checkpointWorkingBytes) ||
+      sourceWorkingBytes + checkpointWorkingBytes + checkpointIndexBytes + bytes >
+        NATIVE_OWNER_WORKING_BYTES
+    )
+      throw new Error(
+        'The native plan exceeds its available reconstruction working memory. Its source is preserved.',
+      )
+  }
+  const planRead = input.action === 'read-answer' && input.includePlan !== false
+  const ancestors: RecordValue[] = []
+  if (planRead) {
+    const indexed = new Map<string, { entry: RecordValue; index: number }>()
+    for (let index = 0; index < next; index++) {
+      const entry = main[index]!
+      if (typeof entry.uuid !== 'string') continue
+      if (indexed.has(entry.uuid)) throw new Error('The native ancestry has duplicate identities.')
+      indexed.set(entry.uuid, { entry, index })
+    }
+    let cursor = { entry: rootEntry, index: start }
+    while (typeof cursor.entry.parentUuid === 'string') {
+      const parent = indexed.get(cursor.entry.parentUuid)
+      if (!parent) break
+      if (parent.index >= cursor.index || parent.entry.sessionId !== input.nativeSessionId)
+        throw new Error('The native plan ancestry is ambiguous or incomplete.')
+      ancestors.push(parent.entry)
+      cursor = parent
+    }
+  }
+  ancestors.reverse()
+  const nativeBinding = (entry: RecordValue): ClaudePlanBinding | undefined => {
+    if (entry.type !== 'attachment' || !isObject(entry.attachment)) return undefined
+    const attachment = entry.attachment
+    if (attachment.type !== 'plan_mode' || attachment.isSubAgent !== false) return undefined
+    if (
+      entry.sessionId !== input.nativeSessionId ||
+      typeof rootEntry.promptId !== 'string' ||
+      !uuid.test(rootEntry.promptId) ||
+      typeof attachment.planFilePath !== 'string' ||
+      !isAbsolute(attachment.planFilePath) ||
+      attachment.planFilePath.length > 4096 ||
+      Buffer.byteLength(JSON.stringify(attachment)) > 256 * 1024
+    )
+      throw new Error('The native plan attachment is incomplete or oversized.')
+    return { promptId: rootEntry.promptId, path: attachment.planFilePath }
+  }
+  const realInput = (entry: RecordValue): boolean => {
+    if (entry.type !== 'user' || entry.isMeta) return false
+    const content = object(entry.message).content
+    return (
+      !Array.isArray(content) ||
+      !content.length ||
+      !content.every((block) => object(block).type === 'tool_result')
+    )
+  }
+  let checkpointBase: string | undefined
+  let checkpointBinding: ClaudePlanBinding | undefined
+  if (input.planCheckpoint) {
+    const checkpoint = input.planCheckpoint,
+      sourceIndex = main.findIndex((entry) => entry.uuid === checkpoint.sourceNativeTurnId),
+      ancestorIds = new Set(ancestors.map((entry) => entry.uuid)),
+      positions = new Map(main.map((entry, index) => [entry, index]))
+    if (
+      checkpoint.nativeSessionId !== input.nativeSessionId ||
+      checkpoint.targetNativeTurnId !== input.nativeTurnId ||
+      sourceIndex < 0 ||
+      sourceIndex >= start ||
+      !ancestorIds.has(checkpoint.sourceNativeTurnId) ||
+      !realInput(main[sourceIndex]!) ||
+      main[sourceIndex]!.agentId ||
+      main[sourceIndex]!.parent_tool_use_id
+    )
+      throw new Error('The published plan checkpoint belongs to another native root.')
+    const interval = main.slice(sourceIndex + 1, start)
+    if (interval.some(realInput))
+      throw new Error('The published plan checkpoint has intervening native input.')
+    const uses = interval.flatMap((entry) => {
+      const content = isObject(entry.message) ? entry.message.content : undefined
+      return entry.type === 'assistant' && Array.isArray(content)
+        ? content
+            .filter(
+              (block) =>
+                isObject(block) &&
+                block.type === 'tool_use' &&
+                block.id === checkpoint.sourceNativeId,
+            )
+            .map((block) => ({ entry, block: object(block) }))
+        : []
+    })
+    const receipts = interval.flatMap((entry) => {
+      const content = isObject(entry.message) ? entry.message.content : undefined
+      return entry.type === 'user' && Array.isArray(content)
+        ? content
+            .filter(
+              (block) =>
+                isObject(block) &&
+                block.type === 'tool_result' &&
+                block.tool_use_id === checkpoint.sourceNativeId,
+            )
+            .map((block) => ({ entry, block: object(block) }))
+        : []
+    })
+    const use = uses[0],
+      receipt = receipts[0]
+    // Current Claude may write the tool result beside the main message chain while
+    // still linking it to the exact authenticated Write/Edit operation.
+    const receiptAnchored =
+      receipt !== undefined &&
+      use !== undefined &&
+      (ancestorIds.has(receipt.entry.uuid) || receipt.entry.parentUuid === use.entry.uuid)
+    if (
+      uses.length !== 1 ||
+      receipts.length !== 1 ||
+      !use ||
+      !receipt ||
+      !ancestorIds.has(use.entry.uuid) ||
+      !receiptAnchored ||
+      use.entry.sessionId !== input.nativeSessionId ||
+      receipt.entry.sessionId !== input.nativeSessionId ||
+      use.entry.agentId ||
+      receipt.entry.agentId ||
+      use.entry.parent_tool_use_id ||
+      receipt.entry.parent_tool_use_id ||
+      !['Write', 'Edit'].includes(String(use.block.name)) ||
+      receipt.block.is_error === true ||
+      (receipt.block.is_error !== undefined && receipt.block.is_error !== false)
+    )
+      throw new Error('The published plan checkpoint has no unique successful native operation.')
+    const useIndex = positions.get(use.entry)!,
+      receiptIndex = positions.get(receipt.entry)!
+    if (receiptIndex <= useIndex)
+      throw new Error('The published plan checkpoint acknowledgement precedes its operation.')
+    for (const entry of ancestors) {
+      if (positions.get(entry)! > useIndex) break
+      const binding = nativeBinding(entry)
+      if (binding) checkpointBinding = binding
+    }
+    const operation = object(use.block.input),
+      acknowledgement = object(receipt.entry.toolUseResult)
+    if (
+      !checkpointBinding ||
+      operation.file_path !== checkpointBinding.path ||
+      acknowledgement.filePath !== checkpointBinding.path ||
+      acknowledgement.userModified !== false ||
+      (use.block.name === 'Write'
+        ? typeof operation.content !== 'string' || acknowledgement.content !== operation.content
+        : typeof operation.old_string !== 'string' ||
+          !operation.old_string ||
+          typeof operation.new_string !== 'string' ||
+          acknowledgement.oldString !== operation.old_string ||
+          acknowledgement.newString !== operation.new_string ||
+          typeof acknowledgement.replaceAll !== 'boolean' ||
+          acknowledgement.replaceAll !== (operation.replace_all ?? false))
+    )
+      throw new Error('The published plan checkpoint operation does not match its native receipt.')
+    for (const entry of ancestors) {
+      if (positions.get(entry)! <= useIndex) continue
+      const binding = nativeBinding(entry)
+      if (binding && binding.path !== checkpointBinding.path)
+        throw new Error('The native plan attachment changed after its published checkpoint.')
+    }
+    // The checkpoint authenticates only the prefix through its exact operation.
+    // Inspect the raw interval too: a sibling/child write cannot be hidden by the selected ancestry.
+    const rawUseIndex = sourceEntries.indexOf(use.entry),
+      rawReceiptIndex = sourceEntries.indexOf(receipt.entry),
+      rawTargetIndex = sourceEntries.indexOf(rootEntry),
+      rawEnd = next < main.length ? sourceEntries.indexOf(main[next]!) : sourceEntries.length,
+      document = checkpoint.basis.document,
+      baseWorkingBytes = 4096 + document.bytes * 4 + document.chars * 2
+    const acknowledgementContent = object(receipt.entry.message).content
+    if (
+      !Array.isArray(acknowledgementContent) ||
+      acknowledgementContent.filter((block) => isObject(block) && block.type === 'tool_result')
+        .length !== 1
+    )
+      throw new Error('The published checkpoint acknowledgement is ambiguous.')
+    const priorOperations = new Set<string>(),
+      targetOperations = new Set<string>()
+    for (let index = 0; index < rawEnd; index++) {
+      const entry = sourceEntries[index]!,
+        content = isObject(entry.message) ? entry.message.content : undefined
+      // Current Claude snapshots the API request beside the transcript. Its message
+      // blocks repeat earlier operations; only native transcript events own work.
+      if (entry.type === 'api-request-blob' || !Array.isArray(content)) continue
+      for (const value of content) {
+        const block = object(value)
+        if (
+          block.type === 'tool_use' &&
+          ['Write', 'Edit'].includes(String(block.name)) &&
+          object(block.input).file_path === checkpointBinding.path
+        ) {
+          if (typeof block.id !== 'string') throw new Error('Invalid checkpoint plan operation.')
+          const operations = index < rawTargetIndex ? priorOperations : targetOperations
+          if (!operations.has(block.id)) {
+            checkpointIndexBytes += 128 + block.id.length * 2
+            reservePlan(baseWorkingBytes)
+            operations.add(block.id)
+          }
+          if (
+            index < rawTargetIndex &&
+            (index > rawUseIndex ||
+              (index === rawUseIndex && block.id !== checkpoint.sourceNativeId) ||
+              (block.id === checkpoint.sourceNativeId && entry !== use.entry))
+          )
+            throw new Error('A later or conflicting native plan write invalidates the checkpoint.')
+          if (
+            index >= rawTargetIndex &&
+            (entry.type !== 'assistant' ||
+              entry.isSidechain ||
+              entry.agentId ||
+              entry.parent_tool_use_id ||
+              entry.isCompactSummary ||
+              entry.sessionId !== input.nativeSessionId ||
+              !belongsToRoot(entry))
+          )
+            throw new Error('An unowned target plan write invalidates the checkpoint.')
+        }
+        if (
+          block.type === 'tool_result' &&
+          index > rawReceiptIndex &&
+          ((typeof block.tool_use_id === 'string' &&
+            (priorOperations.has(block.tool_use_id) || targetOperations.has(block.tool_use_id))) ||
+            (isObject(entry.toolUseResult) &&
+              entry.toolUseResult.filePath === checkpointBinding.path))
+        ) {
+          if (typeof block.tool_use_id !== 'string' || !block.tool_use_id)
+            throw new Error('A native plan acknowledgement has no checkpoint operation identity.')
+          if (index < rawTargetIndex)
+            throw new Error('A later native plan acknowledgement invalidates the checkpoint.')
+          if (
+            !targetOperations.has(block.tool_use_id) ||
+            entry.type !== 'user' ||
+            entry.isSidechain ||
+            entry.agentId ||
+            entry.parent_tool_use_id ||
+            entry.isCompactSummary ||
+            entry.sessionId !== input.nativeSessionId ||
+            !belongsToRoot(entry)
+          )
+            throw new Error('An unowned target plan acknowledgement invalidates the checkpoint.')
+        }
+      }
+    }
+    reservePlan(baseWorkingBytes)
+    checkpointBase = await new Promise<string>((resolve, reject) => {
+      const receive = (message: unknown) => {
+        parentPort!.off('message', receive)
+        const body = claudePlanCheckpointReplySchema.safeParse(message)
+        if (
+          !body.success ||
+          body.data.text.length !== document.chars ||
+          Buffer.byteLength(body.data.text) !== document.bytes ||
+          createHash('sha256').update(body.data.text).digest('hex') !== document.sha256
+        )
+          reject(new Error('The published plan checkpoint body is not authenticated.'))
+        else resolve(body.data.text)
+      }
+      parentPort!.on('message', receive)
+      void postReply({ type: 'plan_checkpoint_request' }).catch(reject)
+    })
+  }
+  let inherited: ClaudeNativePlan | undefined
+  let inheritedCalls = new Map<string, { name: string; input: unknown }>()
+  const observeArtifact = (
+    artifact: ClaudeNativePlan,
+    calls: Map<string, { name: string; input: unknown }>,
+    entry: RecordValue,
+  ): void => {
+    if (entry.type !== 'assistant' && entry.type !== 'user') return
+    const content = object(entry.message).content
+    if (!Array.isArray(content)) return
+    for (const block of content) {
+      if (!isObject(block)) continue
+      if (
+        entry.type === 'assistant' &&
+        block.type === 'tool_use' &&
+        typeof block.id === 'string' &&
+        ['Write', 'Edit'].includes(String(block.name))
+      ) {
+        if (artifact.begin(String(block.name), block.id, block.input) && !calls.has(block.id))
+          calls.set(block.id, { name: String(block.name), input: block.input })
+      } else if (
+        entry.type === 'user' &&
+        block.type === 'tool_result' &&
+        typeof block.tool_use_id === 'string'
+      ) {
+        const call = calls.get(block.tool_use_id)
+        if (!call) continue
+        if (block.is_error) artifact.reject(block.tool_use_id)
+        else artifact.acknowledge(call.name, block.tool_use_id, call.input, entry.toolUseResult)
+      }
+    }
+  }
+  for (const entry of input.planCheckpoint ? [] : ancestors) {
+    if (entry.isCompactSummary) continue
+    const binding = nativeBinding(entry)
+    if (binding && (!inherited || binding.path !== inherited.binding.path)) {
+      inherited = new ClaudeNativePlan(binding, reservePlan)
+      inheritedCalls = new Map()
+    } else if (inherited && realInput(entry)) {
+      inherited.finish()
+      inherited = new ClaudeNativePlan(inherited.binding, reservePlan, inherited.completeText)
+      inheritedCalls = new Map()
+    }
+    if (inherited) observeArtifact(inherited, inheritedCalls, entry)
+  }
+  inherited?.finish()
+  let currentBinding: ClaudePlanBinding | undefined
+  for (const entry of planRead ? selected : []) {
+    if (!belongsToRoot(entry) || entry.isCompactSummary) continue
+    const binding = nativeBinding(entry)
+    if (!binding) continue
+    if (currentBinding && currentBinding.path !== binding.path)
+      throw new Error('The native root has conflicting plan attachments.')
+    currentBinding = binding
+  }
+  const planBinding = currentBinding ?? checkpointBinding ?? inherited?.binding
+  if (checkpointBinding && planBinding?.path !== checkpointBinding.path)
+    throw new Error('The current native plan path differs from its published checkpoint.')
+  const base =
+    checkpointBase ??
+    (planBinding?.path === inherited?.binding.path ? inherited?.completeText : undefined)
+  const artifact = planBinding ? new ClaudeNativePlan(planBinding, reservePlan, base) : undefined
+  const operations = new Map<string, { name: string; input: unknown }>()
+  let hookLocated = false
+  let retainedId: string | undefined
+  if (input.planHook) {
+    let matches = 0
+    for (const entry of selected) {
+      if (
+        !belongsToRoot(entry) ||
+        entry.sessionId !== input.nativeSessionId ||
+        entry.type !== 'assistant' ||
+        entry.isCompactSummary
+      )
+        continue
+      const content = object(entry.message).content
+      if (!Array.isArray(content)) continue
+      for (const block of content) {
+        if (!isObject(block) || block.type !== 'tool_use' || block.id !== input.planHook.id)
+          continue
+        matches++
+        if (
+          claudePlanInputFingerprint(String(block.name), block.input) !==
+          input.planHook.inputFingerprint
+        )
+          throw new Error('The live native plan Hook differs from its recorded operation.')
+      }
+    }
+    if (matches !== 1)
+      throw Object.assign(
+        new Error('The exact live native plan operation is not available in the root history.'),
+        {
+          code: matches === 0 ? 'CLAUDE_PLAN_OPERATION_MISSING' : 'CLAUDE_PLAN_OPERATION_DUPLICATE',
+        },
+      )
+  }
+  const submission = input.terminalPlanSubmission
+  let submissionLocated = false
+  if (submission) {
+    if (
+      !artifact ||
+      submission.promptId !== rootEntry.promptId ||
+      artifact.binding.promptId !== submission.promptId
+    )
+      throw new Error('The terminal plan submission has no matching authenticated prompt binding.')
+    let matches = 0
+    for (const entry of selected) {
+      if (
+        !belongsToRoot(entry) ||
+        entry.sessionId !== input.nativeSessionId ||
+        entry.type !== 'assistant' ||
+        entry.isCompactSummary
+      )
+        continue
+      const content = object(entry.message).content
+      if (!Array.isArray(content)) continue
+      for (const block of content) {
+        if (!isObject(block) || block.type !== 'tool_use' || block.id !== submission.id) continue
+        matches++
+        if (
+          block.name !== 'ExitPlanMode' ||
+          claudePlanSubmissionFingerprint(block.input) !== submission.inputFingerprint
+        )
+          throw new Error('The terminal plan submission differs from its permission intent.')
+      }
+    }
+    if (matches !== 1)
+      throw new Error('The terminal plan submission identity is missing or duplicated.')
+  }
+  using answerItems = new ClaudeAnswerAssembler(input.nativeTurnId ?? input.nativeSessionId)
+  for (const entry of selected) {
+    if (
+      !belongsToRoot(entry) ||
+      entry.isCompactSummary ||
+      entry.sessionId !== input.nativeSessionId
+    )
+      continue
+    if (entry.type !== 'assistant' && entry.type !== 'user') continue
+    const messageValue = object(entry.message),
+      content = messageValue.content
+    if (!Array.isArray(content)) continue
+    if (entry.type === 'user') {
+      for (const block of content) {
+        if (
+          !isObject(block) ||
+          block.type !== 'tool_result' ||
+          typeof block.tool_use_id !== 'string'
+        )
+          continue
+        const operation = operations.get(block.tool_use_id)
+        if (!operation || !artifact || hookLocated) continue
+        if (block.is_error) artifact.reject(block.tool_use_id)
+        else
+          artifact.acknowledge(
+            operation.name,
+            block.tool_use_id,
+            operation.input,
+            entry.toolUseResult,
+          )
+      }
+      continue
+    }
+    if (typeof messageValue.id !== 'string') throw new Error('Incomplete native answer.')
+    let text = '',
+      textBlocks = 0
+    for (const block of content) {
+      if (!isObject(block)) throw new Error('Claude native content is incomplete.')
+      if (block.type === 'text') {
+        if (typeof block.text !== 'string') throw new Error('Claude native text is incomplete.')
+        text += block.text
+        textBlocks++
+      } else if (
+        submissionLocated &&
+        block.type === 'tool_use' &&
+        block.name === 'AskUserQuestion'
+      ) {
+        throw new Error('A native clarification prevents terminal plan submission.')
+      } else if (submission && block.type === 'tool_use' && block.name === 'ExitPlanMode') {
+        if (!artifact || submissionLocated || block.id !== submission.id)
+          throw new Error('Another native submission invalidates the terminal plan intent.')
+        artifact.finish()
+        if (artifact.unavailable || artifact.hasPendingOperations || !artifact.completeText)
+          throw new Error('The terminal plan has incomplete or failed native operations.')
+        const intent = object(block.input)
+        if (
+          (intent.planFilePath !== undefined && intent.planFilePath !== artifact.binding.path) ||
+          (intent.plan !== undefined && intent.plan !== artifact.completeText)
+        )
+          throw new Error(
+            'The submitted native plan body or path differs from its authenticated source.',
+          )
+        artifact.noteSubmission(submission.id, block.input)
+        retainedId = submission.id
+        submissionLocated = true
+      } else if (
+        submissionLocated &&
+        artifact &&
+        block.type === 'tool_use' &&
+        ['Write', 'Edit'].includes(String(block.name)) &&
+        object(block.input).file_path === artifact.binding.path
+      ) {
+        throw new Error('A later native plan operation invalidates the terminal submission.')
+      } else if (input.planHook && block.type === 'tool_use' && block.id === input.planHook.id) {
+        hookLocated = true
+      } else if (
+        artifact &&
+        !hookLocated &&
+        block.type === 'tool_use' &&
+        block.name === 'ExitPlanMode' &&
+        typeof block.id === 'string'
+      ) {
+        artifact.noteSubmission(block.id, block.input)
+        retainedId = block.id
+      } else if (
+        artifact &&
+        !hookLocated &&
+        block.type === 'tool_use' &&
+        typeof block.id === 'string' &&
+        ['Write', 'Edit'].includes(String(block.name)) &&
+        artifact.begin(String(block.name), block.id, block.input)
+      ) {
+        const operation = { name: String(block.name), input: block.input }
+        const previous = operations.get(block.id)
+        if (!previous) operations.set(block.id, operation)
+      }
+    }
+    if (typeof entry.uuid !== 'string') throw new Error('Incomplete native answer identity.')
+    answerItems.frame(messageValue.id, entry.uuid, textBlocks ? text : undefined, textBlocks)
+  }
+  if (!input.planHook) artifact?.finish()
+  const plan = artifact?.plan
+  const retainedPlan = retainedId ? artifact?.retained(retainedId) : undefined
+  answerItems.finalize()
+  const answer = answerItems.text
+  if (input.action === 'read-answer') {
+    if (submission) {
+      if (!submissionLocated || artifact?.unavailable || (!plan && !retainedPlan))
+        throw new Error('The terminal native plan proof is incomplete.')
+      return {
+        nativeSessionId: input.nativeSessionId,
+        nativeTurnId: input.nativeTurnId!,
+        ...(plan ? { plan } : retainedPlan ? { retainedPlan } : {}),
+        ...(planBinding ? { planBinding } : {}),
+        terminalPlanSubmission: submission,
+        nativeStorageRoot: await realpath(root),
+        nativePath: join(await realpath(projectDirectory!), `${input.nativeSessionId}.jsonl`),
+      }
+    }
+    if (input.planHook)
+      return {
+        nativeSessionId: input.nativeSessionId,
+        nativeTurnId: input.nativeTurnId!,
+        ...(planBinding ? { planBinding } : {}),
+        ...(artifact ? { planState: artifact.snapshot() } : {}),
+        nativeStorageRoot: await realpath(root),
+        nativePath: join(await realpath(projectDirectory!), `${input.nativeSessionId}.jsonl`),
+      }
+    return {
+      nativeSessionId: input.nativeSessionId,
+      nativeTurnId: input.nativeTurnId!,
+      ...(answer || plan ? { answer } : {}),
+      ...(plan ? { plan } : {}),
+      ...(retainedPlan ? { retainedPlan } : {}),
+      ...(planBinding ? { planBinding } : {}),
+      ...(artifact?.unavailable ? { planUnavailable: true } : {}),
       nativeStorageRoot: await realpath(root),
       nativePath: join(await realpath(projectDirectory!), `${input.nativeSessionId}.jsonl`),
     }
   }
   if (
     input.action === 'prepare' &&
-    (!answer || createHash('sha256').update(answer).digest('hex') !== input.responseHash)
+    createHash('sha256').update(answer).digest('hex') !== input.responseHash
   )
     throw new Error('Claude native answer does not match the complete selected Pact answer.')
   const rawStart = sourceEntries.findIndex((entry) => entry.uuid === input.nativeTurnId)
@@ -830,57 +1844,199 @@ async function claude(
             : reject(new Error('Candidate persistence was not acknowledged.')),
         ),
       )
-      if (!inside(await realpath(root), directory))
-        throw new Error('Native Fork directory escaped its storage root.')
-      const writeDirectory = await lstat(directory, { bigint: true })
-      if (
-        (await realpath(projectDirectory)) !== directory ||
-        writeDirectory.dev !== directoryIdentity.dev ||
-        writeDirectory.ino !== directoryIdentity.ino ||
-        (await realpath(root)) !== result.nativeStorageRoot
-      )
-        throw new Error('Native Fork store identity changed before its exclusive write.')
       const text = values.map((entry) => JSON.stringify(entry)).join('\n') + '\n'
       const outputBytes = Buffer.byteLength(text)
       if (
         outputBytes > MAX_BYTES ||
-        (!input.answerFormat &&
-          outputBytes - values.reduce((sum, entry) => sum + nativeHistoryImageBytes(entry), 0) >
-            TEXT_BYTES)
+        outputBytes - values.reduce((sum, entry) => sum + nativeHistoryImageBytes(entry), 0) >
+          TEXT_BYTES
       )
         throw new Error('Native Fork output exceeds its text/image byte budget.')
-      const handle = await open(
-        join(directory, `${key.sessionId}.jsonl`),
-        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0),
-        0o600,
-      )
-      try {
-        await handle.writeFile(text)
-        await handle.sync()
-      } finally {
-        await handle.close()
-      }
-      if (process.platform !== 'win32') {
-        const dir = await open(directory, constants.O_RDONLY | (constants.O_DIRECTORY ?? 0))
-        try {
-          await dir.sync()
-        } finally {
-          await dir.close()
+
+      const verifiedProjectDirectory = projectDirectory
+      const targetPath = join(directory, `${key.sessionId}.jsonl`)
+      const stagingPath = deterministicClaudeForkStagingPath(directory, key.sessionId)
+      let dirHandle: FileHandle | undefined
+      let stageFdStat: BigIntStats | undefined
+      let stagingPublishedOrRemoved = false
+
+      const assertPinnedDirectoryUnchanged = async (): Promise<void> => {
+        const canonicalRootNow = await realpath(root)
+        if (
+          canonicalRootNow !== result!.nativeStorageRoot ||
+          !inside(canonicalRootNow, directory)
+        ) {
+          throw new Error('Native Fork directory escaped its storage root.')
+        }
+        const writeDirectory = await lstat(directory, { bigint: true })
+        if (
+          (await realpath(verifiedProjectDirectory)) !== directory ||
+          !writeDirectory.isDirectory() ||
+          writeDirectory.isSymbolicLink() ||
+          writeDirectory.dev !== directoryIdentity.dev ||
+          writeDirectory.ino !== directoryIdentity.ino
+        ) {
+          throw new Error('Native Fork store identity changed before its exclusive write.')
+        }
+        if (dirHandle) {
+          const pinnedDirStat = await dirHandle.stat({ bigint: true })
+          if (
+            !pinnedDirStat.isDirectory() ||
+            pinnedDirStat.dev !== directoryIdentity.dev ||
+            pinnedDirStat.ino !== directoryIdentity.ino
+          ) {
+            throw new Error('Native Fork pinned directory handle identity changed.')
+          }
         }
       }
-      const readback = await records(
-        join(directory, `${key.sessionId}.jsonl`),
-        root,
-        undefined,
-        MAX_RECORDS,
-        false,
-        Boolean(input.answerFormat),
-      )
-      Object.assign(result, {
-        rawHash: readback.rawHash,
-        rawBytes: readback.rawBytes,
-        rawRecords: readback.rawRecords,
-      })
+
+      try {
+        if (process.platform !== 'win32') {
+          dirHandle = await open(
+            directory,
+            constants.O_RDONLY | (constants.O_DIRECTORY ?? 0) | (constants.O_NOFOLLOW ?? 0),
+          )
+        }
+        await assertPinnedDirectoryUnchanged()
+
+        // If a prior attempt crashed between link(stagingPath, targetPath) and unlink(stagingPath),
+        // restore targetPath to nlink === 1 without deleting unrelated files, then fail EEXIST.
+        const recoveredPriorTarget = result.nativeStorageRoot
+          ? await recoverInterruptedClaudeForkStagingLink(targetPath, result.nativeStorageRoot)
+          : undefined
+        if (recoveredPriorTarget) {
+          throw Object.assign(new Error('Native Fork target already exists.'), {
+            code: 'EEXIST',
+          })
+        }
+
+        // Create an EMPTY exclusive staging file first and fence both the opened FD and pinned
+        // parent directory BEFORE writing a single byte of transcript data.
+        const stageHandle = await open(
+          stagingPath,
+          constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0),
+          0o600,
+        )
+        let writtenStat: BigIntStats
+        try {
+          stageFdStat = await stageHandle.stat({ bigint: true })
+          if (
+            !stageFdStat.isFile() ||
+            stageFdStat.nlink !== 1n ||
+            stageFdStat.size !== 0n ||
+            stageFdStat.dev !== directoryIdentity.dev
+          ) {
+            throw new Error('Native Fork staging descriptor identity is invalid.')
+          }
+          await assertPinnedDirectoryUnchanged()
+          const liveStageStat = await lstat(stagingPath, { bigint: true })
+          if (
+            liveStageStat.isSymbolicLink() ||
+            !liveStageStat.isFile() ||
+            liveStageStat.nlink !== 1n ||
+            liveStageStat.dev !== stageFdStat.dev ||
+            liveStageStat.ino !== stageFdStat.ino ||
+            (await realpath(stagingPath)) !== stagingPath
+          ) {
+            throw new Error('Native Fork store identity changed before its exclusive write.')
+          }
+
+          await stageHandle.writeFile(text)
+          await stageHandle.sync()
+          writtenStat = await stageHandle.stat({ bigint: true })
+          if (
+            writtenStat.dev !== stageFdStat.dev ||
+            writtenStat.ino !== stageFdStat.ino ||
+            writtenStat.size !== BigInt(outputBytes)
+          ) {
+            throw new Error('Native Fork staged file changed during write.')
+          }
+        } finally {
+          await stageHandle.close()
+        }
+
+        await assertPinnedDirectoryUnchanged()
+        const prePublishStageStat = await lstat(stagingPath, { bigint: true })
+        if (
+          prePublishStageStat.isSymbolicLink() ||
+          !prePublishStageStat.isFile() ||
+          prePublishStageStat.nlink !== 1n ||
+          prePublishStageStat.dev !== writtenStat.dev ||
+          prePublishStageStat.ino !== writtenStat.ino ||
+          prePublishStageStat.size !== writtenStat.size
+        ) {
+          throw new Error('Native Fork staged file changed before atomic publication.')
+        }
+
+        // Publish exclusively via atomic no-replace link inside the verified parent directory
+        // (EEXIST if target already exists). Fail closed if atomic no-replace is unavailable;
+        // NEVER fall back to lstat-then-rename.
+        try {
+          await link(stagingPath, targetPath)
+        } catch (error) {
+          const code = error instanceof Error ? Reflect.get(error, 'code') : undefined
+          if (code === 'EEXIST') {
+            throw Object.assign(new Error('Native Fork target already exists.'), {
+              code: 'EEXIST',
+            })
+          }
+          throw Object.assign(
+            new Error(
+              `Atomic no-replace publication for Native Fork is unavailable (${String(code ?? 'unknown')}).`,
+            ),
+            { code: typeof code === 'string' ? code : 'EIO' },
+          )
+        }
+        const publishedStat = await lstat(targetPath, { bigint: true })
+        if (
+          publishedStat.isSymbolicLink() ||
+          !publishedStat.isFile() ||
+          publishedStat.dev !== writtenStat.dev ||
+          publishedStat.ino !== writtenStat.ino ||
+          publishedStat.size !== writtenStat.size
+        ) {
+          throw new Error('Native Fork published target identity mismatch.')
+        }
+        await unlink(stagingPath)
+        stagingPublishedOrRemoved = true
+
+        if (dirHandle) {
+          await dirHandle.sync()
+        }
+        const readback = await records(targetPath, root, undefined, MAX_RECORDS, false)
+        const afterReadbackStat = await lstat(targetPath, { bigint: true })
+        if (
+          afterReadbackStat.isSymbolicLink() ||
+          afterReadbackStat.dev !== writtenStat.dev ||
+          afterReadbackStat.ino !== writtenStat.ino ||
+          afterReadbackStat.size !== writtenStat.size
+        ) {
+          throw new Error('Native Fork published file changed during readback verification.')
+        }
+        Object.assign(result, {
+          rawHash: readback.rawHash,
+          rawBytes: readback.rawBytes,
+          rawRecords: readback.rawRecords,
+        })
+      } finally {
+        if (!stagingPublishedOrRemoved && stageFdStat) {
+          try {
+            const currentStage = await lstat(stagingPath, { bigint: true })
+            if (
+              !currentStage.isSymbolicLink() &&
+              currentStage.dev === stageFdStat.dev &&
+              currentStage.ino === stageFdStat.ino
+            ) {
+              await unlink(stagingPath)
+            }
+          } catch {
+            /* Best-effort cleanup of owned staging file. */
+          }
+        }
+        if (dirHandle) {
+          await dirHandle.close().catch(() => undefined)
+        }
+      }
     },
   }
   await forkSession(input.nativeSessionId, {
@@ -952,19 +2108,11 @@ async function paginatedCodex(
     if (boundary && boundary.bytes > MAX_BYTES - rawBytes)
       throw new Error('Native history reference exceeds the remaining aggregate byte budget.')
     const read =
-      initial ??
-      (await records(
-        path,
-        storageRoot,
-        boundary?.bytes,
-        MAX_RECORDS - rawRecords,
-        true,
-        Boolean(input.answerFormat),
-      ))
+      initial ?? (await records(path, storageRoot, boundary?.bytes, MAX_RECORDS - rawRecords, true))
     rawBytes += read.rawBytes
     rawRecords += read.rawRecords
     imageBytes += read.imageBytes
-    if (!input.answerFormat && rawBytes - imageBytes > TEXT_BYTES)
+    if (rawBytes - imageBytes > TEXT_BYTES)
       throw new Error('Resolved Native text exceeds its existing 8 MiB budget.')
     if (rawBytes > MAX_BYTES || rawRecords > MAX_RECORDS)
       throw new Error('Resolved native history exceeds its aggregate 32 MiB/10,000-record budget.')
@@ -1121,13 +2269,7 @@ async function paginatedCodex(
     }
   }
   if (input.responseHash)
-    validateCodexAnswer(
-      entries,
-      selectedStart,
-      selectedEnd - 1,
-      input.responseHash,
-      input.answerFormat,
-    )
+    validateCodexAnswer(entries, selectedStart, selectedEnd - 1, input.responseHash)
   const prefixSegments: Array<{
     nativeSessionId: string
     endOrdinalExclusive: number
@@ -1198,7 +2340,6 @@ function validateCodexAnswer(
   selectedStart: number,
   selectedComplete: number,
   responseHash: string,
-  answerFormat?: NativeForkFileInput['answerFormat'],
 ): void {
   const answerItems = new Map<string, { id: string; text: string; phase?: unknown }>()
   for (let index = selectedStart + 1; index <= selectedComplete; index++) {
@@ -1210,7 +2351,7 @@ function validateCodexAnswer(
       payload.role !== 'assistant'
     )
       continue
-    if (answerFormat && payload.parent_tool_call_id != null) continue
+    if (payload.parent_tool_call_id != null) continue
     if (!Array.isArray(payload.content))
       throw new Error('Codex native answer content is incomplete.')
     const text = payload.content
@@ -1226,8 +2367,8 @@ function validateCodexAnswer(
       answerItems.set(id, { id, text, phase: payload.phase })
     }
   }
-  const text = projectCollaborationAnswer([...answerItems.values()], answerFormat)
-  if (!text || createHash('sha256').update(text).digest('hex') !== responseHash)
+  const text = projectCollaborationAnswer([...answerItems.values()])
+  if (createHash('sha256').update(text).digest('hex') !== responseHash)
     throw new Error('Codex complete native answer does not match the selected Pact answer.')
 }
 
@@ -1246,7 +2387,6 @@ async function codex(input: NativeForkFileInput): Promise<NativeForkFileResult> 
     undefined,
     MAX_RECORDS,
     input.historyMode === 'paginated',
-    Boolean(input.answerFormat),
   )
   const meta = raw.entries[0]
   if (meta?.type !== 'session_meta')
@@ -1441,13 +2581,7 @@ async function codex(input: NativeForkFileInput): Promise<NativeForkFileResult> 
   }
   if (!opaqueRecords.length) throw new Error('Codex native prefix is empty.')
   if (input.responseHash)
-    validateCodexAnswer(
-      raw.entries,
-      selectedStart,
-      selectedComplete,
-      input.responseHash,
-      input.answerFormat,
-    )
+    validateCodexAnswer(raw.entries, selectedStart, selectedComplete, input.responseHash)
   const prefix = { domain: 'codex-native-prefix-v2', opaqueRecords, turnIdentityEvidence }
   const prefixHash = hash(prefix)
   if (

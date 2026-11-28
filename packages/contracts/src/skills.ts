@@ -1,6 +1,10 @@
 import { z } from 'zod'
 
-import { pactSkillSchema, type PactSkill } from './collaboration.js'
+import { PACT_SKILLS, pactSkillSchema, type PactSkill } from './collaboration.js'
+
+export const PACT_COMPOSER_SKILLS = [...PACT_SKILLS, 'btw'] as const
+export type PactComposerSkill = (typeof PACT_COMPOSER_SKILLS)[number]
+export const pactComposerSkillSchema = z.enum(PACT_COMPOSER_SKILLS)
 
 export const SKILL_CATALOG_ITEMS = 4_096
 export const SKILL_CATALOG_BYTES = 1_024 * 1_024
@@ -9,7 +13,7 @@ export const SKILL_PAGE_BYTES = 64 * 1_024
 export const SKILL_INVOCATION_BYTES = 64 * 1_024
 export const SKILL_ITEM_BYTES = 8 * 1_024
 
-const agentSchema = z.enum(['claude', 'codex'])
+const agentSchema = z.enum(['claude', 'codex', 'agy'])
 const nameSchema = z
   .string()
   .min(1)
@@ -181,9 +185,10 @@ export interface FrozenSkillInvocation {
   bindings: SkillBinding[]
 }
 
-type AgentRoute = { type: 'agent'; agentId: 'claude' | 'codex' } | { type: 'all' }
+type AgentRoute = { type: 'agent'; agentId: 'claude' | 'codex' | 'agy' } | { type: 'all' }
 export interface ComposerCommandPrefix {
   pact?: PactSkill
+  btw?: { start: number; end: number }
   route?: AgentRoute
   skills: Array<{ name: string; start: number; end: number }>
   argumentsStart: number
@@ -197,7 +202,7 @@ export function parseComposerCommandPrefix(
 ): ComposerCommandPrefix {
   const result: ComposerCommandPrefix = { skills: [], argumentsStart: 0 }
   if (selections.length > SKILL_CATALOG_ITEMS || !fits(selections, SKILL_INVOCATION_BYTES))
-    return { ...result, error: 'The Skill command area exceeds its capacity.' }
+    return { ...result, error: 'Too many skills selected at once (over capacity).' }
   const atoms = new Map<number, Pick<SkillSelection, 'name' | 'start' | 'end'>>()
   let previousEnd = 0
   for (const entry of selections.toSorted((a, b) => a.start - b.start)) {
@@ -210,7 +215,7 @@ export function parseComposerCommandPrefix(
       !nameSchema.safeParse(entry.name).success ||
       content.slice(entry.start, entry.end) !== `/${entry.name}`
     )
-      return { ...result, error: 'The selected Skill token changed. Select it again.' }
+      return { ...result, error: 'The selected skill command changed. Select it again.' }
     atoms.set(entry.start, entry)
     previousEnd = entry.end
   }
@@ -221,7 +226,7 @@ export function parseComposerCommandPrefix(
     const atom = atoms.get(offset)
     if (atom) {
       if (result.skills.length >= SKILL_CATALOG_ITEMS) {
-        result.error = 'The Skill command area exceeds its capacity.'
+        result.error = 'Too many skills selected at once (over capacity).'
         break
       }
       result.skills.push({ name: atom.name, start: atom.start, end: atom.end })
@@ -231,7 +236,12 @@ export function parseComposerCommandPrefix(
       if (offset < content.length && !/\s/u.test(content[offset]!) && !atoms.has(offset)) break
       continue
     }
-    const token = /^(?:@(claude|codex|all)|\/([\p{L}\p{N}_.:-]+))(?=\s|$)/iu.exec(
+    const unsupportedGemini = /^@gemini(?=\s|$)/iu.exec(content.slice(offset))
+    if (unsupportedGemini) {
+      result.error = 'Use @agy to route to Antigravity; @gemini is not supported.'
+      break
+    }
+    const token = /^(?:@(claude|codex|agy|all)|\/([\p{L}\p{N}_.:-]+))(?=\s|$)/iu.exec(
       content.slice(offset),
     )
     if (!token) break
@@ -245,7 +255,18 @@ export function parseComposerCommandPrefix(
       result.route =
         target === 'all'
           ? { type: 'all' }
-          : { type: 'agent', agentId: target === 'claude' ? 'claude' : 'codex' }
+          : {
+              type: 'agent',
+              agentId: target === 'claude' ? 'claude' : target === 'codex' ? 'codex' : 'agy',
+            }
+    } else if (token[2] === 'btw') {
+      if (result.pact || result.btw) {
+        result.error = 'Choose one Pact Skill for this task.'
+        break
+      }
+      result.btw = { start: offset, end: offset + token[0].length }
+      offset += token[0].length
+      break
     } else if (pact.success) {
       if (result.pact) {
         result.error = 'Choose one Pact Skill for this task.'
@@ -277,9 +298,37 @@ export function skillArguments(content: string, selections: SkillSelection[]): s
     offset = prefix.argumentsStart
   for (const entry of ranges.toSorted((a, b) => a.start - b.start)) {
     if (entry.start < offset || content.slice(entry.start, entry.end) !== `/${entry.name}`)
-      throw new Error('The selected Skill token changed. Select it again.')
+      throw new Error('The selected skill command changed. Select it again.')
     result += content.slice(offset, entry.start)
     offset = entry.end
   }
   return (result + content.slice(offset)).trim()
+}
+
+/** Rejects residual Pact/agent directives left after stripping a leading `@Main` target. */
+export function validateSideChatMainSyncContent(
+  content: string,
+  selections: readonly Pick<SkillSelection, 'name' | 'start' | 'end'>[] = [],
+): { ok: true } | { ok: false; message: string } {
+  const prefix = parseComposerCommandPrefix(content, selections)
+  if (prefix.error) return { ok: false, message: prefix.error }
+  if (prefix.btw) {
+    return {
+      ok: false,
+      message: '/btw opens a side chat instead of sending a regular message.',
+    }
+  }
+  if (prefix.pact) {
+    return {
+      ok: false,
+      message: 'Pact commands (/plan, /build, /review) can only be used directly in the main chat.',
+    }
+  }
+  if (prefix.route) {
+    return {
+      ok: false,
+      message: 'Remove @claude, @codex, @agy, or @all after @Main before sending to the main chat.',
+    }
+  }
+  return { ok: true }
 }

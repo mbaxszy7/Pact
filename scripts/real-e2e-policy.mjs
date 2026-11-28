@@ -12,6 +12,66 @@ import { isScriptEntry } from './script-entry.mjs'
 
 // Exact business cases, independent of a candidate's mutable tags or test outcome.
 export const realCases = [
+  ...['codex', 'claude'].map((primary) => ({
+    path: 'tests/e2e/collaboration-stage-roles-real.spec.ts',
+    title: `real Primary ${primary} plans and reviews code while Secondary reviews the plan and implements`,
+    tier: 'extended',
+    scenario: 'collaboration',
+  })),
+  ...['codex', 'claude'].map((owner) => ({
+    path: 'tests/e2e/collaboration-result-real.spec.ts',
+    title: `real ${owner} retains an unchanged plan and settles its reply without implementation authority`,
+    tier: 'extended',
+    scenario: 'collaboration',
+  })),
+  {
+    path: 'tests/e2e/skill-composer.spec.ts',
+    title:
+      'real Skill menu stays outside the Composer, dismisses, and preserves Pact command badges',
+    tier: 'extended',
+    scenario: 'additional-regression',
+  },
+  {
+    path: 'tests/e2e/skill-composer.spec.ts',
+    title: 'real Skill menu keeps Plan at its original click position while native catalogs load',
+    tier: 'extended',
+    scenario: 'additional-regression',
+  },
+  {
+    path: 'tests/e2e/relay-information-real.spec.ts',
+    title:
+      'real Claude completes a confirmed user value and an already-answered release note without repeated questions',
+    tier: 'extended',
+    platforms: ['darwin'],
+    scenario: 'additional-regression',
+  },
+  ...['codex_luna', 'claude_haiku_5_5'].map((target) => ({
+    path: 'tests/e2e/relay-information-real.spec.ts',
+    title: `real Relay ${target} preserves necessary information through Cancel and a fresh Send without inventing user questions`,
+    tier: 'extended',
+    platforms: ['darwin'],
+    scenario: 'additional-regression',
+  })),
+  ...['codex_luna', 'claude_haiku_5_5'].map((target) => ({
+    path: 'tests/e2e/relay-routing-benefit-real.spec.ts',
+    title: `real Relay ${target} saves one source-author route correction against the legal default`,
+    tier: 'extended',
+    platforms: ['darwin'],
+    scenario: 'routing',
+  })),
+  ...['codex_luna', 'claude_haiku_5_5'].map((target) => ({
+    path: 'tests/e2e/relay-real-handoff.spec.ts',
+    title: `real Relay ${target} compares Off and On through the fixed native reviewer`,
+    tier: 'extended',
+    platforms: ['darwin'],
+    scenario: 'collaboration',
+  })),
+  {
+    path: 'tests/e2e/relay-native-comparison.spec.ts',
+    title: 'real ordinary Pact Session completes one exact Codex Luna task',
+    tier: 'extended',
+    scenario: 'additional-regression',
+  },
   {
     path: 'tests/e2e/real-stop.spec.ts',
     title:
@@ -414,24 +474,78 @@ export const realCases = [
     tier: 'extended',
     scenario: 'additional-regression',
   },
+  {
+    path: 'tests/e2e/agy-real-provider.spec.ts',
+    title:
+      'opt-in local real Antigravity CLI smoke completes readiness, @agy prompt, cold SQLite verification, and Fork in isolated HOME',
+    tier: 'extended',
+    optIn: 'PACT_E2E_REAL_AGY',
+    scenario: 'additional-regression',
+  },
+  {
+    path: 'tests/e2e/agy-real-provider.spec.ts',
+    title:
+      'opt-in local real Antigravity CLI completes 2-turn plan_review on same binding with gemini-pro-orchestrator and ask permissionMode',
+    tier: 'extended',
+    optIn: 'PACT_E2E_REAL_AGY',
+    scenario: 'additional-regression',
+  },
+  {
+    path: 'tests/e2e/agy-collaboration-real.spec.ts',
+    title:
+      'opt-in real Primary agy authors multi-round Brain Plans v1 and v2 while Secondary codex reviews plans, implements after cold restart, and agy reviews code',
+    tier: 'extended',
+    optIn: 'PACT_E2E_REAL_AGY_COLLAB',
+    scenario: 'collaboration',
+  },
+  {
+    path: 'tests/e2e/agy-collaboration-real.spec.ts',
+    title:
+      'opt-in real Primary codex plans and reviews code while Secondary agy reviews plan, implements under ask permissions, and cold session/load replay produces zero ghost edits',
+    tier: 'extended',
+    optIn: 'PACT_E2E_REAL_AGY_COLLAB',
+    scenario: 'collaboration',
+  },
 ]
 
+export const AGY_COLLAB_OPT_IN = 'PACT_E2E_REAL_AGY_COLLAB'
 export const realPolicyHash = createHash('sha256').update(JSON.stringify(realCases)).digest('hex')
 const caseKey = (path, title) => JSON.stringify([path, title])
 const registered = new Map(realCases.map((item) => [caseKey(item.path, item.title), item]))
+const isOptInEnabled = (item, env = process.env) => !item.optIn || env?.[item.optIn] === '1'
+
+export function agyCollaborationRealCases(cases = realCases) {
+  return cases.filter((item) => item.optIn === AGY_COLLAB_OPT_IN)
+}
+
+const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')
+
+export function agyCollaborationGrep(cases = realCases) {
+  const selected = agyCollaborationRealCases(cases)
+  if (!selected.length) {
+    throw new Error('No real Antigravity collaboration E2E cases are registered')
+  }
+  const branches = selected.map((item) => {
+    const fileLabel = escapeRegex(item.path.replace(/^tests\/e2e\//u, ''))
+    const titleLabel = escapeRegex(item.title)
+    return `${fileLabel} ${titleLabel}`
+  })
+  return `(?:^| )(?:${branches.join('|')})(?: @\\S+)*$`
+}
 
 export function requireRealScope(scope) {
   if (!['core', 'full'].includes(scope)) throw new Error('Real E2E scope must be core or full')
   return scope
 }
 
-export function realCaseRequired(target, scope, platform = process.platform) {
+export function realCaseRequired(target, scope, platform = process.platform, env = process.env) {
   requireRealScope(scope)
   if (target.project !== 'real') return true
   const item = registered.get(caseKey(target.path, target.title))
   if (!item) throw new Error('Real E2E case has no reviewed core/extended classification')
   return (
     (!item.platforms || item.platforms.includes(platform)) &&
+    isOptInEnabled(item, env) &&
     (scope === 'full' || item.tier === 'core')
   )
 }
@@ -476,6 +590,49 @@ export function realReportCases(report, workspace) {
   return items
 }
 
+function interpretObservedRealTest(test) {
+  const results = test.results ?? []
+  if (
+    results.length === 1 &&
+    ['passed', 'failed', 'timedOut', 'interrupted', 'skipped'].includes(results[0].status)
+  ) {
+    let status = results[0].status
+    const duration = results[0].duration
+    const durationValid = Number.isFinite(duration) && duration >= 0 && duration <= 2 * 60 * 60_000
+    if (status === 'passed' && (test.expectedStatus !== 'passed' || test.status !== 'expected')) {
+      status = 'failed'
+    }
+    return {
+      status,
+      durationMs: durationValid ? duration : 0,
+      invalidDuration: !durationValid,
+      invalidEvidence: false,
+      failureCategory: {
+        passed: 'none',
+        failed: 'case-failed',
+        timedOut: 'case-timeout',
+        interrupted: 'execution-interrupted',
+        skipped: 'case-skipped',
+      }[status],
+      reason:
+        status === 'passed'
+          ? 'All original case assertions passed.'
+          : status === 'skipped'
+            ? 'Skipped execution does not satisfy a required case.'
+            : 'Execution failed or was interrupted; private diagnostics are withheld.',
+    }
+  }
+  return {
+    status: 'not-run',
+    durationMs: 0,
+    invalidDuration: false,
+    invalidEvidence: true,
+    failureCategory: 'invalid-evidence',
+    reason:
+      'No execution result; missing prerequisites, cancellation or early failure cannot pass.',
+  }
+}
+
 /** Static case names and fixed reasons only: never export errors, attachments, output or config. */
 export function evaluateRealReport(
   report,
@@ -486,6 +643,7 @@ export function evaluateRealReport(
     identity = null,
     execution = 'completed',
     platform = process.platform,
+    env = process.env,
   } = {},
 ) {
   requireRealScope(suite)
@@ -511,6 +669,7 @@ export function evaluateRealReport(
   const cases = realCases.map((item) => {
     const test = observed.get(caseKey(item.path, item.title))
     const applicable = !item.platforms || item.platforms.includes(platform)
+    const optedIn = isOptInEnabled(item, env)
     let status = 'not-run',
       durationMs = 0,
       failureCategory = item.tier === 'extended' && suite === 'core' ? 'deferred' : 'missing-result'
@@ -519,44 +678,37 @@ export function evaluateRealReport(
         ? 'Deferred to explicitly requested manual full regression.'
         : 'No execution result; missing prerequisites, cancellation or early failure cannot pass.'
     if (test) {
-      const results = test.results ?? []
-      if (
-        results.length === 1 &&
-        ['passed', 'failed', 'timedOut', 'interrupted', 'skipped'].includes(results[0].status)
-      ) {
-        status = results[0].status
-        const duration = results[0].duration
-        if (Number.isFinite(duration) && duration >= 0 && duration <= 2 * 60 * 60_000)
-          durationMs = duration
-        else issues.push('invalid-case-duration')
-        if (status === 'passed' && (test.expectedStatus !== 'passed' || test.status !== 'expected'))
-          status = 'failed'
-        failureCategory = {
-          passed: 'none',
-          failed: 'case-failed',
-          timedOut: 'case-timeout',
-          interrupted: 'execution-interrupted',
-          skipped: 'case-skipped',
-        }[status]
-        reason =
-          status === 'passed'
-            ? 'All original case assertions passed.'
-            : status === 'skipped'
-              ? 'Skipped execution does not satisfy a required case.'
-              : 'Execution failed or was interrupted; private diagnostics are withheld.'
-      } else {
+      const interpreted = interpretObservedRealTest(test)
+      if (interpreted.invalidDuration) issues.push('invalid-case-duration')
+      if (interpreted.invalidEvidence) {
         issues.push('missing-result-or-retries')
-        failureCategory = 'invalid-evidence'
+        failureCategory = interpreted.failureCategory
+      } else {
+        status = interpreted.status
+        durationMs = interpreted.durationMs
+        failureCategory = interpreted.failureCategory
+        reason = interpreted.reason
       }
     }
+    const skippedByOptIn =
+      Boolean(test) &&
+      Array.isArray(test.results) &&
+      test.results.length === 1 &&
+      test.results[0].status === 'skipped'
+    const activeOptIn = optedIn || (Boolean(test) && !skippedByOptIn)
     if (!applicable && ['not-run', 'skipped'].includes(status)) {
       status = 'not-applicable'
       failureCategory = 'other-platform'
       reason = 'This native case is required on its declared target platform, not this runner.'
+    } else if (!activeOptIn && ['not-run', 'skipped'].includes(status)) {
+      status = 'not-run'
+      durationMs = 0
+      failureCategory = 'deferred'
+      reason = 'Deferred to explicitly opted-in provider regression.'
     }
     return Object.assign({}, item, {
       applicable,
-      required: applicable && (gate === 'full' || item.tier === 'core'),
+      required: applicable && activeOptIn && (gate === 'full' || item.tier === 'core'),
       status,
       durationMs,
       failureCategory,
@@ -647,6 +799,133 @@ export async function writeRealReport(report, directory, summary, options = {}) 
     summary,
     basename: 'real-summary',
     markdown: realReportMarkdown,
+  })
+}
+
+export function evaluateAgyCollaborationReport(
+  report,
+  {
+    cases = realCases,
+    workspace = resolve(import.meta.dirname, '..'),
+    identity = null,
+    execution = 'completed',
+    platform = process.platform,
+    env = process.env,
+  } = {},
+) {
+  if (!['completed', 'unavailable'].includes(execution))
+    throw new Error('Invalid real execution state')
+  const issues = []
+  const optedIn = env?.[AGY_COLLAB_OPT_IN] === '1'
+  if (!optedIn) issues.push('opt-in-disabled')
+  const selected = agyCollaborationRealCases(cases)
+  if (!selected.length) issues.push('no-registered-cases')
+  const selectedKeys = new Set(selected.map((item) => caseKey(item.path, item.title)))
+  let observed = new Map()
+  try {
+    if (!report || !Array.isArray(report.suites)) throw new Error('Missing execution evidence')
+    observed = realReportCases(report, workspace)
+    if (report.errors?.length) issues.push('playwright-global-error')
+  } catch {
+    issues.push('missing-or-invalid-execution-evidence')
+  }
+  const publicIdentity = publicReportIdentity(identity)
+  if (execution !== 'completed') issues.push('runner-or-preparation-failed')
+  if ([...observed.keys()].some((key) => !selectedKeys.has(key)))
+    issues.push('unexpected-case-executed')
+
+  let applicableCount = 0
+  let applicablePassed = 0
+  const evaluatedCases = selected.map((item) => {
+    const test = observed.get(caseKey(item.path, item.title))
+    const applicable = !item.platforms || item.platforms.includes(platform)
+    let status = 'not-run',
+      durationMs = 0,
+      failureCategory = applicable ? 'missing-result' : 'other-platform',
+      reason = applicable
+        ? 'No execution result; missing prerequisites, cancellation or early failure cannot pass.'
+        : 'This native case is required on its declared target platform, not this runner.'
+    if (test) {
+      const interpreted = interpretObservedRealTest(test)
+      if (interpreted.invalidDuration) issues.push('invalid-case-duration')
+      if (interpreted.invalidEvidence) {
+        issues.push('missing-result-or-retries')
+        failureCategory = interpreted.failureCategory
+      } else {
+        status = interpreted.status
+        durationMs = interpreted.durationMs
+        failureCategory = interpreted.failureCategory
+        reason = interpreted.reason
+      }
+    } else if (!applicable) {
+      status = 'not-applicable'
+    }
+    if (applicable) {
+      applicableCount += 1
+      if (status === 'passed') applicablePassed += 1
+      else issues.push('required-case-not-passed')
+    }
+    return Object.assign({}, item, {
+      applicable,
+      required: applicable,
+      status,
+      durationMs,
+      failureCategory,
+      reason,
+    })
+  })
+  if (applicableCount === 0) issues.push('no-applicable-cases-on-platform')
+  if (applicableCount > 0 && applicablePassed !== applicableCount)
+    issues.push('required-case-not-passed')
+
+  return {
+    schemaVersion: 1,
+    policyHash: realPolicyHash,
+    suite: 'agy-collaboration',
+    identity: publicIdentity,
+    platform,
+    architecture: process.arch,
+    issues: [...new Set(issues)],
+    cases: evaluatedCases,
+    gatePassed: issues.length === 0,
+  }
+}
+
+export function agyCollaborationReportMarkdown(report) {
+  const lines = [
+    '# Real Antigravity Collaboration E2E',
+    '',
+    `Suite: **${report.suite}**; gate: **${report.gatePassed ? 'PASS' : 'FAIL'}**.`,
+    `Platform: ${report.platform}/${report.architecture}; policy: \`${report.policyHash}\`.`,
+    reportIdentityMarkdown(report.identity),
+  ]
+  if (report.issues.length) lines.push('', `Evidence problems: ${report.issues.join(', ')}.`)
+  if (report.reportFiles) {
+    lines.push(
+      '',
+      `Report files: \`${report.reportFiles.json}\`, \`${report.reportFiles.markdown}\`.`,
+      `Persistent local report: \`${report.reportFiles.localDirectory}\`.`,
+    )
+  }
+  lines.push(
+    '',
+    '| Tier / scenario | Case | Required | Result | Duration (s) | Failure category | Reason |',
+    '| --- | --- | --- | --- | ---: | --- | --- |',
+  )
+  for (const item of report.cases)
+    lines.push(
+      `| ${item.tier} / ${item.scenario} | ${item.title.replaceAll('|', '\\|')} | ${item.required ? 'yes' : 'no'} | ${item.status} | ${(item.durationMs / 1000).toFixed(2)} | ${item.failureCategory} | ${item.reason} |`,
+    )
+  return `${lines.join('\n')}\n`
+}
+
+export async function writeAgyCollaborationReport(report, directory, summary, options = {}) {
+  return writeE2EReport(report, {
+    ...options,
+    directory,
+    summary,
+    basename: 'real-summary',
+    markdown: agyCollaborationReportMarkdown,
   })
 }
 

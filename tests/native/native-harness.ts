@@ -3,11 +3,27 @@ import type { Socket } from 'node:net'
 
 import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { access, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises'
+import { constants, type Stats } from 'node:fs'
+import {
+  access,
+  chmod,
+  copyFile,
+  lstat,
+  mkdir,
+  mkdtemp,
+  open,
+  opendir,
+  readFile,
+  readdir,
+  realpath,
+  rm,
+  stat,
+  writeFile,
+} from 'node:fs/promises'
 import { createServer, type Server } from 'node:http'
 import { createRequire } from 'node:module'
-import { tmpdir } from 'node:os'
-import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { homedir, tmpdir } from 'node:os'
+import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
 
@@ -23,7 +39,10 @@ import type {
   NativeProbeResult,
 } from '../../packages/contracts/src/index.js'
 
-import { OwnedProcessGroup } from '../../apps/desktop/src/utility/owned-process-group.js'
+import {
+  OwnedProcessGroup,
+  type WindowsOwnedProcessConfiguration,
+} from '../../apps/desktop/src/utility/owned-process-group.js'
 import {
   writeWindowsObservedLauncher,
   type WindowsLaunchOwner,
@@ -55,6 +74,82 @@ const groupFailureMessages = new Map([
 ])
 const execFileAsync = promisify(execFile)
 
+export interface WindowsFixtureProcessScope {
+  configuration: Readonly<WindowsOwnedProcessConfiguration>
+  /** Call only after the existing physical process/Job owners have released. */
+  assertReceiptsRetired: () => Promise<void>
+}
+
+/** Configuration and directory identity only; this never substitutes for native release proof. */
+export async function createWindowsFixtureProcessScope(
+  root: string,
+): Promise<WindowsFixtureProcessScope | undefined> {
+  if (process.platform !== 'win32') return undefined
+  if (!['x64', 'arm64'].includes(process.arch))
+    throw new Error('Windows process-owner fixtures require native x64 or arm64.')
+  const bridgePath = join(
+    desktopRoot,
+    'out/native',
+    `owned-process-group-win32-${process.arch}.exe`,
+  )
+  let windowsBridgeExecutable: string
+  try {
+    const binary = await lstat(bridgePath)
+    if (
+      !binary.isFile() ||
+      binary.isSymbolicLink() ||
+      binary.size < 88 ||
+      binary.size > 16 * 1024 * 1024
+    )
+      throw new Error('Invalid native helper')
+    windowsBridgeExecutable = await realpath(bridgePath)
+  } catch {
+    throw new Error(
+      'The real Windows product helper is unavailable. Build it with scripts/build-owned-process-group-win32.mjs before native fixtures.',
+    )
+  }
+  const canonicalRoot = await realpath(root)
+  const rootIdentity = await lstat(root, { bigint: true })
+  if (!rootIdentity.isDirectory() || rootIdentity.isSymbolicLink())
+    throw new Error('Windows fixture root must be an owned regular directory.')
+  const receiptDirectory = join(canonicalRoot, 'product-process-receipts')
+  // Each scope belongs to one newly-created fixture/observed-launcher root.
+  await mkdir(receiptDirectory, { mode: 0o700 })
+  const receiptIdentity = await lstat(receiptDirectory, { bigint: true })
+  const configuration = Object.freeze({ windowsBridgeExecutable, receiptDirectory })
+  return {
+    configuration,
+    async assertReceiptsRetired() {
+      const currentRoot = await lstat(root, { bigint: true })
+      const currentReceipt = await lstat(receiptDirectory, { bigint: true })
+      if (
+        !currentRoot.isDirectory() ||
+        currentRoot.isSymbolicLink() ||
+        currentRoot.dev !== rootIdentity.dev ||
+        currentRoot.ino !== rootIdentity.ino ||
+        (await realpath(root)) !== canonicalRoot ||
+        !currentReceipt.isDirectory() ||
+        currentReceipt.isSymbolicLink() ||
+        currentReceipt.dev !== receiptIdentity.dev ||
+        currentReceipt.ino !== receiptIdentity.ino ||
+        (await realpath(receiptDirectory)) !== receiptDirectory
+      )
+        throw new Error(
+          'Windows fixture cleanup is unconfirmed: directory identity changed; recovery data retained.',
+        )
+      const directory = await opendir(receiptDirectory)
+      try {
+        if (await directory.read())
+          throw new Error(
+            'Windows fixture cleanup is unconfirmed: receipts remain; recovery data retained.',
+          )
+      } finally {
+        await directory.close()
+      }
+    },
+  }
+}
+
 /** Fixture process ownership; production Adapter interfaces and policies remain unchanged. */
 export class NativeProcessOwner {
   readonly group: OwnedProcessGroup
@@ -69,6 +164,7 @@ export class NativeProcessOwner {
   private controlClosed = false
   private helperReleased = false
   private jobEmpty = false
+  private windowsUnadmitted = false
   private helperDiagnostic: HelperDiagnostic | undefined
   private groupFailure: string | undefined
 
@@ -77,8 +173,13 @@ export class NativeProcessOwner {
     readonly deadlineAt: number,
     private readonly windows: WindowsLaunchOwner | undefined,
     group?: OwnedProcessGroup,
+    private readonly windowsProcessScope?: WindowsFixtureProcessScope,
   ) {
-    this.group = group ?? new OwnedProcessGroup()
+    this.group =
+      group ??
+      (windowsProcessScope
+        ? new OwnedProcessGroup({ windows: windowsProcessScope.configuration })
+        : new OwnedProcessGroup())
   }
 
   static async prepare(
@@ -86,14 +187,35 @@ export class NativeProcessOwner {
     root: string,
     deadlineAt: number,
     group?: OwnedProcessGroup,
+    preparedWindows?: WindowsLaunchOwner,
   ): Promise<NativeProcessOwner> {
     const remaining = Math.floor(deadlineAt - performance.now())
     if (remaining <= 0 || remaining > 50_000) throw new Error('Native fixture deadline is invalid')
+    // A prepared control owner also supplies the lifecycle test's OS boundary.
     const windows =
-      process.platform === 'win32'
+      preparedWindows ??
+      (process.platform === 'win32'
         ? await writeWindowsObservedLauncher(root, command, remaining)
-        : undefined
-    return new NativeProcessOwner(command, deadlineAt, windows, group)
+        : undefined)
+    try {
+      const windowsProcessScope =
+        windows && !group ? await createWindowsFixtureProcessScope(windows.directory) : undefined
+      return new NativeProcessOwner(command, deadlineAt, windows, group, windowsProcessScope)
+    } catch (error) {
+      // No target was started. Reuse the existing owner to close the prepared
+      // observed launcher rather than leave its control server or helper behind.
+      const prepared = new NativeProcessOwner(command, deadlineAt, windows, group)
+      try {
+        await prepared.close()
+      } catch (cleanup) {
+        throw new AggregateError(
+          [error, cleanup],
+          'Windows fixture preparation cleanup is unconfirmed.',
+          { cause: cleanup },
+        )
+      }
+      throw error
+    }
   }
 
   start(args: readonly string[], options: SpawnOptions): ChildProcessWithoutNullStreams {
@@ -170,13 +292,17 @@ export class NativeProcessOwner {
     const physical =
       this.group.released &&
       (!this.child || this.childClosed) &&
-      (!admitted || !this.windows || this.jobEmpty)
+      (!admitted || !this.windows || this.windowsUnadmitted || this.jobEmpty)
     return {
       admitted,
       spawnFailedBeforeStart: this.spawnFailedBeforeStart,
       childClosed: this.childClosed,
       groupReleased: this.group.released,
-      windowsJobEmpty: this.windows ? (admitted ? this.jobEmpty : null) : null,
+      windowsJobEmpty: this.windows
+        ? admitted && !this.windowsUnadmitted
+          ? this.jobEmpty
+          : null
+        : null,
       controlClosed: !this.windows || this.controlClosed,
       helperReleased: !this.windows || this.helperReleased,
       released: physical && (!this.windows || (this.controlClosed && this.helperReleased)),
@@ -295,7 +421,11 @@ export class NativeProcessOwner {
         if (
           !this.group.released ||
           (this.child &&
-            (!this.childClosed || (this.windows && !this.spawnFailedBeforeStart && !this.jobEmpty)))
+            (!this.childClosed ||
+              (this.windows &&
+                !this.spawnFailedBeforeStart &&
+                !this.windowsUnadmitted &&
+                !this.jobEmpty)))
         )
           throw new Error('Owned native physical release remains unconfirmed')
         return this.release()
@@ -314,6 +444,17 @@ export class NativeProcessOwner {
       }
     }
     if (this.windows && this.child && !this.childClosed) this.child.stdin.end()
+    if (this.windows && this.child && !this.spawnFailedBeforeStart && !this.jobEmpty) {
+      // Keep the observed helper alive until it supplies its own release fact.
+      // Cancellation also permanently prevents a late hello from receiving go.
+      this.windows.cancel()
+      this.windowsUnadmitted = !Object.hasOwn(this.windows.diagnostic().stages, 'go')
+      if (!this.windowsUnadmitted)
+        await attempt(async () => {
+          await within(this.windows!.empty, 5000, 'Owned Windows Job release deadline')
+          this.jobEmpty = true
+        })
+    }
     await attempt(async () => {
       try {
         await this.group.close()
@@ -328,13 +469,6 @@ export class NativeProcessOwner {
     if (this.closed)
       await attempt(() => within(this.closed!, 1500, 'Owned helper child close deadline'))
     if (this.windows) {
-      if (this.child && !this.spawnFailedBeforeStart && !this.jobEmpty) {
-        this.windows.cancel()
-        await attempt(async () => {
-          await within(this.windows!.empty, 5000, 'Owned Windows Job release deadline')
-          this.jobEmpty = true
-        })
-      }
       if (!this.controlClosed)
         await attempt(async () => {
           await this.windows!.disposeControl()
@@ -345,7 +479,9 @@ export class NativeProcessOwner {
       if (
         !this.helperReleased &&
         this.group.released &&
-        (!this.child || (this.childClosed && (this.spawnFailedBeforeStart || this.jobEmpty))) &&
+        (!this.child ||
+          (this.childClosed &&
+            (this.spawnFailedBeforeStart || this.windowsUnadmitted || this.jobEmpty))) &&
         this.controlClosed
       ) {
         let stage: HelperDiagnostic['stage'] = 'canonicalize'
@@ -354,6 +490,7 @@ export class NativeProcessOwner {
           canonicalMatches = (await realpath(this.windows.directory)) === this.windows.directory
           stage = 'identity'
           if (!canonicalMatches) throw new Error('Unsafe Windows RPC cleanup target')
+          await this.windowsProcessScope?.assertReceiptsRetired()
           stage = 'remove'
           await rm(this.windows.directory, { recursive: true, force: true })
           this.helperReleased = true
@@ -570,6 +707,7 @@ export class NativeProcessSet {
 }
 
 export interface Boundary {
+  provider?: 'claude' | 'codex' | 'agy'
   nativeSessionId: string
   nativeTurnId: string
   nativeCutId: string
@@ -579,23 +717,29 @@ export interface Boundary {
   prefixHash: string
   prefixRecords: number
   prefixBytes: number
+  agyCut?: Record<string, unknown>
 }
 export interface Witness {
+  provider?: 'claude' | 'codex' | 'agy'
   version: string
   nativeSessionId: string
   sourceNativeSessionId: string
   sourceCutId: string
   sourcePrefixHash: string
   candidatePrefixHash: string
+  candidatePrefixRecords?: number
+  candidatePrefixBytes?: number
   idMap: Array<[string, string]>
   model: string | null
   effort: string | null
   permissionMode: string
+  nativeStorageRoot?: string
   nativePath?: string
   initializedAt?: string
   initializedPrefixHash?: string
   initializedPrefixBytes?: number
   initializedPrefixRecords?: number
+  agyCut?: Record<string, unknown>
 }
 export interface ForkResult {
   nativeSessionId: string
@@ -620,6 +764,7 @@ export interface NativeAdapter {
   run: AgentAdapter['run']
   steer: NonNullable<AgentAdapter['steer']>
   probeNativeInputs: NonNullable<AgentAdapter['probeNativeInputs']>
+  beginNativeInputsCheck: NonNullable<AgentAdapter['beginNativeInputsCheck']>
   setNativeTitle?(
     input: AgentNativeTitleInput,
     signal: AbortSignal,
@@ -662,7 +807,7 @@ export interface SdkQueryInput {
     [key: string]: unknown
   }
 }
-interface AdapterBundle {
+export interface AdapterBundle {
   ClaudeAgentAdapter: new (executable: string, dependencies: object) => NativeAdapter
   CodexAgentAdapter: new (
     executable: string,
@@ -676,28 +821,233 @@ interface AdapterBundle {
       | undefined,
     readOptions: { storageRoot: string },
   ) => NativeAdapter
+  AgyAgentAdapter: new (options: Record<string, unknown>) => NativeAdapter & {
+    inspectNativeRebuild(
+      input: AgentNativeContextRebuildInput,
+      source: AsyncIterable<NativeContextRebuildChunk>,
+      signal: AbortSignal,
+    ): Promise<AgentNativeContextRebuildResult | undefined>
+  }
+  AgyAcpConnection: new (
+    child: ChildProcessWithoutNullStreams,
+    canonicalCwd: string,
+    permissionScope: 'standard' | 'full',
+    onClosed?: () => void,
+    closeOwnedProcess?: (deadlineAt?: number) => Promise<void>,
+  ) => {
+    readonly executorId: string
+    readonly isOpen: boolean
+    request(
+      method: string,
+      params: object,
+      options: { timeoutMs: number | undefined; signal?: AbortSignal },
+    ): Promise<object>
+    openSessionStream(sessionId: string): {
+      readonly sessionId: string
+      shift(): object | undefined
+      next(timeoutMs?: number, signal?: AbortSignal): Promise<object>
+      close(): void
+    }
+    close(error?: Error): Promise<void>
+  }
+  AgyAcpConnectionPool: new (options: Record<string, unknown>) => {
+    acquire(input: {
+      cwd: string
+      permissionScope: 'standard' | 'full'
+      permissionMode?: string
+      readOnly?: boolean
+      sessionId?: string
+      signal?: AbortSignal
+    }): Promise<{
+      readonly connection: InstanceType<AdapterBundle['AgyAcpConnection']>
+      readonly canonicalCwd: string
+      ensureInitialized(signal: AbortSignal): Promise<object>
+      disposeIfIdle(): Promise<void>
+      release(): void
+    }>
+    dispose(flushDeadlineAt?: number): Promise<void>
+  }
+  NativeForkFiles: new () => {
+    dispose: () => Promise<void>
+    [key: string]: unknown
+  }
+  createAgyNativeStorageClient: (
+    forkFiles: object,
+    defaultAppDataDir?: string,
+  ) => {
+    writeRebuildSeed: (
+      input: {
+        appDataDir: string
+        cwd: string
+        candidateSessionId: string
+        sourceHash?: string
+        chunks: AsyncIterable<{ chunk: NativeContextRebuildChunk }>
+      },
+      signal: AbortSignal,
+    ) => Promise<{
+      seedHash: string
+      chunkCount: number
+      stepCount: number
+      verifiedPrefixBytes: number
+      verifiedPrefixSha256: string
+      pbSha256?: string
+      pbBytes?: number
+      initializationWitness?: Record<string, unknown>
+    }>
+    confirmRebuildColdLoad?: (
+      input: {
+        cwd: string
+        appDataDir: string
+        nativeSessionId: string
+        sourceHash: string
+        pbSha256: string
+        pbBytes: number
+        stepCount: 2
+      },
+      signal: AbortSignal,
+    ) => Promise<Record<string, unknown>>
+    inspectRebuildSeed: (
+      input: {
+        appDataDir: string
+        cwd: string
+        nativeSessionId: string
+        sourceHash?: string
+        chunks: AsyncIterable<NativeContextRebuildChunk>
+      },
+      signal: AbortSignal,
+    ) => Promise<{
+      verified: boolean
+      seedHash: string
+      stepCount: number
+      initializationWitness?: Record<string, unknown>
+    }>
+    [key: string]: unknown
+  }
+  agyNativeStorage: Record<string, unknown>
+  configureAgyStorageChildScriptForTesting: (scriptPath: string | undefined) => void
+  getNodeAgyStorageChildStatsForTesting: () => Readonly<{
+    live: number
+    started: number
+    lastPid: number | undefined
+  }>
+  getAgySqliteFileModuleIdentity: () => Readonly<{
+    version: 1
+    platform: string
+    architecture: string
+    sourceSha256: string
+  }>
+  getOpenAgySqliteViewCountForTesting: () => number
+  openAnchoredLockedSqliteView: (
+    rootDir: string,
+    parentSegments: readonly string[],
+    leafName: string,
+    options?: {
+      readonly acquireSharedLock?: boolean
+      readonly openWal?: boolean
+      readonly openShm?: boolean
+      readonly checkJournal?: boolean
+    },
+  ) => {
+    readonly byteLength: number
+    readonly walByteLength: number
+    readonly shmByteLength: number
+    readonly hasWal: boolean
+    readonly hasShm: boolean
+    readonly hasJournal: boolean
+    readonly sharedLockHeld: boolean
+    readAt(offset: number, length: number): Buffer
+    verifyUnchanged(): { readonly unchanged: boolean; readonly reason?: string }
+    close(): void
+  }
 }
 
-// Actual production modules and their real Worker are built together, so a renamed
-// Worker or unbundled dependency fails this gate as it would in the Electron build.
+async function ensureAgySqliteFileNativeBinary(extraTargetDirs: readonly string[]): Promise<void> {
+  const filename = `agy-sqlite-file-${process.platform}-${process.arch}.node`
+  const repoNativeDir = join(desktopRoot, 'out', 'native')
+  const repoBinary = join(repoNativeDir, filename)
+  const repoMeta = `${repoBinary}.json`
+  const hasVerifiedRepoBinary = async (): Promise<boolean> => {
+    try {
+      const [binStat, metaStat] = await Promise.all([lstat(repoBinary), lstat(repoMeta)])
+      return (
+        binStat.isFile() &&
+        !binStat.isSymbolicLink() &&
+        metaStat.isFile() &&
+        !metaStat.isSymbolicLink()
+      )
+    } catch {
+      return false
+    }
+  }
+  if (!(await hasVerifiedRepoBinary())) {
+    const buildScript = resolve(desktopRoot, '../../scripts/build-agy-sqlite-file.mjs')
+    await execFileAsync(process.execPath, [buildScript], {
+      cwd: resolve(desktopRoot, '../..'),
+      shell: false,
+      windowsHide: true,
+      timeout: 30_000,
+      maxBuffer: 256 * 1024,
+    })
+  }
+  for (const dir of extraTargetDirs) {
+    // oxlint-disable-next-line no-await-in-loop -- Stage regular non-symlink copies into bounded fixture native directories.
+    await mkdir(dir, { recursive: true, mode: 0o700 })
+    // oxlint-disable-next-line no-await-in-loop -- Copy verified native binary and metadata into fixture layout.
+    await Promise.all([
+      copyFile(repoBinary, join(dir, filename)),
+      copyFile(repoMeta, join(dir, `${filename}.json`)),
+    ])
+  }
+}
+
+// Actual production modules and their real Worker/storage-child entrypoints are built together,
+// so a renamed entrypoint or unbundled dependency fails this gate as it would in Electron.
 export async function buildAdapters(root: string): Promise<AdapterBundle> {
   const entry = join(root, 'native-adapters.ts')
   await writeFile(
     entry,
-    `export {ClaudeAgentAdapter} from ${JSON.stringify(join(desktopRoot, 'src/utility/conversation/claude-agent-adapter.ts'))}; export {CodexAgentAdapter} from ${JSON.stringify(join(desktopRoot, 'src/utility/conversation/codex-agent-adapter.ts'))};`,
+    [
+      `export {ClaudeAgentAdapter} from ${JSON.stringify(join(desktopRoot, 'src/utility/conversation/claude-agent-adapter.ts'))};`,
+      `export {CodexAgentAdapter} from ${JSON.stringify(join(desktopRoot, 'src/utility/conversation/codex-agent-adapter.ts'))};`,
+      `export {AgyAgentAdapter} from ${JSON.stringify(join(desktopRoot, 'src/utility/conversation/agy-agent-adapter.ts'))};`,
+      `export {AgyAcpConnection, AgyAcpConnectionPool} from ${JSON.stringify(join(desktopRoot, 'src/utility/conversation/agy-acp-connection.ts'))};`,
+      `export {NativeForkFiles} from ${JSON.stringify(join(desktopRoot, 'src/utility/conversation/native-fork-files.ts'))};`,
+      `export {createAgyNativeStorageClient} from ${JSON.stringify(join(desktopRoot, 'src/utility/conversation/agy/native-storage-client.ts'))};`,
+      `export * as agyNativeStorage from ${JSON.stringify(join(desktopRoot, 'src/utility/conversation/agy-native-storage.ts'))};`,
+      `export {configureAgyStorageChildScriptForTesting, getNodeAgyStorageChildStatsForTesting} from ${JSON.stringify(join(desktopRoot, 'src/utility/conversation/agy-storage-runner.ts'))};`,
+      `export {getAgySqliteFileModuleIdentity, getOpenAgySqliteViewCountForTesting, openAnchoredLockedSqliteView} from ${JSON.stringify(join(desktopRoot, 'src/utility/conversation/agy-sqlite-file.ts'))};`,
+    ].join(' '),
+  )
+  const externalModules = ['better-sqlite3', 'sharp', '@anthropic-ai/claude-agent-sdk'] as const
+  const externalPaths = Object.fromEntries(
+    await Promise.all(
+      externalModules.map(async (specifier) => [
+        specifier,
+        pathToFileURL(await realpath(desktopRequire.resolve(specifier))).href,
+      ]),
+    ),
   )
   const configFile = join(root, 'native.config.mjs')
+  const outDir = join(root, 'bundle')
   await writeFile(
     configFile,
-    `import {externalizeDepsPlugin} from ${JSON.stringify(pathToFileURL(desktopRequire.resolve('electron-vite')).href)}; export default {main:{plugins:[externalizeDepsPlugin({exclude:['@pact/contracts','@pact/agent-runtime']})],build:{outDir:${JSON.stringify(join(root, 'bundle'))},rollupOptions:{input:{'native-adapters':${JSON.stringify(entry)},'native-fork-worker':${JSON.stringify(join(desktopRoot, 'src/utility/conversation/native-fork-worker.ts'))},'native-json-parser-worker':${JSON.stringify(join(desktopRoot, 'src/utility/conversation/native-json-parser-worker.ts'))}}}}}};`,
+    `import {externalizeDepsPlugin} from ${JSON.stringify(pathToFileURL(desktopRequire.resolve('electron-vite')).href)}; export default {main:{plugins:[externalizeDepsPlugin({exclude:['@pact/contracts','@pact/contracts/images','@pact/contracts/diagnostics','@pact/agent-runtime']})],build:{outDir:${JSON.stringify(outDir)},rollupOptions:{external:${JSON.stringify(externalModules)},output:{paths:${JSON.stringify(externalPaths)}},input:{'native-adapters':${JSON.stringify(entry)},'native-fork-worker':${JSON.stringify(join(desktopRoot, 'src/utility/conversation/native-fork-worker.ts'))},'native-json-parser-worker':${JSON.stringify(join(desktopRoot, 'src/utility/conversation/native-json-parser-worker.ts'))},'agy-storage-child':${JSON.stringify(join(desktopRoot, 'src/utility/agy-storage-child.ts'))}}}}}};`,
   )
   // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- This is the installed, trusted build API rather than provider data.
   const { build } = desktopRequire('electron-vite') as {
     build: (options: object) => Promise<void>
   }
   await build({ root: desktopRoot, configFile, ignoreConfigWarning: true, logLevel: 'silent' })
+  await ensureAgySqliteFileNativeBinary([
+    join(root, 'native'),
+    join(root, 'out', 'native'),
+    join(outDir, 'native'),
+  ])
+  await writeFile(join(outDir, 'package.json'), '{"type":"module"}\n')
   // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- The entry above exports exactly these actual production classes.
-  return desktopRequire(join(root, 'bundle/native-adapters.js')) as AdapterBundle
+  const bundle = desktopRequire(join(outDir, 'native-adapters.js')) as AdapterBundle
+  bundle.configureAgyStorageChildScriptForTesting(join(outDir, 'agy-storage-child.js'))
+  return bundle
 }
 
 export function actualSdk(): {
@@ -740,32 +1090,45 @@ export async function recordSdkVersion(): Promise<void> {
 }
 
 export async function executable(
-  agent: 'codex' | 'claude',
+  agent: 'codex' | 'claude' | 'agy',
   owned: { root: string; cwd: string; home: string; processes: NativeProcessSet },
   setupDeadlineAt = performance.now() + 30_000,
 ): Promise<string> {
-  const requested =
-    process.env[`PACT_NATIVE_${agent.toUpperCase()}_EXECUTABLE`] ??
-    (process.platform === 'win32' ? `${agent}.cmd` : agent)
+  const explicitRequested = process.env[`PACT_NATIVE_${agent.toUpperCase()}_EXECUTABLE`]
+  const candidates = explicitRequested
+    ? [explicitRequested]
+    : process.platform === 'win32'
+      ? agent === 'agy'
+        ? ['agy.cmd', 'agy.exe', 'agy']
+        : [`${agent}.cmd`]
+      : [agent]
+  const requested = candidates[0]!
   let path: string | undefined
-  if (isAbsolute(requested) || requested.includes('/') || requested.includes('\\')) {
+  if (
+    explicitRequested &&
+    (isAbsolute(explicitRequested) ||
+      explicitRequested.includes('/') ||
+      explicitRequested.includes('\\'))
+  ) {
     try {
-      path = await realpath(requested)
+      path = await realpath(explicitRequested)
     } catch {
-      throw new Error(`Required real ${agent} CLI is unavailable: ${requested}`)
+      throw new Error(`Required real ${agent} CLI is unavailable: ${explicitRequested}`)
     }
   } else {
     const directories = (process.env.PATH ?? '').split(delimiter)
     if (directories.length > 128) throw new Error('Native executable PATH exceeds 128 entries')
     // oxlint-disable no-await-in-loop -- Executable selection follows the real ordered PATH.
-    for (const directory of directories) {
-      try {
-        const candidate = join(directory, requested)
-        await access(candidate)
-        path = await realpath(candidate)
-        break
-      } catch {
-        /* Continue to the next actual PATH entry, never install a CLI. */
+    outer: for (const directory of directories) {
+      for (const candidateName of candidates) {
+        try {
+          const candidate = join(directory, candidateName)
+          await access(candidate)
+          path = await realpath(candidate)
+          break outer
+        } catch {
+          /* Continue to the next actual PATH entry, never install a CLI. */
+        }
       }
     }
     // oxlint-enable no-await-in-loop
@@ -778,7 +1141,10 @@ export async function executable(
   try {
     handle = owned.processes.spawnOwned(path, ['--version'], {
       cwd: owned.cwd,
-      env: isolatedEnv(owned.root, owned.home),
+      env:
+        agent === 'agy'
+          ? isolatedAgyAllowlistEnv(owned.root, process.env)
+          : isolatedEnv(owned.root, owned.home),
       shell: false,
     })
     const child = handle.child
@@ -814,6 +1180,17 @@ export async function executable(
     )
   } finally {
     await handle?.close()
+  }
+  if (agent === 'agy') {
+    const parsed = parseSupportedAgySemver(version)
+    if (parsed.status === 'unknown') {
+      throw new Error(`Unexpected agy CLI identity: ${version}`)
+    }
+    if (parsed.status === 'outdated') {
+      throw new Error(`Unsupported agy CLI version (< 1.5.9): ${parsed.version}`)
+    }
+    console.info(`[native gate] Antigravity CLI: ${parsed.version}`)
+    return path
   }
   console.info(`[native gate] ${agent}: ${path}; ${version}`)
   if (!version.match(agent === 'codex' ? /^codex-cli \d+\./u : /^\d+\.\d+\.\d+ \(Claude Code\)/u))
@@ -858,6 +1235,7 @@ export function isolatedEnv(root: string, home: string): NodeJS.ProcessEnv {
     TMPDIR: tmpdir(),
     CODEX_HOME: home,
     CLAUDE_CONFIG_DIR: home,
+    ANTIGRAVITY_GEMINI_DIR: join(root, '.gemini'),
     TERM: 'dumb',
     SystemRoot: process.env.SystemRoot,
     WINDIR: process.env.WINDIR,
@@ -1884,9 +2262,11 @@ export class LoopbackProvider {
     this.url = `http://127.0.0.1:${address.port}`
   }
   async configureCodex(home: string): Promise<void> {
+    // Protocol fixtures use only the loopback Provider, without optional plugin downloads.
+    // Native marketplace sync can otherwise outlive its root through network/Git children.
     await writeFile(
       join(home, 'config.toml'),
-      `model = "gpt-5.4"\nmodel_provider = "pact_native_loopback"\nmodel_reasoning_effort = "high"\n[model_providers.pact_native_loopback]\nname = "Pact Native Loopback"\nbase_url = "${this.url}/v1"\nwire_api = "responses"\nrequires_openai_auth = false\nenv_key = "PACT_NATIVE_TOKEN"\nrequest_max_retries = 0\nstream_max_retries = 0\nstream_idle_timeout_ms = 10000\n`,
+      `model = "gpt-5.4"\nmodel_provider = "pact_native_loopback"\nmodel_reasoning_effort = "high"\n[features]\nplugins = false\n[model_providers.pact_native_loopback]\nname = "Pact Native Loopback"\nbase_url = "${this.url}/v1"\nwire_api = "responses"\nrequires_openai_auth = false\nenv_key = "PACT_NATIVE_TOKEN"\nrequest_max_retries = 0\nstream_max_retries = 0\nstream_idle_timeout_ms = 10000\n`,
     )
   }
   async close(): Promise<void> {
@@ -2007,4 +2387,595 @@ export async function boundedNativeText(path: string, ownedStorageRoot: string):
   const text = await readFile(canonicalPath, 'utf8')
   if (Buffer.byteLength(text) > 8 * 1024 * 1024) throw new Error('Native fixture exceeds 8 MiB')
   return text
+}
+
+const MAX_AGY_AUTH_FILE_BYTES = 256 * 1024
+const MAX_AGY_AUTH_TOTAL_BYTES = 768 * 1024
+const AGY_HASH_CHUNK_BYTES = 64 * 1024
+const MAX_AGY_AUTH_ENTRIES = 16
+const MACOS_AGY_APP_SUPPORT_AUTH_FILES = new Set(['credential-user-scope', 'app_storage.json'])
+const AGY_ALLOWED_SYSTEM_ENV_KEYS = [
+  'PATH',
+  'Path',
+  'SystemRoot',
+  'SYSTEMROOT',
+  'WINDIR',
+  'SystemDrive',
+  'COMSPEC',
+  'ComSpec',
+  'PATHEXT',
+  'LANG',
+  'LC_ALL',
+  'LC_CTYPE',
+] as const
+
+export interface CopiedAgyAuthManifest {
+  assertSourceIntegrity(): Promise<void>
+  redact(text: string): string
+}
+
+export interface VerifyAgyMinimumVersionOptions {
+  platform?: NodeJS.Platform
+  cwd?: string
+  isolatedRoot?: string
+  minimumVersion?: string
+}
+
+/**
+ * Constructs an Antigravity child environment strictly from an explicit system allowlist and
+ * fixture-owned directories — never inheriting arbitrary host `process.env` variables.
+ */
+export function isolatedAgyAllowlistEnv(
+  root: string,
+  sourceEnv: NodeJS.ProcessEnv = process.env,
+): Record<string, string> {
+  const env: Record<string, string> = {}
+  for (const key of AGY_ALLOWED_SYSTEM_ENV_KEYS) {
+    const value = sourceEnv[key]
+    if (typeof value === 'string' && !value.includes('\0')) {
+      env[key] = value
+    }
+  }
+  Object.assign(env, {
+    HOME: root,
+    USERPROFILE: root,
+    APPDATA: join(root, 'AppData', 'Roaming'),
+    LOCALAPPDATA: join(root, 'AppData', 'Local'),
+    XDG_CONFIG_HOME: join(root, '.config'),
+    XDG_CACHE_HOME: join(root, '.cache'),
+    XDG_DATA_HOME: join(root, '.local', 'share'),
+    XDG_STATE_HOME: join(root, '.local', 'state'),
+    ANTIGRAVITY_GEMINI_DIR: join(root, '.gemini'),
+    TMPDIR: root,
+    TEMP: root,
+    TMP: root,
+    TERM: 'dumb',
+    NO_PROXY: '127.0.0.1,localhost',
+    no_proxy: '127.0.0.1,localhost',
+    DISABLE_TELEMETRY: '1',
+    DISABLE_ERROR_REPORTING: '1',
+  })
+  if (process.platform === 'win32' && /^[A-Za-z]:/u.test(root)) {
+    env['HOMEDRIVE'] = root.slice(0, 2)
+    env['HOMEPATH'] = root.slice(2)
+  }
+  return env
+}
+
+export function redactRealAgyText(text: string, secrets?: ReadonlySet<string>): string {
+  let sanitized = text
+  if (secrets) {
+    const ordered = [...secrets]
+      .filter((value) => value.length >= 4)
+      .toSorted((left, right) => right.length - left.length)
+    for (const secret of ordered) {
+      sanitized = sanitized.replaceAll(secret, '[REDACTED]')
+      const encoded = JSON.stringify(secret).slice(1, -1)
+      if (encoded !== secret) sanitized = sanitized.replaceAll(encoded, '[REDACTED]')
+    }
+  }
+  return sanitized
+    .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/-]+=*/giu, '$1 [REDACTED]')
+    .replace(
+      /(\b(?:authorization|proxy-authorization|x-api-key|api-key|access_token|refresh_token|id_token|cookie|set-cookie)["']?\s*[:=]\s*["']?)[^\s,"'\r\n}]+/giu,
+      '$1[REDACTED]',
+    )
+}
+
+export function parseSupportedAgySemver(
+  output: string,
+  minimumVersion = '1.5.9',
+):
+  | { status: 'supported'; version: string }
+  | { status: 'outdated'; version: string }
+  | { status: 'unknown' } {
+  const firstLine = output.split(/\r?\n/u).find(Boolean)?.trim().slice(0, 160)
+  const match = firstLine?.match(
+    /(?:^|\s)(\d{1,5})\.(\d{1,5})\.(\d{1,5})(-[\da-z]+(?:[.-][\da-z]+)*)?(?:\+[\da-z]+(?:[.-][\da-z]+)*)?(?=$|\s|\()/iu,
+  )
+  if (!match) return { status: 'unknown' }
+  const versionToken = match[0].trim()
+  const minimum = minimumVersion.split('.').map(Number)
+  for (let index = 0; index < 3; index += 1) {
+    const difference = Number(match[index + 1]) - minimum[index]!
+    if (difference !== 0) {
+      return difference > 0
+        ? { status: 'supported', version: versionToken }
+        : { status: 'outdated', version: versionToken }
+    }
+  }
+  return match[4]
+    ? { status: 'outdated', version: versionToken }
+    : { status: 'supported', version: versionToken }
+}
+
+export function isUnsafeWindowsCmdPath(value: string): boolean {
+  return /[&|<>^%!"\r\n\0]/u.test(value)
+}
+
+export function requireExplicitAgyAuthDir(env: NodeJS.ProcessEnv = process.env): string {
+  const sourceDirRaw = env.PACT_E2E_AGY_AUTH_DIR?.trim()
+  if (!sourceDirRaw) {
+    throw new Error(
+      'Real Antigravity smoke test requires explicit PACT_E2E_AGY_AUTH_DIR (never falls back to host HOME).',
+    )
+  }
+  if (!isAbsolute(sourceDirRaw) || /[\r\n\0]/u.test(sourceDirRaw)) {
+    throw new Error('PACT_E2E_AGY_AUTH_DIR must be an absolute path.')
+  }
+  return sourceDirRaw
+}
+
+export async function verifyAgyMinimumVersion(
+  executablePath: string,
+  env: NodeJS.ProcessEnv,
+  platformOrOptions: NodeJS.Platform | VerifyAgyMinimumVersionOptions = process.platform,
+): Promise<string> {
+  const options: VerifyAgyMinimumVersionOptions =
+    typeof platformOrOptions === 'string' ? { platform: platformOrOptions } : platformOrOptions
+  const platform = options.platform ?? process.platform
+  const isCmd = platform === 'win32' && /\.cmd$/iu.test(executablePath)
+  if (isCmd && isUnsafeWindowsCmdPath(executablePath)) {
+    throw new Error('Unsafe Windows native probe arguments')
+  }
+  const temporaryRoot =
+    options.isolatedRoot === undefined
+      ? await mkdtemp(join(tmpdir(), 'pact-agy-version-probe-'))
+      : undefined
+  try {
+    const isolatedRoot = options.isolatedRoot ?? temporaryRoot!
+    const probeCwd = options.cwd ?? isolatedRoot
+    const allowlistEnv = isolatedAgyAllowlistEnv(isolatedRoot, env)
+    const target = isCmd
+      ? (allowlistEnv['COMSPEC'] ?? allowlistEnv['ComSpec'] ?? 'cmd.exe')
+      : executablePath
+    const args = isCmd ? ['/d', '/s', '/c', `""${executablePath}" --version"`] : ['--version']
+    const stdout = await new Promise<string>((resolveStdout, reject) => {
+      execFile(
+        target,
+        args,
+        {
+          cwd: probeCwd,
+          env: allowlistEnv,
+          encoding: 'utf8',
+          timeout: 5_000,
+          maxBuffer: 16 * 1024,
+          shell: false,
+          windowsHide: true,
+          windowsVerbatimArguments: isCmd,
+        },
+        (error, out) => {
+          if (error) {
+            reject(new Error('Real agy --version probe failed.'))
+            return
+          }
+          resolveStdout(out)
+        },
+      )
+    })
+    const requiredMinimum = options.minimumVersion ?? '1.5.9'
+    const parsed = parseSupportedAgySemver(stdout, requiredMinimum)
+    if (parsed.status === 'unknown') {
+      throw new Error('Real agy --version did not report a semantic version.')
+    }
+    if (parsed.status === 'outdated') {
+      throw new Error(
+        `Real agy version ${parsed.version} is older than required ${requiredMinimum}.`,
+      )
+    }
+    return parsed.version
+  } finally {
+    if (temporaryRoot) {
+      await rm(temporaryRoot, { recursive: true, force: true })
+    }
+  }
+}
+
+function isWithinAgyDir(root: string, target: string): boolean {
+  const normalizedRoot = process.platform === 'win32' ? root.toLowerCase() : root
+  const normalizedTarget = process.platform === 'win32' ? target.toLowerCase() : target
+  const rel = relative(normalizedRoot, normalizedTarget)
+  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel))
+}
+
+async function nonIntrusivePathVariants(rawPath: string): Promise<string[]> {
+  const resolved = resolve(rawPath)
+  const variants = new Set<string>([resolved])
+  const parent = dirname(resolved)
+  const leaf = basename(resolved)
+  if (parent && parent !== resolved && leaf) {
+    try {
+      const canonicalParent = await realpath(parent)
+      variants.add(join(canonicalParent, leaf))
+    } catch {
+      /* Parent may not exist; lexical variant still guards comparisons. */
+    }
+  }
+  return [...variants]
+}
+
+async function collectForbiddenHostAgyDirs(env: NodeJS.ProcessEnv): Promise<string[]> {
+  const forbidden = new Set<string>()
+  const homeCandidates = [env.HOME, env.USERPROFILE, homedir()].filter(
+    (value): value is string =>
+      typeof value === 'string' && value.trim().length > 0 && isAbsolute(value.trim()),
+  )
+  for (const rawHome of homeCandidates) {
+    // oxlint-disable-next-line no-await-in-loop -- Canonicalize parent only, never statting inside a 0o000 sentinel HOME.
+    const homeVariants = await nonIntrusivePathVariants(rawHome.trim())
+    for (const baseHome of homeVariants) {
+      forbidden.add(join(baseHome, '.gemini'))
+      forbidden.add(join(baseHome, 'Library', 'Application Support', 'antigravity'))
+      forbidden.add(join(baseHome, 'Library', 'Keychains'))
+      forbidden.add(join(baseHome, 'AppData', 'Roaming', 'antigravity'))
+      forbidden.add(join(baseHome, 'AppData', 'Local', 'antigravity'))
+      forbidden.add(join(baseHome, '.config', 'antigravity'))
+    }
+  }
+  for (const rawAppData of [env.APPDATA, env.LOCALAPPDATA, env.XDG_CONFIG_HOME]) {
+    if (typeof rawAppData !== 'string' || !isAbsolute(rawAppData.trim())) continue
+    // oxlint-disable-next-line no-await-in-loop -- Canonicalize parent without traversing private subdirectories.
+    for (const baseDir of await nonIntrusivePathVariants(rawAppData.trim())) {
+      forbidden.add(join(baseDir, 'antigravity'))
+    }
+  }
+  if (
+    typeof env.ANTIGRAVITY_GEMINI_DIR === 'string' &&
+    isAbsolute(env.ANTIGRAVITY_GEMINI_DIR.trim())
+  ) {
+    for (const baseGemini of await nonIntrusivePathVariants(env.ANTIGRAVITY_GEMINI_DIR.trim())) {
+      forbidden.add(baseGemini)
+    }
+  }
+  return [...forbidden]
+}
+
+function assertDisjointFromHostAgyDirs(
+  candidateDir: string,
+  forbiddenDirs: readonly string[],
+): void {
+  for (const forbidden of forbiddenDirs) {
+    if (isWithinAgyDir(forbidden, candidateDir) || isWithinAgyDir(candidateDir, forbidden)) {
+      throw new Error(
+        'PACT_E2E_AGY_AUTH_DIR must be a dedicated private directory outside host Antigravity and keychain locations.',
+      )
+    }
+  }
+}
+
+function collectJsonStringSecrets(value: unknown, target: Set<string>, depth = 0): void {
+  if (depth > 16) return
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    if (trimmed.length >= 8 && trimmed.length <= 4096) target.add(trimmed)
+    return
+  }
+  if (Array.isArray(value)) {
+    for (const item of value.slice(0, 64)) collectJsonStringSecrets(item, target, depth + 1)
+    return
+  }
+  if (value && typeof value === 'object') {
+    for (const [key, entry] of Object.entries(value).slice(0, 64)) {
+      if (/token|secret|key|credential|cookie|auth|email|session/iu.test(key)) {
+        collectJsonStringSecrets(entry, target, depth + 1)
+      } else if (entry && typeof entry === 'object') {
+        collectJsonStringSecrets(entry, target, depth + 1)
+      }
+    }
+  }
+}
+
+function assertOwnedAgySourceFileMode(mode: number, uid: number): void {
+  if (process.platform === 'win32') return
+  if (process.getuid && uid !== process.getuid()) {
+    throw new Error('Real Antigravity auth source file must be owned by the current user.')
+  }
+  if ((mode & 0o022) !== 0) {
+    throw new Error('Real Antigravity auth source file must not be group- or world-writable.')
+  }
+}
+
+function assertPrivateOwnedAgyDirectoryInfo(info: Stats): void {
+  if (
+    !info.isDirectory() ||
+    info.isSymbolicLink() ||
+    (process.platform !== 'win32' &&
+      ((info.mode & 0o077) !== 0 || (process.getuid && info.uid !== process.getuid())))
+  ) {
+    throw new Error('PACT_E2E_AGY_AUTH_DIR must be a private 0o700 owned directory.')
+  }
+}
+
+async function hasRegularAgyFile(filePath: string): Promise<boolean> {
+  try {
+    const info = await lstat(filePath)
+    return info.isFile() && !info.isSymbolicLink()
+  } catch (error) {
+    if (error && typeof error === 'object' && Reflect.get(error, 'code') === 'ENOENT') {
+      return false
+    }
+    throw error
+  }
+}
+
+async function hashBoundedOwnedAgyFile(filePath: string, maxBytes: number): Promise<string> {
+  const info = await lstat(filePath)
+  if (!info.isFile() || info.isSymbolicLink() || info.size > maxBytes) {
+    throw new Error('Real Antigravity auth source must be a regular bounded file.')
+  }
+  assertOwnedAgySourceFileMode(info.mode, info.uid)
+  const fd = await open(
+    filePath,
+    constants.O_RDONLY | (process.platform === 'win32' ? 0 : constants.O_NOFOLLOW),
+  )
+  const chunk = Buffer.alloc(Math.min(AGY_HASH_CHUNK_BYTES, Math.max(1, info.size)))
+  try {
+    const opened = await fd.stat()
+    if (opened.dev !== info.dev || opened.ino !== info.ino || opened.size !== info.size) {
+      throw new Error('Real Antigravity auth source file changed while opening.')
+    }
+    const hasher = createHash('sha256')
+    let offset = 0
+    while (offset < info.size) {
+      const toRead = Math.min(chunk.length, info.size - offset)
+      // oxlint-disable-next-line no-await-in-loop -- Bounded positional hash read to EOF.
+      const { bytesRead } = await fd.read(chunk, 0, toRead, offset)
+      if (bytesRead === 0) break
+      hasher.update(chunk.subarray(0, bytesRead))
+      offset += bytesRead
+    }
+    if (offset !== info.size) {
+      throw new Error('Real Antigravity auth source file read was incomplete.')
+    }
+    return hasher.digest('hex')
+  } finally {
+    chunk.fill(0)
+    await fd.close()
+  }
+}
+
+async function copyBoundedOwnedAgyFile(
+  sourcePath: string,
+  destinationPath: string,
+  maxBytes: number,
+  secrets: Set<string>,
+): Promise<{ byteLength: number; sha256: string }> {
+  const info = await lstat(sourcePath)
+  if (!info.isFile() || info.isSymbolicLink() || info.size > maxBytes) {
+    throw new Error('Real Antigravity auth source must be a regular bounded file.')
+  }
+  assertOwnedAgySourceFileMode(info.mode, info.uid)
+  const fd = await open(
+    sourcePath,
+    constants.O_RDONLY | (process.platform === 'win32' ? 0 : constants.O_NOFOLLOW),
+  )
+  const buf = Buffer.alloc(info.size)
+  try {
+    const opened = await fd.stat()
+    if (opened.dev !== info.dev || opened.ino !== info.ino || opened.size !== info.size) {
+      throw new Error('Real Antigravity auth source file changed while opening.')
+    }
+    let offset = 0
+    while (offset < buf.length) {
+      // oxlint-disable-next-line no-await-in-loop -- Bounded positional read to EOF.
+      const { bytesRead } = await fd.read(buf, offset, buf.length - offset, offset)
+      if (bytesRead === 0) break
+      offset += bytesRead
+    }
+    if (offset !== info.size) {
+      throw new Error('Real Antigravity auth source file read was incomplete.')
+    }
+    try {
+      const text = buf.toString('utf8').trim()
+      if (text.startsWith('{') || text.startsWith('[')) {
+        collectJsonStringSecrets(JSON.parse(text), secrets)
+      } else if (text.length >= 8 && text.length <= 4096) {
+        secrets.add(text)
+      }
+    } catch {
+      /* Binary or non-JSON auth files still scrub via generic token/header redaction. */
+    }
+    const sha256 = hash(buf)
+    await writeFile(destinationPath, buf, { mode: 0o600, flag: 'wx' })
+    await chmod(destinationPath, 0o600)
+    return { byteLength: info.size, sha256 }
+  } finally {
+    buf.fill(0)
+    await fd.close()
+  }
+}
+
+async function ensurePrivateAgyDirChain(
+  root: string,
+  segments: readonly string[],
+): Promise<string> {
+  let current = root
+  for (const segment of segments) {
+    current = join(current, segment)
+    // oxlint-disable-next-line no-await-in-loop -- Create and chmod each parent directory sequentially.
+    await mkdir(current, { recursive: true, mode: 0o700 })
+    // oxlint-disable-next-line no-await-in-loop -- Enforce private 0o700 mode on each directory.
+    await chmod(current, 0o700)
+  }
+  return current
+}
+
+export async function copyIsolatedAgyAuthConfig(
+  isolatedHome: string,
+  env: NodeJS.ProcessEnv,
+): Promise<CopiedAgyAuthManifest> {
+  const sourceDirRaw = requireExplicitAgyAuthDir(env)
+  const forbiddenHostDirs = await collectForbiddenHostAgyDirs(env)
+  assertDisjointFromHostAgyDirs(resolve(sourceDirRaw), forbiddenHostDirs)
+
+  // Inspect raw path via lstat BEFORE realpath so symlinked auth directories fail immediately
+  // without traversing into host credential trees.
+  const rawSourceInfo = await lstat(sourceDirRaw)
+  if (rawSourceInfo.isSymbolicLink()) {
+    throw new Error('PACT_E2E_AGY_AUTH_DIR must not be a symbolic link.')
+  }
+  assertPrivateOwnedAgyDirectoryInfo(rawSourceInfo)
+
+  const [sourceDir, canonicalIsolatedHome] = await Promise.all([
+    realpath(sourceDirRaw),
+    realpath(isolatedHome),
+  ])
+  assertDisjointFromHostAgyDirs(sourceDir, forbiddenHostDirs)
+  if (
+    sourceDir === canonicalIsolatedHome ||
+    isWithinAgyDir(canonicalIsolatedHome, sourceDir) ||
+    isWithinAgyDir(sourceDir, canonicalIsolatedHome)
+  ) {
+    throw new Error('PACT_E2E_AGY_AUTH_DIR must be disjoint from the isolated HOME directory.')
+  }
+  assertPrivateOwnedAgyDirectoryInfo(await lstat(sourceDir))
+
+  const names = (await readdir(sourceDir)).toSorted()
+  if (names.length > MAX_AGY_AUTH_ENTRIES) {
+    throw new Error('PACT_E2E_AGY_AUTH_DIR exceeds bounded entry count.')
+  }
+
+  const isolatedAgyRoot = await ensurePrivateAgyDirChain(isolatedHome, [
+    '.gemini',
+    'antigravity-cli',
+  ])
+  await ensurePrivateAgyDirChain(isolatedAgyRoot, ['conversations'])
+  await ensurePrivateAgyDirChain(isolatedAgyRoot, ['brain'])
+
+  const isolatedMacAppSupportDir =
+    process.platform === 'darwin'
+      ? await ensurePrivateAgyDirChain(isolatedHome, [
+          'Library',
+          'Application Support',
+          'antigravity',
+        ])
+      : undefined
+  if (process.platform === 'darwin') {
+    await ensurePrivateAgyDirChain(isolatedHome, ['Library', 'Keychains'])
+  }
+
+  const secrets = new Set<string>([sourceDirRaw, sourceDir])
+  const recorded: Array<{ sourcePath: string; sha256: string; maxBytes: number }> = []
+  let totalBytes = 0
+  const stagedMacFiles = new Set<string>()
+
+  for (const name of names) {
+    if (
+      name === 'conversations' ||
+      name === 'brain' ||
+      name === 'app-support' ||
+      name.endsWith('.db') ||
+      name.endsWith('.db-wal') ||
+      name.endsWith('.db-shm')
+    ) {
+      continue
+    }
+    const sourcePath = join(sourceDir, name)
+    // oxlint-disable-next-line no-await-in-loop -- Bounded private auth files copied sequentially before launch.
+    if (!(await hasRegularAgyFile(sourcePath))) continue
+    // oxlint-disable-next-line no-await-in-loop -- Verify canonical containment within explicit auth dir.
+    const canonicalSource = await realpath(sourcePath)
+    if (!isWithinAgyDir(sourceDir, canonicalSource)) {
+      throw new Error('Antigravity auth source resolved outside PACT_E2E_AGY_AUTH_DIR.')
+    }
+    const destination =
+      isolatedMacAppSupportDir && MACOS_AGY_APP_SUPPORT_AUTH_FILES.has(name)
+        ? join(isolatedMacAppSupportDir, name)
+        : join(isolatedAgyRoot, name)
+    if (isolatedMacAppSupportDir && MACOS_AGY_APP_SUPPORT_AUTH_FILES.has(name)) {
+      stagedMacFiles.add(name)
+    }
+    // oxlint-disable-next-line no-await-in-loop -- Copy bounded owned auth file with zeroed buffer.
+    const copied = await copyBoundedOwnedAgyFile(
+      canonicalSource,
+      destination,
+      MAX_AGY_AUTH_FILE_BYTES,
+      secrets,
+    )
+    totalBytes += copied.byteLength
+    if (totalBytes > MAX_AGY_AUTH_TOTAL_BYTES) {
+      throw new Error('Antigravity isolated auth configuration exceeds 768 KiB limit.')
+    }
+    recorded.push({
+      sourcePath: canonicalSource,
+      sha256: copied.sha256,
+      maxBytes: MAX_AGY_AUTH_FILE_BYTES,
+    })
+  }
+
+  if (isolatedMacAppSupportDir && names.includes('app-support')) {
+    const appSupportSubdir = join(sourceDir, 'app-support')
+    assertPrivateOwnedAgyDirectoryInfo(await lstat(appSupportSubdir))
+    const canonicalSubdir = await realpath(appSupportSubdir)
+    if (!isWithinAgyDir(sourceDir, canonicalSubdir)) {
+      throw new Error('macOS app-support subdirectory resolved outside PACT_E2E_AGY_AUTH_DIR.')
+    }
+    const subNames = (await readdir(canonicalSubdir)).toSorted()
+    if (subNames.length > MAX_AGY_AUTH_ENTRIES) {
+      throw new Error('PACT_E2E_AGY_AUTH_DIR/app-support exceeds bounded entry count.')
+    }
+    for (const name of subNames) {
+      if (!MACOS_AGY_APP_SUPPORT_AUTH_FILES.has(name) || stagedMacFiles.has(name)) continue
+      const sourcePath = join(canonicalSubdir, name)
+      // oxlint-disable-next-line no-await-in-loop -- Check optional dedicated macOS auth files sequentially.
+      if (!(await hasRegularAgyFile(sourcePath))) continue
+      // oxlint-disable-next-line no-await-in-loop -- Verify canonical containment within explicit auth dir.
+      const canonicalSource = await realpath(sourcePath)
+      if (!isWithinAgyDir(sourceDir, canonicalSource)) {
+        throw new Error('macOS Antigravity auth source resolved outside PACT_E2E_AGY_AUTH_DIR.')
+      }
+      const destination = join(isolatedMacAppSupportDir, name)
+      // oxlint-disable-next-line no-await-in-loop -- Copy bounded owned auth file with zeroed buffer.
+      const copied = await copyBoundedOwnedAgyFile(
+        canonicalSource,
+        destination,
+        MAX_AGY_AUTH_FILE_BYTES,
+        secrets,
+      )
+      totalBytes += copied.byteLength
+      if (totalBytes > MAX_AGY_AUTH_TOTAL_BYTES) {
+        throw new Error('Antigravity isolated auth configuration exceeds 768 KiB limit.')
+      }
+      recorded.push({
+        sourcePath: canonicalSource,
+        sha256: copied.sha256,
+        maxBytes: MAX_AGY_AUTH_FILE_BYTES,
+      })
+    }
+  }
+
+  return {
+    async assertSourceIntegrity() {
+      for (const item of recorded) {
+        // oxlint-disable-next-line no-await-in-loop -- Verify each source auth file remained unmutated.
+        const currentSha256 = await hashBoundedOwnedAgyFile(item.sourcePath, item.maxBytes)
+        if (currentSha256 !== item.sha256) {
+          throw new Error('Source Antigravity auth configuration changed during the smoke test.')
+        }
+      }
+    },
+    redact(text: string) {
+      return redactRealAgyText(text, secrets)
+    },
+  }
 }

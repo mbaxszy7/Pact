@@ -85,6 +85,9 @@ function nativeProcess(
       queueMicrotask(() => {
         Object.assign(child, { exitCode: 0 })
         child.emit('exit', 0, null)
+        stdout.end()
+        stderr.end()
+        child.emit('close', 0, null)
       })
       return true
     },
@@ -153,28 +156,30 @@ describe('Codex bounded native protocol', () => {
           },
         },
       ]
-      const requestPermission = vi.fn<NonNullable<AgentRunInput['requestPermission']>>(
-        async (request) => {
-          expect(request.actions?.map((action) => action.label)).not.toContain(
-            'Review and allow command rule…',
-          )
-          expect(request.actions?.map((action) => action.label)).not.toContain(
-            'Review and allow host rule…',
-          )
-          expect(request.actions?.map((action) => action.label)).not.toContain(
-            'Review and block host rule…',
-          )
-          expect(request.actions?.map((action) => action.scope).join(' ')).not.toContain(
-            'Persistence:',
-          )
-          if (kind === 'forged') return 'native-7'
-          const selectedAction = request.actions?.find((action) =>
-            kind === 'session' ? action.kind === 'rule' : action.kind === 'allow',
-          )
-          if (!selectedAction) throw new Error('Required scoped action missing')
-          return selectedAction.id
-        },
-      )
+      const requestPermission = vi.fn<
+        NonNullable<
+          NonNullable<NonNullable<AgentRunInput['host']>['interactions']>['requestPermission']
+        >
+      >(async (request) => {
+        expect(request.actions?.map((action) => action.label)).not.toContain(
+          'Review and allow command rule…',
+        )
+        expect(request.actions?.map((action) => action.label)).not.toContain(
+          'Review and allow host rule…',
+        )
+        expect(request.actions?.map((action) => action.label)).not.toContain(
+          'Review and block host rule…',
+        )
+        expect(request.actions?.map((action) => action.scope).join(' ')).not.toContain(
+          'Persistence:',
+        )
+        if (kind === 'forged') return 'native-7'
+        const selectedAction = request.actions?.find((action) =>
+          kind === 'session' ? action.kind === 'rule' : action.kind === 'allow',
+        )
+        if (!selectedAction) throw new Error('Required scoped action missing')
+        return selectedAction.id
+      })
       const child = nativeProcess((request, send) => {
         const { id, method } = request
         if (method === 'initialize') send({ id, result: {} })
@@ -190,6 +195,7 @@ describe('Codex bounded native protocol', () => {
             id,
             result: {
               thread: { id: 'thread-1' },
+              model: 'gpt-test',
               approvalPolicy: 'on-request',
               approvalsReviewer: 'user',
               sandbox: { type: 'dangerFullAccess' },
@@ -241,12 +247,16 @@ describe('Codex bounded native protocol', () => {
             effort: null,
             permissionMode: 'native',
             peerAssistanceAllowed: false,
-            requestPermission,
             promptEnvelope: {
               version: 'pact-agent-prompt-v1',
               sessionId: 'session-1',
               message: { id: 'message-1', content: 'Synthetic scoped approval' },
               comments: [],
+            },
+            host: {
+              interactions: {
+                requestPermission,
+              },
             },
           },
           new AbortController().signal,
@@ -362,7 +372,7 @@ describe('Codex bounded native protocol', () => {
       })
       const adapter = new CodexAgentAdapter('/fake/codex', forkingFactory(child), home)
       try {
-        const result = await adapter.probeNativeStatus(
+        const checking = adapter.beginNativeStatusCheck(
           {
             target: 'initialized_binding',
             sessionId: 'session-1',
@@ -382,6 +392,8 @@ describe('Codex bounded native protocol', () => {
           },
           new AbortController().signal,
         )
+        const result = await checking.result
+        await checking.physicalCompletion
         expect(result.kind).toBe(
           ['idle', 'notLoaded'].includes(scenario)
             ? 'binding_ready'
@@ -442,9 +454,13 @@ describe('Codex bounded native protocol', () => {
               message: { id: 'message-1', content: 'Hello' },
               comments: [],
             },
-            recordExecutor: () => order.push('executor'),
-            recordDispatch: (phase) => phases.push(phase),
-            recordNativeEvidence: (fact) => evidence.push(fact.kind),
+            host: {
+              lifecycle: {
+                recordExecutor: () => order.push('executor'),
+                recordDispatch: (phase) => phases.push(phase),
+                recordNativeEvidence: (fact) => evidence.push(fact.kind),
+              },
+            },
           },
           new AbortController().signal,
         ))
@@ -527,11 +543,13 @@ describe('Codex bounded native protocol', () => {
             initializationWitness: { kind: 'codex_rollout_v1' },
           })
         else await expect(created).rejects.toThrow(/native|frozen|initialization/iu)
-        const checked = await adapter.inspectNativeRebuild(
+        const checking = adapter.beginNativeRebuildCheck(
           { ...rebuild, nativeSessionId: 'new-thread' },
           seed(),
           new AbortController().signal,
         )
+        const checked = await checking.result
+        await checking.physicalCompletion
         expect(Boolean(checked?.initializationWitness)).toBe(fault === 'valid')
         if (fault === 'open-hook') {
           expect(adapter.hasActiveBackgroundWork(rebuild.rebuildId)).toBe(true)
@@ -543,13 +561,13 @@ describe('Codex bounded native protocol', () => {
               run: { id: 'hook-1', status: 'completed' },
             },
           })
-          await expect(
-            adapter.inspectNativeRebuild(
-              { ...rebuild, nativeSessionId: 'new-thread' },
-              seed(),
-              new AbortController().signal,
-            ),
-          ).resolves.toBeUndefined()
+          const wrongHookCheck = adapter.beginNativeRebuildCheck(
+            { ...rebuild, nativeSessionId: 'new-thread' },
+            seed(),
+            new AbortController().signal,
+          )
+          await expect(wrongHookCheck.result).resolves.toBeUndefined()
+          await wrongHookCheck.physicalCompletion
           notify!({
             method: 'hook/completed',
             params: {
@@ -558,13 +576,15 @@ describe('Codex bounded native protocol', () => {
               run: { id: 'hook-1', status: 'completed' },
             },
           })
-          await expect(
-            adapter.inspectNativeRebuild(
-              { ...rebuild, nativeSessionId: 'new-thread' },
-              seed(),
-              new AbortController().signal,
-            ),
-          ).resolves.toMatchObject({ initializationWitness: { kind: 'codex_rollout_v1' } })
+          const completedHookCheck = adapter.beginNativeRebuildCheck(
+            { ...rebuild, nativeSessionId: 'new-thread' },
+            seed(),
+            new AbortController().signal,
+          )
+          await expect(completedHookCheck.result).resolves.toMatchObject({
+            initializationWitness: { kind: 'codex_rollout_v1' },
+          })
+          await completedHookCheck.physicalCompletion
           expect(adapter.hasActiveBackgroundWork(rebuild.rebuildId)).toBe(false)
         }
         expect(methods.filter((method) => method === 'thread/start')).toHaveLength(1)
@@ -745,6 +765,7 @@ describe('Codex bounded native protocol', () => {
           id,
           result: {
             thread: { id: 'live-thread' },
+            model: 'gpt-test',
             approvalPolicy: 'on-request',
             approvalsReviewer: 'user',
             sandbox: { type: 'dangerFullAccess' },
@@ -957,7 +978,11 @@ describe('Codex bounded native protocol', () => {
             })
           })().catch((error) => {
             errors.push(error)
+            Object.assign(child, { exitCode: 1 })
             child.emit('exit', 1, null)
+            child.stdout.destroy()
+            child.stderr.destroy()
+            child.emit('close', 1, null)
           })
         }
       })
@@ -979,7 +1004,11 @@ describe('Codex bounded native protocol', () => {
               message: { id: `message-${index}`, content: 'Review code' },
               comments: [],
             },
-            recordExecutor: (executor) => executorIds.push(executor),
+            host: {
+              lifecycle: {
+                recordExecutor: (executor) => executorIds.push(executor),
+              },
+            },
           }
           const events: NormalizedAgentEvent[] = []
           // oxlint-disable-next-line no-await-in-loop -- Later Turns deliberately reuse the same native Thread/capability.

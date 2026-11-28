@@ -1,11 +1,17 @@
 import { dialog, type BrowserWindow, type Dialog, type OpenDialogOptions } from 'electron'
 
-import type { RpcResult, RuntimeAgentId, RuntimePreparation } from '@pact/contracts'
+import {
+  agentDisplayName,
+  type RpcResult,
+  type RuntimeAgentId,
+  type RuntimePreparation,
+  type RuntimePreparationGetInput,
+} from '@pact/contracts'
 
 import type { UtilityProcessClient } from '../../utility-process/client'
 
 export interface RuntimePreparationController {
-  load(): Promise<RpcResult<RuntimePreparation>>
+  load(input?: RuntimePreparationGetInput): Promise<RpcResult<RuntimePreparation>>
   chooseExecutable(
     agentId: RuntimeAgentId,
     owner?: BrowserWindow,
@@ -19,8 +25,8 @@ class ElectronRuntimePreparationController implements RuntimePreparationControll
     private readonly platform: NodeJS.Platform,
   ) {}
 
-  load(): Promise<RpcResult<RuntimePreparation>> {
-    return this.utilityClient.getRuntimePreparation()
+  load(input?: RuntimePreparationGetInput): Promise<RpcResult<RuntimePreparation>> {
+    return this.utilityClient.getRuntimePreparation(input)
   }
 
   async chooseExecutable(
@@ -39,7 +45,7 @@ class ElectronRuntimePreparationController implements RuntimePreparationControll
 
   private executableDialogOptions(agentId: RuntimeAgentId): OpenDialogOptions {
     return {
-      title: `Choose ${agentId === 'claude' ? 'Claude Code' : 'Codex'} executable`,
+      title: `Choose ${agentDisplayName(agentId)} executable`,
       properties: ['openFile'],
       ...(this.platform === 'win32'
         ? { filters: [{ name: 'Executable', extensions: ['exe', 'cmd'] }] }

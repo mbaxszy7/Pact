@@ -466,6 +466,37 @@ function journey(
   return {
     originalPath,
     originalTitle: title,
+    ...(file === 'runtime-preparation.spec.ts' &&
+    title === 'shows independent first-use readiness for both CLIs'
+      ? {
+          contractUpdates: [
+            {
+              originalLine: 12,
+              reason:
+                'Runtime preparation now evaluates 3 coding agents (Claude Code, Codex, Antigravity) with a minimum-2-ready threshold; retain the exact 2-ready first-use gate while Antigravity fixture defaults to Sign-in required.',
+              replacementAssertions: [
+                "expect(window.getByText('2 of 3 ready · Minimum 2 required', { exact: true })).toBeVisible()",
+              ],
+            },
+            {
+              originalLine: 16,
+              reason:
+                'The accepted CLI compatibility page labels the detected version explicitly; retain the exact Claude Code version and its visible identity.',
+              replacementAssertions: [
+                "expect(window.getByText('Detected: 2.1.272 (Claude Code)', { exact: true })).toBeVisible()",
+              ],
+            },
+            {
+              originalLine: 17,
+              reason:
+                'The accepted minimum Codex version is 0.159.2. The UI fixture now represents that supported release; preserve the exact visible detected-version assertion and both independent Ready/Continue obligations.',
+              replacementAssertions: [
+                "expect(window.getByText('Detected: codex-cli 0.159.2', { exact: true })).toBeVisible()",
+              ],
+            },
+          ],
+        }
+      : {}),
     ...(projectNameContracts.length
       ? {
           contractUpdates: projectNameContracts.map(([originalLine, name, state]) => ({
@@ -483,6 +514,29 @@ function journey(
                     `expect(navigation.getByText('${name}', { exact: true })).toHaveCount(0)`,
                   ],
           })),
+        }
+      : {}),
+    ...(file === 'default-session-settings.spec.ts' &&
+    title === 'saves first-use defaults and reopens the singleton from Settings'
+      ? {
+          contractUpdates: [
+            {
+              originalLine: 31,
+              reason:
+                'Updated UI terminology from Primary LLM to Primary agent while keeping Codex selected as primary.',
+              replacementAssertions: [
+                "expect(window.getByRole('radio', { name: 'Codex Primary agent' })).toBeChecked()",
+              ],
+            },
+            {
+              originalLine: 32,
+              reason:
+                'The accepted collaboration-limit terminology labels the same maxDiscussionRounds field Plan reviews. Preserve the exact saved value 4 after cold restart, Codex primary, repair attempts 3, unchanged-default save disabling and cursor obligations.',
+              replacementAssertions: [
+                "expect(window.getByRole('spinbutton', { name: 'Plan reviews' })).toHaveValue('4')",
+              ],
+            },
+          ],
         }
       : {}),
     ...(file === 'workspace-shell.spec.ts' && title.startsWith('resizes and collapses')
@@ -574,6 +628,22 @@ function journey(
           ],
         }
       : {}),
+    ...(file === 'workspace-shell.spec.ts' &&
+    title === 'keeps Project navigation left of the workspace at the minimum supported width'
+      ? {
+          contractUpdates: [
+            {
+              originalLine: 134,
+              reason:
+                'The accepted floating porcelain sheet layout applies --pact-sheet-gap (8px) left inset to the workspace when navigation collapses. Preserve exact sheet-gap value and collapsed workspace-left alignment; navigation x=0, zero separator width, zero root scroll, and reopen overflow obligations remain unchanged.',
+              replacementAssertions: [
+                'expect(collapsed.sheetGap).toBe(8)',
+                'expect(collapsed.workspace[0]).toBeCloseTo(collapsed.sheetGap, 0)',
+              ],
+            },
+          ],
+        }
+      : {}),
     ...(file === 'agent-handoff.spec.ts' &&
     title === '@all preserves ordered distinct Agent rows while the second response is pending'
       ? {
@@ -593,6 +663,69 @@ function journey(
                 }
               })
             ).toEqual({ codex: true, claude: true, unique: true })`,
+              ],
+            },
+          ],
+        }
+      : {}),
+    ...(file === 'agent-handoff.spec.ts' &&
+    title ===
+      'a failed candidate check offers one confirmed creation and never dispatches the old task'
+      ? {
+          contractUpdates: [
+            {
+              originalLine: 583,
+              reason:
+                'The background recovery card combines its warnings in one paragraph and says A previous attempt instead of The previous attempt. Preserve the visible warning that a candidate may already exist; all confirmation, native creation count, old-task non-replay and cold-recovery assertions remain unchanged.',
+              replacementAssertions: [
+                `expect(card.getByText('A previous attempt may have created a session.')).toBeVisible()`,
+              ],
+            },
+          ],
+        }
+      : {}),
+    ...(file === 'agent-handoff.spec.ts' &&
+    title === 'supplies every intervening peer question and answer to the next Agent'
+      ? {
+          contractUpdates: [
+            {
+              originalLine: 209,
+              reason:
+                'ContextReceipt uses clearer human phrasing ("Shared N earlier messages from ...") instead of internal "Context supplied · ... involving ...". Preserve verifying that all 4 intervening messages involving Claude Code were shared.',
+              replacementAssertions: [
+                `expect(window.getByText('Shared 4 earlier messages from Claude Code')).toBeVisible()`,
+              ],
+            },
+          ],
+        }
+      : {}),
+    ...(file === 'session-fork.spec.ts' &&
+    title ===
+      'a committed fork survives startup with sidebar error, readable history and a locked Composer'
+      ? {
+          contractUpdates: [
+            {
+              originalLine: 346,
+              reason:
+                'SessionFork action button renamed from Continue native fork to Finish fork setup for clarity while keeping both sides awaiting setup.',
+              replacementAssertions: [
+                `expect(page.getByRole('button', { name: 'Finish fork setup', exact: true })).toHaveCount(2)`,
+              ],
+            },
+          ],
+        }
+      : {}),
+    ...(file === 'session-fork.spec.ts' &&
+    title ===
+      'failed initialization closes the create dialog and restart recovers the same candidate once'
+      ? {
+          contractUpdates: [
+            {
+              originalLine: 470,
+              reason:
+                'SessionFork action buttons renamed from Check original candidate / Continue initialization to Check status / Complete setup while preserving candidate reuse and settings read count.',
+              replacementAssertions: [
+                `expect(recovery.getByRole('button', { name: 'Complete setup', exact: true })).toBeEnabled()`,
               ],
             },
           ],

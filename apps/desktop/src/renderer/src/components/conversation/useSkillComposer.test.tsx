@@ -24,13 +24,39 @@ const session: CollaborationSession = {
   updatedAt: '2026-10-07T00:00:00.000Z',
   settings: {
     primaryAgentId: 'codex',
-    agents: { codex: { model: null, effort: null }, claude: { model: null, effort: null } },
+    secondaryAgentId: 'claude',
+    agents: {
+      codex: { model: null, effort: null },
+      claude: { model: null, effort: null },
+      agy: { model: null, effort: null },
+    },
     maxDiscussionRounds: 3,
-    runningMessagePolicy: 'next_round',
+
     maxReviewCycles: 3,
     maxRepairAttempts: 3,
   },
 }
+
+it('keeps a dismissed query closed across cursor events until the command changes', () => {
+  vi.stubGlobal('pact', composerBridgeFixture())
+  const hook = renderHook(
+    ({ text }) => useSkillComposer({ session, text, selections: [], disabled: false }),
+    { initialProps: { text: '/' } },
+  )
+  act(() => hook.result.current.update('/', 1, []))
+  expect(hook.result.current.query?.text).toBe('')
+  act(() => hook.result.current.close())
+  act(() => hook.result.current.update('/', 1, []))
+  expect(hook.result.current.query).toBeUndefined()
+  hook.rerender({ text: '/p' })
+  act(() => hook.result.current.update('/p', 2, []))
+  expect(hook.result.current.query?.text).toBe('p')
+  act(() => hook.result.current.close())
+  act(() => hook.result.current.update('', 0, []))
+  hook.rerender({ text: '/' })
+  act(() => hook.result.current.update('/', 1, []))
+  expect(hook.result.current.query?.text).toBe('')
+})
 
 it('More Skills advances the visible window, crosses native pages and permits reverse navigation', async () => {
   const bridge = composerBridgeFixture()
@@ -74,6 +100,7 @@ it('More Skills advances the visible window, crosses native pages and permits re
     'plan',
     'build',
     'review',
+    'btw',
   ])
   expect(
     hook.result.current.visibleOptions.length + hook.result.current.pactOptions.length,
@@ -123,4 +150,116 @@ it('distinguishes a primary mismatch from an explicit target even when the Agent
   expect(hook.result.current.warning).toContain('your primary Agent (Codex)')
   hook.rerender({ text: '/x @codex task' })
   expect(hook.result.current.warning).toContain('your selected Agent @codex (Codex)')
+})
+
+it('hides Pact slash options and rejects /plan, /build, /review, and /btw in a side chat', () => {
+  vi.stubGlobal('pact', composerBridgeFixture())
+  const sideChatSession: CollaborationSession = {
+    ...session,
+    id: '256996b7-77f1-4230-9dc9-f94ca3016c47',
+    parentSessionId: session.id,
+    sideChatOrigin: 'btw',
+  }
+
+  const hook = renderHook(
+    ({ text }) =>
+      useSkillComposer({
+        session: sideChatSession,
+        text,
+        selections: [],
+        disabled: false,
+      }),
+    { initialProps: { text: '/' } },
+  )
+
+  act(() => hook.result.current.update('/', 1, []))
+  expect(hook.result.current.pactOptions).toEqual([])
+
+  for (const command of ['/plan ', '/build ', '/review ', '/btw ']) {
+    hook.rerender({ text: `${command}follow up` })
+    expect(hook.result.current.warning).toBe(
+      'Pact commands (/plan, /build, /review, /btw) can only be used in the main chat.',
+    )
+    expect(hook.result.current.checking).toBe(false)
+  }
+})
+
+it('keeps main-chat /btw handoff unblocked and routes side-chat @Main validation to mainTargetAgentId', () => {
+  vi.stubGlobal('pact', composerBridgeFixture())
+  const claudeSkill: SkillSelection = {
+    id: 'b'.repeat(64),
+    agentId: 'claude',
+    name: 'audit',
+    start: 5,
+    end: 11,
+  }
+  const btwHook = renderHook(() =>
+    useSkillComposer({
+      session,
+      text: '/btw /audit check auth',
+      selections: [claudeSkill],
+      disabled: false,
+    }),
+  )
+  expect(btwHook.result.current.warning).toBeUndefined()
+  expect(btwHook.result.current.checking).toBe(false)
+
+  const sideChatSession: CollaborationSession = {
+    ...session,
+    id: '356996b7-77f1-4230-9dc9-f94ca3016c47',
+    parentSessionId: session.id,
+    sideChatOrigin: 'btw',
+  }
+  const codexSkill: SkillSelection = {
+    id: 'c'.repeat(64),
+    agentId: 'codex',
+    name: 'lint',
+    start: 6,
+    end: 11,
+  }
+  const mainHook = renderHook(() =>
+    useSkillComposer({
+      session: sideChatSession,
+      text: '@Main /lint fix warnings',
+      selections: [codexSkill],
+      mainTargetAgentId: 'claude',
+      disabled: false,
+    }),
+  )
+  expect(mainHook.result.current.warning).toBe(
+    '/lint belongs to Codex. It does not match the main chat target (Claude Code).',
+  )
+})
+
+it('orders skill catalog groups by the active 2-of-3 pair and warns when mentioning the inactive 3rd agent', () => {
+  vi.stubGlobal('pact', composerBridgeFixture())
+  const claudeAgySession: CollaborationSession = {
+    ...session,
+    settings: {
+      ...session.settings,
+      primaryAgentId: 'claude',
+      secondaryAgentId: 'agy',
+    },
+  }
+
+  const activeHook = renderHook(() =>
+    useSkillComposer({
+      session: claudeAgySession,
+      text: '@agy /',
+      selections: [],
+      disabled: false,
+    }),
+  )
+  expect(activeHook.result.current.agents).toEqual(['agy', 'claude'])
+  expect(activeHook.result.current.warning).toBeUndefined()
+
+  const inactiveHook = renderHook(() =>
+    useSkillComposer({
+      session: claudeAgySession,
+      text: '@codex check status',
+      selections: [],
+      disabled: false,
+    }),
+  )
+  expect(inactiveHook.result.current.warning).toBe('@codex (Codex) is not active in this session.')
 })

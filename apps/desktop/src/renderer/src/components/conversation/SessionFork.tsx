@@ -1,16 +1,17 @@
 import { Check, LoaderCircle, Split, TriangleAlert } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 
-import type {
-  NativeInputRespond,
-  NativePermissionDecision,
-  NativePermissionRequest,
-  PendingNativeInteraction,
-  RuntimeAgentId,
-  SessionCatalogChange,
-  SessionForkInput,
-  SessionForkOperation,
-  SessionForkPrepared,
+import {
+  resolveActiveAgentPair,
+  type NativeInputRespond,
+  type NativePermissionDecision,
+  type NativePermissionRequest,
+  type PendingNativeInteraction,
+  type RuntimeAgentId,
+  type SessionCatalogChange,
+  type SessionForkInput,
+  type SessionForkOperation,
+  type SessionForkPrepared,
 } from '@pact/contracts'
 
 import type { NativeInputDraft } from './useConversation'
@@ -20,7 +21,11 @@ import { NativePermissionCard } from './NativePermissionCard'
 
 const secondary =
   'inline-flex min-h-8 items-center justify-center gap-1.5 rounded-control px-3 text-caption text-secondary hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-focus disabled:cursor-default disabled:opacity-40'
-const names = { claude: 'Claude Code', codex: 'Codex' }
+const names: Record<RuntimeAgentId, string> = {
+  claude: 'Claude Code',
+  codex: 'Codex',
+  agy: 'Antigravity',
+}
 const modeNames = { native: 'Native', ask: 'Ask', auto: 'Auto', full: 'Full access' }
 const working = (operation: SessionForkOperation | undefined): boolean =>
   !!operation &&
@@ -71,7 +76,7 @@ function NativeForkStates({
                   disabled={!!busy}
                   onClick={() => onAction(side.agentId, 'check')}
                 >
-                  {busy === `${side.agentId}:check` ? 'Checking…' : 'Check original candidate'}
+                  {busy === `${side.agentId}:check` ? 'Checking…' : 'Check status'}
                 </button>
                 {side.canInitialize ? (
                   <button
@@ -80,7 +85,7 @@ function NativeForkStates({
                     disabled={!!busy}
                     onClick={() => onAction(side.agentId, 'initialize')}
                   >
-                    Continue initialization
+                    Complete setup
                   </button>
                 ) : side.canContinue ? (
                   <button
@@ -89,7 +94,7 @@ function NativeForkStates({
                     disabled={!!busy}
                     onClick={() => onAction(side.agentId, 'continue')}
                   >
-                    Continue native fork
+                    Finish fork setup
                   </button>
                 ) : null}
               </div>
@@ -179,7 +184,7 @@ export function SessionForkDialog({
             ) {
               if (alive.current)
                 setError(
-                  'The fork exists, but its sidebar receipt could not be confirmed. Retry this same creation.',
+                  'The forked session was created, but the sidebar didn’t update. Try creating again to reload it.',
                 )
               return undefined
             }
@@ -201,7 +206,7 @@ export function SessionForkDialog({
           .catch(() => {
             if (alive.current)
               setError(
-                'The fork exists, but its sidebar receipt could not be confirmed. Retry this same creation.',
+                'The forked session was created, but the sidebar didn’t update. Try creating again to reload it.',
               )
           })
           .finally(() => {
@@ -254,9 +259,9 @@ export function SessionForkDialog({
             ) {
               const catalogs = settingsResult.value.value.modelCatalogs
               const labels: Partial<Record<RuntimeAgentId, string>> = {}
-              for (const agentId of ['claude', 'codex'] as const) {
+              for (const agentId of resolveActiveAgentPair(snapshot.settings)) {
                 const selected = snapshot.settings.agents[agentId].model
-                const model = catalogs[agentId].models.find((entry) => entry.id === selected)
+                const model = catalogs[agentId]?.models.find((entry) => entry.id === selected)
                 if (selected && model)
                   labels[agentId] =
                     model.displayName.toLowerCase() === selected.toLowerCase()
@@ -266,13 +271,13 @@ export function SessionForkDialog({
               setModelLabels(labels)
             }
           } else setError(result.ok ? 'Unexpected fork preparation.' : result.error.message)
-        } else setError('Native histories could not be checked. Close this dialog and try again.')
+        } else setError('Couldn’t check agent history. Close this dialog and try again.')
         setPreparing(false)
         return undefined
       })
       .catch(() => {
         if (alive.current && current) {
-          setError('Native histories could not be checked. Close this dialog and try again.')
+          setError('Couldn’t check agent history. Close this dialog and try again.')
           setPreparing(false)
         }
       })
@@ -302,7 +307,7 @@ export function SessionForkDialog({
     setCreating(true)
     setError(undefined)
     try {
-      const full = (['claude', 'codex'] as const).filter(
+      const full = resolveActiveAgentPair(prepared.settings).filter(
         (agentId) => prepared.settings.permissionModes?.[agentId] === 'full',
       )
       const request: Extract<SessionForkInput, { action: 'create' }> = {
@@ -336,7 +341,7 @@ export function SessionForkDialog({
     } catch {
       if (alive.current)
         setError(
-          'Fork creation was not acknowledged. Retry uses this same operation; it will not create a second conversation.',
+          'Fork status wasn’t confirmed. Retrying uses the same fork and won’t create a duplicate.',
         )
     } finally {
       creationPending.current = false
@@ -392,7 +397,7 @@ export function SessionForkDialog({
   )
   const full =
     prepared &&
-    (['claude', 'codex'] as const).filter(
+    resolveActiveAgentPair(prepared.settings).filter(
       (agentId) => prepared.settings.permissionModes?.[agentId] === 'full',
     )
   return (
@@ -413,14 +418,14 @@ export function SessionForkDialog({
         </h2>
       </div>
       <p id="pact-fork-description" className="mt-3 text-body text-secondary">
-        Keep history through this reply and share the current Project files. The original
-        conversation and drafts stay available.
+        Copies conversation history up to this reply and shares current project files. Your original
+        session stays unchanged.
       </p>
       <div className="mt-4 max-h-[60vh] space-y-4 overflow-y-auto">
         {preparing ? (
           <output className="flex items-center gap-2 text-caption text-secondary">
             <LoaderCircle className="size-4 animate-spin" aria-hidden="true" />
-            Checking native histories…
+            Checking agent history…
           </output>
         ) : null}
         {prepared && !operation ? (
@@ -429,7 +434,7 @@ export function SessionForkDialog({
               {prepared.preview}
             </blockquote>
             <dl className="space-y-2 text-caption">
-              {(['claude', 'codex'] as const).map((agentId) => (
+              {resolveActiveAgentPair(prepared.settings).map((agentId) => (
                 <div key={agentId} className="flex flex-wrap justify-between gap-2">
                   <dt className="font-medium">
                     {names[agentId]}
@@ -443,7 +448,7 @@ export function SessionForkDialog({
                     {
                       modeNames[
                         prepared.settings.permissionModes?.[agentId] ??
-                          (agentId === 'claude' ? 'ask' : 'native')
+                          (agentId === 'codex' ? 'native' : 'ask')
                       ]
                     }
                   </dd>
@@ -528,16 +533,16 @@ export function NativeForkRecovery({
       })
       if (!result.ok) setError(result.error.message)
     } catch {
-      setError('Native confirmation was not acknowledged. Check the original candidate.')
+      setError('Setup wasn’t confirmed. Click Check status to verify.')
     } finally {
       setBusy(undefined)
     }
   }
   return (
     <section className="mt-group" aria-label="Native fork confirmation">
-      <h3 className="text-body font-medium">Finish native confirmation</h3>
+      <h3 className="text-body font-medium">Finish fork setup</h3>
       <p className="mb-3 mt-1 text-caption text-secondary">
-        History is available. Sending becomes available when both Native sessions are ready.
+        Conversation history is ready. Sending unlocks once both agents finish setup.
       </p>
       <NativeForkStates
         operation={operation}

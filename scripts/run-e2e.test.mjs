@@ -7,6 +7,7 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 
+import { AGY_COLLAB_OPT_IN } from './real-e2e-policy.mjs'
 import { main, run } from './run-e2e.mjs'
 
 const posixOnly = { skip: process.platform === 'win32', timeout: 20_000 }
@@ -959,4 +960,101 @@ await test('core real selection retains one build, both-provider admission, inte
     await assert.rejects(main({ lane: 'real', realScope: 'core', forwarded }), /narrowed|override/)
   }
   await assert.rejects(main({ lane: 'all', realScope: 'core' }), /only to the real/)
+})
+
+const mustNotLoad = async () => {
+  throw new Error('Must not load credentials')
+}
+const mustNotRun = async () => {
+  throw new Error('Must not spawn build or Playwright')
+}
+
+await test('agy collaboration runner enforces opt-in and external PR rejection before loading configuration, forbids narrowing, and passes exact target selection', async () => {
+  const synthCases = [
+    {
+      path: 'tests/e2e/agy-collaboration-real.spec.ts',
+      title: 'case-1',
+      tier: 'extended',
+      optIn: AGY_COLLAB_OPT_IN,
+      scenario: 'collaboration',
+    },
+    {
+      path: 'tests/e2e/agy-collaboration-real.spec.ts',
+      title: 'case-2',
+      tier: 'extended',
+      optIn: AGY_COLLAB_OPT_IN,
+      scenario: 'collaboration',
+    },
+  ]
+
+  await assert.rejects(
+    main({
+      lane: 'real',
+      realProfile: 'agy-collaboration',
+      env: { GITHUB_EVENT_NAME: 'pull_request', [AGY_COLLAB_OPT_IN]: '1' },
+      selectCollaborationCases: () => synthCases,
+      loadConfiguration: mustNotLoad,
+      runJob: mustNotRun,
+    }),
+    /external pull requests/u,
+  )
+  await assert.rejects(
+    main({
+      lane: 'real',
+      realProfile: 'agy-collaboration',
+      env: {},
+      selectCollaborationCases: () => synthCases,
+      loadConfiguration: mustNotLoad,
+      runJob: mustNotRun,
+    }),
+    /PACT_E2E_REAL_AGY_COLLAB=1/u,
+  )
+  for (const forwarded of [['--grep', 'case-1'], ['tests/e2e/other.spec.ts']]) {
+    // oxlint-disable-next-line eslint/no-await-in-loop -- Each disallowed override must reject before reading credentials.
+    await assert.rejects(
+      main({
+        lane: 'real',
+        realProfile: 'agy-collaboration',
+        forwarded,
+        env: { [AGY_COLLAB_OPT_IN]: '1' },
+        selectCollaborationCases: () => synthCases,
+        loadConfiguration: mustNotLoad,
+        runJob: mustNotRun,
+      }),
+      /narrowed/u,
+    )
+  }
+
+  const calls = []
+  let integrityChecks = 0
+  const code = await main({
+    lane: 'real',
+    realProfile: 'agy-collaboration',
+    forwarded: ['--reporter=line,json'],
+    env: { [AGY_COLLAB_OPT_IN]: '1' },
+    selectCollaborationCases: () => synthCases,
+    loadConfiguration: async () => ({
+      redact: (text) => text,
+      assertSourceIntegrity: async () => {
+        integrityChecks += 1
+      },
+    }),
+    runJob: async (args) => {
+      calls.push(args)
+      return 0
+    },
+  })
+  assert.equal(code, 0)
+  assert.equal(integrityChecks, 1)
+  assert.deepEqual(calls[0], ['build'])
+  assert.deepEqual(calls[1], [
+    'exec',
+    'playwright',
+    'test',
+    '--project=real',
+    'tests/e2e/agy-collaboration-real.spec.ts',
+    '--grep',
+    '(?:^| )(?:agy-collaboration-real\\.spec\\.ts case-1|agy-collaboration-real\\.spec\\.ts case-2)(?: @\\S+)*$',
+    '--reporter=line,json',
+  ])
 })

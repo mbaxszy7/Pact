@@ -10,12 +10,18 @@ import { PactDatabase } from '@pact/persistence'
 
 import { ProjectFileReader } from '../project-file/project-file-reader.js'
 import { RuntimePreparation } from '../runtime-preparation/runtime-preparation.js'
-import { Conversation } from './conversation.js'
+import { runDirectoryWorker } from '../workspace-changes/directory-worker.test-support.js'
+import { Conversation, type ConversationTerminalCoordinator } from './conversation.js'
 
 const settings: DefaultSessionSettings = {
   primaryAgentId: 'codex',
-  agents: { claude: { model: null, effort: null }, codex: { model: null, effort: null } },
-  runningMessagePolicy: 'next_round',
+  secondaryAgentId: 'claude',
+  agents: {
+    claude: { model: null, effort: null },
+    codex: { model: null, effort: null },
+    agy: { model: null, effort: null },
+  },
+
   maxDiscussionRounds: 3,
   maxReviewCycles: 3,
   maxRepairAttempts: 3,
@@ -29,7 +35,10 @@ function value<T>(result: RpcResult<T>): T {
   return result.value
 }
 
-async function fixture(filePath = ':memory:') {
+async function fixture(
+  filePath = ':memory:',
+  terminalCoordinator?: ConversationTerminalCoordinator,
+) {
   const db = await PactDatabase.open({ filePath, migrationsFolder })
   const projectId = randomUUID(),
     createdAt = '2026-10-15T00:00:00.000Z'
@@ -50,7 +59,12 @@ async function fixture(filePath = ':memory:') {
     db.sessionRepository,
     db.projectCatalogRepository,
     new RuntimePreparation(db.runtimePreparationRepository),
-    new ProjectFileReader(db.sessionRepository, db.projectCatalogRepository),
+    new ProjectFileReader(db.sessionRepository, db.projectCatalogRepository, runDirectoryWorker),
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    terminalCoordinator,
   )
   owners.push({ db, flow })
   await flow.initializeNativePresence()
@@ -254,5 +268,53 @@ describe('Native metadata and quit through production owners', () => {
     expect(vi.getTimerCount()).toBe(1)
     await f.flow.dispose()
     expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('does not block App Quit on open or active-command terminals while still blocking Project Archive', async () => {
+    let targetProjectId = ''
+    const coordinator: ConversationTerminalCoordinator = {
+      listBlockingProjectSummaries: () => [
+        {
+          terminalId: randomUUID(),
+          projectId: targetProjectId,
+          title: 'Terminal 1',
+          state: 'running',
+          hasActiveChild: false,
+          foregroundCommand: null,
+        },
+        {
+          terminalId: randomUUID(),
+          projectId: targetProjectId,
+          title: 'Terminal 2',
+          state: 'running',
+          hasActiveChild: true,
+          foregroundCommand: 'sleep 30',
+        },
+      ],
+      acquireProjectArchiveLock: () => () => undefined,
+      releaseIdleProjectTerminals: async () => undefined,
+    }
+    const f = await fixture(':memory:', coordinator)
+    targetProjectId = f.projectId
+    const archivePreview = f.flow.prepareWorkspaceArchive({
+      operationId: randomUUID(),
+      scope: { kind: 'project', projectId: f.projectId },
+    })
+    expect(archivePreview).toMatchObject({
+      ok: true,
+      value: {
+        blockedReason:
+          'Close running project terminals before archiving this project. Nothing was stopped.',
+      },
+    })
+    const quitResult = f.flow.prepareNativeQuit({ operationId: randomUUID() })
+    expect(quitResult).toMatchObject({
+      ok: true,
+      value: {
+        state: 'idle_prepared',
+        activeCount: 0,
+        sessions: [],
+      },
+    })
   })
 })

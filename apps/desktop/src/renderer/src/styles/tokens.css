@@ -27,8 +27,14 @@
   --color-surface: var(--pact-surface);
   --color-surface-muted: var(--pact-surface-muted);
   --color-surface-raised: var(--pact-surface-raised);
+  --color-code-surface: var(--pact-code-surface);
+  --color-code-block-surface: var(--pact-code-block-surface);
+  --color-code-foreground: var(--pact-code-foreground);
+  --color-code-border: var(--pact-code-border);
   --color-menu-surface: var(--pact-menu-surface);
   --color-surface-inverse: var(--pact-surface-inverse);
+  --color-row-hover: var(--pact-row-hover);
+  --color-accent-soft: var(--pact-accent-soft);
   --color-primary: var(--pact-text-primary);
   --color-secondary: var(--pact-text-secondary);
   --color-tertiary: var(--pact-text-tertiary);
@@ -54,22 +60,36 @@
   --color-danger-muted: var(--pact-danger-muted);
   --color-speaker-user: var(--pact-speaker-user);
   --color-speaker-claude: var(--pact-speaker-claude);
+  --color-speaker-claude-foreground: var(--pact-speaker-claude-fg);
+  --color-speaker-claude-line: var(--pact-speaker-claude-line);
   --color-speaker-codex: var(--pact-speaker-codex);
+  --color-speaker-codex-foreground: var(--pact-speaker-codex-fg);
+  --color-speaker-codex-line: var(--pact-speaker-codex-line);
+  --color-speaker-agy: var(--pact-speaker-agy);
+  --color-speaker-agy-foreground: var(--pact-speaker-agy-fg);
+  --color-speaker-agy-line: var(--pact-speaker-agy-line);
   --color-diff-added: var(--pact-diff-added);
+  --color-diff-added-gutter: var(--pact-diff-added-gutter);
   --color-diff-added-foreground: var(--pact-diff-added-foreground);
   --color-diff-removed: var(--pact-diff-removed);
+  --color-diff-removed-gutter: var(--pact-diff-removed-gutter);
   --color-diff-removed-foreground: var(--pact-diff-removed-foreground);
 
   --radius-control: 0.5rem;
   --radius-message: 0.75rem;
   --radius-card: 0.75rem;
   --radius-panel: 0.875rem;
+  --radius-sheet: 0.875rem;
   --radius-pill: 9999px;
 
+  --shadow-sheet: var(--pact-shadow-sheet);
+  --shadow-island: var(--pact-shadow-island);
   --shadow-popover: var(--pact-shadow-popover);
   --shadow-dialog: var(--pact-shadow-dialog);
 
-  --ease-out-pact: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-silk-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-silk-in-out: cubic-bezier(0.42, 0, 0.18, 1);
+  --ease-out-pact: var(--ease-silk-out);
 }
 
 :root {
@@ -78,8 +98,13 @@
   --pact-space-panel: 1.125rem;
   --pact-space-section: 1.5rem;
   --pact-space-spacious: 2.25rem;
-  --pact-material-navigation-alpha: 0.725;
-  --pact-material-chat-alpha: 0.845;
+  --pact-sheet-gap: 8px;
+  --pact-sheet-radius: 14px;
+  --ease-silk-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-silk-in-out: cubic-bezier(0.42, 0, 0.18, 1);
+  --ease-out-pact: var(--ease-silk-out);
+  --pact-material-navigation-alpha: 0.74;
+  --pact-material-chat-alpha: 0.88;
   --pact-material-code-alpha: 0.965;
-  --pact-material-message-alpha: 0.91;
+  --pact-material-message-alpha: 0.92;
 }

@@ -3,6 +3,7 @@ import { and, asc, count, eq, gt, inArray, isNull, ne, sql } from 'drizzle-orm'
 import {
   WORKSPACE_CHANGE_FILES,
   WORKSPACE_CHANGE_PAGE_FILES,
+  WORKSPACE_CHANGES_PAGE_BYTES,
   WORKSPACE_FILE_BYTES,
   WORKSPACE_STORAGE_BYTES,
   workspaceChangeSetSchema,
@@ -50,6 +51,91 @@ export interface WorkspaceChangeIntent {
   createdAt: string
   updatedAt: string
   reconciledAt: string | null
+}
+
+type WorkspaceChangesQueryDb = Pick<PactDrizzleDatabase, 'select'>
+
+export interface WorkspaceFileSummaryStats {
+  visibleCount: number
+  undoableCount: number
+  notUndoneVisibleCount: number
+  incompleteCounts: boolean
+}
+
+export function aggregateWorkspaceFileStats(
+  database: WorkspaceChangesQueryDb,
+  changeSetId: string,
+): WorkspaceFileSummaryStats {
+  const row = database
+    .select({
+      visibleCount: sql<number>`coalesce(sum(case when ${workspaceFileChanges.hidden} = 0 then 1 else 0 end), 0)`,
+      undoableCount: sql<number>`coalesce(sum(case when ${workspaceFileChanges.hidden} = 0 and coalesce(json_extract(${workspaceFileChanges.nativeEvidenceJson}, '$.undoStrategy'), '') not in ('unavailable', 'patch') and coalesce(json_extract(${workspaceFileChanges.nativeEvidenceJson}, '$.beforeAvailable'), 1) != 0 and coalesce(json_extract(${workspaceFileChanges.nativeEvidenceJson}, '$.afterAvailable'), 1) != 0 and coalesce(json_extract(${workspaceFileChanges.nativeEvidenceJson}, '$.undone'), 0) = 0 then 1 else 0 end), 0)`,
+      notUndoneVisibleCount: sql<number>`coalesce(sum(case when ${workspaceFileChanges.hidden} = 0 and coalesce(json_extract(${workspaceFileChanges.nativeEvidenceJson}, '$.undone'), 0) = 0 then 1 else 0 end), 0)`,
+      incompleteCount: sql<number>`coalesce(sum(case when ${workspaceFileChanges.additions} is null or ${workspaceFileChanges.deletions} is null then 1 else 0 end), 0)`,
+    })
+    .from(workspaceFileChanges)
+    .where(eq(workspaceFileChanges.changeSetId, changeSetId))
+    .get()
+  return {
+    visibleCount: row?.visibleCount ?? 0,
+    undoableCount: row?.undoableCount ?? 0,
+    notUndoneVisibleCount: row?.notUndoneVisibleCount ?? 0,
+    incompleteCounts: (row?.incompleteCount ?? 0) > 0,
+  }
+}
+
+export function firstUnavailableFileReason(
+  database: WorkspaceChangesQueryDb,
+  changeSetId: string,
+): string | null {
+  const row = database
+    .select({ reason: workspaceFileChanges.reason })
+    .from(workspaceFileChanges)
+    .where(
+      and(
+        eq(workspaceFileChanges.changeSetId, changeSetId),
+        eq(workspaceFileChanges.hidden, false),
+        sql`coalesce(json_extract(${workspaceFileChanges.nativeEvidenceJson}, '$.undone'), 0) = 0`,
+        sql`${workspaceFileChanges.reason} IS NOT NULL`,
+      ),
+    )
+    .orderBy(asc(workspaceFileChanges.path))
+    .limit(1)
+    .get()
+  return row?.reason ?? null
+}
+
+/** Single authoritative summary builder shared by repository reads and publication validation. */
+export function buildWorkspaceChangeSetSummary(
+  database: WorkspaceChangesQueryDb,
+  row: typeof workspaceChangeSets.$inferSelect,
+): WorkspaceChangeSet {
+  const {
+    root: _root,
+    rootDevice: _rootDevice,
+    rootInode: _rootInode,
+    stagingRoot: _stagingRoot,
+    projectionPending: _projectionPending,
+    ...persisted
+  } = row
+  const stats = aggregateWorkspaceFileStats(database, row.id)
+  const roundWideBlocked =
+    persisted.state === 'undone' ||
+    persisted.state === 'recovery_required' ||
+    persisted.undoUnavailableReason !== null
+  const undoableFileCount = roundWideBlocked ? 0 : stats.undoableCount
+  const undoUnavailableReason =
+    persisted.undoUnavailableReason ??
+    (persisted.state !== 'undone' && stats.notUndoneVisibleCount > stats.undoableCount
+      ? (firstUnavailableFileReason(database, row.id) ??
+        'Complete original and final native file versions are unavailable for Undo.')
+      : null)
+  return workspaceChangeSetSchema.parse({
+    ...persisted,
+    undoableFileCount,
+    undoUnavailableReason,
+    countsAvailable: !stats.incompleteCounts,
+  })
 }
 
 /** Durable metadata only: Utility owns blob writes and filesystem application/recovery. */
@@ -122,32 +208,26 @@ export class WorkspaceChangesRepository {
         stagingRoot: input.stagingRoot,
       })
       .run()
-    return changeSet
+    return this.summary(input.runId)
   }
 
   summary(id: string): WorkspaceChangeSet {
-    const {
-      root: _root,
-      rootDevice: _rootDevice,
-      rootInode: _rootInode,
-      stagingRoot: _stagingRoot,
-      ...summary
-    } = this.require(id)
-    const incompleteCounts = this.database
-      .select({ path: workspaceFileChanges.path })
-      .from(workspaceFileChanges)
-      .where(
-        and(
-          eq(workspaceFileChanges.changeSetId, id),
-          sql`(${workspaceFileChanges.additions} IS NULL OR ${workspaceFileChanges.deletions} IS NULL)`,
-        ),
-      )
-      .limit(1)
+    const row = this.database
+      .select()
+      .from(workspaceChangeSets)
+      .where(eq(workspaceChangeSets.id, id))
       .get()
-    return workspaceChangeSetSchema.parse({
-      ...summary,
-      countsAvailable: incompleteCounts === undefined,
-    })
+    if (!row) throw new Error('Workspace changes do not exist.')
+    WorkspaceChangesRepository.validateRootIdentity(row.rootDevice, row.rootInode)
+    return buildWorkspaceChangeSetSummary(this.database, row)
+  }
+
+  state(id: string): WorkspaceChangeSet['state'] | undefined {
+    return this.database
+      .select({ state: workspaceChangeSets.state })
+      .from(workspaceChangeSets)
+      .where(eq(workspaceChangeSets.id, id))
+      .get()?.state
   }
 
   find(id: string): WorkspaceChangeSetRecord | undefined {
@@ -254,13 +334,41 @@ export class WorkspaceChangesRepository {
       .orderBy(asc(workspaceFileChanges.path))
       .limit(WORKSPACE_CHANGE_PAGE_FILES + 1)
       .all()
-    const files = rows
-      .slice(0, WORKSPACE_CHANGE_PAGE_FILES)
-      .map((row) => WorkspaceChangesRepository.toFile(row))
+    const changeSet = this.summary(changeSetId)
+    const candidates = rows.slice(0, WORKSPACE_CHANGE_PAGE_FILES)
+    const hasRowsBeyondCandidates = rows.length > WORKSPACE_CHANGE_PAGE_FILES
+    const encoder = new TextEncoder()
+    const prefixBytes = encoder.encode(
+      `{"changeSet":${JSON.stringify(changeSet)},"files":[`,
+    ).byteLength
+    const suffixBeforeNextPathBytes = encoder.encode('],"nextPath":').byteLength
+    const closingBraceBytes = 1
+    const files: WorkspaceFileChange[] = []
+    let filesBytes = 0
+    for (let index = 0; index < candidates.length; index += 1) {
+      const candidate = WorkspaceChangesRepository.toFile(candidates[index]!)
+      const hasMoreAfterCandidate = index < candidates.length - 1 || hasRowsBeyondCandidates
+      const candidateNextPath = hasMoreAfterCandidate ? candidate.path : null
+      const fileBytes = encoder.encode(JSON.stringify(candidate)).byteLength
+      const commaBytes = files.length > 0 ? 1 : 0
+      const nextPathBytes = encoder.encode(JSON.stringify(candidateNextPath)).byteLength
+      const totalBytes =
+        prefixBytes +
+        filesBytes +
+        commaBytes +
+        fileBytes +
+        suffixBeforeNextPathBytes +
+        nextPathBytes +
+        closingBraceBytes
+      if (totalBytes > WORKSPACE_CHANGES_PAGE_BYTES && files.length > 0) break
+      files.push(candidate)
+      filesBytes += commaBytes + fileBytes
+    }
+    const hasMore = files.length < candidates.length || hasRowsBeyondCandidates
     return workspaceChangesPageSchema.parse({
-      changeSet: this.summary(changeSetId),
+      changeSet,
       files,
-      nextPath: rows.length > WORKSPACE_CHANGE_PAGE_FILES ? (files.at(-1)?.path ?? null) : null,
+      nextPath: hasMore ? (files.at(-1)?.path ?? null) : null,
     })
   }
 
@@ -302,6 +410,7 @@ export class WorkspaceChangesRepository {
               ? false
               : (previous?.modeKnown ?? change.modeKnown),
           patchVersions: [...(previous?.patchVersions ?? []), ...(change.patchVersions ?? [])],
+          undone: previous?.undone ?? change.undone,
           reason: previous?.reason ?? change.reason,
         }
         if (next.beforeAvailable === false || next.afterAvailable === false) {
@@ -313,7 +422,8 @@ export class WorkspaceChangesRepository {
           next.beforeAvailable === false ||
           next.afterAvailable === false ||
           next.undoStrategy === 'patch' ||
-          previous?.undoStrategy === 'unavailable'
+          previous?.undoStrategy === 'unavailable' ||
+          (next.reason !== null && next.undoStrategy === undefined)
         ) {
           next.undoStrategy = 'unavailable'
           next.reason ??=
@@ -326,7 +436,7 @@ export class WorkspaceChangesRepository {
           next.undoStrategy !== 'unavailable' &&
           before.hash === next.after.hash &&
           before.bytes === next.after.bytes &&
-          before.mode === next.after.mode
+          (next.modeKnown === false || before.mode === next.after.mode)
         ) {
           files.delete(next.path)
           this.database
@@ -374,12 +484,7 @@ export class WorkspaceChangesRepository {
           fileCount: visible.length,
           additions: visible.reduce((total, file) => total + (file.additions ?? 0), 0),
           deletions: visible.reduce((total, file) => total + (file.deletions ?? 0), 0),
-          undoUnavailableReason:
-            current.undoUnavailableReason ??
-            unavailableReason ??
-            parsed.find((file) => file.reason)?.reason ??
-            all.find((file) => file.reason)?.reason ??
-            null,
+          undoUnavailableReason: current.undoUnavailableReason ?? unavailableReason ?? null,
         })
         .where(eq(workspaceChangeSets.id, id))
         .run()
@@ -405,11 +510,15 @@ export class WorkspaceChangesRepository {
       const current = this.require(id)
       if (current.state !== 'recording') return
       const run = this.database
-        .select({ nativeEffectsState: agentRuns.nativeEffectsState })
+        .select({
+          nativeEffectsState: agentRuns.nativeEffectsState,
+          workspaceChangesJson: agentRuns.workspaceChangesJson,
+        })
         .from(agentRuns)
         .where(eq(agentRuns.id, current.runId))
         .get()
       if (run?.nativeEffectsState === 'settled') return
+      const hasPublishedRunSummary = run?.workspaceChangesJson != null
       const reason =
         'Native file recording was interrupted before completion was confirmed. Original versions, last confirmed bytes and patches are retained; the final version and Undo are unavailable.'
       for (const file of this.files(id)) {
@@ -439,7 +548,7 @@ export class WorkspaceChangesRepository {
         .update(workspaceChangeSets)
         .set({
           state: 'mixed',
-          projectionPending: true,
+          projectionPending: current.fileCount > 0 || hasPublishedRunSummary,
           revision: sql`${workspaceChangeSets.revision} + 1`,
           additions: 0,
           deletions: 0,
@@ -455,7 +564,24 @@ export class WorkspaceChangesRepository {
   finalize(id: string): WorkspaceChangeSet {
     this.database.transaction(() => {
       const current = this.require(id)
-      if (current.state !== 'recording' && current.state !== 'recovery_required') return
+      const hasPublishedRunSummary =
+        this.database
+          .select({ summary: agentRuns.workspaceChangesJson })
+          .from(agentRuns)
+          .where(eq(agentRuns.id, current.runId))
+          .get()?.summary != null
+      if (current.state !== 'recording' && current.state !== 'recovery_required') {
+        if (current.fileCount === 0 && !hasPublishedRunSummary) {
+          this.database
+            .update(workspaceChangeSets)
+            .set({ projectionPending: false })
+            .where(
+              and(eq(workspaceChangeSets.id, id), eq(workspaceChangeSets.projectionPending, true)),
+            )
+            .run()
+        }
+        return
+      }
       const unfinished = this.database
         .select({ id: workspaceChangeIntents.id })
         .from(workspaceChangeIntents)
@@ -469,19 +595,26 @@ export class WorkspaceChangesRepository {
         .limit(1)
         .get()
       const recoveryRequired = current.state === 'recovery_required' || unfinished !== undefined
+      const stats = aggregateWorkspaceFileStats(this.database, id)
+      const roundWideReason =
+        current.undoUnavailableReason ??
+        (unfinished ? 'This round contains an unfinished file operation.' : null)
+      const nextState = recoveryRequired
+        ? ('recovery_required' as const)
+        : stats.visibleCount > 0 && stats.notUndoneVisibleCount === 0
+          ? ('undone' as const)
+          : roundWideReason === null && stats.undoableCount === stats.notUndoneVisibleCount
+            ? ('ready' as const)
+            : ('mixed' as const)
+      const shouldProject =
+        stats.visibleCount > 0 || nextState === 'recovery_required' || hasPublishedRunSummary
       this.database
         .update(workspaceChangeSets)
         .set({
-          projectionPending: true,
+          projectionPending: shouldProject,
           revision: sql`${workspaceChangeSets.revision} + 1`,
-          state: recoveryRequired
-            ? 'recovery_required'
-            : current.undoUnavailableReason
-              ? 'mixed'
-              : 'ready',
-          undoUnavailableReason:
-            current.undoUnavailableReason ??
-            (unfinished ? 'This round contains an unfinished file operation.' : null),
+          state: nextState,
+          undoUnavailableReason: nextState === 'undone' ? null : roundWideReason,
           finalizedAt: current.finalizedAt ?? new Date().toISOString(),
         })
         .where(eq(workspaceChangeSets.id, id))
@@ -512,10 +645,34 @@ export class WorkspaceChangesRepository {
     this.database.transaction(() => {
       const intent = this.findIntent(intentId)
       const current = this.require(id)
-      if (!intent || intent.changeSetId !== id || intent.kind !== 'undo')
+      if (
+        !intent ||
+        intent.changeSetId !== id ||
+        intent.kind !== 'undo' ||
+        intent.payload['path'] !== undefined
+      )
         throw new Error('This Undo intent does not belong to the round.')
-      if (current.state === 'undone' && intent.status === 'applied') return
-      if (current.state !== 'ready') throw new Error('This round cannot complete Undo safely.')
+      if (current.state === 'undone' && intent.status === 'applied' && intent.reconciledAt === null)
+        return
+      if (intent.status !== 'pending' || intent.reconciledAt !== null)
+        throw new Error('This Undo intent is not pending and cannot complete Undo.')
+      if (current.state !== 'ready' || current.undoUnavailableReason !== null)
+        throw new Error('This round cannot complete Undo safely.')
+      const remainingVisible = this.files(id).filter((file) => !file.hidden && !file.undone)
+      if (remainingVisible.some((file) => !WorkspaceChangesRepository.isUndoable(file)))
+        throw new Error('This round contains listed files whose Undo evidence is incomplete.')
+      for (const file of remainingVisible) {
+        const updated: WorkspaceFileChange = { ...file, undone: true }
+        this.database
+          .update(workspaceFileChanges)
+          .set({
+            nativeEvidenceJson: WorkspaceChangesRepository.fileRow(id, updated).nativeEvidenceJson,
+          })
+          .where(
+            and(eq(workspaceFileChanges.changeSetId, id), eq(workspaceFileChanges.path, file.path)),
+          )
+          .run()
+      }
       this.database
         .update(workspaceChangeIntents)
         .set({ status: 'applied', reconciledAt: null, updatedAt: new Date().toISOString() })
@@ -525,6 +682,7 @@ export class WorkspaceChangesRepository {
         .update(workspaceChangeSets)
         .set({
           state: 'undone',
+          undoUnavailableReason: null,
           projectionPending: true,
           revision: sql`${workspaceChangeSets.revision} + 1`,
           finalizedAt: current.finalizedAt ?? new Date().toISOString(),
@@ -533,6 +691,76 @@ export class WorkspaceChangesRepository {
         .run()
     })
     return this.summary(id)
+  }
+
+  /** Marks one file undone; transitions the round to `undone` ONLY when every listed file is undone. */
+  markFileUndone(changeSetId: string, path: string, intentId: string): WorkspaceChangeSet {
+    this.database.transaction(() => {
+      const current = this.require(changeSetId)
+      const intent = this.findIntent(intentId)
+      if (
+        !intent ||
+        intent.changeSetId !== changeSetId ||
+        intent.kind !== 'undo' ||
+        typeof intent.payload['path'] !== 'string' ||
+        intent.payload['path'] !== path
+      )
+        throw new Error('This Undo intent does not match the target file.')
+      const target = this.file(changeSetId, path)
+      if (!target || target.hidden)
+        throw new Error('The requested file does not belong to this round.')
+      const now = new Date().toISOString()
+      if (target.undone) {
+        if (intent.status === 'applied' && intent.reconciledAt !== null) return
+        throw new Error('This file has already been undone by another operation.')
+      }
+      if (intent.status !== 'pending' || intent.reconciledAt !== null)
+        throw new Error('This Undo intent is not pending and cannot complete Undo.')
+      const perFileAllowed =
+        current.undoUnavailableReason === null &&
+        (current.state === 'ready' || current.state === 'mixed')
+      if (!perFileAllowed || !WorkspaceChangesRepository.isUndoable(target))
+        throw new Error('This round cannot complete Undo safely.')
+      const updated: WorkspaceFileChange = { ...target, undone: true }
+      this.database
+        .update(workspaceFileChanges)
+        .set({
+          nativeEvidenceJson: WorkspaceChangesRepository.fileRow(changeSetId, updated)
+            .nativeEvidenceJson,
+        })
+        .where(
+          and(
+            eq(workspaceFileChanges.changeSetId, changeSetId),
+            eq(workspaceFileChanges.path, path),
+          ),
+        )
+        .run()
+      this.database
+        .update(workspaceChangeIntents)
+        .set({ status: 'applied', reconciledAt: now, updatedAt: now })
+        .where(eq(workspaceChangeIntents.id, intentId))
+        .run()
+      const stats = aggregateWorkspaceFileStats(this.database, changeSetId)
+      const nextState =
+        stats.notUndoneVisibleCount === 0
+          ? ('undone' as const)
+          : current.undoUnavailableReason === null &&
+              stats.undoableCount === stats.notUndoneVisibleCount
+            ? ('ready' as const)
+            : ('mixed' as const)
+      this.database
+        .update(workspaceChangeSets)
+        .set({
+          state: nextState,
+          undoUnavailableReason: nextState === 'undone' ? null : current.undoUnavailableReason,
+          projectionPending: true,
+          revision: sql`${workspaceChangeSets.revision} + 1`,
+          finalizedAt: current.finalizedAt ?? now,
+        })
+        .where(eq(workspaceChangeSets.id, changeSetId))
+        .run()
+    })
+    return this.summary(changeSetId)
   }
 
   /** Settles observed state only; original intent payloads and recovery blobs remain intact. */
@@ -707,7 +935,18 @@ export class WorkspaceChangesRepository {
         return
       }
       const current = this.require(input.changeSetId)
-      if (input.kind === 'undo' ? current.state !== 'ready' : current.state !== 'recording')
+      const intentPath = input.payload['path']
+      if (
+        input.kind === 'undo' &&
+        intentPath !== undefined &&
+        (typeof intentPath !== 'string' || intentPath.length === 0 || intentPath.length > 4096)
+      )
+        throw new Error('Invalid workspace operation intent.')
+      const isSingleFileUndo = input.kind === 'undo' && typeof intentPath === 'string'
+      const undoAllowed =
+        current.undoUnavailableReason === null &&
+        (current.state === 'ready' || (isSingleFileUndo && current.state === 'mixed'))
+      if (input.kind === 'undo' ? !undoAllowed : current.state !== 'recording')
         throw new Error('This workspace round cannot accept another operation.')
       const intents =
         this.database
@@ -860,6 +1099,8 @@ export class WorkspaceChangesRepository {
   }
 
   private static toFile(row: typeof workspaceFileChanges.$inferSelect): WorkspaceFileChange {
+    const rawEvidence: unknown = row.nativeEvidenceJson ? JSON.parse(row.nativeEvidenceJson) : null
+    const evidence = WorkspaceChangesRepository.isPayload(rawEvidence) ? rawEvidence : {}
     return workspaceFileChangeSchema.parse({
       path: row.path,
       previousPath: row.previousPath,
@@ -870,7 +1111,18 @@ export class WorkspaceChangesRepository {
       deletions: row.deletions,
       hidden: row.hidden,
       reason: row.reason,
-      ...(row.nativeEvidenceJson ? JSON.parse(row.nativeEvidenceJson) : {}),
+      ...(evidence['beforeAvailable'] !== undefined
+        ? { beforeAvailable: evidence['beforeAvailable'] }
+        : {}),
+      ...(evidence['afterAvailable'] !== undefined
+        ? { afterAvailable: evidence['afterAvailable'] }
+        : {}),
+      ...(evidence['modeKnown'] !== undefined ? { modeKnown: evidence['modeKnown'] } : {}),
+      ...(evidence['undoStrategy'] !== undefined ? { undoStrategy: evidence['undoStrategy'] } : {}),
+      ...(evidence['undone'] !== undefined ? { undone: evidence['undone'] } : {}),
+      ...(evidence['patchVersions'] !== undefined
+        ? { patchVersions: evidence['patchVersions'] }
+        : {}),
     })
   }
 
@@ -898,9 +1150,21 @@ export class WorkspaceChangesRepository {
         afterAvailable: file.afterAvailable,
         modeKnown: file.modeKnown,
         undoStrategy: file.undoStrategy,
+        ...(file.undone !== undefined ? { undone: file.undone } : {}),
         patchVersions: file.patchVersions,
       }),
     }
+  }
+
+  private static isUndoable(file: WorkspaceFileChange): boolean {
+    return (
+      !file.hidden &&
+      file.undoStrategy !== 'unavailable' &&
+      file.undoStrategy !== 'patch' &&
+      file.beforeAvailable !== false &&
+      file.afterAvailable !== false &&
+      !file.undone
+    )
   }
 
   private static toIntent(row: typeof workspaceChangeIntents.$inferSelect): WorkspaceChangeIntent {

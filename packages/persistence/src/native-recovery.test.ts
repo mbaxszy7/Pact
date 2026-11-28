@@ -9,8 +9,10 @@ import { describe, expect, it } from 'vitest'
 
 import type { DefaultSessionSettings, NativeProbeResult, RuntimeAgentId } from '@pact/contracts'
 
+import { freezeOutputAtSteer } from './conversation-output-snapshots.js'
 import { ConversationRepository } from './conversation-repository.js'
 import { seedHistoricalAnswerAttempt } from './legacy-database.test-support.js'
+import { nativeSessionIssueMetadata } from './native-presence-metadata.js'
 import { PactDatabase } from './pact-database.js'
 import {
   agentEventJournal,
@@ -20,16 +22,19 @@ import {
   nativeRebuildOperations,
   schema,
 } from './schema/index.js'
+import { projectSessionIssues } from './session-issues.js'
 
 const migrationsFolder = resolve(import.meta.dirname, '../drizzle')
 const settings: DefaultSessionSettings = {
   primaryAgentId: 'codex',
+  secondaryAgentId: 'claude',
   agents: {
     claude: { model: null, effort: null },
     codex: { model: 'frozen-model', effort: 'high' },
+    agy: { model: null, effort: null },
   },
   maxDiscussionRounds: 6,
-  runningMessagePolicy: 'immediate_safe_point',
+
   maxReviewCycles: 3,
   maxRepairAttempts: 3,
 }
@@ -77,7 +82,7 @@ function seed(f: Fixture, agentId: RuntimeAgentId = 'codex', abandon = false) {
     expectedGeneration: generation,
     abandon,
   })
-  const sourceHash = f.repo.freezeNativeRebuildSource(id, [])
+  const sourceHash = f.repo.freezeNativeRebuildSource(id, [], new Map())
   f.repo.markNativeRebuildDispatched(id)
   f.repo.recordNativeRebuildIdentity(id, nativeSessionId)
   const witness = {
@@ -609,7 +614,7 @@ describe('Durable Native recovery ownership', () => {
           expectedGeneration: 1,
           abandon: false,
         })
-        f.repo.freezeNativeRebuildSource(id, [])
+        f.repo.freezeNativeRebuildSource(id, [], new Map())
         f.repo.markNativeRebuildDispatched(id)
         expect(() => f.repo.recordNativeRebuildIdentity(id, nativeSessionId)).toThrow(/string/iu)
         expect(f.repo.nativeRebuildOperation(id)).toMatchObject({ stage: 'creating' })
@@ -799,6 +804,7 @@ describe('Session-scoped permission revisions', () => {
       expect(f.db.sessionRepository.find(f.sessionId)?.settings.permissionModes).toEqual({
         claude: 'ask',
         codex: 'ask',
+        agy: 'ask',
       })
     } finally {
       f.db.close()
@@ -875,6 +881,7 @@ describe('Session-scoped permission revisions', () => {
       expect(db.sessionRepository.find(f.sessionId)?.settings.permissionModes).toEqual({
         claude: 'full',
         codex: 'auto',
+        agy: 'ask',
       })
       const id = randomUUID()
       db.sessionRepository.create(
@@ -889,6 +896,7 @@ describe('Session-scoped permission revisions', () => {
       expect(db.sessionRepository.find(id)?.settings.permissionModes).toEqual({
         claude: 'ask',
         codex: 'native',
+        agy: 'ask',
       })
       expect(db.defaultSessionSettingsRepository.read()).toEqual(global)
     } finally {
@@ -1012,6 +1020,7 @@ it('uses partial unsettled-work indexes without scanning a thousand ended histor
     const runPlan = explain('agent_runs')
     const creationPlan = explain('native_rebuild_operations')
     expect(production.sessionHasNativeWork(f.sessionId)).toBe(false)
+    expect(production.bindingHasUnsettledWork(f.sessionId, 'codex', 1)).toBe(false)
     const capturePlans = () =>
       queries
         .filter(
@@ -1026,7 +1035,7 @@ it('uses partial unsettled-work indexes without scanning a thousand ended histor
     const partialStats = () =>
       sqlite
         .prepare<unknown[], { name: string; cells: number; bytes: number }>(
-          `SELECT name, sum(ncell) AS cells, sum(pgsize) AS bytes FROM dbstat WHERE name IN ('agent_runs_session_unsettled_work_idx','native_rebuild_operations_unsettled_work_idx','agent_runs_native_generation_latest_idx') GROUP BY name ORDER BY name`,
+          `SELECT name, sum(ncell) AS cells, sum(pgsize) AS bytes FROM dbstat WHERE name IN ('agent_runs_session_unsettled_work_idx','native_rebuild_operations_unsettled_work_idx','agent_runs_native_quit_unsettled_idx','agent_runs_native_generation_latest_idx') GROUP BY name ORDER BY name`,
         )
         .all()
     const before = capturePlans(),
@@ -1035,6 +1044,7 @@ it('uses partial unsettled-work indexes without scanning a thousand ended histor
     queries.length = 0
     expect(production.projectHasNativeWork(f.projectId)).toBe(false)
     expect(production.sessionHasNativeWork(f.sessionId)).toBe(false)
+    expect(production.bindingHasUnsettledWork(f.sessionId, 'codex', 1)).toBe(false)
     const after = capturePlans(),
       afterStats = partialStats()
     expect(after).toEqual(before)
@@ -1048,7 +1058,9 @@ it('uses partial unsettled-work indexes without scanning a thousand ended histor
       after
         .filter((item) => item.query.includes('FROM "agent_runs"'))
         .every((item) =>
-          JSON.stringify(item.plan).includes('agent_runs_session_unsettled_work_idx'),
+          /agent_runs_(session_unsettled_work|native_quit_unsettled)_idx/u.test(
+            JSON.stringify(item.plan),
+          ),
         ),
     ).toBe(true)
     expect(
@@ -1058,8 +1070,13 @@ it('uses partial unsettled-work indexes without scanning a thousand ended histor
           JSON.stringify(item.plan).includes('native_rebuild_operations_unsettled_work_idx'),
         ),
     ).toBe(true)
-    expect(afterStats.filter((item) => item.name.endsWith('_unsettled_work_idx'))).toEqual(
-      beforeStats.filter((item) => item.name.endsWith('_unsettled_work_idx')),
+    const bindingPlans = after.filter((item) =>
+      JSON.stringify(item.plan).includes('agent_runs_native_quit_unsettled_idx'),
+    )
+    expect(bindingPlans).toHaveLength(1)
+    expect(bindingPlans[0]?.rows).toBe(0)
+    expect(afterStats.filter((item) => item.name.includes('_unsettled'))).toEqual(
+      beforeStats.filter((item) => item.name.includes('_unsettled')),
     )
     expect(
       afterStats.find((item) => item.name === 'agent_runs_native_generation_latest_idx')!.cells,
@@ -1172,4 +1189,652 @@ it('offers a first Retry after observation loss and upgrades only an unsuccessfu
   } finally {
     f.db.close()
   }
+})
+
+it('projects response_too_large as retry_check while recoveryAction is retry and as rebuild_offer once recoveryAction is rebuild', async () => {
+  const f = await fixture()
+  try {
+    const agySessionId = randomUUID()
+    f.db.sessionRepository.create(
+      {
+        id: agySessionId,
+        projectId: f.projectId,
+        title: 'Recovery Agy',
+        createdAt: new Date().toISOString(),
+      },
+      { ...settings, primaryAgentId: 'agy', secondaryAgentId: 'codex' },
+    )
+    const agyFixture: Fixture = { ...f, sessionId: agySessionId }
+    const run = start(agyFixture, 'agy').run
+    const nativeSessionId = randomUUID()
+    f.repo.applyEvent(agySessionId, run.id, {
+      type: 'session.started',
+      agentId: 'agy',
+      nativeSessionId,
+    })
+    f.repo.recordDispatch(run.id, 'possibly_sent', nativeSessionId, randomUUID())
+    f.repo.recordNativeEvidence(
+      {
+        kind: 'no_evidence',
+        reason: 'Notification queue overflowed.',
+        identity: {
+          sessionId: agySessionId,
+          agentId: 'agy',
+          runId: run.id,
+          requestId: run.id,
+          nativeSessionId,
+          bindingGeneration: 1,
+        },
+      },
+      'retry',
+    )
+    f.repo.failRun(
+      run.id,
+      'response_too_large',
+      'Antigravity notification queue exceeded its 8 MiB / 4096-item capacity.',
+      false,
+    )
+
+    const retryContext = f.repo.nativeContext(agySessionId, 'agy')!
+    expect(retryContext.recoveryAction).toBe('retry')
+    const retryIssues = projectSessionIssues(agySessionId, [retryContext], [f.repo.findRun(run.id)])
+    expect(retryIssues.agents.find((issue) => issue.agentId === 'agy')).toMatchObject({
+      agentId: 'agy',
+      phase: 'warning',
+      action: 'retry_check',
+    })
+
+    // Simulating a checkNativeBinding failure that persists `response_too_large` with `recoveryAction: 'rebuild'`.
+    f.repo.setContinuation(
+      agySessionId,
+      'agy',
+      'recovery_required',
+      'Native state check failed: Antigravity text/metadata exceeds the 8 MiB inspection budget.',
+      retryContext.bindingGeneration,
+      {
+        kind: 'response_too_large',
+        message: 'Antigravity text/metadata exceeds the 8 MiB inspection budget.',
+        action: 'rebuild',
+      },
+    )
+    const rebuildContext = f.repo.nativeContext(agySessionId, 'agy')!
+    expect(rebuildContext.recoveryAction).toBe('rebuild')
+    const rebuildIssues = projectSessionIssues(
+      agySessionId,
+      [rebuildContext],
+      [f.repo.findRun(run.id)],
+      [],
+      [],
+      [],
+      { sanitize: (value) => value },
+    )
+    expect(rebuildIssues.inputGate).toBe('read_only')
+    expect(rebuildIssues.agents.find((issue) => issue.agentId === 'agy')).toMatchObject({
+      agentId: 'agy',
+      phase: 'rebuild_offer',
+      action: 'rebuild',
+      title: 'Antigravity response too large',
+      reason: 'The response exceeds Pact’s size limit.',
+    })
+  } finally {
+    f.db.close()
+  }
+})
+
+describe('clean user stop persistence and issue projection', () => {
+  it.each(['interrupted', 'completed'] as const)(
+    'settles post-dispatch user_stopped cleanly for %s outcome without warning cards',
+    async (outcome) => {
+      const f = await fixture()
+      try {
+        const run = start(f).run
+        const executorId = randomUUID()
+        f.repo.applyEvent(f.sessionId, run.id, {
+          type: 'session.started',
+          agentId: 'codex',
+          nativeSessionId: `native-clean-stop-${outcome}`,
+        })
+        f.repo.recordDispatch(run.id, 'accepted', `native-clean-stop-${outcome}`, executorId)
+        f.repo.applyEvent(f.sessionId, run.id, {
+          type: 'turn.started',
+          agentId: 'codex',
+          turnId: `turn-${outcome}`,
+        })
+        f.repo.applyEvent(f.sessionId, run.id, {
+          type: 'tool.started',
+          agentId: 'codex',
+          turnId: `turn-${outcome}`,
+          toolCallId: 'cmd-1',
+          toolName: 'exec_command',
+          title: 'Running build',
+        })
+        f.repo.failRun(run.id, 'user_stopped', 'Stopped by user.', true)
+        // While foreground drain is active, suppress lostForeground warning and hold send_blocked.
+        const drainingIssues = projectSessionIssues(
+          f.sessionId,
+          [f.repo.nativeContext(f.sessionId, 'codex')!],
+          [f.repo.findRun(run.id)],
+          [],
+          [],
+          [],
+          { stoppingRunId: run.id },
+        )
+        expect(drainingIssues.agents).toEqual([])
+        expect(drainingIssues.inputGate).toBe('send_blocked')
+        expect(drainingIssues.stoppingAgentId).toBe('codex')
+
+        f.repo.recordNativeEvidence({
+          kind: 'ended',
+          source: 'live_terminal',
+          outcome,
+          identity: {
+            sessionId: f.sessionId,
+            agentId: 'codex',
+            runId: run.id,
+            requestId: run.id,
+            nativeSessionId: `native-clean-stop-${outcome}`,
+            nativeTurnId: `turn-${outcome}`,
+            bindingGeneration: 1,
+            executorId,
+          },
+        })
+        f.repo.recordNativeEffects(run.id, 'settled')
+        f.repo.settleKnownNativeEnding(run.id)
+        const settled = f.repo.findRun(run.id)!
+        expect(settled.status).toBe('interrupted')
+        expect(settled.failureKind).toBe('user_stopped')
+        expect(settled.dispatchPhase).toBe('ended')
+        expect(settled.nativeOutcome).toBe(outcome)
+
+        const context = f.repo.nativeContext(f.sessionId, 'codex')!
+        expect(context.state).toBe('active')
+        expect(context.continuationState).toBe('ready')
+        expect(context.nativeSessionId).toBe(`native-clean-stop-${outcome}`)
+
+        const activities = f.repo.readPage({
+          scope: 'activities',
+          sessionId: f.sessionId,
+          runId: run.id,
+        })
+        if (activities.scope !== 'activities') throw new Error('Expected activities page')
+        expect(activities.activities[0]?.activity.status).toBe('interrupted')
+
+        const issues = projectSessionIssues(f.sessionId, [context], [settled])
+        expect(issues.agents).toEqual([])
+        expect(issues.inputGate).toBe('open')
+        expect(issues.stoppingAgentId).toBeUndefined()
+      } finally {
+        f.db.close()
+      }
+    },
+  )
+
+  it('settles pre-dispatch user_stopped without warning cards and preserves recovery for failed, unconfirmed, or output_unavailable runs', async () => {
+    const f = await fixture()
+    try {
+      // 1. Pre-dispatch user_stopped (not_sent) -> clean, zero issues.
+      const pre = start(f).run
+      f.repo.failRun(pre.id, 'user_stopped', 'Stopped by user.', true)
+      const preRun = f.repo.findRun(pre.id)!
+      expect(preRun.status).toBe('interrupted')
+      expect(preRun.dispatchPhase).toBe('not_sent')
+      expect(projectSessionIssues(f.sessionId, [], [preRun])).toMatchObject({
+        agents: [],
+        inputGate: 'open',
+      })
+
+      // 2. Unconfirmed post-dispatch user_stopped (10s timeout, dispatchPhase stays accepted) -> MUST surface recovery!
+      const timedOut = start(f).run
+      const timedOutExec = randomUUID()
+      f.repo.applyEvent(f.sessionId, timedOut.id, {
+        type: 'session.started',
+        agentId: 'codex',
+        nativeSessionId: 'native-timeout-stop',
+      })
+      f.repo.recordDispatch(timedOut.id, 'accepted', 'native-timeout-stop', timedOutExec)
+      f.repo.failRun(timedOut.id, 'user_stopped', 'Stopped by user.', true)
+      const timedOutIssues = projectSessionIssues(
+        f.sessionId,
+        [f.repo.nativeContext(f.sessionId, 'codex')!],
+        [f.repo.findRun(timedOut.id)],
+      )
+      expect(timedOutIssues.agents.length).toBeGreaterThan(0)
+      expect(timedOutIssues.inputGate).not.toBe('open')
+
+      // 3. Real native 'failed' outcome after user_stopped -> MUST NOT be masked as clean stop!
+      f.repo.recordNativeEvidence({
+        kind: 'ended',
+        source: 'live_terminal',
+        outcome: 'failed',
+        identity: {
+          sessionId: f.sessionId,
+          agentId: 'codex',
+          runId: timedOut.id,
+          requestId: timedOut.id,
+          nativeSessionId: 'native-timeout-stop',
+          bindingGeneration: 1,
+          executorId: timedOutExec,
+        },
+      })
+      f.repo.recordNativeEffects(timedOut.id, 'settled')
+      f.repo.settleKnownNativeEnding(timedOut.id)
+      const failedSettled = f.repo.findRun(timedOut.id)!
+      const failedIssues = projectSessionIssues(
+        f.sessionId,
+        [f.repo.nativeContext(f.sessionId, 'codex')!],
+        [failedSettled],
+      )
+      expect(failedIssues.agents.length).toBeGreaterThan(0)
+
+      // 4. Real pact.output_unavailable + racing completed -> MUST NOT settle cleanly!
+      const unavail = start(f, 'claude').run
+      const unavailExec = randomUUID()
+      f.repo.applyEvent(f.sessionId, unavail.id, {
+        type: 'session.started',
+        agentId: 'claude',
+        nativeSessionId: 'claude-unavail-stop',
+      })
+      f.repo.recordDispatch(unavail.id, 'accepted', 'claude-unavail-stop', unavailExec)
+      f.repo.failRun(unavail.id, 'user_stopped', 'Stopped by user.', true)
+      f.db.drizzle
+        .insert(agentEventJournal)
+        .values({
+          sessionId: f.sessionId,
+          runId: unavail.id,
+          sequence: 99,
+          eventType: 'pact.output_unavailable',
+          payload: JSON.stringify({ reason: 'disk full' }),
+          createdAt: new Date().toISOString(),
+        })
+        .run()
+      f.repo.recordNativeEvidence({
+        kind: 'ended',
+        source: 'live_terminal',
+        outcome: 'completed',
+        identity: {
+          sessionId: f.sessionId,
+          agentId: 'claude',
+          runId: unavail.id,
+          requestId: unavail.id,
+          nativeSessionId: 'claude-unavail-stop',
+          bindingGeneration: 1,
+          executorId: unavailExec,
+        },
+      })
+      f.repo.recordNativeEffects(unavail.id, 'settled')
+      f.repo.settleKnownNativeEnding(unavail.id)
+      const unavailSettled = f.repo.findRun(unavail.id)!
+      expect(unavailSettled.status).toBe('interrupted')
+      const unavailIssues = projectSessionIssues(
+        f.sessionId,
+        [f.repo.nativeContext(f.sessionId, 'claude')!],
+        [unavailSettled],
+        [],
+        [unavail.id],
+      )
+      expect(unavailIssues.agents).toContainEqual(
+        expect.objectContaining({
+          agentId: 'claude',
+          resultDisposition: 'incomplete',
+        }),
+      )
+    } finally {
+      f.db.close()
+    }
+  })
+
+  it('preserves frozen visible prefix on Retry recovery, keeps Stop boundary after recordOutputFailure, honors B-F6 synthetic failed turn.completed, and aligns nativeSessionIssueMetadata', async () => {
+    const f = await fixture()
+    try {
+      // 1. Retry recordNativeOutputComplete must NOT replace the frozen visible prefix of a user_stopped run.
+      const r1 = start(f).run
+      const exec1 = randomUUID()
+      f.repo.applyEvent(f.sessionId, r1.id, {
+        type: 'session.started',
+        agentId: 'codex',
+        nativeSessionId: 'native-retry-stop',
+      })
+      f.repo.recordDispatch(r1.id, 'accepted', 'native-retry-stop', exec1)
+      f.repo.applyEvent(f.sessionId, r1.id, {
+        type: 'turn.started',
+        agentId: 'codex',
+        turnId: 'turn-retry-stop',
+      })
+      f.repo.applyEvent(f.sessionId, r1.id, {
+        type: 'text.delta',
+        agentId: 'codex',
+        turnId: 'turn-retry-stop',
+        outputId: 'answer',
+        text: 'Frozen visible prefix',
+      })
+      f.repo.failRun(r1.id, 'user_stopped', 'Stopped by user.', true)
+      const visibleBefore = f.db.drizzle
+        .select()
+        .from(conversationMessages)
+        .where(eq(conversationMessages.runId, r1.id))
+        .all()
+        .find((m) => m.role === 'assistant' && m.isVisible)!
+      await f.repo.recordNativeOutputComplete(
+        r1.id,
+        {
+          outputId: 'answer',
+          text: 'Late full recovered answer from Retry.',
+          completeness: 'complete',
+        },
+        new AbortController().signal,
+      )
+      const msgsAfter = f.db.drizzle
+        .select()
+        .from(conversationMessages)
+        .where(eq(conversationMessages.runId, r1.id))
+        .all()
+        .filter((m) => m.role === 'assistant')
+      const visibleAfter = msgsAfter.filter((m) => m.isVisible)
+      expect(visibleAfter).toHaveLength(1)
+      expect(visibleAfter[0]?.id).toBe(visibleBefore.id)
+      expect(visibleAfter[0]?.content).toBe('Frozen visible prefix')
+      expect(msgsAfter.some((m) => !m.isVisible && m.content.includes('Late full recovered'))).toBe(
+        true,
+      )
+
+      // 2. B-F6 synthetic turn.completed(failed) after verified ended/completed keeps user_stopped neutral,
+      // and nativeSessionIssueMetadata reports zero agents just like projectSessionIssues.
+      f.repo.recordNativeEvidence({
+        kind: 'ended',
+        source: 'live_terminal',
+        outcome: 'completed',
+        identity: {
+          sessionId: f.sessionId,
+          agentId: 'codex',
+          runId: r1.id,
+          requestId: r1.id,
+          nativeSessionId: 'native-retry-stop',
+          nativeTurnId: 'turn-retry-stop',
+          bindingGeneration: 1,
+          executorId: exec1,
+        },
+      })
+      f.repo.applyArchivedEvent(f.sessionId, r1.id, {
+        type: 'turn.completed',
+        agentId: 'codex',
+        turnId: 'turn-retry-stop',
+        outcome: 'failed',
+      })
+      f.repo.recordNativeEffects(r1.id, 'settled')
+      f.repo.settleKnownNativeEnding(r1.id)
+      expect(f.repo.findRun(r1.id)).toMatchObject({
+        status: 'interrupted',
+        failureKind: 'user_stopped',
+        nativeOutcome: 'completed',
+      })
+      expect(nativeSessionIssueMetadata(f.db.drizzle, f.sessionId).issues.agents).toEqual([])
+
+      // 3. Stop + real recordOutputFailure + racing completed NEVER promotes run back to completed!
+      const r2 = start(f, 'claude').run
+      const exec2 = randomUUID()
+      f.repo.applyEvent(f.sessionId, r2.id, {
+        type: 'session.started',
+        agentId: 'claude',
+        nativeSessionId: 'claude-outfail-stop',
+      })
+      f.repo.recordDispatch(r2.id, 'accepted', 'claude-outfail-stop', exec2)
+      f.repo.failRun(r2.id, 'user_stopped', 'Stopped by user.', true)
+      f.repo.recordOutputFailure(r2.id, {
+        kind: 'response_too_large',
+        message: 'Output exceeded storage limit.',
+      })
+      f.repo.recordNativeEvidence({
+        kind: 'ended',
+        source: 'live_terminal',
+        outcome: 'completed',
+        identity: {
+          sessionId: f.sessionId,
+          agentId: 'claude',
+          runId: r2.id,
+          requestId: r2.id,
+          nativeSessionId: 'claude-outfail-stop',
+          bindingGeneration: 1,
+          executorId: exec2,
+        },
+      })
+      f.repo.recordNativeEffects(r2.id, 'settled')
+      f.repo.settleKnownNativeEnding(r2.id)
+      expect(f.repo.findRun(r2.id)?.status).toBe('interrupted')
+      expect(f.repo.findRun(r2.id)?.failureKind).toBe('response_too_large')
+
+      // 4. Carbon F1: restorePreDispatchContext discards fresh 0-turn context but preserves established bindings.
+      const fFresh = await fixture()
+      try {
+        const freshRun = start(fFresh, 'claude').run
+        fFresh.repo.applyEvent(fFresh.sessionId, freshRun.id, {
+          type: 'session.started',
+          agentId: 'claude',
+          nativeSessionId: 'claude-fresh-0turn',
+        })
+        fFresh.repo.recordDispatch(freshRun.id, 'rejected', 'claude-fresh-0turn', randomUUID())
+        fFresh.repo.failRun(freshRun.id, 'user_stopped', 'Stopped by user.', true)
+        fFresh.repo.recordNativeEffects(
+          freshRun.id,
+          'not_dispatched',
+          'stopped_before_native_dispatch',
+        )
+        const discardedPatch = fFresh.repo.restorePreDispatchContext(freshRun.id)
+        expect(discardedPatch).toBeDefined()
+        expect(fFresh.repo.nativeContext(fFresh.sessionId, 'claude')).toBeUndefined()
+        expect(
+          nativeSessionIssueMetadata(fFresh.db.drizzle, fFresh.sessionId).issues,
+        ).toMatchObject({
+          agents: [],
+          inputGate: 'open',
+        })
+
+        // Established binding (Run 1 accepted & completed; Run 2 stopped pre-dispatch) stays active/ready!
+        const estRun1 = start(fFresh, 'codex').run
+        const estExec = randomUUID()
+        fFresh.repo.applyEvent(fFresh.sessionId, estRun1.id, {
+          type: 'session.started',
+          agentId: 'codex',
+          nativeSessionId: 'codex-established',
+        })
+        fFresh.repo.recordDispatch(estRun1.id, 'accepted', 'codex-established', estExec)
+        fFresh.repo.applyEvent(fFresh.sessionId, estRun1.id, {
+          type: 'text.completed',
+          agentId: 'codex',
+          turnId: 'turn-est-1',
+          outputId: 'answer',
+          text: 'Completed turn 1.',
+        })
+        fFresh.repo.recordNativeEvidence({
+          kind: 'ended',
+          source: 'live_terminal',
+          outcome: 'completed',
+          identity: {
+            sessionId: fFresh.sessionId,
+            agentId: 'codex',
+            runId: estRun1.id,
+            requestId: estRun1.id,
+            nativeSessionId: 'codex-established',
+            nativeTurnId: 'turn-est-1',
+            bindingGeneration: 1,
+            executorId: estExec,
+          },
+        })
+        fFresh.repo.recordNativeEffects(estRun1.id, 'settled')
+        fFresh.repo.settleKnownNativeEnding(estRun1.id)
+
+        const estRun2 = start(fFresh, 'codex').run
+        fFresh.repo.setContinuation(fFresh.sessionId, 'codex', 'responding', undefined, 1)
+        fFresh.repo.recordDispatch(estRun2.id, 'rejected', 'codex-established', estExec)
+        fFresh.repo.failRun(estRun2.id, 'user_stopped', 'Stopped by user.', true)
+        fFresh.repo.recordNativeEffects(
+          estRun2.id,
+          'not_dispatched',
+          'stopped_before_native_dispatch',
+        )
+        expect(fFresh.repo.restorePreDispatchContext(estRun2.id)).toBeDefined()
+        expect(fFresh.repo.nativeContext(fFresh.sessionId, 'codex')).toMatchObject({
+          nativeSessionId: 'codex-established',
+          state: 'active',
+          continuationState: 'ready',
+        })
+      } finally {
+        fFresh.db.close()
+      }
+
+      // 5. Astra #1: failRun with explicit { userStopped: true } on output flush failure preserves
+      // real failure visibility while blocking Retry from promoting the run back to completed.
+      const fFlushFail = await fixture()
+      try {
+        const rFlush = start(fFlushFail, 'codex').run
+        const execFlush = randomUUID()
+        fFlushFail.repo.applyEvent(fFlushFail.sessionId, rFlush.id, {
+          type: 'session.started',
+          agentId: 'codex',
+          nativeSessionId: 'codex-flush-fail',
+        })
+        fFlushFail.repo.recordDispatch(rFlush.id, 'accepted', 'codex-flush-fail', execFlush)
+        fFlushFail.repo.applyEvent(fFlushFail.sessionId, rFlush.id, {
+          type: 'text.delta',
+          agentId: 'codex',
+          turnId: 'turn-flush',
+          outputId: 'answer',
+          text: 'Prefix before flush fail',
+        })
+        fFlushFail.repo.failRun(
+          rFlush.id,
+          'protocol_error',
+          'Latest output could not be saved.',
+          true,
+          { userStopped: true },
+        )
+        fFlushFail.repo.recordNativeEvidence({
+          kind: 'ended',
+          source: 'live_terminal',
+          outcome: 'completed',
+          identity: {
+            sessionId: fFlushFail.sessionId,
+            agentId: 'codex',
+            runId: rFlush.id,
+            requestId: rFlush.id,
+            nativeSessionId: 'codex-flush-fail',
+            nativeTurnId: 'turn-flush',
+            bindingGeneration: 1,
+            executorId: execFlush,
+          },
+        })
+        fFlushFail.repo.recordNativeEffects(rFlush.id, 'settled')
+        await fFlushFail.repo.recordNativeOutputComplete(
+          rFlush.id,
+          {
+            outputId: 'answer',
+            text: 'Full recovered answer after flush fail',
+            completeness: 'complete',
+          },
+          new AbortController().signal,
+        )
+        fFlushFail.repo.settleKnownNativeEnding(rFlush.id)
+        expect(fFlushFail.repo.findRun(rFlush.id)).toMatchObject({
+          status: 'interrupted',
+          failureKind: 'protocol_error',
+        })
+        const flushMsgs = fFlushFail.db.drizzle
+          .select()
+          .from(conversationMessages)
+          .where(eq(conversationMessages.runId, rFlush.id))
+          .all()
+          .filter((m) => m.role === 'assistant')
+        expect(flushMsgs.filter((m) => m.isVisible)).toMatchObject([
+          { content: 'Prefix before flush fail', state: 'incomplete' },
+        ])
+        expect(
+          flushMsgs.some(
+            (m) => !m.isVisible && m.content === 'Full recovered answer after flush fail',
+          ),
+        ).toBe(true)
+      } finally {
+        fFlushFail.db.close()
+      }
+
+      // 6. Astra #8: Steer with empty suffix + Stop + repeated Retry (small & sealed >128 KiB body)
+      // keeps frozen visible row `incomplete` and deduplicates to strictly one hidden recovery row.
+      await Promise.all(
+        ['Identical small prefix', 'S'.repeat(140_000)].map(async (bodyText) => {
+          const fSteer = await fixture()
+          try {
+            const rSteer = start(fSteer, 'codex').run
+            const execSteer = randomUUID()
+            fSteer.repo.applyEvent(fSteer.sessionId, rSteer.id, {
+              type: 'session.started',
+              agentId: 'codex',
+              nativeSessionId: 'codex-steer-stop',
+            })
+            fSteer.repo.recordDispatch(rSteer.id, 'accepted', 'codex-steer-stop', execSteer)
+            fSteer.repo.applyEvent(fSteer.sessionId, rSteer.id, {
+              type: 'turn.started',
+              agentId: 'codex',
+              turnId: 'turn-steer-stop',
+            })
+            fSteer.repo.applyEvent(fSteer.sessionId, rSteer.id, {
+              type: 'text.delta',
+              agentId: 'codex',
+              turnId: 'turn-steer-stop',
+              outputId: 'answer',
+              text: bodyText,
+            })
+            const steerUserMsgId = randomUUID()
+            fSteer.db.drizzle
+              .insert(conversationMessages)
+              .values({
+                id: steerUserMsgId,
+                sessionId: fSteer.sessionId,
+                runId: rSteer.id,
+                role: 'user',
+                isVisible: true,
+                content: 'Steer input',
+                state: 'complete',
+                sequence: 99,
+                createdAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString(),
+              })
+              .run()
+            freezeOutputAtSteer(fSteer.db.drizzle, fSteer.repo.findRun(rSteer.id)!, steerUserMsgId)
+            fSteer.repo.failRun(rSteer.id, 'user_stopped', 'Stopped by user.', true)
+            const visibleBeforeSteer = fSteer.db.drizzle
+              .select()
+              .from(conversationMessages)
+              .where(eq(conversationMessages.runId, rSteer.id))
+              .all()
+              .find((m) => m.role === 'assistant' && m.isVisible)!
+            await fSteer.repo.recordNativeOutputComplete(
+              rSteer.id,
+              { outputId: 'answer', text: bodyText, completeness: 'complete' },
+              new AbortController().signal,
+            )
+            await fSteer.repo.recordNativeOutputComplete(
+              rSteer.id,
+              { outputId: 'answer', text: bodyText, completeness: 'complete' },
+              new AbortController().signal,
+            )
+            const steerMsgs = fSteer.db.drizzle
+              .select()
+              .from(conversationMessages)
+              .where(eq(conversationMessages.runId, rSteer.id))
+              .all()
+              .filter((m) => m.role === 'assistant')
+            const visibleAfterSteer = steerMsgs.filter((m) => m.isVisible)
+            const hiddenAfterSteer = steerMsgs.filter((m) => !m.isVisible)
+            expect(visibleAfterSteer).toHaveLength(1)
+            expect(visibleAfterSteer[0]?.id).toBe(visibleBeforeSteer.id)
+            expect(visibleAfterSteer[0]?.state).toBe('incomplete')
+            expect(hiddenAfterSteer).toHaveLength(1)
+            expect(hiddenAfterSteer[0]?.content).toBe(bodyText)
+          } finally {
+            fSteer.db.close()
+          }
+        }),
+      )
+    } finally {
+      f.db.close()
+    }
+  })
 })

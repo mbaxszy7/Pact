@@ -1,13 +1,31 @@
 import { describe, expect, it } from 'vitest'
 
-import { nativeMemoryDiagnosticsSchema } from '@pact/contracts'
-
 import {
+  DECISION_WORKING_BYTES,
+  nativeMemoryCapacitiesSchema,
+  nativeMemoryDiagnosticsSchema,
+} from '@pact/contracts'
+
+import { AgentExecutionError, NativeCapacityError } from './agent-execution-error'
+import {
+  DecisionMemoryLease,
   NativeWorkingMemory,
   nativeWorkingMemoryDiagnostics,
   NATIVE_APP_WORKING_BYTES,
   NATIVE_OWNER_WORKING_BYTES,
+  NATIVE_COMBINED_WORKING_BYTES,
+  nativeWorkingMemoryCapacities,
+  decisionWorkingMemoryDiagnostics,
 } from './native-working-memory'
+
+function captureError(fn: () => void): unknown {
+  try {
+    fn()
+    return undefined
+  } catch (error) {
+    return error
+  }
+}
 
 describe('Native working reservation observations', () => {
   it('counts zero-byte live reservations and every successful resize/release boundary', () => {
@@ -80,10 +98,28 @@ describe('Native working reservation observations', () => {
         expect(() => owner.reserve(invalid)).toThrow('Invalid Native working reservation.')
         expect(owner.diagnostics()).toEqual(before)
       }
-      expect(() => reservation.resize(NATIVE_OWNER_WORKING_BYTES + 1)).toThrow(
-        'Native working capacity is full.',
-      )
-      expect(() => owner.reserve(1)).toThrow('Native working capacity is full.')
+      const overResize = captureError(() => reservation.resize(NATIVE_OWNER_WORKING_BYTES + 1))
+      expect(overResize).toBeInstanceOf(NativeCapacityError)
+      expect(overResize).toBeInstanceOf(AgentExecutionError)
+      expect(overResize).toMatchObject({
+        kind: 'runtime_incompatible',
+        message: 'Native working capacity is full.',
+      })
+
+      const overReserve = captureError(() => owner.reserve(1))
+      expect(overReserve).toBeInstanceOf(NativeCapacityError)
+      expect(overReserve).toMatchObject({ message: 'Native working capacity is full.' })
+
+      const invalidReserve = captureError(() => owner.reserve(-1))
+      expect(invalidReserve).toBeInstanceOf(AgentExecutionError)
+      expect(invalidReserve).not.toBeInstanceOf(NativeCapacityError)
+      expect(invalidReserve).toMatchObject({ kind: 'protocol_error' })
+
+      const invalidResize = captureError(() => reservation.resize(Number.NaN))
+      expect(invalidResize).toBeInstanceOf(AgentExecutionError)
+      expect(invalidResize).not.toBeInstanceOf(NativeCapacityError)
+      expect(invalidResize).toMatchObject({ kind: 'protocol_error' })
+
       expect(owner.diagnostics()).toEqual(before)
       expect(reservation.bytes).toBe(NATIVE_OWNER_WORKING_BYTES)
     } finally {
@@ -167,5 +203,101 @@ describe('Native working reservation observations', () => {
     expect(after.acquiredItems).toBe(before.acquiredItems! + 100)
     expect(after.releasedItems).toBe(before.releasedItems! + 100)
     expect(nativeMemoryDiagnosticsSchema.safeParse(after).success).toBe(true)
+  })
+})
+
+describe('Independent decision working capacity', () => {
+  it('retains the original four full business owners while the entire decision allocation remains held', () => {
+    const before = nativeWorkingMemoryCapacities()
+    const auxiliary = new NativeWorkingMemory('decision').reserve(DECISION_WORKING_BYTES)
+    const reservations = []
+    try {
+      // This is managed-reservation evidence, not allocation of four physical 128 MiB buffers or RSS.
+      for (let index = 0; index < 4; index++)
+        reservations.push(new NativeWorkingMemory().reserve(NATIVE_OWNER_WORKING_BYTES))
+      expect(nativeWorkingMemoryDiagnostics().chargedBytes).toBe(NATIVE_APP_WORKING_BYTES)
+      expect(decisionWorkingMemoryDiagnostics().chargedBytes).toBe(DECISION_WORKING_BYTES)
+      expect(nativeWorkingMemoryCapacities()).toMatchObject({
+        businessLimitBytes: 512 * 1024 * 1024,
+        decisionLimitBytes: 16 * 1024 * 1024,
+        combinedLimitBytes: 528 * 1024 * 1024,
+        chargedBytes: NATIVE_COMBINED_WORKING_BYTES,
+      })
+      expect(nativeMemoryCapacitiesSchema.safeParse(nativeWorkingMemoryCapacities()).success).toBe(
+        true,
+      )
+      expect(() => new NativeWorkingMemory().reserve(1)).toThrow('Native working capacity is full.')
+      expect(() => new NativeWorkingMemory('decision').reserve(1)).toThrow(
+        'Native working capacity is full.',
+      )
+      reservations[0]!.release()
+      reservations.push(new NativeWorkingMemory().reserve(NATIVE_OWNER_WORKING_BYTES))
+      expect(auxiliary.bytes).toBe(DECISION_WORKING_BYTES)
+      expect(nativeWorkingMemoryCapacities().chargedBytes).toBe(NATIVE_COMBINED_WORKING_BYTES)
+    } finally {
+      for (const reservation of reservations) reservation.release()
+      auxiliary.release()
+    }
+    const after = nativeWorkingMemoryCapacities()
+    expect(after.chargedBytes).toBe(before.chargedBytes)
+    expect(after.business.reservationItems).toBe(before.business.reservationItems)
+    expect(after.decision.reservationItems).toBe(before.decision.reservationItems)
+  })
+
+  it('enforces one shared 16 MiB decision cap across owners without changing failed-resize accounting', () => {
+    const first = new NativeWorkingMemory('decision')
+    const second = new NativeWorkingMemory('decision')
+    const a = first.reserve(8 * 1024 * 1024)
+    const b = second.reserve(8 * 1024 * 1024)
+    try {
+      const before = nativeWorkingMemoryCapacities()
+      expect(() => a.resize(a.bytes + 1)).toThrow('Native working capacity is full.')
+      expect(() => first.reserve(DECISION_WORKING_BYTES + 1)).toThrow(
+        'Native working capacity is full.',
+      )
+      expect(() => b.resize(-1)).toThrow('Invalid Native working reservation.')
+      expect(nativeWorkingMemoryCapacities()).toEqual(before)
+      a.release()
+      b.resize(DECISION_WORKING_BYTES)
+      expect(second.bytes).toBe(DECISION_WORKING_BYTES)
+      const business = new NativeWorkingMemory().reserve(NATIVE_OWNER_WORKING_BYTES)
+      try {
+        expect(nativeWorkingMemoryDiagnostics().chargedBytes).toBe(NATIVE_OWNER_WORKING_BYTES)
+      } finally {
+        business.release()
+      }
+    } finally {
+      a.release()
+      b.release()
+    }
+    expect(first.bytes).toBe(0)
+    expect(second.bytes).toBe(0)
+  })
+
+  it('throws NativeCapacityError on app-wide and DecisionMemoryLease capacity exhaustion while keeping protocol_error on invalid arguments', () => {
+    const lease = new DecisionMemoryLease()
+    const held = lease.reserve(DECISION_WORKING_BYTES)
+    try {
+      const leaseReserveOverflow = captureError(() => lease.reserve(1))
+      expect(leaseReserveOverflow).toBeInstanceOf(NativeCapacityError)
+      expect(leaseReserveOverflow).toMatchObject({ message: 'Decision working capacity is full.' })
+
+      const leaseResizeOverflow = captureError(() => held.resize(DECISION_WORKING_BYTES + 1))
+      expect(leaseResizeOverflow).toBeInstanceOf(NativeCapacityError)
+      expect(leaseResizeOverflow).toMatchObject({ message: 'Decision working capacity is full.' })
+
+      const leaseInvalidArg = captureError(() => held.resize(-5))
+      expect(leaseInvalidArg).toBeInstanceOf(AgentExecutionError)
+      expect(leaseInvalidArg).not.toBeInstanceOf(NativeCapacityError)
+      expect(leaseInvalidArg).toMatchObject({ kind: 'protocol_error' })
+
+      const secondDecisionOwner = new NativeWorkingMemory('decision')
+      const decisionCapError = captureError(() => secondDecisionOwner.reserve(1))
+      expect(decisionCapError).toBeInstanceOf(NativeCapacityError)
+      expect(decisionCapError).toMatchObject({ message: 'Native working capacity is full.' })
+    } finally {
+      held.release()
+      lease.release()
+    }
   })
 })

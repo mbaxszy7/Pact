@@ -1,10 +1,11 @@
-import type {
-  AgentRun,
-  NativeAgentContext,
-  NativeRebuildOperation,
-  RuntimeAgentId,
-  SessionIssue,
-  SessionIssues,
+import {
+  agentDisplayName,
+  type AgentRun,
+  type NativeAgentContext,
+  type NativeRebuildOperation,
+  type RuntimeAgentId,
+  type SessionIssue,
+  type SessionIssues,
 } from '@pact/contracts'
 
 export type SessionIssueRun = Pick<
@@ -15,10 +16,12 @@ export type SessionIssueRun = Pick<
   | 'dispatchPhase'
   | 'nativeOutcome'
   | 'nativeEffectsState'
+  | 'nativeEffectsReason'
   | 'bindingGeneration'
   | 'failureKind'
   | 'failureMessage'
->
+> &
+  Partial<Pick<AgentRun, 'nativeSessionId' | 'executorId' | 'controlDisposition'>>
 export type SessionIssueRebuild = Pick<
   NativeRebuildOperation,
   'id' | 'stage' | 'provisionalNativeSessionId' | 'checkAction' | 'failureReason'
@@ -34,7 +37,32 @@ export type SessionIssueContext = Pick<
   | 'recoveryAction'
   | 'recoveryReason'
   | 'recoveryFailureMessage'
-> & { rebuildOperation?: SessionIssueRebuild | undefined }
+> &
+  Partial<Pick<NativeAgentContext, 'lastRunId' | 'executorId' | 'permissionRequests'>> & {
+    rebuildOperation?: SessionIssueRebuild | undefined
+    hasPendingPermission?: boolean | undefined
+  }
+
+export function isRetiredAgentRecoverySettled(input: {
+  continuationState: string | undefined
+  recoveryAction?: string | null | undefined
+  recoveryFailureKind?: string | null | undefined
+  hasPendingPermission?: boolean | undefined
+  hasPendingRebuild?: boolean | undefined
+  hasUnsettledRun?: boolean | undefined
+}): boolean {
+  if (input.hasPendingPermission || input.hasPendingRebuild || input.hasUnsettledRun) {
+    return false
+  }
+  if (input.continuationState === undefined || input.continuationState === 'ready') {
+    return true
+  }
+  return (
+    input.continuationState === 'recovery_required' &&
+    input.recoveryAction !== 'check' &&
+    input.recoveryFailureKind !== 'unknown_delivery'
+  )
+}
 
 /** Pure, bounded projection of durable facts; never dispatches or infers an ending. */
 export function projectSessionIssues(
@@ -45,17 +73,37 @@ export function projectSessionIssues(
   incompleteResults: string[] = [],
   operations: Array<{ agentId: RuntimeAgentId; operation: SessionIssueRebuild }> = [],
   presentation?: {
-    isArchivedRejection: (error: unknown, nativeSessionId: string) => boolean
-    sanitize: (value: string, maximum: number) => string
+    isArchivedRejection?: (error: unknown, nativeSessionId: string) => boolean
+    sanitize?: (value: string, maximum: number) => string
+    activeAgents?: readonly [RuntimeAgentId, RuntimeAgentId] | undefined
+    stoppingRunId?: string | undefined
   },
 ): SessionIssues {
   const isCodexArchivedSessionRejection = presentation?.isArchivedRejection ?? (() => false)
   const safeNativePermissionText = presentation?.sanitize ?? (() => '')
+  const activeAgents = presentation?.activeAgents
   const agents: SessionIssue[] = []
   let inputGate: SessionIssues['inputGate'] = 'open'
-  for (const agentId of ['codex', 'claude'] as const) {
+  let stoppingAgentId: RuntimeAgentId | undefined
+  for (const agentId of ['codex', 'claude', 'agy'] as const) {
+    const isActiveMember =
+      !activeAgents || activeAgents[0] === agentId || activeAgents[1] === agentId
     const context = contexts.find((item) => item.agentId === agentId)
-    const run = runs.find((item) => item?.agentId === agentId)
+    const latest = runs.find((item) => item?.agentId === agentId)
+    const cursor = cursors.find((item) => item?.agentId === agentId)
+    const retainedCursor =
+      cursor &&
+      context?.lastRunId === cursor.id &&
+      context.nativeSessionId === cursor.nativeSessionId &&
+      context.bindingGeneration === cursor.bindingGeneration &&
+      cursor.controlDisposition !== 'abandoned' &&
+      ['pending', 'unknown'].includes(cursor.nativeEffectsState ?? '') &&
+      (!latest ||
+        latest.id === cursor.id ||
+        (['failed', 'interrupted'].includes(latest.status) &&
+          ['not_sent', 'rejected'].includes(latest.dispatchPhase ?? '') &&
+          latest.bindingGeneration === cursor.bindingGeneration))
+    const run = retainedCursor ? cursor : latest
     const savedOperation =
       context?.rebuildOperation ?? operations.find((item) => item.agentId === agentId)?.operation
     const operation =
@@ -65,12 +113,33 @@ export function projectSessionIssues(
     const pending =
       operation && ['preparing', 'creating', 'seeding', 'unconfirmed'].includes(operation.stage)
     const state = context?.continuationState
+    const uncertainWork =
+      state === 'responding' ||
+      state === 'waiting_user' ||
+      [run, cursor].some(
+        (item) =>
+          item &&
+          ((!['not_sent', 'rejected', 'ended'].includes(item.dispatchPhase ?? '') &&
+            !item.nativeOutcome) ||
+            item.nativeEffectsState === 'pending' ||
+            item.nativeEffectsState === 'unknown'),
+      )
+    const backgroundRecovery =
+      retainedCursor &&
+      run?.dispatchPhase === 'ended' &&
+      context?.state === 'active' &&
+      context.recoveryFailureKind !== 'native_session_occupied' &&
+      !pending
     const blocked =
-      state === 'recovery_required' ||
+      (state === 'recovery_required' && !backgroundRecovery) ||
       state === 'rebuilding' ||
       state === 'checking' ||
       Boolean(pending)
+    const isForegroundStopping = Boolean(
+      presentation?.stoppingRunId && run?.id === presentation.stoppingRunId,
+    )
     const lostForeground =
+      !isForegroundStopping &&
       (state === 'responding' || state === 'waiting_user') &&
       run &&
       ['failed', 'interrupted'].includes(run.status)
@@ -82,8 +151,67 @@ export function projectSessionIssues(
       (!run.nativeOutcome || incompleteResults.includes(run.id))
     const unsettledEffects =
       !processing && run && ['pending', 'unknown'].includes(run.nativeEffectsState ?? '')
+    const hasPendingPermission =
+      Boolean(context?.hasPendingPermission) || Boolean(context?.permissionRequests?.length)
+    if (isForegroundStopping && !blocked && !pending && operation?.stage !== 'failed') {
+      if (inputGate === 'open') inputGate = 'send_blocked'
+      stoppingAgentId = agentId
+      continue
+    }
+    if (
+      !isActiveMember &&
+      isRetiredAgentRecoverySettled({
+        continuationState: state,
+        recoveryAction: context?.recoveryAction,
+        recoveryFailureKind: context?.recoveryFailureKind,
+        hasPendingPermission,
+        hasPendingRebuild: Boolean(pending) || state === 'rebuilding',
+        hasUnsettledRun:
+          Boolean(processing || uncertainWork || unsettledEffects || lostForeground) || incomplete,
+      })
+    )
+      continue
+    if (!isActiveMember && !blocked && !lostForeground && !uncertainWork && !unsettledEffects)
+      continue
+    const contextHealthy =
+      !context ||
+      (context.state === 'active' &&
+        state === 'ready' &&
+        !context.recoveryReason &&
+        !context.recoveryFailureKind &&
+        !context.recoveryFailureMessage &&
+        (!context.recoveryAction || context.recoveryAction === 'none'))
+    const cleanWithheldGuard =
+      run?.status === 'failed' &&
+      run.failureKind === 'user_stopped' &&
+      (run.dispatchPhase === 'not_sent' || run.dispatchPhase === 'rejected') &&
+      (run.nativeEffectsState === 'not_dispatched' ||
+        (run.nativeEffectsState === 'settled' &&
+          (run.nativeEffectsReason === 'workflow_input_withheld' ||
+            run.nativeEffectsReason === 'native_turn_not_started')))
+    const cleanUserStop =
+      !blocked &&
+      !lostForeground &&
+      !uncertainWork &&
+      !unsettledEffects &&
+      !incomplete &&
+      !hasPendingPermission &&
+      operation?.stage !== 'failed' &&
+      contextHealthy &&
+      (cleanWithheldGuard ||
+        (run?.status === 'interrupted' &&
+          run.failureKind === 'user_stopped' &&
+          ((run.dispatchPhase === 'ended' &&
+            (run.nativeOutcome === 'interrupted' || run.nativeOutcome === 'completed') &&
+            (run.nativeEffectsState === 'settled' ||
+              run.nativeEffectsState === 'not_dispatched')) ||
+            ((run.dispatchPhase === 'not_sent' || run.dispatchPhase === 'rejected') &&
+              (!run.nativeEffectsState ||
+                run.nativeEffectsState === 'not_dispatched' ||
+                run.nativeEffectsState === 'settled')))))
+    if (cleanUserStop) continue
     if (!blocked && !lostForeground && !failed && !incomplete && !unsettledEffects) continue
-    const name = agentId === 'codex' ? 'Codex' : 'Claude Code'
+    const name = agentDisplayName(agentId)
     const inputDisposition: SessionIssue['inputDisposition'] =
       !run || run.dispatchPhase === 'not_sent' || run.dispatchPhase === 'rejected'
         ? 'not_submitted'
@@ -118,17 +246,19 @@ export function projectSessionIssues(
         : undefined) ??
       context?.recoveryReason ??
       run?.failureMessage ??
-      'The session status could not be confirmed.'
+      'Couldn’t confirm the session status.'
     // Display a cause, not the transport's follow-up instructions or repeated assurances.
     reason =
       reason.replace(/^Native state check failed:\s*/u, '').split(/(?<=[.!?])\s+/u)[0] ?? reason
+    if (state === 'recovery_required' && backgroundRecovery && inputGate === 'open')
+      inputGate = 'send_blocked'
     if (state === 'checking' && run?.dispatchPhase === 'ended' && context?.state === 'active') {
       if (inputGate === 'open') inputGate = 'send_blocked'
     } else if (blocked || lostForeground) inputGate = 'read_only'
     if (state === 'checking') {
-      phase = 'checking'
+      phase = unsettledEffects ? 'background_checking' : 'checking'
       action = 'none'
-      title = `Checking ${name} session`
+      title = phase === 'background_checking' ? 'Checking…' : `Checking ${name} session`
       reason = ''
     } else if (pending && ['preparing', 'creating', 'seeding'].includes(operation.stage)) {
       phase = 'rebuilding'
@@ -153,15 +283,38 @@ export function projectSessionIssues(
       phase = 'rebuild_offer'
       action = 'rebuild'
       title = `${name} session not confirmed`
-      reason = 'Pact couldn’t confirm which session received this request.'
+      reason = 'Pact couldn’t confirm whether the session received your message.'
     } else if (!context && !pending) {
       action = 'none'
+    } else if (
+      unsettledEffects &&
+      !blocked &&
+      !lostForeground &&
+      (!failed || (retainedCursor && run.dispatchPhase === 'ended'))
+    ) {
+      // Live ownership may refine the projection; pending alone proves no activity.
+      // A failed root does not establish that its current background work ended.
+      phase = 'background_check'
+      const checked =
+        run.nativeEffectsReason === 'background_check_unconfirmed' ||
+        context?.recoveryAction === 'rebuild'
+      action = context ? (checked ? 'rebuild' : 'retry_check') : 'none'
+      title = checked
+        ? 'Session needs recovery'
+        : incomplete
+          ? 'Background task status unknown · Reply incomplete'
+          : 'Background task status unknown'
+      reason = checked
+        ? 'The original request ended. Rebuild to continue while earlier background work finishes.'
+        : run.nativeEffectsReason === 'pact_restarted'
+          ? 'Pact restarted before confirming this background task ended.'
+          : 'Pact couldn’t confirm whether this background task ended.'
     } else if (operation?.stage === 'failed' && context?.recoveryAction !== 'rebuild') {
       action = context ? 'retry_check' : 'none'
       title = `${name} session setup couldn’t start`
       if (/adapter slots/iu.test(reason)) reason = 'All agent slots are currently in use.'
       else if (/interaction slots/iu.test(reason))
-        reason = 'Too many requests are waiting for input.'
+        reason = 'Too many requests are waiting for your response.'
       else if (/history.*(?:exceeds|limit|large)/iu.test(reason))
         reason = 'The saved conversation exceeds the restore limit.'
     } else if (!blocked && !lostForeground && inputDisposition === 'not_submitted') {
@@ -169,7 +322,10 @@ export function projectSessionIssues(
       action = 'none'
       title = `${name} request was not started`
       reason = 'Your message wasn’t sent. This session is ready.'
-    } else if (repairRuntime) {
+    } else if (
+      repairRuntime &&
+      !(currentFailure === 'response_too_large' && context?.recoveryAction === 'rebuild')
+    ) {
       action = context ? 'retry_check' : 'none'
     } else if (currentFailure === 'native_session_occupied' && (blocked || lostForeground)) {
       inputGate = 'read_only'
@@ -186,19 +342,35 @@ export function projectSessionIssues(
       } else if (context?.state === 'missing') {
         title = `${name} session not found`
         reason = 'The saved session could not be found.'
+      } else if (currentFailure === 'response_too_large') {
+        title = `${name} response too large`
+        reason = 'The response exceeds Pact’s size limit.'
       } else title = `${name} session check failed`
+    } else if (
+      run?.dispatchPhase === 'ended' &&
+      run.nativeOutcome === 'interrupted' &&
+      run.nativeEffectsState === 'settled' &&
+      !uncertainWork &&
+      context?.state === 'active' &&
+      state === 'ready' &&
+      !context.recoveryReason &&
+      !context.recoveryFailureKind &&
+      !context.recoveryFailureMessage &&
+      (!run.failureKind || run.failureKind === 'user_stopped') &&
+      (!run.failureMessage || run.failureKind === 'user_stopped')
+    ) {
+      // An interrupted task may never produce a final answer. Preserve that
+      // fact without offering another check of an already resolved session.
+      phase = 'resolved'
+      action = 'none'
+      title = `${name} task stopped`
+      reason = 'This task was stopped. You can continue below.'
     } else if (context?.recoveryAction === 'none') {
       action = 'none'
     } else if (incomplete && !blocked) {
       phase = 'resolved'
       title = `${name} response incomplete`
-      reason = 'The task has ended, but its full response is unavailable.'
-    } else if (unsettledEffects && !blocked && !lostForeground && !failed) {
-      // Historical effects uncertainty is not a new Session-wide admission rule.
-      // Native continuation and the live Adapter still own current work admission.
-      action = 'none'
-      title = `${name} earlier background work unconfirmed`
-      reason = 'The reply is complete. Some earlier background work could not be verified.'
+      reason = 'The task finished, but part of its reply wasn’t saved.'
     }
     // A just-failed setup reports its own cause, even when the old binding still needs replacement.
     if (
@@ -209,7 +381,7 @@ export function projectSessionIssues(
       reason = operation.failureReason?.split(/(?<=[.!?])\s+/u)[0] ?? reason
       if (/adapter slots/iu.test(reason)) reason = 'All agent slots are currently in use.'
       else if (/interaction slots/iu.test(reason))
-        reason = 'Too many requests are waiting for input.'
+        reason = 'Too many requests are waiting for your response.'
       else if (/history.*(?:exceeds|limit|large)/iu.test(reason))
         reason = 'The saved conversation exceeds the restore limit.'
     } else if (phase === 'warning' && lostForeground) {
@@ -232,26 +404,14 @@ export function projectSessionIssues(
         reason = 'The response exceeds Pact’s size limit.'
       } else if (/executable.*unavailable/iu.test(reason)) {
         title = `${name} unavailable`
-        reason = `The ${name} executable is unavailable. Check its installation.`
+        reason = `Couldn’t start ${name}. Check that it is installed and available.`
       }
     } else if (phase === 'warning' && /native transport disconnected/iu.test(reason)) {
       title = `${name} connection lost`
-      reason = `The connection to ${name} was interrupted.`
+      reason = `Lost connection to ${name}.`
     }
     if (/connection reset|ECONNRESET/iu.test(reason))
       reason = 'The connection was reset during the session check.'
-    const cursor = cursors.find((item) => item?.agentId === agentId)
-    const uncertainWork =
-      state === 'responding' ||
-      state === 'waiting_user' ||
-      [run, cursor].some(
-        (item) =>
-          item &&
-          ((!['not_sent', 'rejected', 'ended'].includes(item.dispatchPhase ?? '') &&
-            !item.nativeOutcome) ||
-            item.nativeEffectsState === 'pending' ||
-            item.nativeEffectsState === 'unknown'),
-      )
     agents.push({
       agentId,
       generation: context?.bindingGeneration ?? run?.bindingGeneration ?? 1,
@@ -276,5 +436,5 @@ export function projectSessionIssues(
       previousCreationUnconfirmed: operation?.stage === 'unconfirmed',
     })
   }
-  return { sessionId, inputGate, agents }
+  return { sessionId, inputGate, ...(stoppingAgentId ? { stoppingAgentId } : {}), agents }
 }

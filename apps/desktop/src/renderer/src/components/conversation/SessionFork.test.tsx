@@ -27,6 +27,19 @@ import { NativeForkRecovery, SessionForkDialog } from './SessionFork'
 const showDescriptor = Object.getOwnPropertyDescriptor(HTMLDialogElement.prototype, 'showModal')
 const closeDescriptor = Object.getOwnPropertyDescriptor(HTMLDialogElement.prototype, 'close')
 beforeEach(() => {
+  vi.stubGlobal(
+    'ResizeObserver',
+    class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    },
+  )
+  vi.stubGlobal('matchMedia', () => ({
+    matches: true,
+    addEventListener: vi.fn<() => void>(),
+    removeEventListener: vi.fn<() => void>(),
+  }))
   vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) =>
     window.setTimeout(() => callback(0), 0),
   )
@@ -70,13 +83,15 @@ function fixture() {
     preview: 'Selected completed reply',
     settings: {
       primaryAgentId: 'claude',
+      secondaryAgentId: 'codex',
       agents: {
         claude: { model: 'claude-opus', effort: 'high' },
         codex: { model: 'gpt-6.1-sol', effort: 'medium' },
+        agy: { model: null, effort: null },
       },
-      permissionModes: { claude: 'full', codex: 'ask' },
+      permissionModes: { claude: 'full', codex: 'ask', agy: 'ask' },
       maxDiscussionRounds: 3,
-      runningMessagePolicy: 'next_round',
+
       maxReviewCycles: 3,
       maxRepairAttempts: 3,
     },
@@ -342,7 +357,7 @@ it('publishes a failed committed branch then closes its creation modal without e
   await f.receipt(failed)
   expect(screen.getByText('Ready')).toBeDefined()
   expect(screen.getByText('Candidate needs confirmation')).toBeDefined()
-  expect(screen.queryByRole('button', { name: 'Check original candidate' })).toBeNull()
+  expect(screen.queryByRole('button', { name: 'Check status' })).toBeNull()
   expect(f.props.onCreated).toHaveBeenCalledWith(f.change, false)
   expect(f.props.onClose).toHaveBeenCalledOnce()
   expect(f.props.onCreated.mock.calls.filter(([, enter]) => enter)).toEqual([])
@@ -352,7 +367,7 @@ it('retries a lost creation acknowledgement with the same operation identity', a
   const f = fixture()
   await f.start()
   await act(async () => f.createReceipt.reject(new Error('Lost ACK')))
-  expect((await screen.findByRole('alert')).textContent).toContain('same operation')
+  expect((await screen.findByRole('alert')).textContent).toContain('same fork')
   const first = f.forkSession.mock.calls.find(([input]) => input.action === 'create')![0]
   f.forkSession.mockResolvedValueOnce({
     ok: true,
@@ -418,7 +433,7 @@ it('keeps the creation receipt recovery visible when reconciliation belongs to a
     },
   })
   await act(async () => f.createReceipt.reject(new Error('Lost committed ACK')))
-  expect((await screen.findByRole('alert')).textContent).toContain('sidebar receipt')
+  expect((await screen.findByRole('alert')).textContent).toContain('sidebar didn’t update')
   expect(f.props.onClose).not.toHaveBeenCalled()
   expect(f.props.onCreated).not.toHaveBeenCalled()
 })
@@ -450,10 +465,8 @@ it('makes recovery explicit for the failed Agent and keeps readiness controlled 
   }
   cleanup()
   const mounted = render(<NativeForkRecovery operation={value} />)
-  expect(
-    screen.getByText(/Sending becomes available when both Native sessions are ready/u),
-  ).toBeDefined()
-  fireEvent.click(screen.getByRole('button', { name: 'Continue initialization' }))
+  expect(screen.getByText(/Sending unlocks once both agents finish setup/u)).toBeDefined()
+  fireEvent.click(screen.getByRole('button', { name: 'Complete setup' }))
   await waitFor(() =>
     expect(f.forkSession).toHaveBeenLastCalledWith({
       action: 'initialize',

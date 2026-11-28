@@ -9,6 +9,7 @@ import { PactDatabase } from '@pact/persistence'
 
 import { ProjectFileReader } from '../project-file/project-file-reader.js'
 import { RuntimePreparation } from '../runtime-preparation/runtime-preparation.js'
+import { runDirectoryWorker } from '../workspace-changes/directory-worker.test-support.js'
 import { Conversation } from './conversation.js'
 
 const lifecycle = vi.hoisted(() => ({
@@ -72,6 +73,16 @@ vi.mock('./codex-agent-adapter.js', () => ({
       }
     }
 
+    beginNativeStatusCheck(input: AgentNativeProbeInput, signal: AbortSignal) {
+      const result = this.probeNativeStatus(input, signal)
+      return {
+        result,
+        physicalCompletion: result.then(
+          () => undefined,
+          () => undefined,
+        ),
+      }
+    }
     async dispose() {
       if (this.running) lifecycle.disposedWhileRunning += 1
       if (this.inspecting) lifecycle.disposedWhileInspecting += 1
@@ -102,6 +113,16 @@ vi.mock('./claude-agent-adapter.js', () => ({
       }
     }
 
+    beginNativeStatusCheck(input: AgentNativeProbeInput, signal: AbortSignal) {
+      const result = this.probeNativeStatus(input, signal)
+      return {
+        result,
+        physicalCompletion: result.then(
+          () => undefined,
+          () => undefined,
+        ),
+      }
+    }
     async dispose() {
       if (this.inspecting) lifecycle.disposedWhileInspecting += 1
       lifecycle.disposed += 1
@@ -152,9 +173,14 @@ function inspectNativeProbe(input: AgentNativeProbeInput, signal: AbortSignal) {
 const migrationsFolder = resolve(import.meta.dirname, '../../../../../packages/persistence/drizzle')
 const settings: DefaultSessionSettings = {
   primaryAgentId: 'codex',
-  agents: { claude: { model: null, effort: null }, codex: { model: null, effort: null } },
+  secondaryAgentId: 'claude',
+  agents: {
+    claude: { model: null, effort: null },
+    codex: { model: null, effort: null },
+    agy: { model: null, effort: null },
+  },
   maxDiscussionRounds: 6,
-  runningMessagePolicy: 'immediate_safe_point',
+
   maxReviewCycles: 3,
   maxRepairAttempts: 3,
 }
@@ -205,7 +231,7 @@ describe('bounded Conversation Adapter lifetime', () => {
       db.sessionRepository,
       db.projectCatalogRepository,
       preparation,
-      new ProjectFileReader(db.sessionRepository, db.projectCatalogRepository),
+      new ProjectFileReader(db.sessionRepository, db.projectCatalogRepository, runDirectoryWorker),
     )
     try {
       for (let index = 0; index < 1_000; index += 1) {
@@ -341,7 +367,7 @@ describe('bounded Conversation Adapter lifetime', () => {
       db.sessionRepository,
       db.projectCatalogRepository,
       preparation,
-      new ProjectFileReader(db.sessionRepository, db.projectCatalogRepository),
+      new ProjectFileReader(db.sessionRepository, db.projectCatalogRepository, runDirectoryWorker),
     )
     inspections.enabled = true
     try {

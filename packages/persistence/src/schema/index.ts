@@ -1,5 +1,17 @@
 import { sql } from 'drizzle-orm'
-import { index, integer, primaryKey, sqliteTable, text, uniqueIndex } from 'drizzle-orm/sqlite-core'
+import {
+  check,
+  foreignKey,
+  index,
+  integer,
+  primaryKey,
+  sqliteTable,
+  text,
+  uniqueIndex,
+  type AnySQLiteColumn,
+} from 'drizzle-orm/sqlite-core'
+
+import { SESSION_GROUP_COLORS } from '@pact/contracts'
 
 export const pactSchemaMeta = sqliteTable('pact_schema_meta', {
   key: text('key').primaryKey(),
@@ -13,6 +25,34 @@ export const appearanceSettings = sqliteTable('appearance_settings', {
   materialOpacity: integer('material_opacity').notNull(),
   revision: integer('revision').notNull(),
   updatedAt: text('updated_at').notNull(),
+})
+
+export const schedulingSettings = sqliteTable('scheduling_settings', {
+  id: integer('id').primaryKey(),
+  enabled: integer('enabled', { mode: 'boolean' }).notNull().default(false),
+  showIndicator: integer('show_indicator', { mode: 'boolean' }).notNull().default(true),
+  revision: integer('revision').notNull().default(0),
+  configurationGeneration: integer('configuration_generation').notNull().default(0),
+  updatedAt: text('updated_at').notNull(),
+})
+
+/** Encrypted-at-rest singleton; the plaintext key never enters this table. */
+export const relayCredentials = sqliteTable('relay_credentials', {
+  id: integer('id').primaryKey(),
+  ciphertext: text('ciphertext'),
+  revision: integer('revision').notNull().default(0),
+  updatedAt: text('updated_at').notNull(),
+})
+
+/** Durable credential mutation receipts; requestFingerprint is a ciphertext-identity hash, never key material. */
+export const relayCredentialReceipts = sqliteTable('relay_credential_receipts', {
+  nonce: text('nonce').primaryKey(),
+  operation: text('operation', { enum: ['save', 'remove'] }).notNull(),
+  expectedRevision: integer('expected_revision').notNull(),
+  revision: integer('revision').notNull(),
+  configured: integer('configured', { mode: 'boolean' }).notNull(),
+  requestFingerprint: text('request_fingerprint').notNull(),
+  createdAt: text('created_at').notNull(),
 })
 
 export const appUpdateSettings = sqliteTable('app_update_settings', {
@@ -36,14 +76,17 @@ export const appSetupState = sqliteTable('app_setup_state', {
 })
 
 export const runtimeCliPaths = sqliteTable('runtime_cli_paths', {
-  agentId: text('agent_id', { enum: ['claude', 'codex'] }).primaryKey(),
+  agentId: text('agent_id', { enum: ['claude', 'codex', 'agy'] }).primaryKey(),
   executablePath: text('executable_path').notNull(),
   updatedAt: text('updated_at').notNull(),
 })
 
 export const defaultSessionSettings = sqliteTable('default_session_settings', {
   id: integer('id').primaryKey(),
-  primaryAgentId: text('primary_agent_id', { enum: ['claude', 'codex'] }).notNull(),
+  primaryAgentId: text('primary_agent_id', { enum: ['claude', 'codex', 'agy'] }).notNull(),
+  secondaryAgentId: text('secondary_agent_id', { enum: ['claude', 'codex', 'agy'] })
+    .notNull()
+    .default('claude'),
   claudeModel: text('claude_model'),
   claudeEffort: text('claude_effort'),
   claudeSpeed: text('claude_speed', { enum: ['native', 'standard', 'fast'] })
@@ -52,6 +95,11 @@ export const defaultSessionSettings = sqliteTable('default_session_settings', {
   codexModel: text('codex_model'),
   codexEffort: text('codex_effort'),
   codexSpeed: text('codex_speed', { enum: ['native', 'standard', 'fast'] })
+    .notNull()
+    .default('native'),
+  agyModel: text('agy_model'),
+  agyEffort: text('agy_effort'),
+  agySpeed: text('agy_speed', { enum: ['native', 'standard', 'fast'] })
     .notNull()
     .default('native'),
   maxDiscussionRounds: integer('max_discussion_rounds').notNull(),
@@ -83,6 +131,8 @@ export const projects = sqliteTable('projects', {
   createdAt: text('created_at').notNull(),
   archivedAt: text('archived_at'),
   needsAttentionCount: integer('needs_attention_count').notNull().default(0),
+  sessionGroupRevision: integer('session_group_revision').notNull().default(0),
+  nextSessionGroupOrdinal: integer('next_session_group_ordinal').notNull().default(1),
 })
 
 export const sessions = sqliteTable(
@@ -116,6 +166,7 @@ export const sessions = sqliteTable(
     lastSeenMessageSequence: integer('last_seen_message_sequence'),
     lastOpenedOrdinal: integer('last_opened_ordinal'),
     workspaceVisible: integer('workspace_visible', { mode: 'boolean' }).notNull().default(true),
+    sidebarHidden: integer('sidebar_hidden', { mode: 'boolean' }).notNull().default(false),
     needsAttention: integer('needs_attention', { mode: 'boolean' }).notNull().default(false),
     jumpListSuppressed: integer('jump_list_suppressed', { mode: 'boolean' })
       .notNull()
@@ -125,8 +176,20 @@ export const sessions = sqliteTable(
       .default(false),
     queueEnabled: integer('queue_enabled', { mode: 'boolean' }).notNull().default(true),
     queueRevision: integer('queue_revision').notNull().default(0),
+    nextMessageSequence: integer('next_message_sequence').notNull().default(0),
     queuePauseReason: text('queue_pause_reason'),
     commentsRevision: integer('comments_revision').notNull().default(0),
+    parentSessionId: text('parent_session_id').references((): AnySQLiteColumn => sessions.id, {
+      onDelete: 'cascade',
+    }),
+    sideChatOrigin: text('side_chat_origin', { enum: ['selection', 'btw'] }),
+    anchorCutoffId: text('anchor_cutoff_id'),
+    anchorMessageId: text('anchor_message_id'),
+    anchorQuote: text('anchor_quote'),
+    anchorQuotePreview: text('anchor_quote_preview'),
+    anchorStartOffset: integer('anchor_start_offset'),
+    anchorEndOffset: integer('anchor_end_offset'),
+    mutationSeq: integer('mutation_seq').notNull().default(0),
     createdAt: text('created_at').notNull(),
     updatedAt: text('updated_at').notNull(),
     archivedAt: text('archived_at'),
@@ -135,7 +198,7 @@ export const sessions = sqliteTable(
     index('sessions_native_recent_idx')
       .on(table.lastOpenedOrdinal, table.id)
       .where(
-        sql`${table.workspaceVisible} = 1 AND ${table.needsAttention} = 0 AND ${table.lastOpenedOrdinal} IS NOT NULL`,
+        sql`${table.workspaceVisible} = 1 AND ${table.needsAttention} = 0 AND ${table.lastOpenedOrdinal} IS NOT NULL AND ${table.parentSessionId} IS NULL`,
       ),
     index('sessions_native_attention_idx')
       .on(table.lastOpenedOrdinal, table.id)
@@ -144,6 +207,67 @@ export const sessions = sqliteTable(
     index('sessions_project_created_id_active_idx')
       .on(table.projectId, table.createdAt, table.id)
       .where(sql`${table.status} <> 'archived'`),
+    index('sessions_parent_created_id_idx').on(table.parentSessionId, table.createdAt, table.id),
+    uniqueIndex('sessions_id_project_unique').on(table.id, table.projectId),
+    check(
+      'sessions_side_chat_origin_check',
+      sql.raw(
+        "(CASE WHEN ((parent_session_id IS NULL AND side_chat_origin IS NULL AND anchor_cutoff_id IS NULL AND anchor_message_id IS NULL AND anchor_quote IS NULL AND anchor_quote_preview IS NULL AND anchor_start_offset IS NULL AND anchor_end_offset IS NULL) OR (parent_session_id IS NOT NULL AND parent_session_id <> id AND side_chat_origin = 'selection' AND anchor_cutoff_id IS NOT NULL AND anchor_message_id IS NOT NULL AND anchor_quote IS NOT NULL AND anchor_quote_preview IS NOT NULL AND anchor_start_offset IS NOT NULL AND anchor_end_offset IS NOT NULL AND anchor_start_offset >= 0 AND anchor_end_offset > anchor_start_offset) OR (parent_session_id IS NOT NULL AND parent_session_id <> id AND side_chat_origin = 'btw' AND anchor_cutoff_id IS NOT NULL AND anchor_message_id IS NULL AND anchor_quote IS NULL AND anchor_quote_preview IS NULL AND anchor_start_offset IS NULL AND anchor_end_offset IS NULL)) THEN 1 ELSE 0 END) = 1",
+      ),
+    ),
+  ],
+)
+
+export const sessionGroups = sqliteTable(
+  'session_groups',
+  {
+    id: text('id').primaryKey(),
+    projectId: text('project_id')
+      .notNull()
+      .references(() => projects.id, { onDelete: 'restrict' }),
+    creationOrdinal: integer('creation_ordinal').notNull(),
+    name: text('name').notNull(),
+    color: text('color', { enum: SESSION_GROUP_COLORS }).notNull(),
+    position: integer('position').notNull(),
+    collapsed: integer('collapsed', { mode: 'boolean' }).notNull().default(false),
+    createdAt: text('created_at').notNull(),
+    updatedAt: text('updated_at').notNull(),
+  },
+  (table) => [
+    uniqueIndex('session_groups_id_project_unique').on(table.id, table.projectId),
+    uniqueIndex('session_groups_project_creation_ordinal_unique').on(
+      table.projectId,
+      table.creationOrdinal,
+    ),
+    uniqueIndex('session_groups_project_position_unique').on(table.projectId, table.position),
+    index('session_groups_project_position_id_idx').on(table.projectId, table.position, table.id),
+  ],
+)
+
+export const sessionGroupMembers = sqliteTable(
+  'session_group_members',
+  {
+    sessionId: text('session_id').primaryKey(),
+    projectId: text('project_id').notNull(),
+    groupId: text('group_id').notNull(),
+    position: integer('position').notNull().default(0),
+  },
+  (table) => [
+    uniqueIndex('session_group_members_position_unique').on(
+      table.groupId,
+      table.projectId,
+      table.position,
+    ),
+    foreignKey({
+      columns: [table.sessionId, table.projectId],
+      foreignColumns: [sessions.id, sessions.projectId],
+      name: 'session_group_members_session_project_fk',
+    }).onDelete('cascade'),
+    foreignKey({
+      columns: [table.groupId, table.projectId],
+      foreignColumns: [sessionGroups.id, sessionGroups.projectId],
+      name: 'session_group_members_group_project_fk',
+    }).onDelete('cascade'),
   ],
 )
 
@@ -190,7 +314,10 @@ export const sessionSettingsRevisions = sqliteTable(
       .notNull()
       .references(() => sessions.id, { onDelete: 'cascade' }),
     revision: integer('revision').notNull(),
-    primaryAgentId: text('primary_agent_id', { enum: ['claude', 'codex'] }).notNull(),
+    primaryAgentId: text('primary_agent_id', { enum: ['claude', 'codex', 'agy'] }).notNull(),
+    secondaryAgentId: text('secondary_agent_id', { enum: ['claude', 'codex', 'agy'] })
+      .notNull()
+      .default('claude'),
     claudeModel: text('claude_model'),
     claudeEffort: text('claude_effort'),
     claudeSpeed: text('claude_speed', { enum: ['native', 'standard', 'fast'] })
@@ -201,12 +328,20 @@ export const sessionSettingsRevisions = sqliteTable(
     codexSpeed: text('codex_speed', { enum: ['native', 'standard', 'fast'] })
       .notNull()
       .default('native'),
+    agyModel: text('agy_model'),
+    agyEffort: text('agy_effort'),
+    agySpeed: text('agy_speed', { enum: ['native', 'standard', 'fast'] })
+      .notNull()
+      .default('native'),
     claudePermissionMode: text('claude_permission_mode', {
       enum: ['native', 'ask', 'auto', 'full'],
     })
       .notNull()
       .default('ask'),
     codexPermissionMode: text('codex_permission_mode', { enum: ['native', 'ask', 'auto', 'full'] })
+      .notNull()
+      .default('native'),
+    agyPermissionMode: text('agy_permission_mode', { enum: ['native', 'ask', 'auto', 'full'] })
       .notNull()
       .default('native'),
     maxDiscussionRounds: integer('max_discussion_rounds').notNull(),
@@ -231,12 +366,13 @@ export const conversationMessages = sqliteTable(
     replyToMessageId: text('reply_to_message_id'),
     isVisible: integer('is_visible', { mode: 'boolean' }).notNull().default(true),
     role: text('role', { enum: ['user', 'assistant', 'system'] }).notNull(),
-    agentId: text('agent_id', { enum: ['claude', 'codex'] }),
+    agentId: text('agent_id', { enum: ['claude', 'codex', 'agy'] }),
     routeKind: text('route_kind', { enum: ['primary', 'agent', 'all'] }),
     routeAgentsJson: text('route_agents_json'),
     skillInvocationJson: text('skill_invocation_json'),
-    routePendingAgentId: text('route_pending_agent_id', { enum: ['claude', 'codex'] }),
+    routePendingAgentId: text('route_pending_agent_id', { enum: ['claude', 'codex', 'agy'] }),
     sourceMessageId: text('source_message_id'),
+    originSideChatJson: text('origin_side_chat_json'),
     content: text('content').notNull(),
     contentRevision: integer('content_revision').notNull().default(0),
     state: text('state', { enum: ['complete', 'streaming', 'incomplete'] }).notNull(),
@@ -266,6 +402,11 @@ export const conversationMessages = sqliteTable(
       table.isVisible,
       table.sequence,
     ),
+    index('conversation_messages_archived_background_idx')
+      .on(table.sessionId, table.sequence)
+      .where(
+        sql`${table.isVisible} = 0 AND ${table.role} = 'assistant' AND ${table.runId} IS NULL AND ${table.sourceMessageId} IS NOT NULL`,
+      ),
     uniqueIndex('conversation_messages_visible_reply_unique')
       .on(table.replyToMessageId, table.agentId)
       .where(
@@ -335,6 +476,7 @@ export const conversationImageAssets = sqliteTable(
     height: integer('height'),
     sha256: text('sha256'),
     thumbnailBytes: integer('thumbnail_bytes').notNull().default(0),
+    storageObjectId: text('storage_object_id'),
     createdAt: text('created_at').notNull(),
     updatedAt: text('updated_at').notNull(),
   },
@@ -345,6 +487,7 @@ export const conversationImageAssets = sqliteTable(
     index('conversation_image_assets_temp_idx')
       .on(t.updatedAt)
       .where(sql`${t.committed} = 0`),
+    index('conversation_image_assets_storage_object_idx').on(t.storageObjectId),
   ],
 )
 export const conversationMessageImages = sqliteTable(
@@ -381,7 +524,7 @@ export const conversationBodyInputs = sqliteTable(
       .references(() => sessions.id, { onDelete: 'cascade' }),
     clientMessageId: text('client_message_id').notNull(),
     ownerKey: text('owner_key').notNull(),
-    purpose: text('purpose', { enum: ['input', 'answer', 'collaboration'] }).notNull(),
+    purpose: text('purpose', { enum: ['input', 'answer', 'collaboration', 'cutoff'] }).notNull(),
     bytes: integer('bytes').notNull().default(0),
     chars: integer('chars').notNull().default(0),
     parts: integer('parts').notNull().default(0),
@@ -400,17 +543,17 @@ export const conversationBodyInputs = sqliteTable(
     index('conversation_body_inputs_owner_capacity_idx')
       .on(table.ownerKey, table.bytes, table.parts)
       .where(
-        sql`${table.committedMessageId} IS NULL AND ${table.pendingReceiptId} IS NULL AND ${table.sourceRunId} IS NULL`,
+        sql`${table.committedMessageId} IS NULL AND ${table.pendingReceiptId} IS NULL AND ${table.sourceRunId} IS NULL AND ${table.purpose} <> 'cutoff'`,
       ),
     index('conversation_body_inputs_bytes_idx')
       .on(table.bytes, table.parts)
       .where(
-        sql`${table.committedMessageId} IS NULL AND ${table.pendingReceiptId} IS NULL AND ${table.sourceRunId} IS NULL`,
+        sql`${table.committedMessageId} IS NULL AND ${table.pendingReceiptId} IS NULL AND ${table.sourceRunId} IS NULL AND ${table.purpose} <> 'cutoff'`,
       ),
     index('conversation_body_inputs_unreferenced_expiry_idx')
       .on(table.updatedAt)
       .where(
-        sql`${table.committedMessageId} IS NULL AND ${table.pendingReceiptId} IS NULL AND ${table.sourceRunId} IS NULL`,
+        sql`${table.committedMessageId} IS NULL AND ${table.pendingReceiptId} IS NULL AND ${table.sourceRunId} IS NULL AND ${table.purpose} <> 'cutoff'`,
       ),
   ],
 )
@@ -425,7 +568,10 @@ export const conversationBodyParts = sqliteTable(
     text: text('text').notNull(),
     endBytes: integer('end_bytes').notNull(),
   },
-  (table) => [primaryKey({ columns: [table.inputId, table.offset] })],
+  (table) => [
+    primaryKey({ columns: [table.inputId, table.offset] }),
+    index('conversation_body_parts_input_end_bytes_idx').on(table.inputId, table.endBytes),
+  ],
 )
 
 export const anchoredComments = sqliteTable(
@@ -496,14 +642,14 @@ export const agentRuns = sqliteTable(
     collaborationKind: text('collaboration_kind', { enum: ['plan', 'build', 'review'] }),
     collaborationStage: text('collaboration_stage', {
       enum: [
-        'draft',
-        'discuss',
-        'clarify',
+        'plan',
+        'plan_review',
         'implement',
-        'supplement',
-        'review',
+        'code_review',
+        'collaborate',
         'respond',
         'repair',
+        'reply',
       ],
     }),
     id: text('id').primaryKey(),
@@ -511,7 +657,7 @@ export const agentRuns = sqliteTable(
       .notNull()
       .references(() => sessions.id, { onDelete: 'cascade' }),
     userMessageId: text('user_message_id').notNull(),
-    agentId: text('agent_id', { enum: ['claude', 'codex'] }).notNull(),
+    agentId: text('agent_id', { enum: ['claude', 'codex', 'agy'] }).notNull(),
     status: text('status', {
       enum: ['starting', 'running', 'recovering', 'completed', 'failed', 'interrupted'],
     }).notNull(),
@@ -551,6 +697,9 @@ export const agentRuns = sqliteTable(
     workspaceRecordingUnavailableReason: text('workspace_recording_unavailable_reason'),
     reexecutedFromRunId: text('reexecuted_from_run_id'),
     reexecutionOperationId: text('reexecution_operation_id'),
+    automaticRecoveryRevoked: integer('automatic_recovery_revoked', { mode: 'boolean' })
+      .notNull()
+      .default(false),
     failureKind: text('failure_kind', {
       enum: [
         'transient_transport',
@@ -573,7 +722,7 @@ export const agentRuns = sqliteTable(
     handoffMessageCount: integer('handoff_message_count').notNull().default(0),
     peerProposalId: text('peer_proposal_id'),
     peerProposalTargetAgentId: text('peer_proposal_target_agent_id', {
-      enum: ['claude', 'codex'],
+      enum: ['claude', 'codex', 'agy'],
     }),
     peerProposalKind: text('peer_proposal_kind', {
       enum: ['supplement', 'fact_check', 'challenge', 'review'],
@@ -652,14 +801,14 @@ export const agentRunActivities = sqliteTable(
     runId: text('run_id')
       .notNull()
       .references(() => agentRuns.id, { onDelete: 'cascade' }),
-    agentId: text('agent_id', { enum: ['claude', 'codex'] }).notNull(),
+    agentId: text('agent_id', { enum: ['claude', 'codex', 'agy'] }).notNull(),
     nativeId: text('native_id').notNull(),
     kind: text('kind', { enum: ['reasoning', 'tool'] }).notNull(),
     toolName: text('tool_name'),
     title: text('title').notNull(),
     detail: text('detail'),
     detailRevision: integer('detail_revision').notNull().default(0),
-    status: text('status', { enum: ['running', 'completed', 'failed'] }).notNull(),
+    status: text('status', { enum: ['running', 'completed', 'failed', 'interrupted'] }).notNull(),
     sequence: integer('sequence').notNull(),
     createdAt: text('created_at').notNull(),
     updatedAt: text('updated_at').notNull(),
@@ -689,7 +838,7 @@ export const workspaceChangeSets = sqliteTable(
     projectId: text('project_id')
       .notNull()
       .references(() => projects.id, { onDelete: 'restrict' }),
-    agentId: text('agent_id', { enum: ['claude', 'codex'] }).notNull(),
+    agentId: text('agent_id', { enum: ['claude', 'codex', 'agy'] }).notNull(),
     root: text('root').notNull(),
     rootDevice: text('root_device').notNull(),
     rootInode: text('root_inode').notNull(),
@@ -798,7 +947,7 @@ export const nativeAgentContexts = sqliteTable(
     sessionId: text('session_id')
       .notNull()
       .references(() => sessions.id, { onDelete: 'cascade' }),
-    agentId: text('agent_id', { enum: ['claude', 'codex'] }).notNull(),
+    agentId: text('agent_id', { enum: ['claude', 'codex', 'agy'] }).notNull(),
     nativeSessionId: text('native_session_id').notNull(),
     bindingGeneration: integer('binding_generation').notNull().default(1),
     executorId: text('executor_id'),
@@ -843,6 +992,7 @@ export const nativeAgentContexts = sqliteTable(
     rebuildMessageCount: integer('rebuild_message_count'),
     rebuiltThroughSequence: integer('rebuilt_through_sequence'),
     forkThroughSequence: integer('fork_through_sequence'),
+    deliveredCutoffIdsJson: text('delivered_cutoff_ids_json'),
     updatedAt: text('updated_at').notNull(),
   },
   (table) => [
@@ -875,6 +1025,7 @@ export const agentEventJournal = sqliteTable(
   },
   (table) => [
     primaryKey({ columns: [table.sessionId, table.sequence] }),
+    index('agent_event_journal_run_type_sequence').on(table.runId, table.eventType, table.sequence),
     index('agent_event_journal_reported_title')
       .on(table.sessionId)
       .where(
@@ -890,7 +1041,7 @@ export const nativeRebuildOperations = sqliteTable(
     sessionId: text('session_id')
       .notNull()
       .references(() => sessions.id, { onDelete: 'cascade' }),
-    agentId: text('agent_id', { enum: ['claude', 'codex'] }).notNull(),
+    agentId: text('agent_id', { enum: ['claude', 'codex', 'agy'] }).notNull(),
     oldGeneration: integer('old_generation').notNull(),
     oldNativeSessionId: text('old_native_session_id'),
     oldRunId: text('old_run_id').references(() => agentRuns.id, { onDelete: 'set null' }),
@@ -972,7 +1123,7 @@ export const nativeForkIntents = sqliteTable(
     operationId: text('operation_id')
       .notNull()
       .references(() => sessionForkOperations.id, { onDelete: 'restrict' }),
-    agentId: text('agent_id', { enum: ['claude', 'codex'] }).notNull(),
+    agentId: text('agent_id', { enum: ['claude', 'codex', 'agy'] }).notNull(),
     sourceJson: text('source_json').notNull(),
     state: text('state', {
       enum: ['prepared', 'forking', 'unconfirmed', 'initializing', 'ready', 'error'],
@@ -1012,7 +1163,7 @@ export const nativeForkCandidateReceipts = sqliteTable(
     operationId: text('operation_id')
       .notNull()
       .references(() => sessionForkOperations.id, { onDelete: 'restrict' }),
-    agentId: text('agent_id', { enum: ['claude', 'codex'] }).notNull(),
+    agentId: text('agent_id', { enum: ['claude', 'codex', 'agy'] }).notNull(),
     nativeSessionId: text('native_session_id').notNull(),
     witnessJson: text('witness_json').notNull(),
     createdAt: text('created_at').notNull(),
@@ -1038,8 +1189,522 @@ export const collaborationTasks = sqliteTable(
     uniqueIndex('collaboration_tasks_active_session')
       .on(table.sessionId)
       .where(sql`${table.active} = 1`),
+    index('collaboration_tasks_pending_workflow')
+      .on(table.updatedAt, table.id)
+      .where(
+        sql`${table.active} = 1 AND json_extract(${table.stateJson}, '$.protocol') = 'native-workflow-v1' AND (json_extract(${table.stateJson}, '$.automation') = 'active' OR (json_extract(${table.stateJson}, '$.automation') = 'paused' AND json_extract(${table.stateJson}, '$.pauseReason') = 'limit' AND json_extract(${table.stateJson}, '$.kind') = 'plan' AND json_extract(${table.stateJson}, '$.stage') IN ('plan','reply'))) AND json_extract(${table.stateJson}, '$.status') IN ('waiting','ready')`,
+      ),
   ],
 )
+/** User decisions stay durable across lost acknowledgements, cancellation and restart. */
+export const relayDecisions = sqliteTable(
+  'relay_decisions',
+  {
+    id: text('id').primaryKey(),
+    sessionId: text('session_id')
+      .notNull()
+      .references(() => sessions.id, { onDelete: 'cascade' }),
+    taskId: text('task_id').references(() => collaborationTasks.id, { onDelete: 'cascade' }),
+    matterKey: text('matter_key').notNull(),
+    kind: text('kind', {
+      enum: [
+        'supplement_plan',
+        'supplement_code_response',
+        'repair',
+        'rebuild_native_context',
+        'scheduling_information',
+        'prepared_input_continue',
+        'reassign_roles',
+        'extend_plan_review',
+        'repair_role_request',
+      ],
+    }).notNull(),
+    formatVersion: integer('format_version').notNull().default(1),
+    state: text('state', {
+      enum: [
+        'requested',
+        'awaiting_answer',
+        'available',
+        'bound',
+        'cancelled',
+        'invalid',
+        'closed',
+      ],
+    }).notNull(),
+    revision: integer('revision').notNull().default(0),
+    afterRunId: text('after_run_id').references(() => agentRuns.id),
+    handoffId: text('handoff_id'),
+    proofJson: text('proof_json').notNull(),
+    answerNonce: text('answer_nonce'),
+    answerDigest: text('answer_digest'),
+    answerJson: text('answer_json'),
+    resultJson: text('result_json'),
+    active: integer('active', { mode: 'boolean' }).notNull().default(true),
+    createdAt: text('created_at').notNull(),
+    updatedAt: text('updated_at').notNull(),
+  },
+  (t) => [
+    uniqueIndex('relay_decisions_active_matter')
+      .on(t.sessionId, t.matterKey)
+      .where(sql`${t.active} = 1`),
+    index('relay_decisions_session_active').on(t.sessionId, t.active),
+    index('relay_decisions_task_state').on(t.taskId, t.state),
+    index('relay_decisions_handoff_created').on(t.handoffId, t.createdAt, t.id),
+    index('relay_decisions_matter_history').on(t.sessionId, t.matterKey, t.formatVersion),
+  ],
+)
+
+/** One immutable user action, with a single Run binding; no receipt is a replay queue. */
+export const collaborationActionReceipts = sqliteTable(
+  'collaboration_action_receipts',
+  {
+    id: text('id').primaryKey(),
+    sessionId: text('session_id')
+      .notNull()
+      .references(() => sessions.id, { onDelete: 'cascade' }),
+    taskId: text('task_id')
+      .notNull()
+      .references(() => collaborationTasks.id, { onDelete: 'cascade' }),
+    clientNonce: text('client_nonce').notNull(),
+    requestDigest: text('request_digest').notNull(),
+    action: text('action').notNull(),
+    actor: text('actor', { enum: ['claude', 'codex', 'agy'] }).notNull(),
+    handoffId: text('handoff_id').notNull(),
+    decisionId: text('decision_id').references(() => relayDecisions.id),
+    rootReceiptId: text('root_receipt_id').notNull(),
+    basisJson: text('basis_json').notNull(),
+    state: text('state', {
+      enum: ['available', 'bound', 'settled', 'unknown', 'not_sent', 'cancelled'],
+    }).notNull(),
+    boundRunId: text('bound_run_id').references(() => agentRuns.id),
+    budgetReservationId: text('budget_reservation_id'),
+    reviewState: text('review_state', { enum: ['pending', 'fulfilled', 'not_required'] }),
+    reviewRunId: text('review_run_id').references(() => agentRuns.id),
+    active: integer('active', { mode: 'boolean' }).notNull().default(true),
+    createdAt: text('created_at').notNull(),
+    updatedAt: text('updated_at').notNull(),
+  },
+  (t) => [
+    uniqueIndex('collaboration_action_receipts_nonce').on(t.sessionId, t.clientNonce),
+    uniqueIndex('collaboration_action_receipts_handoff')
+      .on(t.handoffId)
+      .where(sql`${t.active} = 1`),
+    uniqueIndex('collaboration_action_receipts_run').on(t.boundRunId),
+    index('collaboration_action_receipts_session_state').on(t.sessionId, t.state),
+    index('collaboration_action_receipts_task_state').on(t.taskId, t.state),
+    index('collaboration_action_receipts_pending_review')
+      .on(t.taskId, t.id)
+      .where(sql`${t.reviewState} = 'pending'`),
+    uniqueIndex('collaboration_action_receipts_review_run').on(t.reviewRunId),
+    index('collaboration_action_receipts_unsettled')
+      .on(t.id)
+      .where(sql`${t.boundRunId} IS NOT NULL AND ${t.state} IN ('bound', 'unknown')`),
+  ],
+)
+
+/** Native workflow turns bind small metadata to an immutable host-owned root. */
+/** Exact pathless root input and native-effective receipts; never an executable queue. */
+export const runExecutionInputs = sqliteTable('run_execution_inputs', {
+  runId: text('run_id')
+    .primaryKey()
+    .references(() => agentRuns.id, { onDelete: 'cascade' }),
+  documentJson: text('document_json').notNull(),
+  requestedJson: text('requested_json').notNull(),
+  effectiveJson: text('effective_json'),
+  executorId: text('executor_id'),
+  nativeSessionId: text('native_session_id'),
+  proofJson: text('proof_json'),
+  nativeGeneration: text('native_generation').notNull(),
+  configurationGeneration: integer('configuration_generation').notNull(),
+  utilityEpoch: text('utility_epoch').notNull(),
+  createdAt: text('created_at').notNull(),
+})
+
+/** One independently identified replacement per original fault. Startup never dispatches these rows. */
+export const runReexecutionOperations = sqliteTable(
+  'run_reexecution_operations',
+  {
+    id: text('id').primaryKey(),
+    faultId: text('fault_id')
+      .notNull()
+      .references(() => schedulingRecoveryFaults.id),
+    originalRunId: text('original_run_id')
+      .notNull()
+      .references(() => agentRuns.id),
+    replacementRunId: text('replacement_run_id')
+      .notNull()
+      .references(() => agentRuns.id),
+    budgetReservationId: text('budget_reservation_id')
+      .notNull()
+      .references(() => schedulingBudgetReservations.id),
+    handoffJson: text('handoff_json').notNull(),
+    dispatchGuardJson: text('dispatch_guard_json'),
+    result: text('result', {
+      enum: ['reserved', 'possibly_sent', 'completed', 'failed', 'not_sent'],
+    })
+      .notNull()
+      .default('reserved'),
+    createdAt: text('created_at').notNull(),
+    updatedAt: text('updated_at').notNull(),
+  },
+  (table) => [
+    uniqueIndex('run_reexecution_operations_fault').on(table.faultId),
+    uniqueIndex('run_reexecution_operations_replacement').on(table.replacementRunId),
+    index('run_reexecution_operations_original').on(table.originalRunId),
+  ],
+)
+
+export const workflowTurns = sqliteTable(
+  'workflow_turns',
+  {
+    runId: text('run_id')
+      .primaryKey()
+      .references(() => agentRuns.id, { onDelete: 'cascade' }),
+    taskId: text('task_id')
+      .notNull()
+      .references(() => collaborationTasks.id, { onDelete: 'cascade' }),
+    stage: text('stage', {
+      enum: [
+        'plan',
+        'plan_review',
+        'implement',
+        'code_review',
+        'collaborate',
+        'respond',
+        'repair',
+        'reply',
+      ],
+    }).notNull(),
+    actor: text('actor', { enum: ['claude', 'codex', 'agy'] }).notNull(),
+    inputSequence: integer('input_sequence').notNull(),
+    taskRevision: integer('task_revision').notNull().default(0),
+    authorizationJson: text('authorization_json').notNull(),
+    stateJson: text('state_json').notNull(),
+    planBodyId: text('plan_body_id').references(() => conversationBodyInputs.id),
+    planNativeId: text('plan_native_id'),
+    verdict: text('verdict', {
+      enum: ['accepted', 'changes_requested', 'needs_user', 'incomplete'],
+    }),
+    verdictConflict: integer('verdict_conflict', { mode: 'boolean' }).notNull().default(false),
+    reservation: text('reservation', {
+      enum: ['discussionRounds', 'reviewCycles', 'repairAttempts'],
+    }),
+    reportBodyId: text('report_body_id').references(() => conversationBodyInputs.id),
+    applied: integer('applied', { mode: 'boolean' }).notNull().default(false),
+    createdAt: text('created_at').notNull(),
+  },
+  (t) => [
+    index('workflow_turns_task_created_idx').on(t.taskId, t.createdAt),
+    index('workflow_turns_task_stage_revision_idx').on(t.taskId, t.stage, t.taskRevision),
+  ],
+)
+
+/** Durable dispatch facts; configuration and task revisions never form the identity. */
+export const schedulingHandoffs = sqliteTable(
+  'scheduling_handoffs',
+  {
+    id: text('id').primaryKey(),
+    sessionId: text('session_id')
+      .notNull()
+      .references(() => sessions.id, { onDelete: 'cascade' }),
+    budgetSubjectId: text('budget_subject_id').notNull(),
+    eventId: text('event_id').notNull(),
+    slot: text('slot').notNull(),
+    faultSubjectId: text('fault_subject_id'),
+    factFingerprint: text('fact_fingerprint').notNull(),
+    freshnessGuardJson: text('freshness_guard_json').notNull(),
+    action: text('action'),
+    runId: text('run_id').references(() => agentRuns.id, { onDelete: 'restrict' }),
+    operationId: text('operation_id'),
+    createdAt: text('created_at').notNull(),
+  },
+  (t) => [
+    uniqueIndex('scheduling_handoffs_event_slot').on(t.budgetSubjectId, t.eventId, t.slot),
+    uniqueIndex('scheduling_handoffs_run').on(t.runId),
+  ],
+)
+
+export const schedulingBudgetCounters = sqliteTable('scheduling_budget_counters', {
+  subjectId: text('subject_id').primaryKey(),
+  sessionId: text('session_id')
+    .notNull()
+    .references(() => sessions.id, { onDelete: 'cascade' }),
+  evaluationCalls: integer('evaluation_calls').notNull().default(0),
+  extraPlanTurns: integer('extra_plan_turns').notNull().default(0),
+  extraCodeTurns: integer('extra_code_turns').notNull().default(0),
+  automaticChecks: integer('automatic_checks').notNull().default(0),
+  automaticResends: integer('automatic_resends').notNull().default(0),
+})
+
+export const schedulingEvaluations = sqliteTable(
+  'scheduling_evaluations',
+  {
+    id: text('id').primaryKey(),
+    sessionId: text('session_id')
+      .notNull()
+      .references(() => sessions.id, { onDelete: 'cascade' }),
+    handoffId: text('handoff_id')
+      .notNull()
+      .references(() => schedulingHandoffs.id),
+    budgetSubjectId: text('budget_subject_id').notNull(),
+    factFingerprint: text('fact_fingerprint').notNull(),
+    provider: text('provider', { enum: ['codex', 'claude', 'agy', 'openai'] }).notNull(),
+    model: text('model').notNull(),
+    configurationFingerprint: text('configuration_fingerprint').notNull(),
+    inputSha256: text('input_sha256'),
+    remoteOutcome: text('remote_outcome', {
+      enum: ['not_sent', 'unknown', 'responded'],
+    }),
+    selectedCandidateId: text('selected_candidate_id'),
+    handoffJson: text('handoff_json').notNull(),
+    active: integer('active', { mode: 'boolean' }).notNull().default(true),
+    called: integer('called', { mode: 'boolean' }).notNull().default(false),
+    outcome: text('outcome', {
+      enum: ['reserved', 'possibly_sent', 'completed', 'failed', 'not_sent'],
+    }).notNull(),
+    usageJson: text('usage_json'),
+    physicalWitnessJson: text('physical_witness_json'),
+    createdAt: text('created_at').notNull(),
+    deadline: text('deadline').notNull(),
+    settledAt: text('settled_at'),
+  },
+  (t) => [
+    uniqueIndex('scheduling_evaluations_fact').on(t.budgetSubjectId, t.factFingerprint),
+    index('scheduling_evaluations_activity_created').on(t.createdAt, t.id),
+    index('scheduling_evaluations_activity_unresolved').on(t.active, t.createdAt, t.id),
+    uniqueIndex('scheduling_evaluations_active_app')
+      .on(t.active)
+      .where(sql`${t.active} = 1`),
+    index('scheduling_evaluations_handoff').on(t.handoffId),
+  ],
+)
+
+/** The sole App-wide physical admission; evaluation.active is a compatibility projection. */
+export const schedulingRuntimeOwners = sqliteTable(
+  'scheduling_runtime_owners',
+  {
+    id: text('id').primaryKey(),
+    kind: text('kind', { enum: ['probe', 'evaluation', 'check'] }).notNull(),
+    sessionId: text('session_id').references(() => sessions.id),
+    evaluationId: text('evaluation_id').references(() => schedulingEvaluations.id),
+    provider: text('provider', { enum: ['codex', 'claude', 'agy', 'openai'] }).notNull(),
+    model: text('model').notNull(),
+    configurationFingerprint: text('configuration_fingerprint').notNull(),
+    physicalWitnessJson: text('physical_witness_json'),
+    httpOwnerJson: text('http_owner_json'),
+    nativeGeneration: integer('native_generation').notNull().default(0),
+    nativeStage: text('native_stage', {
+      enum: [
+        'host_metadata',
+        'project_metadata',
+        'guarded_context',
+        'project_verification',
+        'native_context',
+      ],
+    }),
+    active: integer('active', { mode: 'boolean' }).notNull().default(true),
+    phase: text('phase', {
+      enum: ['reserved', 'preparing', 'running', 'cleanup_unconfirmed', 'released'],
+    })
+      .notNull()
+      .default('reserved'),
+    createdAt: text('created_at').notNull(),
+    deadline: text('deadline').notNull(),
+    settledAt: text('settled_at'),
+  },
+  (t) => [
+    uniqueIndex('scheduling_runtime_owners_active_app')
+      .on(t.active)
+      .where(sql`${t.active} = 1`),
+    uniqueIndex('scheduling_runtime_owners_evaluation').on(t.evaluationId),
+  ],
+)
+
+/** Already-closed native receipt files awaiting retirement; never an execution admission. */
+export const schedulingPhysicalReceipts = sqliteTable(
+  'scheduling_physical_receipts',
+  {
+    receiptId: text('receipt_id').primaryKey(),
+    runtimeOwnerId: text('runtime_owner_id')
+      .notNull()
+      .references(() => schedulingRuntimeOwners.id, { onDelete: 'restrict' }),
+    nativeGeneration: integer('native_generation').notNull(),
+    witnessJson: text('witness_json').notNull(),
+    state: text('state', { enum: ['pending', 'retiring'] }).notNull(),
+    entryBytes: integer('entry_bytes').notNull(),
+  },
+  (t) => [
+    uniqueIndex('scheduling_physical_receipts_generation').on(t.runtimeOwnerId, t.nativeGeneration),
+  ],
+)
+
+export const schedulingBudgetReservations = sqliteTable(
+  'scheduling_budget_reservations',
+  {
+    id: text('id').primaryKey(),
+    sessionId: text('session_id')
+      .notNull()
+      .references(() => sessions.id, { onDelete: 'cascade' }),
+    handoffId: text('handoff_id')
+      .notNull()
+      .references(() => schedulingHandoffs.id),
+    budgetSubjectId: text('budget_subject_id').notNull(),
+    faultSubjectId: text('fault_subject_id'),
+    factFingerprint: text('fact_fingerprint').notNull(),
+    budget: text('budget', {
+      enum: ['extra_plan_turn', 'extra_code_turn', 'automatic_check', 'automatic_resend'],
+    }).notNull(),
+    authorizationId: text('authorization_id'),
+    replacesReservationId: text('replaces_reservation_id').references(
+      (): AnySQLiteColumn => schedulingBudgetReservations.id,
+    ),
+    state: text('state', { enum: ['reserved', 'possibly_sent', 'settled', 'not_sent'] }).notNull(),
+    createdAt: text('created_at').notNull(),
+  },
+  (t) => [
+    uniqueIndex('scheduling_budget_reservations_handoff')
+      .on(t.handoffId, t.budget)
+      .where(sql`${t.replacesReservationId} IS NULL`),
+    uniqueIndex('scheduling_budget_reservations_replacement')
+      .on(t.replacesReservationId)
+      .where(sql`${t.replacesReservationId} IS NOT NULL`),
+    uniqueIndex('scheduling_budget_reservations_fault_fact').on(
+      t.faultSubjectId,
+      t.budget,
+      t.factFingerprint,
+    ),
+  ],
+)
+
+/** Immutable fault origin; settings changes/restarts cannot create new recovery eligibility. */
+export const schedulingRecoveryFaults = sqliteTable(
+  'scheduling_recovery_faults',
+  {
+    id: text('id').primaryKey(),
+    sessionId: text('session_id')
+      .notNull()
+      .references(() => sessions.id, { onDelete: 'cascade' }),
+    faultKind: text('fault_kind', { enum: ['run', 'queue', 'rebuild'] }).notNull(),
+    faultId: text('fault_id').notNull(),
+    runId: text('run_id')
+      .notNull()
+      .references(() => agentRuns.id, { onDelete: 'restrict' }),
+    agentId: text('agent_id', { enum: ['codex', 'claude', 'agy'] }).notNull(),
+    utilityEpoch: text('utility_epoch').notNull(),
+    configurationGeneration: integer('configuration_generation').notNull(),
+    originSequence: integer('origin_sequence').notNull(),
+    observedFingerprint: text('observed_fingerprint').notNull(),
+    consideredFingerprint: text('considered_fingerprint'),
+    armed: integer('armed', { mode: 'boolean' }).notNull().default(false),
+    pending: integer('pending', { mode: 'boolean' }).notNull().default(false),
+    active: integer('active', { mode: 'boolean' }).notNull().default(true),
+    latestAction: text('latest_action', { enum: ['check', 'resend'] })
+      .notNull()
+      .default('check'),
+    result: text('result', {
+      enum: ['reserved', 'possibly_sent', 'completed', 'failed', 'not_sent'],
+    })
+      .notNull()
+      .default('not_sent'),
+    physicalUnconfirmed: integer('physical_unconfirmed', { mode: 'boolean' })
+      .notNull()
+      .default(false),
+    createdAt: text('created_at').notNull(),
+    activityAt: text('activity_at').notNull(),
+  },
+  (t) => [
+    uniqueIndex('scheduling_recovery_faults_origin').on(t.faultKind, t.faultId),
+    index('scheduling_recovery_faults_eligible').on(
+      t.utilityEpoch,
+      t.configurationGeneration,
+      t.active,
+      t.pending,
+      t.id,
+    ),
+    index('scheduling_recovery_faults_session').on(
+      t.sessionId,
+      t.active,
+      t.utilityEpoch,
+      t.configurationGeneration,
+      t.agentId,
+      t.faultKind,
+    ),
+    index('scheduling_recovery_faults_activity').on(t.activityAt, t.id),
+    index('scheduling_recovery_faults_unresolved').on(t.physicalUnconfirmed, t.activityAt, t.id),
+    index('scheduling_recovery_faults_run').on(t.runId, t.id),
+  ],
+)
+
+/** Attempts own the existing App lease and original budget; no queued or restart replay intent. */
+export const schedulingRecoveryAttempts = sqliteTable(
+  'scheduling_recovery_attempts',
+  {
+    id: text('id')
+      .primaryKey()
+      .references(() => schedulingRuntimeOwners.id, { onDelete: 'restrict' }),
+    faultId: text('fault_id')
+      .notNull()
+      .references(() => schedulingRecoveryFaults.id, { onDelete: 'restrict' }),
+    reservationId: text('reservation_id')
+      .notNull()
+      .references(() => schedulingBudgetReservations.id, { onDelete: 'restrict' }),
+    handoffJson: text('handoff_json').notNull(),
+    utilityPid: integer('utility_pid').notNull(),
+    physicalOwnerJson: text('physical_owner_json').notNull(),
+    started: integer('started', { mode: 'boolean' }).notNull().default(false),
+    result: text('result', {
+      enum: ['reserved', 'possibly_sent', 'completed', 'failed', 'not_sent'],
+    })
+      .notNull()
+      .default('reserved'),
+    physicalReleased: integer('physical_released', { mode: 'boolean' }).notNull().default(false),
+    createdAt: text('created_at').notNull(),
+    deadline: text('deadline').notNull(),
+  },
+  (t) => [index('scheduling_recovery_attempts_fault').on(t.faultId, t.createdAt, t.id)],
+)
+
+/** Durable metadata projection of existing scheduling facts; never execution authority. */
+export const schedulingActivity = sqliteTable(
+  'scheduling_activity',
+  {
+    id: text('id').primaryKey(),
+    sessionId: text('session_id')
+      .notNull()
+      .references(() => sessions.id, { onDelete: 'cascade' }),
+    evaluationId: text('evaluation_id').references(() => schedulingEvaluations.id),
+    faultId: text('fault_id').references(() => schedulingRecoveryFaults.id),
+    decisionId: text('decision_id').references(() => relayDecisions.id),
+    rebuildId: text('rebuild_id').references(() => nativeRebuildOperations.id),
+    handoffId: text('handoff_id').references(() => schedulingHandoffs.id),
+    reason: text('reason', {
+      enum: [
+        'workflow',
+        'input',
+        'native_check',
+        'queue_check',
+        'rebuild_check',
+        'confirmed_resend',
+        'native_rebuild',
+      ],
+    }).notNull(),
+    suggestionState: text('suggestion_state').notNull().default('none'),
+    action: text('action'),
+    actionResult: text('action_result'),
+    unresolved: integer('unresolved', { mode: 'boolean' }).notNull().default(true),
+    activityAt: text('activity_at').notNull(),
+  },
+  (t) => [
+    index('scheduling_activity_created').on(t.activityAt, t.id),
+    index('scheduling_activity_unresolved').on(t.unresolved, t.activityAt, t.id),
+    uniqueIndex('scheduling_activity_evaluation').on(t.evaluationId),
+    uniqueIndex('scheduling_activity_fault').on(t.faultId),
+    index('scheduling_activity_handoff').on(t.handoffId),
+    uniqueIndex('scheduling_activity_decision').on(t.decisionId),
+    uniqueIndex('scheduling_activity_rebuild').on(t.rebuildId),
+  ],
+)
+
 export const collaborationTurns = sqliteTable(
   'collaboration_turns',
   {
@@ -1075,7 +1740,7 @@ export const collaborationTurnAuthorizations = sqliteTable(
     taskId: text('task_id')
       .notNull()
       .references(() => collaborationTasks.id, { onDelete: 'cascade' }),
-    actor: text('actor', { enum: ['claude', 'codex'] }).notNull(),
+    actor: text('actor', { enum: ['claude', 'codex', 'agy'] }).notNull(),
     duty: text('duty').notNull(),
     ledgerRevision: integer('ledger_revision').notNull(),
     inputWatermark: integer('input_watermark').notNull(),
@@ -1101,7 +1766,7 @@ export const collaborationTodos = sqliteTable(
     kind: text('kind', { enum: ['opinion', 'decision', 'information'] }).notNull(),
     status: text('status', { enum: ['open', 'awaiting_review', 'done'] }).notNull(),
     titlePreview: text('title_preview').notNull(),
-    author: text('author', { enum: ['claude', 'codex'] }).notNull(),
+    author: text('author', { enum: ['claude', 'codex', 'agy'] }).notNull(),
     sourceRunId: text('source_run_id')
       .notNull()
       .references(() => agentRuns.id, { onDelete: 'cascade' }),
@@ -1118,8 +1783,8 @@ export const collaborationTodos = sqliteTable(
     questionId: text('question_id'),
     questionRevision: integer('question_revision'),
     questionJson: text('question_json'),
-    answerResolver: text('answer_resolver', { enum: ['claude', 'codex'] }),
-    confirmedBy: text('confirmed_by', { enum: ['claude', 'codex'] }),
+    answerResolver: text('answer_resolver', { enum: ['claude', 'codex', 'agy'] }),
+    confirmedBy: text('confirmed_by', { enum: ['claude', 'codex', 'agy'] }),
     confirmedRunId: text('confirmed_run_id'),
     updatedAt: text('updated_at').notNull(),
   },
@@ -1144,7 +1809,7 @@ export const collaborationTodoRevisions = sqliteTable(
     kind: text('kind', { enum: ['opinion', 'decision', 'information'] }).notNull(),
     status: text('status', { enum: ['open', 'awaiting_review', 'done'] }).notNull(),
     titlePreview: text('title_preview').notNull(),
-    author: text('author', { enum: ['claude', 'codex'] }).notNull(),
+    author: text('author', { enum: ['claude', 'codex', 'agy'] }).notNull(),
     sourceRunId: text('source_run_id')
       .notNull()
       .references(() => agentRuns.id, { onDelete: 'cascade' }),
@@ -1161,8 +1826,8 @@ export const collaborationTodoRevisions = sqliteTable(
     questionId: text('question_id'),
     questionRevision: integer('question_revision'),
     questionJson: text('question_json'),
-    answerResolver: text('answer_resolver', { enum: ['claude', 'codex'] }),
-    confirmedBy: text('confirmed_by', { enum: ['claude', 'codex'] }),
+    answerResolver: text('answer_resolver', { enum: ['claude', 'codex', 'agy'] }),
+    confirmedBy: text('confirmed_by', { enum: ['claude', 'codex', 'agy'] }),
     confirmedRunId: text('confirmed_run_id'),
     updatedAt: text('updated_at').notNull(),
   },
@@ -1201,7 +1866,14 @@ export const conversationInputBatches = sqliteTable(
     sequence: integer('sequence').notNull(),
     clientMessageId: text('client_message_id').notNull(),
     commentsRevision: integer('comments_revision').notNull(),
-    actor: text('actor', { enum: ['claude', 'codex'] }).notNull(),
+    actor: text('actor', { enum: ['claude', 'codex', 'agy'] }).notNull(),
+    /** Prepared retains the frozen default actor; only Run admission binds the recipient. */
+    dispatchState: text('dispatch_state', {
+      enum: ['prepared', 'paused', 'superseded', 'cancelled', 'dispatched'],
+    }),
+    dispatchMetadataJson: text('dispatch_metadata_json'),
+    dispatchInformationJson: text('dispatch_information_json'),
+    userInformationDocumentJson: text('user_information_document_json'),
     runId: text('run_id').references(() => agentRuns.id, { onDelete: 'cascade' }),
     messageId: text('message_id').references(() => conversationMessages.id, {
       onDelete: 'cascade',
@@ -1225,6 +1897,12 @@ export const conversationInputBatches = sqliteTable(
     uniqueIndex('conversation_input_batches_task_sequence_idx').on(t.taskId, t.sequence),
     index('conversation_input_batches_task_state_sequence_idx').on(t.taskId, t.state, t.sequence),
     index('conversation_input_batches_run_idx').on(t.runId),
+    uniqueIndex('conversation_input_batches_preparing_session_idx')
+      .on(t.sessionId)
+      .where(sql`${t.dispatchState} = 'prepared'`),
+    uniqueIndex('conversation_input_batches_paused_session_idx')
+      .on(t.sessionId)
+      .where(sql`${t.dispatchState} = 'paused'`),
   ],
 )
 
@@ -1248,7 +1926,7 @@ export const conversationInputBatchMembers = sqliteTable(
     questionRevision: integer('question_revision'),
     bodySha256: text('body_sha256').notNull(),
     bodyDocumentJson: text('body_document_json'),
-    answerResolver: text('answer_resolver', { enum: ['claude', 'codex'] }),
+    answerResolver: text('answer_resolver', { enum: ['claude', 'codex', 'agy'] }),
     state: text('state', {
       enum: ['pending_response', 'responded', 'awaiting_confirmation', 'resolved', 'withdrawn'],
     })
@@ -1339,7 +2017,7 @@ export const collaborationReviewFacts = sqliteTable(
     runId: text('run_id')
       .notNull()
       .references(() => agentRuns.id, { onDelete: 'cascade' }),
-    reviewer: text('reviewer', { enum: ['claude', 'codex'] }).notNull(),
+    reviewer: text('reviewer', { enum: ['claude', 'codex', 'agy'] }).notNull(),
     phase: text('phase', { enum: ['plan', 'code'] }).notNull(),
     basisJson: text('basis_json').notNull(),
     ledgerRevision: integer('ledger_revision').notNull(),
@@ -1463,7 +2141,7 @@ export const collaborationInputs = sqliteTable(
       .references(() => conversationBodyInputs.id),
     metadataJson: text('metadata_json').notNull(),
     digest: text('digest').notNull(),
-    actor: text('actor', { enum: ['claude', 'codex'] }).notNull(),
+    actor: text('actor', { enum: ['claude', 'codex', 'agy'] }).notNull(),
     policy: text('policy', { enum: ['immediate_safe_point', 'next_round'] }).notNull(),
     state: text('state', { enum: ['accepted', 'blocked', 'cancelled', 'materialized'] }).notNull(),
     materializedRunId: text('materialized_run_id'),
@@ -1544,7 +2222,124 @@ export const conversationQueueOperations = sqliteTable(
   ],
 )
 
+export const conversationCutoffs = sqliteTable(
+  'conversation_cutoffs',
+  {
+    id: text('id').primaryKey(),
+    sourceSessionId: text('source_session_id')
+      .notNull()
+      .references(() => sessions.id, { onDelete: 'cascade' }),
+    ownerKind: text('owner_kind', { enum: ['side_chat', 'sync_main'] }).notNull(),
+    ownerOperationId: text('owner_operation_id').notNull(),
+    maxMessageSequence: integer('max_message_sequence').notNull(),
+    sessionMutationSeq: integer('session_mutation_seq').notNull(),
+    streamingMessageId: text('streaming_message_id'),
+    createdAt: text('created_at').notNull(),
+  },
+  (table) => [
+    uniqueIndex('conversation_cutoffs_owner_unique_idx').on(
+      table.ownerKind,
+      table.ownerOperationId,
+    ),
+    index('conversation_cutoffs_source_seq_idx').on(
+      table.sourceSessionId,
+      table.sessionMutationSeq,
+    ),
+    index('conversation_cutoffs_source_max_msg_idx').on(
+      table.sourceSessionId,
+      table.maxMessageSequence,
+      table.sessionMutationSeq,
+    ),
+    check(
+      'conversation_cutoffs_bounds_check',
+      sql.raw('max_message_sequence >= -1 AND session_mutation_seq >= 1'),
+    ),
+  ],
+)
+
+export const conversationCutoffRevisions = sqliteTable(
+  'conversation_cutoff_revisions',
+  {
+    id: text('id').primaryKey(),
+    sourceSessionId: text('source_session_id')
+      .notNull()
+      .references(() => sessions.id, { onDelete: 'cascade' }),
+    messageId: text('message_id').references(() => conversationMessages.id, {
+      onDelete: 'set null',
+    }),
+    preservedMessageId: text('preserved_message_id').notNull(),
+    messageSequence: integer('message_sequence').notNull(),
+    role: text('role', { enum: ['user', 'assistant', 'system'] }).notNull(),
+    agentId: text('agent_id', { enum: ['claude', 'codex', 'agy'] }),
+    messageCreatedAt: text('message_created_at').notNull(),
+    validUpToMutationSeq: integer('valid_up_to_mutation_seq').notNull(),
+    state: text('state', { enum: ['complete', 'streaming', 'incomplete'] }).notNull(),
+    isVisible: integer('is_visible', { mode: 'boolean' }).notNull(),
+    contentInline: text('content_inline'),
+    bodyInputId: text('body_input_id').references(() => conversationBodyInputs.id, {
+      onDelete: 'set null',
+    }),
+    createdAt: text('created_at').notNull(),
+  },
+  (table) => [
+    uniqueIndex('conversation_cutoff_revisions_msg_seq_unique_idx').on(
+      table.preservedMessageId,
+      table.validUpToMutationSeq,
+    ),
+    index('conversation_cutoff_revisions_source_msg_idx').on(
+      table.sourceSessionId,
+      table.preservedMessageId,
+      table.validUpToMutationSeq,
+    ),
+    index('conversation_cutoff_revisions_source_seq_idx').on(
+      table.sourceSessionId,
+      table.messageSequence,
+      table.validUpToMutationSeq,
+    ),
+    index('conversation_cutoff_revisions_body_input_idx').on(table.bodyInputId),
+    check(
+      'conversation_cutoff_revisions_body_check',
+      sql.raw(
+        '(content_inline IS NOT NULL AND body_input_id IS NULL) OR (content_inline IS NULL AND body_input_id IS NOT NULL)',
+      ),
+    ),
+  ],
+)
+
+export const sideChatOperations = sqliteTable(
+  'side_chat_operations',
+  {
+    id: text('id').primaryKey(),
+    kind: text('kind', { enum: ['create', 'sync_main'] }).notNull(),
+    sessionId: text('session_id')
+      .notNull()
+      .references(() => sessions.id, { onDelete: 'cascade' }),
+    targetSessionId: text('target_session_id')
+      .notNull()
+      .references(() => sessions.id, { onDelete: 'cascade' }),
+    requestSha256: text('request_sha256').notNull(),
+    receiptJson: text('receipt_json'),
+    createdAt: text('created_at').notNull(),
+  },
+  (table) => [
+    index('side_chat_operations_session_kind_idx').on(table.sessionId, table.kind),
+    index('side_chat_operations_target_kind_idx').on(table.targetSessionId, table.kind),
+  ],
+)
+
 export const schema = {
+  schedulingSettings,
+  schedulingHandoffs,
+  schedulingBudgetCounters,
+  schedulingEvaluations,
+  schedulingRuntimeOwners,
+  schedulingPhysicalReceipts,
+  schedulingBudgetReservations,
+  schedulingRecoveryFaults,
+  schedulingRecoveryAttempts,
+  schedulingActivity,
+  runExecutionInputs,
+  runReexecutionOperations,
   conversationOutputSnapshots,
   conversationQueueOperations,
   nativePresenceMetadata,
@@ -1565,6 +2360,8 @@ export const schema = {
   collaborationResultInputResponses,
   collaborationInputs,
   collaborationTasks,
+  relayDecisions,
+  collaborationActionReceipts,
   collaborationTurns,
   collaborationReportItems,
   collaborationMarkdownPages,
@@ -1597,4 +2394,7 @@ export const schema = {
   sessionForkOperations,
   nativeForkIntents,
   nativeForkCandidateReceipts,
+  conversationCutoffs,
+  conversationCutoffRevisions,
+  sideChatOperations,
 }

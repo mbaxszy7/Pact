@@ -18,9 +18,11 @@ export function presentSessionIssues(
   cursors: Array<AgentRun | undefined> = [],
   incompleteResults: string[] = [],
   operations: Array<{ agentId: RuntimeAgentId; operation: NativeRebuildOperation }> = [],
+  stoppingRunId?: string,
 ): SessionIssues {
   return projectSessionIssues(sessionId, contexts, runs, cursors, incompleteResults, operations, {
     isArchivedRejection: isCodexArchivedSessionRejection,
     sanitize: safeNativePermissionText,
+    ...(stoppingRunId ? { stoppingRunId } : {}),
   })
 }

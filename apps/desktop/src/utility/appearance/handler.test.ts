@@ -42,7 +42,7 @@ describe('Appearance utility handler', () => {
       ok: false,
       error: {
         code: 'CONFLICT',
-        message: 'Appearance settings changed at revision 4; refresh before retrying.',
+        message: 'Appearance settings changed elsewhere (revision 4). Try again.',
       },
     })
   })

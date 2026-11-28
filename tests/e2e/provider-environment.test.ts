@@ -1,9 +1,31 @@
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { execFile } from 'node:child_process'
+import {
+  chmod,
+  link,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
+import { promisify } from 'node:util'
+import { parse as parseToml } from 'smol-toml'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
-import { loadProviderConfiguration, prepareProviderEnvironment } from './provider-environment.js'
+import {
+  buildWindowsAgyApiKeyLauncherSource,
+  DEFAULT_REAL_AGY_MODEL,
+  loadProviderConfiguration,
+  prepareProviderEnvironment,
+  providerExecutableCandidates,
+  runIsolatedKeylessProjectNode,
+} from './provider-environment.js'
+
+const execFileAsync = promisify(execFile)
 
 const claudeKey = 'synthetic-claude-credential-123456'
 const codexKey = 'synthetic-codex-credential-123456'
@@ -69,6 +91,56 @@ describe('E2E provider configuration boundary', () => {
   afterEach(async () => {
     await rm(root, { recursive: true, force: true })
   })
+
+  it.each(['absent', 'enabled', 'disabled'] as const)(
+    'isolates optional Codex downloads while preserving all other native settings: %s',
+    async (plugins) => {
+      const original =
+        'approval_policy = "on-request"\nsandbox_mode = "workspace-write"\n' +
+        defaultToml +
+        (plugins === 'absent'
+          ? ''
+          : `\n[features]\nplugins = ${plugins === 'enabled'}\nother_native_feature = true\n`)
+      await writeFile(join(configRoot, 'codex/config.toml'), original)
+      const config = await loadProviderConfiguration(configRoot, environment)
+      const prepared = await prepareProviderEnvironment(join(root, 'scene'), config, environment, {
+        disableCodexPlugins: true,
+      })
+      const expected = parseToml(original)
+      expect(parseToml(await readFile(join(prepared.codexHome, 'config.toml'), 'utf8'))).toEqual({
+        ...expected,
+        features: {
+          ...(plugins === 'absent' ? {} : { other_native_feature: true }),
+          plugins: false,
+        },
+      })
+      expect(await readFile(join(configRoot, 'codex/config.toml'), 'utf8')).toBe(original)
+      const [claudeSource, claudeCopy, authSource, authCopy] = await Promise.all([
+        readFile(join(configRoot, 'claude/settings.json')),
+        readFile(join(prepared.claudeHome, 'settings.json')),
+        readFile(join(configRoot, 'codex/auth.json')),
+        readFile(join(prepared.codexHome, 'auth.json')),
+      ])
+      expect(claudeCopy).toEqual(claudeSource)
+      expect(authCopy).toEqual(authSource)
+      await expect(config.assertSourceIntegrity()).resolves.toBeUndefined()
+    },
+  )
+
+  it.each(['true', '2026-11-10'])(
+    'refuses to replace a non-table Codex features value: %s',
+    async (value) => {
+      const original = `features = ${value}\n${defaultToml}`
+      await writeFile(join(configRoot, 'codex/config.toml'), original)
+      const config = await loadProviderConfiguration(configRoot, environment)
+      await expect(
+        prepareProviderEnvironment(join(root, 'scene'), config, environment, {
+          disableCodexPlugins: true,
+        }),
+      ).rejects.toThrow('Codex features must be a table')
+      await expect(config.assertSourceIntegrity()).resolves.toBeUndefined()
+    },
+  )
 
   it('copies complete native bytes privately and keeps the sources unchanged', async () => {
     const originals = await Promise.all([
@@ -363,4 +435,325 @@ describe('E2E provider configuration boundary', () => {
     ).rejects.toMatchObject({ code: 'EEXIST' })
     await expect(config.assertSourceIntegrity()).resolves.toBeUndefined()
   })
+
+  it('loads codex-agy profile without Claude, rejects external PRs before reading secrets, and isolates GEMINI_API_KEY inside an agy-only wrapper', async () => {
+    const geminiKey = 'synthetic-gemini-credential-123456'
+    const fakeAgyScript = join(root, 'fake-agy.mjs')
+    let fakeAgyBin = fakeAgyScript
+    await writeFile(
+      fakeAgyScript,
+      `#!${process.execPath}
+process.stdout.write(JSON.stringify({
+  argv: process.argv.slice(2),
+  hasKey: process.env.GEMINI_API_KEY === ${JSON.stringify(geminiKey)},
+  geminiDir: process.env.ANTIGRAVITY_GEMINI_DIR ?? null,
+}) + '\\n')
+`,
+      { mode: 0o755 },
+    )
+    await chmod(fakeAgyScript, 0o755)
+    if (process.platform === 'win32') {
+      fakeAgyBin = join(root, 'fake-agy.cmd')
+      await writeFile(fakeAgyBin, `@echo off\r\n"${process.execPath}" "${fakeAgyScript}" %*\r\n`)
+    }
+
+    await rm(join(configRoot, 'claude'), { recursive: true, force: true })
+    await mkdir(join(configRoot, 'agy'), { recursive: true })
+    const envPath = join(configRoot, 'agy/.env')
+    await writeFile(envPath, `GEMINI_API_KEY=${geminiKey}\nAGY_MODEL=gemini-4-neon\n`, {
+      mode: 0o600,
+    })
+
+    // External PR env MUST reject before touching or reading missing files.
+    await expect(
+      loadProviderConfiguration(
+        join(root, 'missing-dir'),
+        { ...environment, GITHUB_EVENT_NAME: 'pull_request' },
+        {},
+        { profile: 'codex-agy' },
+      ),
+    ).rejects.toThrow('external pull requests')
+
+    const agyOnlyEnv: NodeJS.ProcessEnv = {
+      PATH: join(root, 'empty-path'),
+      HOME: '/synthetic-daily-home',
+      LANG: 'en_US.UTF-8',
+      GEMINI_API_KEY: 'synthetic-host-daily-gemini-key',
+      PACT_E2E_CODEX_EXECUTABLE: process.execPath,
+      PACT_E2E_AGY_EXECUTABLE: fakeAgyBin,
+    }
+    const config = await loadProviderConfiguration(
+      configRoot,
+      agyOnlyEnv,
+      {},
+      { profile: 'codex-agy' },
+    )
+    expect(config.claudePath).toBeNull()
+    expect(config.models).toEqual({
+      claude: null,
+      codex: 'arbitrary-provider/model',
+      agy: 'gemini-4-neon',
+    })
+    expect(config.sourceHashes.map((item) => item.file).toSorted()).toEqual([
+      'agy/.env',
+      'codex/auth.json',
+      'codex/config.toml',
+    ])
+    expect(config.redact(`leak ${geminiKey}`)).not.toContain(geminiKey)
+
+    const prepared = await prepareProviderEnvironment(join(root, 'agy-scene'), config, agyOnlyEnv, {
+      disableCodexPlugins: true,
+    })
+    expect(prepared.claudePath).toBeNull()
+    expect(prepared.agyPath).toBeTruthy()
+    expect(prepared.agyPath).not.toBe(fakeAgyBin)
+    expect(prepared.env['ANTIGRAVITY_GEMINI_DIR']).toBe(prepared.geminiHome)
+    expect(prepared.env['DISABLE_TELEMETRY']).toBe('1')
+    expect(prepared.env['DISABLE_ERROR_REPORTING']).toBe('1')
+    expect(prepared.env).not.toHaveProperty('GEMINI_API_KEY')
+    expect(prepared.env).not.toHaveProperty('GOOGLE_API_KEY')
+    await expect(stat(join(prepared.codexHome, '.env'))).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(
+      JSON.parse(
+        await readFile(join(prepared.geminiHome, 'antigravity-cli/settings.json'), 'utf8'),
+      ),
+    ).toEqual({ modelProvider: 'gemini' })
+    expect(
+      JSON.parse(
+        await readFile(join(prepared.home, '.gemini/antigravity-cli/settings.json'), 'utf8'),
+      ),
+    ).toEqual({ modelProvider: 'gemini' })
+
+    // Verify wrapped agy injects GEMINI_API_KEY only into agy child and forwards arguments.
+    const wrapperResult = await execFileAsync(
+      prepared.agyPath!,
+      ['acp', '--arg-with-space', 'hello world'],
+      { env: prepared.env, shell: false },
+    )
+    expect(JSON.parse(wrapperResult.stdout)).toEqual({
+      argv: ['acp', '--arg-with-space', 'hello world'],
+      hasKey: true,
+      geminiDir: prepared.geminiHome,
+    })
+
+    // Detect agy/.env modification via assertSourceIntegrity.
+    const changedKey = 'synthetic-changed-gemini-credential'
+    await writeFile(envPath, `GEMINI_API_KEY=${changedKey}\n`, { mode: 0o600 })
+    await expect(config.assertSourceIntegrity()).rejects.toThrow('changed during the test run')
+  })
+
+  it.skipIf(process.platform === 'win32')(
+    'enforces 0600 mode on agy settings and rejects symlinked PACT_E2E_AGY_ENV_FILE on POSIX',
+    async () => {
+      await rm(join(configRoot, 'claude'), { recursive: true, force: true })
+      await mkdir(join(configRoot, 'agy'), { recursive: true })
+      const envPath = join(configRoot, 'agy/.env')
+      await writeFile(envPath, `GEMINI_API_KEY=synthetic-gemini-credential-posix\n`, {
+        mode: 0o600,
+      })
+
+      const posixEnv: NodeJS.ProcessEnv = {
+        PATH: join(root, 'empty-path'),
+        HOME: '/synthetic-daily-home',
+        LANG: 'en_US.UTF-8',
+        PACT_E2E_CODEX_EXECUTABLE: process.execPath,
+        PACT_E2E_AGY_EXECUTABLE: process.execPath,
+      }
+      const config = await loadProviderConfiguration(
+        configRoot,
+        posixEnv,
+        {},
+        { profile: 'codex-agy' },
+      )
+      expect(config.models.agy).toBe(DEFAULT_REAL_AGY_MODEL)
+      const prepared = await prepareProviderEnvironment(join(root, 'agy-posix'), config, posixEnv)
+      expect(
+        (await stat(join(prepared.geminiHome, 'antigravity-cli/settings.json'))).mode & 0o777,
+      ).toBe(0o600)
+      expect(
+        (await stat(join(prepared.home, '.gemini/antigravity-cli/settings.json'))).mode & 0o777,
+      ).toBe(0o600)
+
+      const symlinkEnv = join(root, 'sym-agy.env')
+      await symlink(envPath, symlinkEnv)
+      await expect(
+        loadProviderConfiguration(
+          configRoot,
+          { ...posixEnv, PACT_E2E_AGY_ENV_FILE: symlinkEnv },
+          {},
+          { profile: 'codex-agy' },
+        ),
+      ).rejects.toThrow('owned regular file')
+    },
+  )
+
+  it('keeps HOME/.gemini as geminiHome for default/bare fixtures while isolating codex-agy', async () => {
+    const defaultConfig = await loadProviderConfiguration(configRoot, environment)
+    const defaultPrepared = await prepareProviderEnvironment(
+      join(root, 'default-scene'),
+      defaultConfig,
+      environment,
+    )
+    expect(defaultPrepared.geminiHome).toBe(join(defaultPrepared.home, '.gemini'))
+    expect(defaultPrepared.env['ANTIGRAVITY_GEMINI_DIR']).toBeUndefined()
+
+    const barePrepared = await prepareProviderEnvironment(
+      join(root, 'bare-scene'),
+      undefined,
+      environment,
+    )
+    expect(barePrepared.geminiHome).toBe(join(barePrepared.home, '.gemini'))
+    expect(barePrepared.env['ANTIGRAVITY_GEMINI_DIR']).toBeUndefined()
+  })
+
+  it('isolates keyless project verification from fixture key files and credential sources', async () => {
+    await rm(join(configRoot, 'claude'), { recursive: true, force: true })
+    await mkdir(join(configRoot, 'agy'), { recursive: true })
+    const syntheticKey = 'synthetic-isolated-verifier-key'
+    const envPath = join(configRoot, 'agy/.env')
+    await writeFile(envPath, `GEMINI_API_KEY=${syntheticKey}\n`, { mode: 0o600 })
+    const agyOnlyEnv: NodeJS.ProcessEnv = {
+      PATH: join(root, 'empty-path'),
+      HOME: '/synthetic-daily-home',
+      LANG: 'en_US.UTF-8',
+      PACT_E2E_CODEX_EXECUTABLE: process.execPath,
+      PACT_E2E_AGY_EXECUTABLE: process.execPath,
+    }
+    const config = await loadProviderConfiguration(
+      configRoot,
+      agyOnlyEnv,
+      {},
+      { profile: 'codex-agy' },
+    )
+    expect(config.models.agy).toBe(DEFAULT_REAL_AGY_MODEL)
+    const fixtureDir = join(root, 'isolated-fixture')
+    const prepared = await prepareProviderEnvironment(fixtureDir, config, agyOnlyEnv)
+    const projectDir = join(fixtureDir, 'workspace')
+    await mkdir(projectDir, { recursive: true })
+    await writeFile(
+      join(projectDir, 'parse-port.mjs'),
+      'export const parsePort = (v) => Number(v)\n',
+    )
+    await writeFile(
+      join(projectDir, 'parse-port.test.mjs'),
+      "import test from 'node:test'\nimport assert from 'node:assert/strict'\nimport { parsePort } from './parse-port.mjs'\ntest('ok', () => assert.equal(parsePort('80'), 80))\n",
+    )
+
+    const forbidden = [fixtureDir, configRoot]
+    const passRes = await runIsolatedKeylessProjectNode({
+      projectDirectory: projectDir,
+      entry: { kind: 'test', file: 'parse-port.test.mjs' },
+      forbiddenPaths: forbidden,
+    })
+    expect(passRes.code).toBe(0)
+
+    await writeFile(
+      join(projectDir, 'bad.test.mjs'),
+      "import test from 'node:test'\nimport assert from 'node:assert/strict'\ntest('fail', () => assert.equal(1, 2))\n",
+    )
+    const failRes = await runIsolatedKeylessProjectNode({
+      projectDirectory: projectDir,
+      entry: { kind: 'test', file: 'bad.test.mjs' },
+      forbiddenPaths: forbidden,
+    })
+    expect(failRes.code).toBe(1)
+
+    const preparedKeyPath = join(dirname(prepared.agyPath!), 'gemini-key')
+    const probeReadRes = await runIsolatedKeylessProjectNode({
+      projectDirectory: projectDir,
+      entry: {
+        kind: 'eval',
+        code: [
+          "import { readFileSync } from 'node:fs';",
+          'const blocked = (p) => { try { readFileSync(p, "utf8"); return false; } catch { return true; } };',
+          `const a = blocked(${JSON.stringify(envPath)});`,
+          `const b = blocked(${JSON.stringify(preparedKeyPath)});`,
+          'if (!a || !b) process.exit(1);',
+        ].join(' '),
+      },
+      forbiddenPaths: forbidden,
+    })
+    expect(probeReadRes.code).toBe(0)
+  })
+
+  it.skipIf(process.platform === 'win32')(
+    'rejects short GEMINI_API_KEY, default/explicit agy/.env symlinks/hardlinks/FIFOs, and post-load replacement',
+    async () => {
+      await rm(join(configRoot, 'claude'), { recursive: true, force: true })
+      await mkdir(join(configRoot, 'agy'), { recursive: true })
+      const envPath = join(configRoot, 'agy/.env')
+      const baseEnv: NodeJS.ProcessEnv = {
+        PATH: join(root, 'empty-path'),
+        HOME: '/synthetic-daily-home',
+        LANG: 'en_US.UTF-8',
+        PACT_E2E_CODEX_EXECUTABLE: process.execPath,
+        PACT_E2E_AGY_EXECUTABLE: process.execPath,
+      }
+
+      // 1. Short GEMINI_API_KEY (< 8 chars) is rejected at load time.
+      await writeFile(envPath, 'GEMINI_API_KEY=abc\n', { mode: 0o600 })
+      await expect(
+        loadProviderConfiguration(configRoot, baseEnv, {}, { profile: 'codex-agy' }),
+      ).rejects.toThrow('at least 8')
+
+      // 2. Default agy/.env hardlink (nlink > 1) and symlink are rejected.
+      const validKey = 'synthetic-valid-gemini-credential'
+      const validBody = `GEMINI_API_KEY=${validKey}\n`
+      await rm(envPath)
+      await writeFile(envPath, validBody, { mode: 0o600 })
+      const extraLink = join(root, 'agy-hardlink.env')
+      await link(envPath, extraLink)
+      await expect(
+        loadProviderConfiguration(configRoot, baseEnv, {}, { profile: 'codex-agy' }),
+      ).rejects.toThrow('owned regular file')
+      await rm(extraLink)
+
+      const internalTarget = join(configRoot, 'agy/.real.env')
+      await writeFile(internalTarget, validBody, { mode: 0o600 })
+      await rm(envPath)
+      await symlink(internalTarget, envPath)
+      await expect(
+        loadProviderConfiguration(configRoot, baseEnv, {}, { profile: 'codex-agy' }),
+      ).rejects.toThrow('owned regular file')
+      await rm(internalTarget)
+
+      // 3. FIFO at agy/.env rejects cleanly without blocking.
+      await rm(envPath)
+      await promisify(execFile)('mkfifo', [envPath])
+      await expect(
+        loadProviderConfiguration(configRoot, baseEnv, {}, { profile: 'codex-agy' }),
+      ).rejects.toThrow('owned regular file')
+
+      // 4. Post-load replacement with symlink or FIFO fails integrity check without blocking.
+      await rm(envPath)
+      await writeFile(envPath, validBody, { mode: 0o600 })
+      const config = await loadProviderConfiguration(
+        configRoot,
+        baseEnv,
+        {},
+        { profile: 'codex-agy' },
+      )
+      await rm(envPath)
+      await writeFile(envPath, validBody, { mode: 0o600 })
+      await expect(config.assertSourceIntegrity()).rejects.toThrow('changed during the test run')
+
+      await rm(envPath)
+      await promisify(execFile)('mkfifo', [envPath])
+      await expect(config.assertSourceIntegrity()).rejects.toThrow('owned regular file')
+
+      // 5. Generated Windows API-key launcher handles .exe vs .cmd safely and prefers .exe first.
+      expect(providerExecutableCandidates('agy', 'win32')).toEqual(['agy.exe', 'agy.cmd', 'agy'])
+      const cmdSource = buildWindowsAgyApiKeyLauncherSource(
+        'C:\\tmp\\gemini-key',
+        'C:\\Program Files\\agy\\agy.cmd',
+      )
+      expect(cmdSource).toContain('windowsVerbatimArguments: true')
+      expect(cmdSource).toContain('lstatSync')
+      const exeSource = buildWindowsAgyApiKeyLauncherSource(
+        'C:\\tmp\\gemini-key',
+        'C:\\Program Files\\agy\\agy.exe',
+      )
+      expect(exeSource).toContain('shell: false')
+    },
+  )
 })

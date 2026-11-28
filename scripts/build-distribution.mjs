@@ -18,6 +18,23 @@ import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:pat
 import { promisify } from 'node:util'
 
 import identities from '../apps/desktop/app-identities.json' with { type: 'json' }
+import {
+  agySqliteFileResourcePrefix,
+  agySqliteFileSourceHash,
+  inspectAgySqliteFileResource,
+  validateAgySqliteFileManifest,
+} from '../apps/desktop/build/agy-sqlite-file-resource.mjs'
+import {
+  inspectTerminalHelperResource,
+  terminalHelperResourcePrefix,
+  terminalHelperSourceHash,
+  validateTerminalHelperManifest,
+} from '../apps/desktop/build/terminal-helper-resource.mjs'
+import {
+  inspectWindowsOwnedProcessResource,
+  validateWindowsOwnedProcessManifest,
+  windowsOwnedProcessSourceHash,
+} from '../apps/desktop/build/windows-owned-process-resource.mjs'
 import { run } from './run-e2e.mjs'
 import { isScriptEntry } from './script-entry.mjs'
 
@@ -507,6 +524,29 @@ export async function main(args = process.argv.slice(2)) {
     if (application.platform !== options.platform || application.arch !== options.arch)
       throw new Error('Builder produced an unexpected application architecture.')
     const content = await applicationContent(application.appPath, options.platform)
+    const windowsOwnedProcess =
+      options.platform === 'win32'
+        ? await inspectWindowsOwnedProcessResource(
+            join(application.appPath, 'resources/native'),
+            options.arch,
+            await windowsOwnedProcessSourceHash(),
+            { runIdentity: true },
+          )
+        : null
+    const agySqliteFile = await inspectAgySqliteFileResource(
+      join(application.appPath, agySqliteFileResourcePrefix(options.platform)),
+      options.platform,
+      options.arch,
+      await agySqliteFileSourceHash(),
+      { verifyLoad: true, allowSignedBinary: options.platform === 'darwin' },
+    )
+    const terminalHelper = await inspectTerminalHelperResource(
+      join(application.appPath, terminalHelperResourcePrefix(options.platform)),
+      options.platform,
+      options.arch,
+      await terminalHelperSourceHash(options.platform),
+      { verifyLoad: true, allowSignedBinary: options.platform === 'darwin' },
+    )
     if (windowsSharp)
       requireSharpInspection(
         'packaged',
@@ -547,6 +587,9 @@ export async function main(args = process.argv.slice(2)) {
         entries: content.entries,
       },
       artifacts,
+      windowsOwnedProcess,
+      agySqliteFile,
+      terminalHelper,
       signing: { mac: 'ad-hoc', windows: 'none', notarized: false },
       verification: {
         packagedSmoke: 'pending',
@@ -554,6 +597,9 @@ export async function main(args = process.argv.slice(2)) {
           'TODO: native installation, coexistence, upgrade and uninstall debugging remain required',
       },
     }
+    validateWindowsOwnedProcessManifest(manifest)
+    validateAgySqliteFileManifest(manifest)
+    validateTerminalHelperManifest(manifest)
     const bytes = `${JSON.stringify(manifest, null, 2)}\n`
     if (Buffer.byteLength(bytes) > MAX_MANIFEST_BYTES)
       throw new Error('Distribution manifest exceeds its metadata bound.')

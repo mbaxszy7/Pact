@@ -2,12 +2,13 @@
 import { Check, ChevronDown, LoaderCircle } from 'lucide-react'
 import { useEffect, useRef, useState, type KeyboardEvent } from 'react'
 
-import type {
-  AgentRun,
-  AgentSpeed,
-  CollaborationSession,
-  RuntimeAgentId,
-  SessionSpeedSaveInput,
+import {
+  agentDisplayName,
+  type AgentRun,
+  type AgentSpeed,
+  type CollaborationSession,
+  type RuntimeAgentId,
+  type SessionSpeedSaveInput,
 } from '@pact/contracts'
 
 const speeds = {
@@ -46,7 +47,8 @@ export function SpeedMenu({
   const inFlight = useRef(false)
   const mounted = useRef(true)
   const selected = session.settings.agents[agent].speed ?? 'native'
-  const name = agent === 'claude' ? 'Claude Code' : 'Codex'
+  const name = agentDisplayName(agent)
+  const nativeOnly = agent === 'agy'
   const id = `speed-${session.id}-${agent}`
   const pending =
     run?.agentId === agent &&
@@ -139,13 +141,13 @@ export function SpeedMenu({
   }
 
   return (
-    <div className="shrink-0 text-caption">
+    <div className="min-w-0 text-caption">
       <button
         ref={trigger}
         type="button"
         popoverTarget={id}
         disabled={disabled || saving}
-        className="pact-agent-trigger"
+        className="pact-agent-trigger max-w-full"
         style={{ anchorName: `--${id}` }}
         aria-label={`${name} speed: ${speeds[selected].label}`}
         aria-haspopup="menu"
@@ -159,7 +161,7 @@ export function SpeedMenu({
           focusChoice()
         }}
       >
-        <span className="whitespace-nowrap">Speed: {speeds[selected].label}</span>
+        <span className="truncate">Speed: {speeds[selected].label}</span>
         <ChevronDown aria-hidden="true" className="pact-agent-chevron size-3 shrink-0" />
       </button>
       <div
@@ -188,9 +190,9 @@ export function SpeedMenu({
             role="menuitemradio"
             aria-checked={selected === speed}
             data-speed={speed}
-            disabled={disabled || saving}
+            disabled={disabled || saving || (nativeOnly && speed !== 'native')}
             onClick={() => void choose(speed)}
-            className="pact-composer-menu-item"
+            className="pact-composer-menu-item disabled:cursor-not-allowed disabled:opacity-50"
           >
             <span className="min-w-0 flex-1">
               <span className="block font-medium">{speeds[speed].label}</span>
@@ -207,7 +209,9 @@ export function SpeedMenu({
             </>
           ) : (
             <>
-              <p>Next run · This Session</p>
+              <p>
+                {nativeOnly ? 'Antigravity uses its native CLI speed.' : 'Next run · This session'}
+              </p>
               {pending ? <p className="mt-1">Current work keeps its original speed.</p> : null}
               {fallback ? <p className="mt-1 text-status-warning-foreground">{fallback}</p> : null}
             </>

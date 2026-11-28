@@ -24,6 +24,7 @@ import {
 
 import { ProjectFileReader } from '../project-file/project-file-reader.js'
 import { RuntimePreparation } from '../runtime-preparation/runtime-preparation.js'
+import { runDirectoryWorker } from '../workspace-changes/directory-worker.test-support.js'
 import { Conversation } from './conversation.js'
 
 const native = vi.hoisted(() => ({
@@ -41,7 +42,7 @@ async function* startupRun(
   signal: AbortSignal,
 ): AsyncIterable<NormalizedAgentEvent> {
   native.starts.push({ runId: input.runId, executorId })
-  if (!native.omitExecutor) input.recordExecutor?.(executorId)
+  if (!native.omitExecutor) input.host?.lifecycle?.recordExecutor?.(executorId)
   const request: NativeUserInputRequest = {
     kind: native.kind,
     title: 'Startup request',
@@ -64,15 +65,16 @@ async function* startupRun(
         }
       : {}),
   }
-  if (!input.requestUserInput) throw new Error('Missing public startup callback')
-  const answer = await input.requestUserInput(request, signal)
+  if (!input.host?.interactions?.requestUserInput)
+    throw new Error('Missing public startup callback')
+  const answer = await input.host?.interactions?.requestUserInput(request, signal)
   native.replies.push(answer)
   signal.throwIfAborted()
   const nativeSessionId = `native:${input.runId}`
-  input.recordDispatch?.('possibly_sent', nativeSessionId, executorId)
+  input.host?.lifecycle?.recordDispatch?.('possibly_sent', nativeSessionId, executorId)
   native.dispatched += 1
   yield { agentId, type: 'session.started', nativeSessionId }
-  input.recordDispatch?.('accepted', nativeSessionId, executorId)
+  input.host?.lifecycle?.recordDispatch?.('accepted', nativeSessionId, executorId)
   yield { agentId, type: 'turn.started', turnId: `turn:${input.runId}` }
   yield {
     agentId,
@@ -126,9 +128,14 @@ afterEach(() => {
 const migrationsFolder = resolve(import.meta.dirname, '../../../../../packages/persistence/drizzle')
 const settings: DefaultSessionSettings = {
   primaryAgentId: 'codex',
-  agents: { codex: { model: null, effort: null }, claude: { model: null, effort: null } },
+  secondaryAgentId: 'claude',
+  agents: {
+    codex: { model: null, effort: null },
+    claude: { model: null, effort: null },
+    agy: { model: null, effort: null },
+  },
   maxDiscussionRounds: 3,
-  runningMessagePolicy: 'next_round',
+
   maxReviewCycles: 3,
   maxRepairAttempts: 3,
 }
@@ -150,7 +157,11 @@ async function fixture(agentId: RuntimeAgentId, kind: typeof native.kind) {
   })
   db.sessionRepository.create(
     { id: sessionId, projectId, title: 'Fixture', createdAt: timestamp },
-    { ...settings, primaryAgentId: agentId },
+    {
+      ...settings,
+      primaryAgentId: agentId,
+      secondaryAgentId: agentId === 'claude' ? 'codex' : 'claude',
+    },
   )
   const createFlow = () => {
     const preparation = new RuntimePreparation(db.runtimePreparationRepository)
@@ -179,7 +190,7 @@ async function fixture(agentId: RuntimeAgentId, kind: typeof native.kind) {
       db.sessionRepository,
       db.projectCatalogRepository,
       preparation,
-      new ProjectFileReader(db.sessionRepository, db.projectCatalogRepository),
+      new ProjectFileReader(db.sessionRepository, db.projectCatalogRepository, runDirectoryWorker),
     )
   }
   let flow = createFlow()

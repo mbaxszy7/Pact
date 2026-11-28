@@ -74,9 +74,13 @@ test(
           { id: sessionId, projectId, title: 'IPC worker fixture', createdAt },
           {
             primaryAgentId: 'codex',
-            agents: { claude: { model: null, effort: null }, codex: { model: null, effort: null } },
+            secondaryAgentId: 'claude',
+            agents: {
+              claude: { model: null, effort: null },
+              codex: { model: null, effort: null },
+              agy: { model: null, effort: null },
+            },
             maxDiscussionRounds: 3,
-            runningMessagePolicy: 'next_round',
             maxReviewCycles: 2,
             maxRepairAttempts: 2,
           },
@@ -146,7 +150,7 @@ test(
         })
         expect(during.ok).toBe(true)
         if (!during.ok) throw new Error('Missing measured health.')
-        expect(during.value.ipcTraffic?.owners).toHaveLength(9)
+        expect(during.value.ipcTraffic?.owners).toHaveLength(10)
         const monaco = during.value.ipcTraffic?.owners.find(
           (owner) => owner.owner === 'renderer-monaco',
         )

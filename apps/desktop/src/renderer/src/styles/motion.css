@@ -1,0 +1,526 @@
+@layer components {
+  .pact-silk-surface {
+    transition:
+      background-color 220ms var(--ease-silk-out),
+      color 180ms var(--ease-silk-out),
+      border-color 220ms var(--ease-silk-out),
+      box-shadow 220ms var(--ease-silk-out);
+  }
+
+  .pact-pressable {
+    transition:
+      transform 140ms var(--ease-silk-out),
+      background-color 160ms var(--ease-silk-out),
+      color 160ms var(--ease-silk-out),
+      border-color 160ms var(--ease-silk-out),
+      opacity 160ms var(--ease-silk-out);
+  }
+
+  .pact-pressable:active:not(:disabled) {
+    transform: scale(0.985);
+  }
+
+  .pact-inspector-tab-indicator {
+    position: absolute;
+    inset-block: 2px;
+    left: 0;
+    border-radius: 0.625rem;
+    background: var(--pact-surface-raised);
+    border: 1px solid var(--pact-border);
+    box-shadow: 0 1px 3px rgb(15 23 42 / 9%);
+    pointer-events: none;
+    will-change: transform, width;
+    transition:
+      transform 240ms var(--ease-silk-out),
+      width 240ms var(--ease-silk-out),
+      opacity 160ms var(--ease-silk-out);
+  }
+
+  /* Zero-reflow InputReplacement pane transitions */
+  .input-replacement {
+    position: relative;
+    min-width: 0;
+  }
+
+  .input-replacement-pane {
+    position: absolute;
+    inset: 0 0 auto;
+    min-width: 0;
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+    transform: translate3d(0, 6px, 0) scale(0.99);
+    transform-origin: center bottom;
+    will-change: transform, opacity;
+    transition:
+      opacity 160ms var(--ease-silk-out),
+      transform 220ms var(--ease-silk-out),
+      visibility 0s 220ms;
+  }
+
+  .input-replacement-pane[data-active='true'] {
+    position: relative;
+    opacity: 1;
+    visibility: visible;
+    pointer-events: auto;
+    transform: translate3d(0, 0, 0) scale(1);
+    transition-delay: 0s;
+  }
+
+  .session-activity-spin {
+    animation: session-activity-spin 1.6s linear infinite;
+  }
+
+  .agent-activity-reveal {
+    display: grid;
+    grid-template-rows: 0fr;
+    opacity: 0;
+    transition:
+      grid-template-rows 220ms var(--ease-silk-out),
+      opacity 160ms var(--ease-silk-out);
+  }
+
+  .agent-activity-reveal[data-expanded='true'] {
+    grid-template-rows: 1fr;
+    opacity: 1;
+  }
+
+  @starting-style {
+    .agent-activity-reveal[data-expanded='true'] {
+      grid-template-rows: 0fr;
+      opacity: 0;
+    }
+  }
+
+  [data-pact-comment-pulse='true'] [data-pact-message-bubble] {
+    position: relative;
+  }
+
+  [data-pact-comment-pulse='true'] [data-pact-message-bubble]::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border: 2px solid var(--pact-focus);
+    border-radius: inherit;
+    pointer-events: none;
+    animation: comment-anchor-breathe 2.2s var(--ease-silk-out) both;
+  }
+
+  @keyframes workspace-context-expand {
+    from {
+      opacity: 0.94;
+      transform: scale(0.996);
+    }
+
+    to {
+      opacity: 1;
+      transform: scale(1);
+    }
+  }
+
+  @keyframes session-activity-spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+
+  @keyframes comment-anchor-breathe {
+    0%,
+    100% {
+      opacity: 0;
+    }
+
+    25%,
+    70% {
+      opacity: 0.85;
+    }
+
+    48% {
+      opacity: 0.3;
+    }
+  }
+
+  @keyframes pact-reminder-enter {
+    from {
+      opacity: 0;
+      transform: translate3d(0, 6px, 0);
+    }
+    to {
+      opacity: 1;
+      transform: translate3d(0, 0, 0);
+    }
+  }
+
+  @keyframes pact-badge-pop {
+    0% {
+      opacity: 0.35;
+      transform: scale(0.84);
+    }
+    65% {
+      opacity: 1;
+      transform: scale(1.05);
+    }
+    100% {
+      opacity: 1;
+      transform: scale(1);
+    }
+  }
+
+  .pact-session-reminder {
+    animation: pact-reminder-enter 180ms var(--ease-silk-out);
+  }
+
+  .pact-reminder-icon-pop {
+    animation: pact-badge-pop 180ms var(--ease-silk-out);
+  }
+
+  .pact-reminder-badge {
+    animation: pact-badge-pop 190ms var(--ease-silk-out);
+  }
+
+  .pact-selection-surface-actions {
+    display: none;
+    opacity: 0;
+    transform: translate3d(0, 4px, 0) scale(0.98);
+    transition:
+      opacity 100ms var(--ease-silk-out),
+      transform 120ms var(--ease-silk-out),
+      display 100ms allow-discrete;
+  }
+
+  .pact-selection-surface-actions[data-open='true'] {
+    display: inline-flex;
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+    transition:
+      opacity 160ms var(--ease-silk-out),
+      transform 180ms var(--ease-silk-out),
+      display 160ms allow-discrete;
+  }
+
+  @starting-style {
+    .pact-selection-surface-actions[data-open='true'] {
+      opacity: 0;
+      transform: translate3d(0, 4px, 0) scale(0.98);
+    }
+  }
+
+  /* SideChatStage push/pop transitions aligned with --ease-silk-out */
+  @keyframes pact-side-chat-push-in {
+    from {
+      opacity: 0;
+      transform: translate3d(12px, 0, 0);
+    }
+    to {
+      opacity: 1;
+      transform: translate3d(0, 0, 0);
+    }
+  }
+
+  @keyframes pact-side-chat-push-out {
+    from {
+      opacity: 1;
+      transform: translate3d(0, 0, 0);
+    }
+    to {
+      opacity: 0;
+      transform: translate3d(-12px, 0, 0);
+    }
+  }
+
+  @keyframes pact-side-chat-pop-in {
+    from {
+      opacity: 0;
+      transform: translate3d(-12px, 0, 0);
+    }
+    to {
+      opacity: 1;
+      transform: translate3d(0, 0, 0);
+    }
+  }
+
+  @keyframes pact-side-chat-pop-out {
+    from {
+      opacity: 1;
+      transform: translate3d(0, 0, 0);
+    }
+    to {
+      opacity: 0;
+      transform: translate3d(12px, 0, 0);
+    }
+  }
+
+  .pact-side-chat-stage-layer[data-stage-state='active'][data-animate='true'][data-direction='1'] {
+    animation: pact-side-chat-push-in 180ms var(--ease-silk-out) both;
+  }
+
+  .pact-side-chat-stage-layer[data-stage-state='outgoing'][data-animate='true'][data-direction='-1'] {
+    animation: pact-side-chat-push-out 180ms var(--ease-silk-out) both;
+  }
+
+  .pact-side-chat-stage-layer[data-stage-state='active'][data-animate='true'][data-direction='-1'] {
+    animation: pact-side-chat-pop-in 160ms var(--ease-silk-out) both;
+  }
+
+  .pact-side-chat-stage-layer[data-stage-state='outgoing'][data-animate='true'][data-direction='1'] {
+    animation: pact-side-chat-pop-out 160ms var(--ease-silk-out) both;
+  }
+
+  @keyframes pact-side-chat-row-in {
+    from {
+      opacity: 0;
+      transform: translate3d(0, 4px, 0);
+    }
+    to {
+      opacity: 1;
+      transform: translate3d(0, 0, 0);
+    }
+  }
+
+  .pact-side-chat-row-enter {
+    animation: pact-side-chat-row-in 160ms var(--ease-silk-out) both;
+  }
+
+  .pact-side-chat-chevron {
+    transition:
+      transform 160ms var(--ease-silk-out),
+      color 160ms var(--ease-silk-out);
+  }
+
+  .group:hover .pact-side-chat-chevron,
+  .group:focus-visible .pact-side-chat-chevron {
+    transform: translate3d(2px, 0, 0);
+  }
+
+  @keyframes pact-side-chat-origin-in {
+    from {
+      opacity: 0;
+      transform: translate3d(0, -8px, 0);
+    }
+    to {
+      opacity: 1;
+      transform: translate3d(0, 0, 0);
+    }
+  }
+
+  .pact-side-chat-origin-enter {
+    animation: pact-side-chat-origin-in 180ms var(--ease-silk-out) both;
+  }
+
+  @keyframes pact-side-chat-badge-in {
+    from {
+      opacity: 0;
+      transform: translate3d(0, 8px, 0);
+    }
+    to {
+      opacity: 1;
+      transform: translate3d(0, 0, 0);
+    }
+  }
+
+  .pact-side-chat-from-badge {
+    animation: pact-side-chat-badge-in 180ms var(--ease-silk-out) both;
+  }
+
+  .pact-side-chat-sync-bar {
+    animation: pact-reminder-enter 180ms var(--ease-silk-out) both;
+  }
+
+  .pact-send-icon {
+    opacity: 1;
+    transform: scale(1);
+    transition:
+      opacity 160ms var(--ease-silk-out),
+      transform 160ms var(--ease-silk-out);
+  }
+
+  @starting-style {
+    .pact-send-icon {
+      opacity: 0;
+      transform: scale(0.9);
+    }
+  }
+
+  @keyframes pact-composer-handoff-iris {
+    from {
+      opacity: 0.92;
+    }
+    to {
+      opacity: 0;
+    }
+  }
+
+  .pact-composer-handoff-arrive {
+    position: relative;
+  }
+
+  .pact-composer-handoff-arrive::after {
+    content: '';
+    pointer-events: none;
+    position: absolute;
+    inset: -1px;
+    border-radius: inherit;
+    border: 2px solid var(--pact-focus);
+    background: color-mix(in srgb, var(--pact-focus) 7%, transparent);
+    animation: pact-composer-handoff-iris 220ms var(--ease-silk-out) forwards;
+  }
+}
+
+/* Gentle displacement-free reduced motion: 80–120ms opacity fades while zeroing transforms/scale */
+@media (prefers-reduced-motion: reduce) {
+  @keyframes pact-reduced-fade-in {
+    from {
+      opacity: 0;
+    }
+    to {
+      opacity: 1;
+    }
+  }
+
+  @keyframes pact-reduced-fade-out {
+    from {
+      opacity: 1;
+    }
+    to {
+      opacity: 0;
+    }
+  }
+
+  html,
+  body,
+  * {
+    scroll-behavior: auto !important;
+  }
+
+  .pact-pressable:active:not(:disabled) {
+    transform: none;
+  }
+
+  .pact-inspector-tab-indicator {
+    transition:
+      opacity 100ms ease-out,
+      width 0s,
+      transform 0s;
+  }
+
+  .input-replacement-pane,
+  .input-replacement-pane[data-active='true'] {
+    transform: none;
+    transition:
+      opacity 100ms ease-out,
+      visibility 0s;
+  }
+
+  .agent-activity-reveal,
+  .agent-activity-reveal[data-expanded='true'] {
+    transition: opacity 100ms ease-out;
+  }
+
+  .session-activity-spin,
+  .primary-action-spinner,
+  .pact-image-loading,
+  .animate-spin,
+  .animate-pulse {
+    animation: none !important;
+  }
+
+  [data-pact-comment-pulse='true'] [data-pact-message-bubble]::after {
+    animation: pact-reduced-fade-in 120ms ease-out both;
+    opacity: 0.75;
+  }
+
+  .pact-session-reminder,
+  .pact-reminder-icon-pop,
+  .pact-reminder-badge {
+    transform: none;
+    animation: pact-reduced-fade-in 100ms ease-out both;
+  }
+
+  .pact-selection-surface-actions,
+  .pact-selection-surface-actions[data-open='true'],
+  .pact-send-icon,
+  .pact-composer-popover,
+  .pact-composer-popover:popover-open,
+  .pact-skill-menu,
+  .pact-mention-menu,
+  .pact-skill-menu[data-open='true'],
+  .pact-mention-menu[data-open='true'],
+  .workspace-context-overlay,
+  .workspace-context-dialog,
+  .workspace-panel-content {
+    transform: none !important;
+    transition-property: opacity !important;
+    transition-duration: 100ms !important;
+    transition-timing-function: ease-out !important;
+  }
+
+  .pact-image-slide,
+  .pact-image-slide[data-visible='true'] {
+    transform: none !important;
+    transition: none !important;
+  }
+
+  @starting-style {
+    .pact-selection-surface-actions[data-open='true'],
+    .pact-send-icon,
+    .pact-composer-popover:popover-open,
+    .pact-image-slide[data-visible='true'],
+    .workspace-context-dialog[data-open='true'] {
+      transform: none;
+    }
+
+    .agent-activity-reveal[data-expanded='true'] {
+      grid-template-rows: 1fr;
+      opacity: 1;
+    }
+  }
+
+  .pact-side-chat-stage-layer[data-stage-state='active'][data-animate='true'],
+  .pact-side-chat-row-enter,
+  .pact-side-chat-origin-enter,
+  .pact-side-chat-from-badge,
+  .pact-side-chat-sync-bar,
+  .workspace-layout[data-context-expanded='true']
+    > #workspace-context[data-panel]
+    > .workspace-panel-content {
+    transform: none !important;
+    animation: pact-reduced-fade-in 100ms ease-out both !important;
+    animation-delay: 0ms !important;
+  }
+
+  .pact-side-chat-stage-layer[data-stage-state='outgoing'][data-animate='true'] {
+    transform: none !important;
+    animation: pact-reduced-fade-out 100ms ease-out both !important;
+  }
+
+  .group:hover .pact-side-chat-chevron,
+  .group:focus-visible .pact-side-chat-chevron,
+  .pact-project-trigger,
+  .pact-project-chevron,
+  .primary-action-button:hover:not(:disabled),
+  .primary-action-button:active:not(:disabled) {
+    transform: none !important;
+  }
+
+  .pact-agent-chevron {
+    transition: none !important;
+  }
+
+  .workspace-separator::before,
+  .workspace-separator:hover::before,
+  .workspace-separator:focus-visible::before,
+  .workspace-separator[data-separator='active']::before {
+    transform: translate(-50%, -50%) !important;
+  }
+
+  .pact-project-copied,
+  .runtime-bridge[data-loading='true'] .runtime-bridge-signal,
+  .runtime-scan-line::after,
+  .runtime-status-dot {
+    animation: none;
+  }
+
+  .pact-composer-handoff-arrive::after {
+    animation-duration: 100ms !important;
+  }
+}

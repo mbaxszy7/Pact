@@ -1,15 +1,17 @@
 import { createHash } from 'node:crypto'
-import { constants, type BigIntStats } from 'node:fs'
+import { constants, promises as fsPromises, type BigIntStats } from 'node:fs'
 import { link, lstat, open, rename, stat, type FileHandle } from 'node:fs/promises'
-import { dirname, isAbsolute } from 'node:path'
+import { dirname, isAbsolute, sep } from 'node:path'
 
 import {
   directoryFileOperationInputSchema,
   directoryFileOperationResultSchema,
-  WORKSPACE_FILE_BYTES,
+  PROJECT_FILE_PREVIEW_BYTES,
   type DirectoryFileOperationInput,
   type DirectoryFileOperationResult,
-} from '@pact/contracts'
+  type DirectoryIdentity,
+} from '@pact/contracts/directory-file-operations'
+import { WORKSPACE_FILE_BYTES } from '@pact/contracts/workspace-changes'
 
 const COPY_BUFFER_BYTES = 64 * 1024
 type FailureCode = Extract<DirectoryFileOperationResult, { ok: false }>['code']
@@ -37,7 +39,10 @@ function requireRegular(info: BigIntStats): void {
   if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1n)
     throw new DirectoryFileError('UNSUPPORTED', 'Only non-linked regular files can be protected.')
 }
-function metadata(info: BigIntStats, hash: string | null = null): DirectoryFileOperationResult {
+function metadata(
+  info: BigIntStats,
+  hash: string | null = null,
+): Extract<DirectoryFileOperationResult, { ok: true }> {
   return {
     ok: true,
     existed: true,
@@ -54,6 +59,9 @@ function absent(): DirectoryFileOperationResult {
 function isMissing(error: unknown): boolean {
   return error instanceof Error && Reflect.get(error, 'code') === 'ENOENT'
 }
+function isAlreadyExists(error: unknown): boolean {
+  return error instanceof Error && Reflect.get(error, 'code') === 'EEXIST'
+}
 async function syncDirectory(path: string): Promise<void> {
   if (process.platform === 'win32') return
   const directory = await open(path, constants.O_RDONLY | (constants.O_DIRECTORY ?? 0))
@@ -64,8 +72,10 @@ async function syncDirectory(path: string): Promise<void> {
   }
 }
 
-/** All Project operations use this process's anchored cwd, never a reconstructed absolute path. */
-async function enterDirectory(input: DirectoryFileOperationInput): Promise<void> {
+async function verifyRootDirectory(input: DirectoryFileOperationInput): Promise<BigIntStats> {
+  for (const value of [...input.directories, input.name])
+    if (value.includes(sep))
+      throw new DirectoryFileError('UNSUPPORTED', 'Invalid preview file-name component.')
   const root = await stat('.', { bigint: true })
   if (
     !root.isDirectory() ||
@@ -73,9 +83,27 @@ async function enterDirectory(input: DirectoryFileOperationInput): Promise<void>
     root.ino.toString() !== input.rootInode
   )
     throw new DirectoryFileError('PATH_CHANGED', 'The Project directory identity changed.')
+  return root
+}
+
+/** All Project operations use this process's anchored cwd, never a reconstructed absolute path. */
+async function enterDirectory(
+  input: DirectoryFileOperationInput,
+  allowMissingAncestor = false,
+): Promise<{ entered: boolean; parentDirs: DirectoryIdentity[] }> {
+  await verifyRootDirectory(input)
+  const parentDirs: DirectoryIdentity[] = []
+  let rel = ''
   for (const component of input.directories) {
-    // oxlint-disable-next-line no-await-in-loop -- Each checked directory becomes the cwd anchor for the next component.
-    const named = await lstat(`./${component}`, { bigint: true })
+    rel = rel ? `${rel}/${component}` : component
+    let named: BigIntStats
+    try {
+      // oxlint-disable-next-line no-await-in-loop -- Each checked directory becomes the cwd anchor for the next component.
+      named = await lstat(`./${component}`, { bigint: true })
+    } catch (error) {
+      if (allowMissingAncestor && isMissing(error)) return { entered: false, parentDirs }
+      throw error
+    }
     if (named.isSymbolicLink() || !named.isDirectory())
       throw new DirectoryFileError(
         'UNSUPPORTED',
@@ -86,7 +114,131 @@ async function enterDirectory(input: DirectoryFileOperationInput): Promise<void>
     const entered = await stat('.', { bigint: true })
     if (!sameObject(named, entered) || !entered.isDirectory())
       throw new DirectoryFileError('PATH_CHANGED', 'A Project directory changed during navigation.')
+    parentDirs.push({
+      path: rel,
+      device: entered.dev.toString(),
+      inode: entered.ino.toString(),
+    })
   }
+  return { entered: true, parentDirs }
+}
+
+async function ensureParents(
+  input: DirectoryFileOperationInput,
+): Promise<DirectoryFileOperationResult> {
+  let current = await verifyRootDirectory(input)
+  const parentDirs: DirectoryIdentity[] = []
+  let rel = ''
+  for (const component of input.directories) {
+    rel = rel ? `${rel}/${component}` : component
+    let named: BigIntStats
+    try {
+      // oxlint-disable-next-line no-await-in-loop -- Each checked directory becomes the cwd anchor for the next component.
+      named = await lstat(`./${component}`, { bigint: true })
+    } catch (error) {
+      if (!isMissing(error)) throw error
+      try {
+        // oxlint-disable-next-line no-await-in-loop -- Create single child relative to the verified parent cwd.
+        await fsPromises.mkdir(`./${component}`, { mode: 0o755 })
+      } catch (mkdirError) {
+        if (!isAlreadyExists(mkdirError)) throw mkdirError
+      }
+      // oxlint-disable-next-line no-await-in-loop -- Persist created directory entry in parent before entering it.
+      await syncDirectory('.')
+      // oxlint-disable-next-line no-await-in-loop -- Verify newly created child before chdir.
+      named = await lstat(`./${component}`, { bigint: true })
+    }
+    if (named.isSymbolicLink() || !named.isDirectory())
+      throw new DirectoryFileError(
+        'UNSUPPORTED',
+        'Linked or non-directory ancestors cannot be modified.',
+      )
+    process.chdir(`./${component}`)
+    // oxlint-disable-next-line no-await-in-loop -- Verify the cwd object before accessing its next child.
+    const entered = await stat('.', { bigint: true })
+    if (!sameObject(named, entered) || !entered.isDirectory())
+      throw new DirectoryFileError('PATH_CHANGED', 'A Project directory changed during navigation.')
+    current = entered
+    parentDirs.push({
+      path: rel,
+      device: entered.dev.toString(),
+      inode: entered.ino.toString(),
+    })
+  }
+  return {
+    ok: true,
+    existed: true,
+    hash: null,
+    bytes: 0,
+    mode: Number(current.mode & 0o7777n),
+    device: current.dev.toString(),
+    inode: current.ino.toString(),
+    parentDirs,
+  }
+}
+
+async function inspectParents(
+  input: DirectoryFileOperationInput,
+): Promise<DirectoryFileOperationResult> {
+  const root = await verifyRootDirectory(input)
+  const parentDirs: DirectoryIdentity[] = []
+  const missingDirs: string[] = []
+  let rel = ''
+  let missing = false
+  for (const component of input.directories) {
+    rel = rel ? `${rel}/${component}` : component
+    if (missing) {
+      missingDirs.push(rel)
+      continue
+    }
+    let named: BigIntStats
+    try {
+      // oxlint-disable-next-line no-await-in-loop -- Each checked directory becomes the cwd anchor for the next component.
+      named = await lstat(`./${component}`, { bigint: true })
+    } catch (error) {
+      if (isMissing(error)) {
+        missing = true
+        missingDirs.push(rel)
+        continue
+      }
+      throw error
+    }
+    if (named.isSymbolicLink() || !named.isDirectory())
+      throw new DirectoryFileError(
+        'UNSUPPORTED',
+        'Linked or non-directory ancestors cannot be modified.',
+      )
+    process.chdir(`./${component}`)
+    // oxlint-disable-next-line no-await-in-loop -- Verify the cwd object before accessing its next child.
+    const entered = await stat('.', { bigint: true })
+    if (!sameObject(named, entered) || !entered.isDirectory())
+      throw new DirectoryFileError('PATH_CHANGED', 'A Project directory changed during navigation.')
+    parentDirs.push({
+      path: rel,
+      device: entered.dev.toString(),
+      inode: entered.ino.toString(),
+    })
+  }
+  return {
+    ok: true,
+    existed: missingDirs.length === 0,
+    hash: null,
+    bytes: 0,
+    mode: Number(root.mode & 0o7777n),
+    device: root.dev.toString(),
+    inode: root.ino.toString(),
+    parentDirs,
+    missingDirs,
+  }
+}
+
+function removeVerifiedDir(): never {
+  // POSIX/Node cannot atomically bind rmdir(leaf) to a verified (dirfd, dev, ino) without a
+  // name-lookup TOCTOU window between lstat and rmdir. Preserve empty parent directories safely.
+  throw new DirectoryFileError(
+    'UNSUPPORTED',
+    'Atomic identity-bound directory removal is not supported on this platform; empty parent directories are preserved.',
+  )
 }
 
 async function copySnapshot(
@@ -174,10 +326,82 @@ async function copySnapshot(
   }
 }
 
+async function readPreview(
+  leaf: string,
+  deadlineAt: number,
+): Promise<DirectoryFileOperationResult> {
+  if (Date.now() >= deadlineAt) throw new DirectoryFileError('CANCELLED', 'File preview timed out.')
+  const named = await lstat(leaf, { bigint: true })
+  if (!named.isFile() || named.isSymbolicLink())
+    throw new DirectoryFileError('UNSUPPORTED', 'This link does not point to a file.')
+  const handle = await open(
+    leaf,
+    constants.O_RDONLY | constants.O_NONBLOCK | (constants.O_NOFOLLOW ?? 0),
+  )
+  try {
+    const before = await handle.stat({ bigint: true })
+    if (!before.isFile() || !sameObject(named, before))
+      throw new DirectoryFileError('PATH_CHANGED', 'This file changed while being read. Try again.')
+    if (before.size > BigInt(PROJECT_FILE_PREVIEW_BYTES))
+      throw new DirectoryFileError('TOO_LARGE', 'This file is too large to preview.')
+    const buffer = Buffer.alloc(Number(before.size) + 1)
+    let length = 0
+    while (length < buffer.length) {
+      if (Date.now() >= deadlineAt)
+        throw new DirectoryFileError('CANCELLED', 'File preview timed out.')
+      // oxlint-disable-next-line eslint/no-await-in-loop -- Read the same bounded descriptor sequentially until EOF or the byte limit.
+      const { bytesRead } = await handle.read(buffer, length, buffer.length - length, length)
+      if (!bytesRead) break
+      length += bytesRead
+    }
+    const after = await handle.stat({ bigint: true })
+    const stillNamed = await lstat(leaf, { bigint: true })
+    if (
+      length !== Number(before.size) ||
+      !stableVersion(before, after) ||
+      !stableVersion(after, stillNamed) ||
+      stillNamed.isSymbolicLink()
+    )
+      throw new DirectoryFileError('PATH_CHANGED', 'This file changed while being read. Try again.')
+    const bytes = buffer.subarray(0, length)
+    if (bytes.includes(0))
+      throw new DirectoryFileError('UNSUPPORTED', 'Binary files cannot be previewed.')
+    let content: string
+    try {
+      content = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+    } catch {
+      throw new DirectoryFileError('UNSUPPORTED', 'This file is not valid UTF-8 text.')
+    }
+    const result = metadata(after, createHash('sha256').update(bytes).digest('hex'))
+    if (!result.ok) return result
+    const preview = {
+      ...result,
+      preview: { content, updatedAt: new Date(Number(after.mtimeMs)).toISOString() },
+    }
+    if (Buffer.byteLength(JSON.stringify(preview), 'utf8') > PROJECT_FILE_PREVIEW_BYTES)
+      throw new DirectoryFileError('TOO_LARGE', 'This file is too large to preview.')
+    if (Date.now() >= deadlineAt)
+      throw new DirectoryFileError('CANCELLED', 'File preview timed out.')
+    return preview
+  } finally {
+    await handle.close()
+  }
+}
+
 async function execute(input: DirectoryFileOperationInput): Promise<DirectoryFileOperationResult> {
-  await enterDirectory(input)
+  if (input.operation === 'preview') {
+    if (Date.now() >= input.deadlineAt)
+      throw new DirectoryFileError('CANCELLED', 'File preview timed out.')
+    await enterDirectory(input)
+    return readPreview(`./${input.name}`, input.deadlineAt)
+  }
+  if (input.operation === 'mkdir_parents') return ensureParents(input)
+  if (input.operation === 'inspect_parents') return inspectParents(input)
+  if (input.operation === 'rmdir_verified') return removeVerifiedDir()
   const leaf = `./${input.name}`
   if (input.operation === 'absent') {
+    const { entered } = await enterDirectory(input, true)
+    if (!entered) return absent()
     try {
       await lstat(leaf, { bigint: true })
     } catch (error) {
@@ -192,8 +416,12 @@ async function execute(input: DirectoryFileOperationInput): Promise<DirectoryFil
   const maximumBytes = input.maximumBytes ?? WORKSPACE_FILE_BYTES
   if (input.linkedCandidatePath && !isAbsolute(input.linkedCandidatePath))
     throw new DirectoryFileError('IO', 'The private installation link must be absolute.')
-  if (input.operation === 'capture')
+  if (input.operation === 'capture') {
+    const { entered } = await enterDirectory(input, input.linkedCandidatePath === undefined)
+    if (!entered) return absent()
     return copySnapshot(leaf, auxiliary, maximumBytes, input.linkedCandidatePath)
+  }
+  const { parentDirs } = await enterDirectory(input)
   if (input.operation === 'stash') {
     const before = await lstat(leaf, { bigint: true })
     requireRegular(before)
@@ -228,7 +456,7 @@ async function execute(input: DirectoryFileOperationInput): Promise<DirectoryFil
   const installed = await lstat(leaf, { bigint: true })
   if (!installed.isFile() || !sameObject(candidate, installed))
     throw new DirectoryFileError('PATH_CHANGED', 'The destination changed during installation.')
-  return metadata(installed)
+  return { ...metadata(installed), parentDirs }
 }
 
 const parentPort = process.parentPort

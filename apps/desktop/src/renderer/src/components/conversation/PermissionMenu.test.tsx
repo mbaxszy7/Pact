@@ -14,6 +14,19 @@ import { PermissionMenu } from './PermissionMenu'
 type MenuProps = ComponentProps<typeof PermissionMenu>
 const popoverDescriptor = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'hidePopover')
 beforeEach(() => {
+  vi.stubGlobal(
+    'ResizeObserver',
+    class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    },
+  )
+  vi.stubGlobal('matchMedia', () => ({
+    matches: true,
+    addEventListener: vi.fn<() => void>(),
+    removeEventListener: vi.fn<() => void>(),
+  }))
   vi.stubGlobal('pact', composerBridgeFixture())
   Object.defineProperty(HTMLElement.prototype, 'hidePopover', {
     configurable: true,
@@ -46,12 +59,14 @@ function session(): CollaborationSession {
     hasUnread: false,
     settings: {
       primaryAgentId: 'codex',
+      secondaryAgentId: 'claude',
       agents: {
         codex: { model: null, effort: null },
         claude: { model: 'deepseek-flash', effort: null },
+        agy: { model: null, effort: null },
       },
       maxDiscussionRounds: 3,
-      runningMessagePolicy: 'next_round',
+
       maxReviewCycles: 3,
       maxRepairAttempts: 3,
     },
@@ -71,7 +86,11 @@ function menuProps(): MenuProps {
 
 function openMenu(agent: 'codex' | 'claude' = 'codex'): HTMLElement {
   const name = agent === 'codex' ? 'Codex' : 'Claude Code'
-  fireEvent.click(screen.getByRole('button', { name: new RegExp(`^${name} permissions:`, 'u') }))
+  fireEvent.click(
+    screen.getByRole('button', {
+      name: new RegExp(`^${name} permissions for the next task:`, 'u'),
+    }),
+  )
   // jsdom has the UA hidden-popover style but not native activation behavior.
   const panel = screen.getByLabelText<HTMLDivElement>(
     `${agent === 'codex' ? 'Codex' : 'Claude Code'} permissions`,
@@ -158,7 +177,7 @@ it('Full access requires confirmation, cancellation grants nothing, and duplicat
 
 it('revoking Full access and enabling it again needs a fresh confirmation at the current revision', async () => {
   const props = menuProps()
-  props.session.settings.permissionModes = { codex: 'full', claude: 'ask' }
+  props.session.settings.permissionModes = { codex: 'full', claude: 'ask', agy: 'ask' }
   function Controlled() {
     const [current, setCurrent] = useState(props.session)
     return (
@@ -188,7 +207,7 @@ it('revoking Full access and enabling it again needs a fresh confirmation at the
   fireEvent.click(screen.getByRole('button', { name: /^Ask for approval/u }))
   await waitFor(() =>
     expect(
-      screen.getByRole('button', { name: 'Codex permissions: Ask for approval' }),
+      screen.getByRole('button', { name: 'Codex permissions for the next task: Ask for approval' }),
     ).toBeDefined(),
   )
   expect(props.onSave).toHaveBeenCalledWith(
@@ -207,7 +226,7 @@ it('revoking Full access and enabling it again needs a fresh confirmation at the
 
 it('shows next-task pending without answering the current native approval', async () => {
   const props = menuProps()
-  props.session.settings.permissionModes = { codex: 'full', claude: 'ask' }
+  props.session.settings.permissionModes = { codex: 'full', claude: 'ask', agy: 'ask' }
   const run: AgentRun = {
     id: crypto.randomUUID(),
     sessionId: props.session.id,
@@ -296,7 +315,9 @@ it('mounts the permission control after the Composer, outside its input surface'
     />,
   )
   const composer = screen.getByRole('combobox', { name: 'Message' })
-  const permission = screen.getByRole('button', { name: 'Codex permissions: Native settings' })
+  const permission = screen.getByRole('button', {
+    name: 'Codex permissions for the next task: Native settings',
+  })
   expect(composer.compareDocumentPosition(permission) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
     Node.DOCUMENT_POSITION_FOLLOWING,
   )
@@ -315,20 +336,26 @@ it.each([true, false])(
       createdAt: initial.createdAt,
     }
     let stored = initial
-    const getSessionCatalog = vi.fn<DesktopBridge['getSessionCatalog']>(async () => ({
+    const getSessionPage = vi.fn<DesktopBridge['getSessionPage']>(async () => ({
       ok: true,
       value: {
         kind: 'page',
         projectId: project.id,
+        scope: { kind: 'ungrouped' },
+        groupRevision: 0,
         revision: stored.settingsRevision,
         sessions: [stored],
+        hasGroups: false,
       },
     }))
     const saveSessionPermission = vi.fn<DesktopBridge['saveSessionPermission']>(async () => {
       stored = {
         ...initial,
         settingsRevision: 2,
-        settings: { ...initial.settings, permissionModes: { codex: 'full', claude: 'ask' } },
+        settings: {
+          ...initial.settings,
+          permissionModes: { codex: 'full', claude: 'ask', agy: 'ask' },
+        },
       }
       throw new Error('Committed reply was lost')
     })
@@ -357,11 +384,12 @@ it.each([true, false])(
         : { ok: false, error: { code: 'TIMEOUT', message: 'Readback unavailable' } },
     )
     const notice = vi.fn<MenuProps['onNotice']>()
-    vi.stubGlobal('pact', { getSessionCatalog, saveSessionPermission, getSessionSettings })
+    const onUtilityRecovered = vi.fn<() => void>()
+    vi.stubGlobal('pact', { getSessionPage, saveSessionPermission, getSessionSettings })
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
     const projects = [project]
     function Connected() {
-      const owner = useSessionWorkspace(true, projects)
+      const owner = useSessionWorkspace(true, projects, onUtilityRecovered)
       const current = owner.catalog?.sessions[0]
       return current ? (
         <>
@@ -381,7 +409,9 @@ it.each([true, false])(
         <Connected />
       </QueryClientProvider>,
     )
-    await screen.findByRole('button', { name: 'Codex permissions: Native settings' })
+    await screen.findByRole('button', {
+      name: 'Codex permissions for the next task: Native settings',
+    })
     openMenu()
     fireEvent.click(screen.getByRole('button', { name: /^Full access/u }))
     fireEvent.click(screen.getByRole('button', { name: 'Enable Full access' }))
@@ -393,11 +423,14 @@ it.each([true, false])(
     expect(
       screen.getByRole('button', {
         name: readbackSucceeds
-          ? 'Codex permissions: Full access'
-          : 'Codex permissions: Native settings',
+          ? 'Codex permissions for the next task: Full access'
+          : 'Codex permissions for the next task: Native settings',
       }),
     ).toBeDefined()
-    expect(getSessionCatalog).toHaveBeenCalledTimes(1)
+    expect(getSessionPage).toHaveBeenCalledExactlyOnceWith({
+      projectId: project.id,
+      scope: { kind: 'ungrouped' },
+    })
     expect(getSessionSettings).toHaveBeenCalledExactlyOnceWith(initial.id)
     expect(screen.getByLabelText('Session activity').textContent).toBe('idle:idle')
     expect(saveSessionPermission).toHaveBeenCalledTimes(1)

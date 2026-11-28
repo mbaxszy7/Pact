@@ -4,7 +4,7 @@ import type { PactDrizzleDatabase } from './drizzle-database.js'
 
 import { appSetupState, runtimeCliPaths } from './schema/index.js'
 
-export type RuntimeAgentId = 'claude' | 'codex'
+export type RuntimeAgentId = 'claude' | 'codex' | 'agy'
 
 export interface RuntimePreparationRepository {
   hasCompletedFirstUseSetup(): boolean

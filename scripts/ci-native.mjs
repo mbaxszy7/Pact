@@ -3,6 +3,7 @@ import { createRequire } from 'node:module'
 import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path'
 
 import { ciEnvironment } from './ci.mjs'
+import { nativeProfile, nativeProfileSetupSupports } from './native-profiles.mjs'
 import { run } from './run-e2e.mjs'
 import { isScriptEntry } from './script-entry.mjs'
 
@@ -63,17 +64,21 @@ async function nativeManifest(path) {
 }
 
 /** Resolve from the pinned wrapper's own dependency context, including pnpm aliases. */
-export async function windowsCodexEntry(directory, arch) {
+export async function windowsCodexEntry(directory, arch, profileName = 'legacy') {
   if (!environmentFilePath(directory) || !['x64', 'arm64'].includes(arch))
     throw new Error('Invalid Windows Codex package selection')
+  const profile = nativeProfile(profileName)
+  if (profile.name !== 'legacy' && profile.name !== 'execution-codex')
+    throw new Error('The fixed native profile does not select a Codex package')
+  const version = profile.codexVersion
   const root = await realpath(directory)
   const packageRoot = await realpath(join(root, 'node_modules', '@openai', 'codex'))
   const manifest = await nativeManifest(join(packageRoot, 'package.json'))
   const alias = `@openai/codex-win32-${arch}`
   if (
     manifest.name !== '@openai/codex' ||
-    manifest.version !== '0.159.2' ||
-    manifest.optionalDependencies?.[alias] !== `npm:@openai/codex@0.159.2-win32-${arch}`
+    manifest.version !== version ||
+    manifest.optionalDependencies?.[alias] !== `npm:@openai/codex@${version}-win32-${arch}`
   )
     throw new Error('Windows Codex wrapper identity mismatch')
   const require = createRequire(join(packageRoot, 'package.json'))
@@ -86,7 +91,7 @@ export async function windowsCodexEntry(directory, arch) {
   const binaryManifest = await nativeManifest(join(binaryRoot, 'package.json'))
   if (
     binaryManifest.name !== '@openai/codex' ||
-    binaryManifest.version !== `0.159.2-win32-${arch}` ||
+    binaryManifest.version !== `${version}-win32-${arch}` ||
     JSON.stringify(binaryManifest.os) !== '["win32"]' ||
     JSON.stringify(binaryManifest.cpu) !== JSON.stringify([arch])
   )
@@ -169,7 +174,7 @@ export async function publishWindowsPnpmPath(source = process.env) {
   await appendFile(source.GITHUB_PATH, dirname(executable) + '\n')
 }
 
-export async function main(source = process.env) {
+export async function main(source = process.env, profileName = 'legacy') {
   let stage = 'source-validation'
   let commandFacts
   let commandStartedAt = performance.now()
@@ -242,6 +247,13 @@ export async function main(source = process.env) {
     }
   }
   try {
+    const profile = nativeProfile(profileName)
+    const executionCodex = profile.name === 'execution-codex'
+    if (!nativeProfileSetupSupports(profile))
+      throw new Error('The fixed native profile does not support this native runner.')
+    // The Windows owner profile builds its product helper through its command, without model CLIs.
+    if (profile.name === 'windows-owner') return
+    const agents = executionCodex ? ['codex'] : ['claude', 'codex']
     if (!source.RUNNER_TEMP || !isAbsolute(source.RUNNER_TEMP))
       throw new Error('Native CI requires the runner-owned temporary directory')
     if (!environmentFilePath(source.GITHUB_ENV))
@@ -250,13 +262,15 @@ export async function main(source = process.env) {
     const pnpmExecutable =
       process.platform === 'win32' ? await windowsPnpmExecutable(source) : 'pnpm'
     stage = 'temporary-project'
-    const directory = join(await realpath(source.RUNNER_TEMP), 'pact-native-cli')
+    const directory = join(await realpath(source.RUNNER_TEMP), profile.directory)
     await mkdir(directory, { mode: 0o700 })
     await writeFile(
       join(directory, 'package.json'),
       JSON.stringify({
         private: true,
-        dependencies: { '@openai/codex': '0.159.2', '@anthropic-ai/claude-code': '2.1.272' },
+        dependencies: executionCodex
+          ? { '@openai/codex': profile.codexVersion }
+          : { '@openai/codex': profile.codexVersion, '@anthropic-ai/claude-code': '2.1.272' },
       }) + '\n',
       { flag: 'wx', mode: 0o600 },
     )
@@ -291,26 +305,56 @@ export async function main(source = process.env) {
     stage = 'native-entry-validation'
     const lines = []
     const nativeCodex =
-      process.platform === 'win32' ? await windowsCodexEntry(directory, process.arch) : undefined
-    for (const agent of ['claude', 'codex']) {
+      process.platform === 'win32' && agents.includes('codex')
+        ? await windowsCodexEntry(directory, process.arch, profile.name)
+        : undefined
+    for (const agent of agents) {
       // The pinned Claude installer supplies bin/claude.exe on every target OS.
       // Selecting that exact native entry preserves executable identity through
       // SDK spawning and owned-process interruption, unlike the pnpm shim.
       const path =
         agent === 'claude'
           ? join(directory, 'node_modules', '@anthropic-ai/claude-code', 'bin', 'claude.exe')
-          : join(
-              directory,
-              'node_modules',
-              '.bin',
-              `codex${process.platform === 'win32' ? '.cmd' : ''}`,
-            )
-      // oxlint-disable-next-line eslint/no-await-in-loop -- Exactly two installed executable entries are checked before publishing either path.
+          : executionCodex && nativeCodex
+            ? nativeCodex.executable
+            : executionCodex && process.platform === 'darwin'
+              ? join(directory, 'node_modules', '@openai', 'codex', 'bin', 'codex.js')
+              : join(
+                  directory,
+                  'node_modules',
+                  '.bin',
+                  `codex${process.platform === 'win32' ? '.cmd' : ''}`,
+                )
+      // oxlint-disable-next-line eslint/no-await-in-loop -- Every selected installed executable is checked before any path is published.
       const info = await lstat(path)
       if (!info.isFile() && !info.isSymbolicLink())
         throw new Error('Pinned native CLI executable is missing')
       if (/[\r\n\0]/u.test(path))
         throw new Error('Native CLI path cannot enter an Actions environment file')
+      if (executionCodex) {
+        stage = 'native-version-validation'
+        let versionOutput = ''
+        // oxlint-disable-next-line no-await-in-loop -- Verify the pinned execution CLI before publishing its private path.
+        const code = await run(['--version'], 10_000, {
+          executable: path,
+          cwd: directory,
+          env: ciEnvironment(source),
+          write: async (channel, text) => {
+            if (channel === 'stdout') versionOutput += text
+            if (Buffer.byteLength(versionOutput) > 1024)
+              throw new Error('Native version output overflow')
+          },
+        })
+        const version = profile.codexVersion
+        const expected = `codex-cli ${version}`
+        if (code !== 0 || versionOutput.trim() !== expected)
+          throw new Error('Pinned execution CLI version mismatch')
+        lines.push(
+          `PACT_NATIVE_EXECUTION_CODEX_EXECUTABLE=${path}`,
+          `PACT_NATIVE_EXECUTION_CODEX_VERSION=${version}`,
+        )
+        continue
+      }
       for (const lane of ['NATIVE', 'E2E'])
         lines.push(
           `PACT_${lane}_${agent.toUpperCase()}_EXECUTABLE=${
@@ -318,7 +362,8 @@ export async function main(source = process.env) {
           }`,
         )
     }
-    if (nativeCodex) lines.push(`PACT_NATIVE_CODEX_PACKAGE_ROOT=${nativeCodex.packageRoot}`)
+    if (nativeCodex && !executionCodex)
+      lines.push(`PACT_NATIVE_CODEX_PACKAGE_ROOT=${nativeCodex.packageRoot}`)
     stage = 'actions-environment-publication'
     await appendFile(source.GITHUB_ENV, lines.join('\n') + '\n')
   } catch (error) {
@@ -337,7 +382,7 @@ export async function main(source = process.env) {
 }
 
 if (isScriptEntry(import.meta.url))
-  main().catch((error) => {
+  main(process.env, process.argv.length <= 3 ? process.argv[2] : 'invalid').catch((error) => {
     console.error('Pinned native CLI setup failed.', JSON.stringify(nativeSetupFailureFacts(error)))
     process.exitCode = 1
   })

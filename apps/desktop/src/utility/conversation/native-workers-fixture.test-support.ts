@@ -1,5 +1,5 @@
 import { build } from 'electron-vite'
-import { mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
+import { copyFile, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -15,6 +15,7 @@ export async function nativeWorkerFixture(
     require = createRequire(join(desktopRoot, 'package.json')),
     configFile = join(directory, 'worker.config.mjs')
   try {
+    await copyFile(join(desktopRoot, 'package.json'), join(directory, 'package.json'))
     await symlink(
       join(desktopRoot, 'node_modules'),
       join(directory, 'node_modules'),
@@ -22,9 +23,10 @@ export async function nativeWorkerFixture(
     )
     await writeFile(
       configFile,
-      `import {externalizeDepsPlugin} from ${JSON.stringify(pathToFileURL(require.resolve('electron-vite')).href)}; export default {main:{plugins:[externalizeDepsPlugin({exclude:['@pact/contracts','@pact/contracts/images','@pact/contracts/diagnostics']})],build:{outDir:${JSON.stringify(join(directory, 'bundle'))},rollupOptions:{input:${JSON.stringify(Object.fromEntries(names.map((name) => [name, sources[name] ?? join(import.meta.dirname, `${name}.ts`)])))}}}}};`,
+      `import {externalizeDepsPlugin} from ${JSON.stringify(pathToFileURL(require.resolve('electron-vite')).href)}; export default {main:{plugins:[externalizeDepsPlugin({include:['better-sqlite3','sharp'],exclude:['@pact/contracts','@pact/contracts/images','@pact/contracts/diagnostics']})],build:{outDir:${JSON.stringify(join(directory, 'bundle'))},rollupOptions:{input:${JSON.stringify(Object.fromEntries(names.map((name) => [name, sources[name] ?? (name === 'agy-storage-child' ? join(import.meta.dirname, '../agy-storage-child.ts') : join(import.meta.dirname, `${name}.ts`))])))}}}}};`,
     )
-    await build({ root: desktopRoot, configFile, ignoreConfigWarning: true, logLevel: 'silent' })
+    await build({ root: directory, configFile, ignoreConfigWarning: true, logLevel: 'silent' })
+    await writeFile(join(directory, 'bundle', 'package.json'), '{"type":"module"}\n')
     return {
       paths: Object.fromEntries(
         names.map((name) => [name, join(directory, 'bundle', `${name}.js`)]),

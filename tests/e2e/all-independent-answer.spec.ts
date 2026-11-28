@@ -36,9 +36,13 @@ test(
         { id: sessionId, projectId, title: 'Independent answers', createdAt },
         {
           primaryAgentId: 'claude',
-          agents: { codex: { model: null, effort: null }, claude: { model: null, effort: null } },
+          secondaryAgentId: 'codex',
+          agents: {
+            codex: { model: null, effort: null },
+            claude: { model: null, effort: null },
+            agy: { model: null, effort: null },
+          },
           maxDiscussionRounds: 3,
-          runningMessagePolicy: 'next_round',
           maxReviewCycles: 3,
           maxRepairAttempts: 3,
         },

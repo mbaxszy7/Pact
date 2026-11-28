@@ -16,6 +16,7 @@ import { PactDatabase, agentRuns, conversationMessages } from '@pact/persistence
 
 import { ProjectFileReader } from '../project-file/project-file-reader.js'
 import { RuntimePreparation } from '../runtime-preparation/runtime-preparation.js'
+import { runDirectoryWorker } from '../workspace-changes/directory-worker.test-support.js'
 import { Conversation } from './conversation.js'
 
 const native = vi.hoisted(() => ({
@@ -148,9 +149,14 @@ afterEach(async () => {
 })
 const settings: DefaultSessionSettings = {
   primaryAgentId: 'codex',
-  agents: { claude: { model: null, effort: null }, codex: { model: null, effort: null } },
+  secondaryAgentId: 'claude',
+  agents: {
+    claude: { model: null, effort: null },
+    codex: { model: null, effort: null },
+    agy: { model: null, effort: null },
+  },
   maxDiscussionRounds: 3,
-  runningMessagePolicy: 'next_round',
+
   maxReviewCycles: 2,
   maxRepairAttempts: 2,
 }
@@ -229,7 +235,7 @@ async function fixture(filePath = ':memory:') {
     db.sessionRepository,
     db.projectCatalogRepository,
     preparation,
-    new ProjectFileReader(db.sessionRepository, db.projectCatalogRepository),
+    new ProjectFileReader(db.sessionRepository, db.projectCatalogRepository, runDirectoryWorker),
   )
   owned.push({ db, flow })
   const prepare = async () => {
@@ -367,17 +373,19 @@ it('releases Fork owners and preserves one committed child through 100 success/f
       const filePath = join(directory, `cycle-${cycle}.sqlite`),
         f = await fixture(filePath)
       const { operation } = await f.create()
-      await vi.waitFor(() =>
-        expect(
-          f.db.conversationRepository
-            .forkOperation(operation.sessionId)!
-            .sides.every(
-              (side) =>
-                side.state === 'ready' ||
-                side.state === 'unconfirmed' ||
-                (native.hold && side.state === 'forking'),
-            ),
-        ).toBe(true),
+      await vi.waitFor(
+        () =>
+          expect(
+            f.db.conversationRepository
+              .forkOperation(operation.sessionId)!
+              .sides.every(
+                (side) =>
+                  side.state === 'ready' ||
+                  side.state === 'unconfirmed' ||
+                  (native.hold && side.state === 'forking'),
+              ),
+          ).toBe(true),
+        { interval: 5 },
       )
       await f.flow.dispose()
       expect(f.flow.diagnostics()).toMatchObject({

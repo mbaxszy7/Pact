@@ -31,7 +31,7 @@ const themeOptions: ReadonlyArray<{
   label: string
   description?: string
 }> = [
-  { value: 'system', label: 'Follow system', description: 'Match your device.' },
+  { value: 'system', label: 'Follow system' },
   { value: 'light', label: 'Light' },
   { value: 'dark', label: 'Dark' },
 ]
@@ -41,7 +41,11 @@ const materialOptions: ReadonlyArray<{
   label: string
   description?: string
 }> = [
-  { value: 'system', label: 'Automatic', description: 'Use an available system background.' },
+  {
+    value: 'system',
+    label: 'Automatic',
+    description: 'Translucent when supported by your device and accessibility settings.',
+  },
   { value: 'solid', label: 'Solid' },
   { value: 'translucent', label: 'Translucent' },
 ]
@@ -138,14 +142,10 @@ export function AppearanceSettingsView({
     settings.windowMaterial === 'system' &&
     settings.materialOpacity === 85
   const backgroundEffectActive = effective?.windowMaterial === 'translucent'
-  const backgroundOptions = materialOptions.map((option) =>
-    platform === 'win32' && option.value === 'translucent'
-      ? { value: option.value, label: option.label, description: 'Requires restarting Pact.' }
-      : option,
-  )
+  const backgroundOptions = materialOptions
   const effectStrength = settings ? toEffectStrength(settings.materialOpacity) : 50
   const fallbackMessage =
-    settings?.windowMaterial === 'translucent'
+    settings?.windowMaterial === 'translucent' || settings?.windowMaterial === 'system'
       ? fallbackDetail(effective?.fallbackReason)
       : undefined
   const commitOpacity = (opacity: number): void => {
@@ -160,8 +160,8 @@ export function AppearanceSettingsView({
         <h2 className="text-title font-medium tracking-[-0.025em] text-primary">Appearance</h2>
         <p className="mt-2 max-w-prose text-body text-secondary">
           {platform === 'win32'
-            ? 'Theme changes apply immediately. Changing the window background requires restarting Pact.'
-            : 'Changes apply to every Pact window.'}
+            ? 'Theme updates immediately. Changing the window background requires restarting Pact.'
+            : 'Theme and transparency apply immediately.'}
         </p>
       </header>
 
@@ -214,9 +214,8 @@ export function AppearanceSettingsView({
             {effective.restartRequired ? (
               <output className="mt-group block rounded-control bg-surface-muted px-group py-2 text-caption text-secondary">
                 <span className="font-medium text-primary">Restart required.</span> Currently using{' '}
-                {effective.windowMaterial === 'solid' ? 'Solid' : 'Translucent'}. To apply your
-                selected background, choose Exit in Pact’s tray menu, then open Pact again. Closing
-                the window keeps Pact running and does not apply the change.
+                {effective.windowMaterial === 'solid' ? 'Solid' : 'Translucent'}. Choose Exit from
+                the tray menu, then reopen Pact. Closing the window keeps Pact running.
               </output>
             ) : null}
             {fallbackMessage ? (
@@ -275,16 +274,21 @@ export function AppearanceSettingsView({
             {!backgroundEffectActive ? (
               <p id="appearance-opacity-help" className="mt-2 text-caption text-secondary">
                 {effective.restartRequired
-                  ? settings.windowMaterial === 'translucent'
-                    ? 'Restart Pact to enable transparency and adjust its strength.'
+                  ? settings.windowMaterial === 'translucent' ||
+                    settings.windowMaterial === 'system'
+                    ? 'Restart Pact to enable transparency.'
                     : 'Restart Pact to use your selected background.'
-                  : 'Choose Translucent to adjust this.'}
+                  : fallbackMessage
+                    ? 'Unavailable while using Solid fallback.'
+                    : 'Choose Translucent or Automatic to adjust this.'}
               </p>
             ) : null}
           </section>
 
           <footer className="mt-spacious flex flex-wrap items-center justify-between gap-group border-t border-border pt-section">
-            <output className="text-caption text-secondary">{saving ? 'Saving…' : 'Saved'}</output>
+            <output className="text-caption text-secondary">
+              {saving ? 'Saving…' : saveError ? 'Not saved' : 'Saved'}
+            </output>
             <button
               className="h-9 rounded-control border border-border bg-surface-raised px-4 text-body font-medium text-primary hover:bg-surface-muted disabled:cursor-not-allowed disabled:opacity-50"
               type="button"

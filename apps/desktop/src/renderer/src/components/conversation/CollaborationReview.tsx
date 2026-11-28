@@ -1,28 +1,33 @@
-import { AlertCircle, ChevronDown, FileText } from 'lucide-react'
-import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { AlertCircle, FileText } from 'lucide-react'
+import { memo, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 
 import type {
   AgentRun,
   CollaborationAction,
+  CollaborationActionInput,
   CollaborationDocument,
   CollaborationSession,
-  CollaborationTask,
   ConversationPage,
   MessageCommentAnchor,
+  RuntimeAgentId,
 } from '@pact/contracts'
 
 import {
-  collaborationPendingPhase,
-  collaborationPendingWork,
-  collaborationReportMarkdown,
-  collaborationSubmission,
+  agentDisplayName,
+  collaborationContinuationLimit,
+  collaborationActor,
+  collaborationInputGate,
+  collaborationInputProcessing,
+  isCollaborationOpenMode,
+  otherAgent,
+  resolveLegacyCompatibleTaskStageRoles,
 } from '@pact/contracts'
 
+import type { ProjectFileTarget } from './MessageMarkdown'
 import type { MessageTextSelection } from './MessageSelectionSurface'
 
-import { readableCollaborationText } from '../../../../shared/collaboration-display-text'
 import { CollaborationDocumentView } from './CollaborationDocumentView'
-import { MessageMarkdown, type ProjectFileTarget } from './MessageMarkdown'
+import { TaskPlanConfirmation } from './TaskPlanConfirmation'
 
 export type PlanTextSelection = MessageTextSelection & {
   plan: NonNullable<MessageCommentAnchor['plan']>
@@ -36,14 +41,29 @@ export type ReportTextSelection = MessageTextSelection & {
   textBasis?: 'markdown-visible-v2' | 'plain-visible-v1' | undefined
   contentHash?: string | undefined
 }
-const agentName = (id: 'claude' | 'codex'): string => (id === 'claude' ? 'Claude Code' : 'Codex')
+const agentName = (id: RuntimeAgentId): string => agentDisplayName(id)
+const verdictLabel = {
+  accepted: 'Accepted',
+  changes_requested: 'Changes requested',
+  needs_user: 'Waiting for your input',
+  incomplete: 'Review incomplete',
+}
+const genericPauseNotice = new Set([
+  'Collaboration is paused. Continue when ready.',
+  'Automatic collaboration is paused. Your message will be answered next.',
+  'Your reply has been processed. Continue collaboration when you are ready.',
+])
+const proposalActionClass =
+  'pact-pressable min-h-8 shrink-0 cursor-pointer whitespace-nowrap rounded-xl border px-3 py-1.5 text-caption font-medium focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-focus disabled:cursor-default disabled:opacity-45'
 
-/** Transcript records contain the conclusion, issue summaries and one current Proposal. */
+/** Natural answers own the report body; this footer owns provenance and current actions. */
 export const CollaborationReview = memo(function CollaborationReview({
   session,
   run,
   latestRunId,
   disabled,
+  continuationBlocked = false,
+  replyBodyComplete: _replyBodyComplete = false,
   onOpenProjectFile,
   onCreateReportComment,
   feedbackDraft = false,
@@ -52,16 +72,18 @@ export const CollaborationReview = memo(function CollaborationReview({
   revealReportOffset,
   revealReportBasis,
   onReportReady,
-  onDetailRead,
+  onTaskChange,
   renderedMessageId,
-  onOpenTodo,
   onOpenPlan,
+  onOpenSessionSettings,
+  nativePresentationSuspended = false,
 }: {
   session: CollaborationSession
   run: AgentRun
   latestRunId?: string | undefined
   disabled: boolean
-  onIterate?: (() => void) | undefined
+  continuationBlocked?: boolean
+  replyBodyComplete?: boolean
   onOpenProjectFile: (target: ProjectFileTarget) => void
   onCreateReportComment?: ((selection: ReportTextSelection) => void) | undefined
   feedbackDraft?: boolean | undefined
@@ -72,33 +94,49 @@ export const CollaborationReview = memo(function CollaborationReview({
   onReportReady?:
     | ((host: HTMLElement, onApplied?: () => void) => (() => void) | undefined)
     | undefined
-  onDetailRead?: (() => void) | undefined
+  onTaskChange?: (() => void) | undefined
   renderedMessageId?: string | undefined
-  onOpenTodo?:
-    | ((target: { taskId: string; todoId: string; todoRevision: number }) => void)
-    | undefined
   onOpenPlan?: ((source: { runId: string; messageId: string; version: number }) => void) | undefined
+  onOpenSessionSettings?: (() => void) | undefined
+  nativePresentationSuspended?: boolean | undefined
 }) {
   const [view, setView] = useState<Extract<ConversationPage, { scope: 'collaboration' }>['view']>()
   const [loadedAt, setLoadedAt] = useState('')
   const [refresh, setRefresh] = useState(0)
   const [readError, setReadError] = useState('')
   const [actionError, setActionError] = useState('')
+  const failedAction = useRef<{ taskId: string; revision: number } | undefined>(undefined)
+  const planTrigger = useRef<HTMLElement | null>(null)
   const [busy, setBusy] = useState(false)
-  const [expanded, setExpanded] = useState<boolean>()
-  const reportRef = useRef<HTMLElement>(null)
-  const reportNavigation = useRef({ opened: '', pending: '' })
+  const [refreshing, setRefreshing] = useState(true)
+  const [planDecision, setPlanDecision] = useState<
+    | {
+        input: CollaborationActionInput
+        currentImplementer: string
+        nextImplementer: string
+        scope: object
+        error?: string | undefined
+      }
+    | undefined
+  >(undefined)
+  const draftHintId = useId()
+  const refreshStatus = (): void => {
+    setRefreshing(true)
+    setRefresh((value) => value + 1)
+  }
   const running = ['starting', 'running', 'recovering'].includes(run.status)
   const historical = run.id !== latestRunId
+  const reportVersion = `${run.updatedAt}:${session.settingsRevision}:${run.workspaceChanges?.revision ?? ''}:${run.workspaceChanges?.state ?? ''}`
   const revealKey =
     revealReport?.runId === run.id
-      ? `${revealReportRequestId ?? ''}:${revealReport.target.type}:${revealReportOffset ?? ''}`
+      ? `${revealReportRequestId ?? ''}:${revealReportOffset ?? ''}`
       : ''
+  const reportNavigation = useRef('')
   const completeReportNavigation = useCallback(
     (host: HTMLElement): (() => void) | undefined => {
-      if (!revealKey || reportNavigation.current.pending !== revealKey) return undefined
+      if (!revealKey || reportNavigation.current === revealKey) return undefined
       return onReportReady?.(host, () => {
-        if (reportNavigation.current.pending === revealKey) reportNavigation.current.pending = ''
+        reportNavigation.current = revealKey
       })
     },
     [revealKey, onReportReady],
@@ -117,384 +155,473 @@ export const CollaborationReview = memo(function CollaborationReview({
         if (!current) return undefined
         if (response.ok && response.value.scope === 'collaboration') {
           setView(response.value.view)
-          setLoadedAt(run.updatedAt)
+          setLoadedAt(reportVersion)
           setReadError('')
+          const next = response.value.view.task
+          if (
+            next &&
+            failedAction.current &&
+            (next.id !== failedAction.current.taskId ||
+              (next.revision !== failedAction.current.revision && next.status !== 'failed'))
+          ) {
+            setActionError('')
+            failedAction.current = undefined
+          }
         } else if (!response.ok) setReadError(response.error.message)
         return undefined
       })
       .catch(() => {
-        if (current) setReadError('The result could not be loaded. Try again.')
+        if (current) setReadError('The collaboration result could not be loaded. Try again.')
+      })
+      .finally(() => {
+        if (current) setRefreshing(false)
       })
     return () => {
       current = false
     }
-    // oxlint-disable-next-line react/exhaustive-effect-dependencies -- Refresh is an explicit read nonce after an action receipt or failed source read.
-  }, [session.id, run.id, run.updatedAt, running, refresh])
-  useLayoutEffect(() => {
-    if (!revealKey || !view?.accepted || reportNavigation.current.opened === revealKey) return
-    reportNavigation.current = { opened: revealKey, pending: revealKey }
-    setExpanded(true)
-  }, [revealKey, view?.accepted])
-  useLayoutEffect(() => {
-    if (
-      !expanded ||
-      !view?.accepted ||
-      view.documents?.some((entry) => entry.key === 'summary') ||
-      reportNavigation.current.pending !== revealKey
-    )
-      return undefined
-    const host = reportRef.current?.querySelector<HTMLElement>('[data-pact-report-key="summary"]')
-    if (!host) return undefined
-    return completeReportNavigation(host)
-  }, [revealKey, view?.accepted, view?.documents, expanded, completeReportNavigation])
+  }, [session.id, run.id, reportVersion, running, refresh])
   const task = view?.task
-  const error = actionError || readError
-  const actionable = !historical && Boolean(view?.actionable) && loadedAt === run.updatedAt
-  const act = async (action: CollaborationAction): Promise<void> => {
-    if (
-      !task ||
-      busy ||
-      disabled ||
-      feedbackDraft ||
-      (!actionable && !['resume_input', 'cancel_input'].includes(action))
-    )
-      return
-    setBusy(true)
+  useEffect(() => {
+    if (!historical) return
     setActionError('')
+    failedAction.current = undefined
+  }, [historical])
+  const visibleActionError = historical ? '' : actionError
+  const error = visibleActionError || readError
+  const actionable = !historical && Boolean(view?.actionable) && loadedAt === reportVersion
+  // An ephemeral scope token retires a frozen decision on Session/task/history change;
+  // the dependencies are intentional even though the memoized value ignores them.
+  // oxlint-disable-next-line react-hooks/exhaustive-deps
+  const decisionScope = useMemo(() => ({}), [session.id, task?.id, historical])
+  const currentPlanDecision =
+    planDecision && planDecision.scope === decisionScope && !historical ? planDecision : undefined
+  const act = async (
+    action: CollaborationAction,
+    confirmedInput?: CollaborationActionInput,
+  ): Promise<boolean> => {
+    if (!task || busy || disabled || (feedbackDraft && action !== 'recover_plan') || !actionable)
+      return false
+    setBusy(true)
+    if (action !== 'recover_plan') setActionError('')
+    failedAction.current = { taskId: task.id, revision: task.revision }
     try {
-      const response = await window.pact.actOnCollaboration({
-        sessionId: session.id,
-        taskId: task.id,
-        revision: task.revision,
-        clientMessageId: crypto.randomUUID(),
-        action,
-        ...(['resume_input', 'cancel_input'].includes(action) && view?.received
-          ? { receivedInputId: view.received.id }
-          : {}),
-      })
-      if (!response.ok)
-        setActionError(
+      const response = await window.pact.actOnCollaboration(
+        confirmedInput ?? {
+          sessionId: session.id,
+          taskId: task.id,
+          revision: task.revision,
+          clientMessageId: crypto.randomUUID(),
+          action,
+        },
+      )
+      if (!response.ok) {
+        const message =
           response.error.code === 'INTERNAL'
-            ? 'This action could not start. Your saved work is preserved. Refresh and try again.'
-            : response.error.message,
-        )
-      setRefresh((value) => value + 1)
+            ? 'This action could not start. Refresh and try again.'
+            : response.error.message
+        setActionError(message)
+        if (confirmedInput)
+          setPlanDecision((current) =>
+            current?.input.clientMessageId === confirmedInput.clientMessageId
+              ? { ...current, error: message }
+              : current,
+          )
+        refreshStatus()
+        onTaskChange?.()
+        return false
+      }
+      refreshStatus()
+      onTaskChange?.()
+      return true
     } catch {
-      setActionError('The action receipt is unavailable. Refresh before trying again.')
-      setRefresh((value) => value + 1)
+      const message = 'Couldn’t complete that action. Refresh and try again.'
+      setActionError(message)
+      if (confirmedInput)
+        setPlanDecision((current) =>
+          current?.input.clientMessageId === confirmedInput.clientMessageId
+            ? { ...current, error: message }
+            : current,
+        )
+      refreshStatus()
+      onTaskChange?.()
+      return false
     } finally {
       setBusy(false)
     }
   }
-  const actionButton = (label: string, action: CollaborationAction, primary = false) => (
-    <button
-      type="button"
-      disabled={disabled || busy || feedbackDraft || !actionable}
-      onClick={() => void act(action)}
-      className={`min-h-8 rounded-control px-3 py-1.5 text-caption font-medium focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus disabled:cursor-default disabled:opacity-45 ${primary ? 'bg-surface-inverse text-inverse hover:opacity-90' : 'text-secondary hover:bg-surface-muted hover:text-primary'}`}
-    >
-      {busy ? 'Sending…' : label}
-    </button>
-  )
+  const confirmPlanDecision = (): void => {
+    if (!currentPlanDecision || busy) return
+    const submitted = currentPlanDecision.input.clientMessageId
+    void act(currentPlanDecision.input.action, currentPlanDecision.input).then((sent) => {
+      setPlanDecision((current) =>
+        current?.input.clientMessageId !== submitted
+          ? current
+          : sent
+            ? undefined
+            : {
+                ...current,
+                error: current.error ?? 'Couldn’t save your choice. Try again.',
+              },
+      )
+      return undefined
+    })
+  }
   if (running) return null
   if (!task)
     return error ? (
       <p role="alert" className="mt-2 text-caption text-status-danger-foreground">
         {error}{' '}
-        <button
-          type="button"
-          className="underline"
-          onClick={() => setRefresh((value) => value + 1)}
-        >
+        <button type="button" className="underline" onClick={() => refreshStatus()}>
           Retry read
         </button>
       </p>
     ) : null
-  const result = view?.accepted ? task.result : undefined
-  const phase = collaborationPendingPhase(task)
-  const planning =
-    task.kind === 'plan' &&
-    task.approvedPlanVersion === undefined &&
-    ['draft', 'discuss', 'clarify'].includes(phase.stage)
-  const planSubmission =
-    result?.submission === 'plan_submission' || result?.submission === 'plan_adoption'
-  const planReview = result?.submission === 'plan_review'
-  const pendingSubmission = collaborationSubmission(task)
-  const pendingPlan = ['plan_submission', 'plan_adoption'].includes(pendingSubmission)
-  const pendingReview = ['plan_review', 'code_review'].includes(pendingSubmission)
-  const heading = planSubmission
-    ? `Plan · v${task.planVersion}`
-    : planReview
-      ? `Review · v${result.reviewedPlan?.version ?? task.planVersion}`
-      : task.reportFailure
-        ? pendingPlan
-          ? 'Plan'
-          : 'Review'
-        : task.stage === 'implement' || task.stage === 'repair'
-          ? 'Changes'
-          : ['respond', 'supplement', 'clarify'].includes(task.stage)
-            ? 'Response'
-            : 'Review'
-  const issues = view?.accepted ? (view.todoSummaries ?? []) : []
-  const documents = view?.documents ?? []
-  const hasDetails = Boolean(
-    (result && !planSubmission) ||
-    issues.length ||
-    task.reportFailure ||
-    view?.received ||
-    task.notice,
+  const stage = run.collaboration?.stage ?? task.stage
+  const planVersion =
+    run.collaboration?.planVersion ??
+    (view?.planSource?.runId === run.id ? task.planVersion : undefined) ??
+    (task.review?.runId === run.id ? task.review.planReference?.version : undefined)
+  const review = task.review?.runId === run.id ? task.review : undefined
+  const planSync = view?.planSync
+  const inputState = collaborationInputProcessing(task)
+  const paused = actionable && task.status !== 'complete' && task.automation === 'paused'
+  const inputGate = collaborationInputGate(task)
+  const continuationLimit =
+    actionable && !planSync && !inputGate
+      ? collaborationContinuationLimit(task, session.settings)
+      : undefined
+  const duplicateLimitNotice = [
+    'The Session discussion limit has been reached.',
+    'The Session review limit has been reached.',
+    'The Session repair limit has been reached.',
+  ].includes(task.notice ?? '')
+  const duplicateRestartNotice =
+    task.pauseReason === 'restart' &&
+    task.notice ===
+      'Application restarted. Check the original execution, then continue collaboration.' &&
+    run.status === 'completed' &&
+    run.nativeOutcome === 'completed' &&
+    run.nativeEffectsState === 'settled' &&
+    run.dispatchPhase === 'ended' &&
+    session.activity.state === 'idle' &&
+    !planSync &&
+    !inputGate
+  const runPublishedPlan =
+    (stage === 'plan' && Boolean(planVersion)) ||
+    (view?.planSource?.runId === run.id && Boolean(planVersion))
+  const runFailedOrStopped =
+    (!historical && task.status === 'failed' && task.runId === run.id) ||
+    ['failed', 'interrupted'].includes(run.status)
+  const runStopped =
+    (task.pauseReason === 'stopped' && task.runId === run.id) || run.failureKind === 'user_stopped'
+  const questionCardActive = Boolean(
+    actionable && inputState.decision && inputGate === 'needs_reply' && !planSync,
   )
-  const cardExpanded = expanded ?? Boolean(!historical && task.reportFailure)
-  const showProposal = actionable && !feedbackDraft && (task.status !== 'complete' || !planning)
-  const pendingWork = collaborationPendingWork(task)
+  const isEndedFinalRun = Boolean(task.ending && run.id === task.runId)
+  const showRestartPaused =
+    !historical &&
+    !isCollaborationOpenMode(task) &&
+    paused &&
+    task.pauseReason === 'restart' &&
+    !planSync &&
+    !inputGate
+  let label: string | undefined
+  if (!historical && planSync) label = 'Plan recovery required'
+  else if (runFailedOrStopped) label = runStopped ? 'Stopped' : 'Failed'
+  else if (stage === 'plan_review') {
+    if (!questionCardActive) label = `Plan review${planVersion ? ` · v${planVersion}` : ''}`
+  } else if (stage === 'code_review') {
+    if (!questionCardActive) label = 'Code review'
+  } else if (runPublishedPlan) {
+    if (!questionCardActive) label = planVersion ? `Plan v${planVersion}` : 'Plan'
+  } else if (showRestartPaused) {
+    label = 'Paused'
+  }
+  const showStageLabel = Boolean(label)
+  const actions = actionable
+    ? (view?.availableActions ?? []).filter(
+        (action): action is CollaborationAction =>
+          (!continuationBlocked || action !== 'resume') &&
+          (!continuationLimit || !['resume', 'retry'].includes(action)) &&
+          (!inputGate || action === 'recover_plan') &&
+          !(action === 'recover_plan' && visibleActionError),
+      )
+    : []
+  const draftBlocksActions = feedbackDraft && actions.some((action) => action !== 'recover_plan')
+  const codeRoles = resolveLegacyCompatibleTaskStageRoles(task)
+  const taskPair: readonly [RuntimeAgentId, RuntimeAgentId] =
+    task.owner !== task.reviewer
+      ? [task.owner, task.reviewer]
+      : [codeRoles.planAuthor, codeRoles.planReviewer]
+  const canOpenLimitSettings = Boolean(continuationLimit && onOpenSessionSettings)
+  const actionLabel = (action: CollaborationAction): string =>
+    ({
+      execute: `Implement plan · ${agentName(
+        isCollaborationOpenMode(task) && task.review
+          ? otherAgent(task.review.actor, taskPair)
+          : collaborationActor(task, 'implement'),
+      )}`,
+      review_plan: `Review plan · ${agentName(
+        isCollaborationOpenMode(task) && task.unreviewedPlanActor
+          ? otherAgent(task.unreviewedPlanActor, taskPair)
+          : collaborationActor(task, 'plan_review'),
+      )}`,
+      review_code: `Review code · ${agentName(
+        task.unreviewedCodeActor
+          ? otherAgent(task.unreviewedCodeActor, taskPair)
+          : collaborationActor(task, 'code_review'),
+      )}`,
+      fix:
+        task.review?.runId === task.runId && task.review.stage === 'plan_review'
+          ? `Update plan · ${agentName(otherAgent(task.review.actor, taskPair))}`
+          : `Fix issues · ${agentName(
+              task.review
+                ? otherAgent(task.review.actor, taskPair)
+                : collaborationActor(task, 'repair'),
+            )}`,
+      swap_code_roles: 'Swap implementer',
+      resume: `Update plan · ${agentName(collaborationActor(task, 'plan'))}`,
+      recover_plan: planSync?.kind === 'response' ? 'Restore plan response' : 'Restore saved plan',
+      retry: `Retry · ${agentName(task.actor)}`,
+    })[action]
+  const reportDocument =
+    view?.documents?.find((entry) => entry.key === 'report')?.source ??
+    (review ? review.document : undefined)
+  const showReportSource = Boolean(
+    reportDocument && (revealKey || !renderedMessageId) && stage !== 'plan',
+  )
   return (
     <section
-      ref={reportRef}
       aria-label="Pact collaboration result"
-      className="pact-review-card mt-2 mb-7 w-full min-w-0 max-w-[72ch] self-start rounded-panel border border-border bg-surface-raised px-4 py-2.5 text-body"
+      data-pact-collaboration-run-id={run.id}
+      className="pact-review-card mt-2.5 mb-2 w-full min-w-0 self-start text-caption empty:hidden"
     >
-      <div className="flex min-h-7 items-center gap-2.5">
-        <FileText
-          aria-hidden="true"
-          className="size-4 shrink-0 text-secondary"
-          strokeWidth={1.75}
-        />
-        <button
-          type="button"
-          aria-expanded={cardExpanded}
-          disabled={!hasDetails}
-          onClick={() => {
-            onDetailRead?.()
-            setExpanded(!cardExpanded)
-          }}
-          className="flex min-h-7 min-w-0 flex-1 items-center gap-2 rounded-control text-left focus-visible:outline-2 focus-visible:outline-focus disabled:cursor-default"
-        >
-          <h3
-            className="min-w-0 flex-1 truncate text-body font-medium text-primary"
-            title={heading}
-          >
-            {heading}
-          </h3>
-          {issues.length ? (
-            <span className="shrink-0 text-caption text-secondary">
-              {issues.length} {issues.length === 1 ? 'update' : 'updates'}
+      {showStageLabel ? (
+        <div className="flex min-h-7 flex-wrap items-center gap-x-2 gap-y-1 text-secondary">
+          <span className="inline-flex items-center gap-1.5 rounded-pill border border-border bg-surface-muted px-2.5 py-0.5 font-medium text-secondary">
+            <FileText aria-hidden="true" className="size-3 shrink-0" strokeWidth={1.8} />
+            <span>{label}</span>
+          </span>
+          {review && (stage === 'plan_review' || stage === 'code_review') ? (
+            <span
+              className={`inline-flex items-center rounded-pill px-2 py-0.5 font-medium ${
+                review.verdict === 'accepted'
+                  ? 'bg-status-ready-muted text-status-ready-foreground'
+                  : review.verdict === 'changes_requested'
+                    ? 'bg-status-warning-muted text-status-warning-foreground'
+                    : 'bg-surface-muted text-secondary'
+              }`}
+            >
+              {verdictLabel[review.verdict]}
             </span>
           ) : null}
-          {hasDetails ? (
-            <ChevronDown
-              aria-hidden="true"
-              className={`size-4 shrink-0 text-secondary ${cardExpanded ? 'rotate-180' : ''}`}
-              strokeWidth={1.75}
-            />
+          {runPublishedPlan && onOpenPlan && view?.planSource && planVersion ? (
+            <button
+              type="button"
+              onClick={() => onOpenPlan({ ...view.planSource!, version: planVersion })}
+              className="pact-pressable min-h-7 cursor-pointer rounded-lg border border-border bg-surface-raised px-2.5 font-medium text-primary hover:bg-surface-muted focus-visible:outline-2 focus-visible:outline-focus"
+            >
+              Open plan
+            </button>
           ) : null}
-        </button>
-        {planSubmission && onOpenPlan && view?.planSource ? (
-          <button
-            type="button"
-            onClick={() => onOpenPlan({ ...view.planSource!, version: task.planVersion })}
-            className="min-h-7 shrink-0 rounded-control px-2 text-caption text-secondary hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-focus"
-          >
-            Open plan
-          </button>
-        ) : null}
-      </div>
-      {cardExpanded && hasDetails ? (
-        <div className="pt-2">
-          {result && !planSubmission ? (
-            <ReportSource
-              target={{ type: 'summary' }}
-              task={task}
-              run={run}
-              navigationId={revealKey}
-              documents={documents}
-              onSourceReady={completeReportNavigation}
-              basis={revealReportBasis}
-              aroundOffset={revealReportOffset}
-              renderedMessageId={renderedMessageId}
-              onOpenProjectFile={onOpenProjectFile}
-              onCreateComment={onCreateReportComment}
-            />
-          ) : null}
-          {issues.length ? (
-            <ul aria-label="Issue summaries" className="mt-2 space-y-0.5">
-              {issues.map((item) => (
-                <li key={`${item.id}:${item.revision}`}>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      onOpenTodo?.({
-                        taskId: task.id,
-                        todoId: item.id,
-                        todoRevision: item.revision,
-                      })
-                    }
-                    className="flex min-h-7 w-full items-start gap-2 rounded-control px-1 py-1 text-left text-caption text-secondary hover:bg-surface-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-focus"
-                  >
-                    <span className="min-w-0 flex-1 break-words">
-                      {readableCollaborationText(item.title, {
-                        taskId: task.id,
-                        runId: run.id,
-                        todoId: item.id,
-                      })}
-                    </span>
-                    <ChevronDown
-                      aria-hidden="true"
-                      className="mt-0.5 size-3.5 shrink-0 -rotate-90"
-                      strokeWidth={1.75}
-                    />
-                  </button>
-                </li>
-              ))}
-            </ul>
-          ) : null}
-          {task.reportFailure ? (
-            <p className="text-caption text-secondary">
-              {task.reportFailure === 'invalid'
-                ? 'Submission needs correction.'
-                : pendingPlan
-                  ? 'Plan not submitted.'
-                  : 'Review not submitted.'}
-            </p>
-          ) : null}
-          {task.notice ? (
-            <p className="mt-2 whitespace-pre-wrap text-caption text-secondary">
-              {readableCollaborationText(task.notice, { taskId: task.id, runId: task.runId })}
-            </p>
-          ) : null}
-          {task.reportFailure && !task.notice && task.noticeDocument ? (
-            <div className="mt-2 text-caption text-secondary">
-              <CollaborationDocumentView
-                sessionId={session.id}
-                runId={run.id}
-                source={task.noticeDocument}
-                messageId={run.userMessageId}
-                displayContext={{ taskId: task.id }}
-                onOpenProjectFile={onOpenProjectFile}
-              />
-            </div>
-          ) : null}
-          {view?.received ? (
-            <output className="mt-2 block text-caption text-secondary">
-              <span>{view.received.preview}</span>
-              <p className="mt-1">
-                {view.received.state === 'blocked'
-                  ? 'Delivery needs attention'
-                  : view.received.state === 'cancelled'
-                    ? 'Cancelled before dispatch'
-                    : 'Received'}{' '}
-                · {agentName(view.received.actor)}
-              </p>
-              {view.received.state === 'blocked' ? (
-                <button
-                  type="button"
-                  disabled={disabled || busy || feedbackDraft}
-                  onClick={() => void act('resume_input')}
-                  className="mt-1 min-h-7 rounded-control px-2 font-medium text-primary hover:bg-surface-muted focus-visible:outline-2 focus-visible:outline-focus"
-                >
-                  Continue received message
-                </button>
-              ) : null}
-              {view.received.state !== 'cancelled' ? (
-                <button
-                  type="button"
-                  disabled={disabled || busy}
-                  onClick={() => void act('cancel_input')}
-                  className="mt-1 min-h-7 rounded-control px-2 text-secondary hover:bg-surface-muted focus-visible:outline-2 focus-visible:outline-focus"
-                >
-                  Cancel received message
-                </button>
-              ) : null}
-            </output>
-          ) : null}
+          {isEndedFinalRun ? <span className="text-tertiary">· Ended</span> : null}
         </div>
       ) : null}
-      {showProposal ? (
+      {isEndedFinalRun && !showStageLabel ? (
+        <div className="mt-1 flex flex-wrap items-center gap-x-2.5 gap-y-1 text-secondary">
+          <span>Ended</span>
+        </div>
+      ) : null}
+      {showReportSource && reportDocument ? (
+        <ReportSource
+          sessionId={session.id}
+          run={run}
+          source={reportDocument}
+          taskId={task.id}
+          navigationId={revealKey}
+          onSourceReady={completeReportNavigation}
+          basis={revealReportBasis}
+          aroundOffset={revealReportOffset}
+          renderedMessageId={renderedMessageId}
+          onOpenProjectFile={onOpenProjectFile}
+          onCreateComment={onCreateReportComment}
+        />
+      ) : null}
+      {planSync && !visibleActionError ? (
+        <p className="mt-1 text-secondary">
+          {planSync.kind === 'response'
+            ? 'Restore the saved response to continue.'
+            : 'Restore the saved plan to continue.'}
+        </p>
+      ) : continuationLimit ? (
+        <p className="mt-1 text-secondary">
+          Plan review limit reached (
+          {continuationLimit.used > continuationLimit.maximum
+            ? `${continuationLimit.used} used; Session limit ${continuationLimit.maximum}`
+            : `${continuationLimit.used}/${continuationLimit.maximum}`}
+          ).
+        </p>
+      ) : null}
+      {actionable &&
+      !planSync &&
+      !inputGate &&
+      !questionCardActive &&
+      task.status !== 'complete' &&
+      !runStopped &&
+      task.notice &&
+      !duplicateLimitNotice &&
+      !duplicateRestartNotice &&
+      // Retained tasks may contain these older generic confirmations; keep other notices.
+      !genericPauseNotice.has(task.notice) &&
+      (!continuationLimit || runFailedOrStopped) ? (
+        <p className="mt-1 whitespace-pre-wrap text-secondary">{task.notice}</p>
+      ) : null}
+      {actionable && view?.received?.state === 'blocked' ? (
+        <p className="mt-1 text-secondary">Your message delivery needs attention.</p>
+      ) : null}
+      {draftBlocksActions ? (
+        <p id={draftHintId} className="mt-1 text-caption text-tertiary">
+          Send or clear your draft before continuing this task.
+        </p>
+      ) : null}
+      {actions.length || canOpenLimitSettings ? (
         <div
           aria-label="Pact Proposal"
-          className="pact-review-actions mt-2 flex flex-wrap items-center gap-1.5"
+          className="pact-review-actions mt-2 flex min-w-0 flex-nowrap items-center gap-1.5 overflow-x-auto"
+          data-compact-targets={actions.length > 2}
         >
-          {task.status === 'failed' ? (
-            actionButton(
-              task.reportFailure
-                ? `${task.reportFailure === 'invalid' ? 'Correct and submit' : 'Submit'} ${pendingPlan ? 'plan' : pendingReview ? 'review' : 'report'} · ${agentName(task.actor)}`
-                : `Retry · ${agentName(task.actor)}`,
-              task.reportFailure ? 'submit_report' : 'retry',
-              true,
-            )
-          ) : task.status === 'paused' ? (
-            actionButton('Resume collaboration', 'resume', true)
-          ) : task.status === 'complete' ? (
-            <>
-              <span className="text-caption text-secondary">Review complete</span>
-              {actionButton('Review current changes · read-only', 'continue')}
-            </>
-          ) : planning ? (
-            task.status === 'ready' ? (
-              actionButton(`Implement plan · ${agentName(task.implementer)}`, 'execute', true)
-            ) : (
-              actionButton(
-                `${task.actor === task.primary ? 'Review plan' : 'Update plan'} · ${agentName(task.actor === task.primary ? (task.primary === 'codex' ? 'claude' : 'codex') : task.primary)}`,
-                'continue',
-                true,
-              )
-            )
-          ) : pendingWork && task.status !== 'questions' ? (
-            task.questionPendingCount || task.unansweredCount ? null : (
-              actionButton(
-                `Continue ${pendingWork.stage === 'repair' ? 'repair' : 'implementation'} · ${agentName(pendingWork.actor)} · edits code`,
-                'continue',
-                true,
-              )
-            )
-          ) : phase.stage === 'review' && task.status !== 'questions' ? (
-            task.ledgerOpenCount + task.ledgerAwaitingCount > 0 ? (
-              <>
-                {actionButton(
-                  `Respond · ${agentName(task.implementer)} · read-only`,
-                  'respond',
-                  true,
+          {actions.map((action, index) => {
+            const actionText = actionLabel(action)
+            const agentSeparator = actionText.lastIndexOf(' · ')
+            const draftBlocked = draftBlocksActions && action !== 'recover_plan'
+            const title = draftBlocked
+              ? `${actionText}. Send or clear your draft first.`
+              : actionText
+            return (
+              <button
+                key={action}
+                type="button"
+                disabled={
+                  disabled || busy || (feedbackDraft && action !== 'recover_plan') || !actionable
+                }
+                aria-label={actionText}
+                title={title}
+                aria-describedby={draftBlocked ? draftHintId : undefined}
+                onClick={(event) => {
+                  if (action === 'swap_code_roles') {
+                    planTrigger.current = event.currentTarget
+                    setPlanDecision({
+                      currentImplementer: agentName(codeRoles.codeAuthor),
+                      nextImplementer: agentName(codeRoles.codeReviewer),
+                      scope: decisionScope,
+                      input: {
+                        sessionId: session.id,
+                        taskId: task.id,
+                        revision: task.revision,
+                        clientMessageId: crypto.randomUUID(),
+                        action,
+                      },
+                    })
+                  } else void act(action)
+                }}
+                className={`${proposalActionClass} ${
+                  index === 0
+                    ? 'border-transparent bg-surface-inverse px-3.5 text-inverse hover:opacity-90'
+                    : 'border-border-strong bg-surface-raised text-primary hover:bg-surface-muted'
+                }`}
+              >
+                {busy ? (
+                  action === 'recover_plan' ? (
+                    'Restoring…'
+                  ) : action === 'swap_code_roles' ? (
+                    'Switching…'
+                  ) : (
+                    'Sending…'
+                  )
+                ) : agentSeparator === -1 ? (
+                  actionText
+                ) : (
+                  <>
+                    {actionText.slice(0, agentSeparator)}
+                    <span className="pact-review-action-agent">
+                      {actionText.slice(agentSeparator)}
+                    </span>
+                  </>
                 )}
-                {!task.questionPendingCount && !task.unansweredCount
-                  ? actionButton(`Repair · ${agentName(task.implementer)} · edits code`, 'repair')
-                  : null}
-              </>
-            ) : (
-              actionButton('Review current changes · read-only', 'continue', true)
+              </button>
             )
-          ) : task.status === 'questions' ? null : (
-            actionButton(`Review changes · ${agentName(task.reviewer)}`, 'continue', true)
-          )}
-          <span className="sr-only">One click authorizes one Agent Turn.</span>
+          })}
+          {canOpenLimitSettings ? (
+            <button
+              type="button"
+              disabled={disabled || busy}
+              onClick={onOpenSessionSettings}
+              className={`${proposalActionClass} ${
+                actions.length === 0
+                  ? 'border-transparent bg-surface-inverse px-3.5 text-inverse hover:opacity-90'
+                  : 'border-border-strong bg-surface-raised text-primary hover:bg-surface-muted'
+              }`}
+            >
+              Session settings
+            </button>
+          ) : null}
         </div>
       ) : null}
       {error ? (
-        <p
+        <div
           role="alert"
-          className="mt-2 flex items-start gap-2 text-caption text-status-danger-foreground"
+          className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-status-danger-foreground"
         >
-          <AlertCircle aria-hidden="true" className="mt-0.5 size-3.5 shrink-0" strokeWidth={1.75} />
+          <AlertCircle aria-hidden="true" className="size-3.5 shrink-0" strokeWidth={1.75} />
           <span>
-            {error}{' '}
-            <button
-              type="button"
-              className="underline"
-              onClick={() => setRefresh((value) => value + 1)}
-            >
-              Refresh
-            </button>
+            {planSync && visibleActionError
+              ? 'Couldn’t restore that version. Your saved plan is intact.'
+              : error}
           </span>
-        </p>
+          <button
+            type="button"
+            disabled={
+              busy ||
+              refreshing ||
+              (Boolean(planSync && visibleActionError) && (disabled || !actionable))
+            }
+            className="min-h-8 rounded-control px-2 text-caption font-medium text-primary underline underline-offset-2 hover:bg-surface-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus disabled:cursor-default disabled:opacity-45"
+            onClick={() =>
+              planSync && visibleActionError ? void act('recover_plan') : refreshStatus()
+            }
+          >
+            {busy ? 'Restoring…' : refreshing ? 'Checking…' : 'Try again'}
+          </button>
+        </div>
+      ) : null}
+      {currentPlanDecision ? (
+        <TaskPlanConfirmation
+          currentImplementer={currentPlanDecision.currentImplementer}
+          nextImplementer={currentPlanDecision.nextImplementer}
+          busy={busy}
+          disabled={disabled || !actionable}
+          suspended={nativePresentationSuspended}
+          error={currentPlanDecision.error}
+          onCancel={() => {
+            if (busy) return
+            setPlanDecision(undefined)
+            const trigger = planTrigger.current
+            planTrigger.current = null
+            if (trigger?.isConnected) queueMicrotask(() => trigger.focus())
+          }}
+          onConfirm={confirmPlanDecision}
+        />
       ) : null}
     </section>
   )
 })
 
 function ReportSource({
-  task,
+  sessionId,
   run,
+  source,
+  taskId,
   navigationId,
-  target,
-  documents,
   onSourceReady,
   aroundOffset,
   basis,
@@ -502,11 +629,11 @@ function ReportSource({
   onOpenProjectFile,
   onCreateComment,
 }: {
-  task: CollaborationTask
+  sessionId: string
   run: AgentRun
+  source: CollaborationDocument
+  taskId: string
   navigationId: string
-  target: NonNullable<MessageCommentAnchor['report']>['target']
-  documents: Array<{ key: string; source: CollaborationDocument }>
   onSourceReady?: ((host: HTMLElement) => (() => void) | undefined) | undefined
   aroundOffset?: number | undefined
   basis?: 'markdown-visible-v2' | 'plain-visible-v1' | undefined
@@ -519,50 +646,36 @@ function ReportSource({
     () => (hostRef.current ? onSourceReady?.(hostRef.current) : undefined),
     [onSourceReady],
   )
-  const result = task.result!
-  const document = documents.find(
-    (entry) => entry.key === (target.type === 'summary' ? 'summary' : `feedback:${target.id}`),
-  )?.source
-  const content = document ? '' : collaborationReportMarkdown(result, target)
   return (
     <div
       ref={hostRef}
+      className="mt-2 text-body"
       data-pact-report-run-id={run.id}
-      data-pact-report-key={target.type === 'summary' ? 'summary' : `feedback:${target.id}`}
+      data-pact-report-key="summary"
       data-pact-message-id={renderedMessageId ?? run.userMessageId}
     >
-      {document ? (
-        <CollaborationDocumentView
-          key={`${document.id}:${navigationId}:${aroundOffset ?? ''}:${basis ?? ''}`}
-          sessionId={task.sessionId}
-          runId={run.id}
-          source={document}
-          displayContext={{ taskId: task.id }}
-          aroundOffset={aroundOffset}
-          basis={basis}
-          onReady={sourceReady}
-          messageId={run.userMessageId}
-          onOpenProjectFile={onOpenProjectFile}
-          onCreateComment={
-            onCreateComment
-              ? (selection) =>
-                  onCreateComment({ ...selection, report: { runId: run.id, target }, content: '' })
-              : undefined
-          }
-        />
-      ) : (
-        <MessageMarkdown
-          content={content}
-          messageId={run.userMessageId}
-          onOpenProjectFile={onOpenProjectFile}
-          onCreateComment={
-            onCreateComment
-              ? (selection) =>
-                  onCreateComment({ ...selection, report: { runId: run.id, target }, content })
-              : undefined
-          }
-        />
-      )}
+      <CollaborationDocumentView
+        key={`${source.id}:${navigationId}:${aroundOffset ?? ''}:${basis ?? ''}`}
+        sessionId={sessionId}
+        runId={run.id}
+        source={source}
+        displayContext={{ taskId }}
+        aroundOffset={aroundOffset}
+        basis={basis}
+        onReady={sourceReady}
+        messageId={run.userMessageId}
+        onOpenProjectFile={onOpenProjectFile}
+        onCreateComment={
+          onCreateComment
+            ? (selection) =>
+                onCreateComment({
+                  ...selection,
+                  report: { runId: run.id, target: { type: 'summary' } },
+                  content: '',
+                })
+            : undefined
+        }
+      />
     </div>
   )
 }

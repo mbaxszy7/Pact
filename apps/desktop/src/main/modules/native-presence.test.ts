@@ -41,7 +41,12 @@ vi.mock('electron', () => ({
     removeListener: (event: string) => harness.appEvents.delete(event),
     setJumpList: (..._args: unknown[]) => harness.setJumpList(),
     getJumpListSettings: () => ({ removedItems: [] }),
-    dock: { setMenu: vi.fn<() => void>() },
+    dock: {
+      setMenu: vi.fn<() => void>(),
+      setBadge: vi.fn<(text: string) => void>(),
+      bounce: vi.fn<() => number>(() => 1),
+      cancelBounce: vi.fn<() => void>(),
+    },
   },
   ipcMain: {
     handle: (channel: string, listener: (event: TrustedIpcEvent, input?: unknown) => unknown) =>

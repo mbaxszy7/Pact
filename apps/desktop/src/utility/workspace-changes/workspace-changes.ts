@@ -4,12 +4,10 @@ import { createHash, randomUUID } from 'node:crypto'
 import { constants } from 'node:fs'
 import {
   chmod,
-  copyFile,
   link,
   lstat,
   mkdir,
   open,
-  opendir,
   readdir,
   realpath,
   rm,
@@ -23,34 +21,76 @@ import type { NativeFileChange } from '@pact/agent-runtime'
 
 import {
   WORKSPACE_CHANGE_FILES,
+  WORKSPACE_EVIDENCE_BYTES,
   WORKSPACE_FILE_BYTES,
   WORKSPACE_OPERATION_TIMEOUT_MS,
+  WORKSPACE_PREVIEW_BYTES,
   WORKSPACE_ROUND_BYTES,
   WORKSPACE_STORAGE_BYTES,
-  WORKSPACE_EVIDENCE_BYTES,
-  WORKSPACE_PREVIEW_BYTES,
   workspaceFileVersionSchema,
   type AgentRun,
+  type DirectoryFileOperationResult,
+  type WorkspaceArchiveScope,
   type WorkspaceChangeFilePreview,
   type WorkspaceChangeFileReadInput,
   type WorkspaceChangeSet,
   type WorkspaceChangesPage,
   type WorkspaceChangesReadInput,
   type WorkspaceFileVersion,
-  type DirectoryFileOperationInput,
-  type DirectoryFileOperationResult,
 } from '@pact/contracts'
 import {
   WorkspaceChangesRepository,
-  type WorkspaceChangeIntent,
-  type WorkspaceChangeSetRecord,
   type ProjectCatalogRepository,
   type SessionRepository,
+  type WorkspaceChangeIntent,
+  type WorkspaceChangeSetRecord,
 } from '@pact/persistence'
 
-import { workspaceGit } from './workspace-git'
+import {
+  anchorStagingDir,
+  blobPathFor,
+  buildValidatedDirectoryJobInput,
+  EMPTY_VERSION,
+  ensureParentDirectoriesViaWorker,
+  executeDirectoryJob,
+  inspectParentDirectoriesViaWorker,
+  isEexist,
+  isEnoent,
+  isTextualBlob,
+  pruneAnchorStagingFiles,
+  pruneCaptureFiles,
+  pruneWorkDirectory,
+  safeRelativePath,
+  sha256Hex,
+  syncDirectory,
+  verifyFileVersion,
+  versionsEqual,
+  WorkspaceChangeError,
+  workspaceKey,
+  writeDurableFile,
+  type ApplyFile,
+  type DirectoryOperationExecutor,
+  type StandardDirectoryOperation,
+  type UndoOperation,
+  type WorkspaceCleanupOwner,
+  type WorkspaceReservation,
+  type WorkspaceRun,
+} from './workspace-change-fs'
+import {
+  computeDiffStatistics,
+  deriveAfterFromBeforeAndPatch,
+  deriveBeforeFromCurrentAndPatch,
+  hasUnsupportedPatchMetadata,
+} from './workspace-change-patch'
+import {
+  applyUndoOperations,
+  planUndoOperations,
+  selectUndoTargets,
+  type UndoExecutionContext,
+} from './workspace-change-undo'
 
-const EMPTY: WorkspaceFileVersion = { hash: null, bytes: 0, mode: 0 }
+export { WorkspaceChangeError, type WorkspaceReservation } from './workspace-change-fs'
+
 const PREVIEW_BYTES = WORKSPACE_PREVIEW_BYTES
 const TOOL_QUEUE_ITEMS = 4
 const RECORDING_RUNS = 5
@@ -58,89 +98,23 @@ const UNDO_OPERATIONS = 5
 const RECOVERY_PAGE_LIMIT = 1024
 const RECOVERY_PATH_REFERENCES = 1024
 
-export class WorkspaceChangeError extends Error {
-  constructor(
-    readonly code:
-      | 'WORKSPACE_BUSY'
-      | 'WORKSPACE_CONFLICT'
-      | 'WORKSPACE_UNDO_UNAVAILABLE'
-      | 'WORKSPACE_RECOVERY_REQUIRED'
-      | 'VALIDATION'
-      | 'PERMISSION_DENIED',
-    message: string,
-  ) {
-    super(message)
-  }
-}
-
-export interface WorkspaceReservation {
-  ownerId: string
-  sessionId: string
-  projectId: string
-  root: string
-  key: string
-  rootDevice: string
-  rootInode: string
-  handle: Awaited<ReturnType<typeof open>>
-}
-
-interface WorkspaceRun {
-  reservation: WorkspaceReservation
-  run: AgentRun
-  stagingRoot: string
-  signal: AbortSignal
-  unavailableReason?: string
-  finalEndpointsUncertain?: boolean
-  retainedHashes: Set<string>
-  operations: Set<string>
-  retainedBytes: number
-  backupBytes: number
-  queued: number
-  queueBytes: number
-  tail: Promise<void>
-  closing: boolean
-  stagingReady: boolean
-}
-
-interface ApplyFile {
-  path: string
-  before: WorkspaceFileVersion
-  after: WorkspaceFileVersion
-  stage: string | null
-  backup: string
-}
-
-interface WorkspaceCleanupOwner {
-  handle?: FileHandle
-  reservation?: WorkspaceReservation
-  cleanup?: Promise<void>
-  cleanupFailed?: boolean
-}
-
 interface RecordingPreparation extends WorkspaceCleanupOwner {
   sessionId: string
   projectId: string
   attempt: Promise<string | undefined>
 }
 
-interface UndoOperation extends WorkspaceCleanupOwner {
-  sessionId: string
-  projectId: string
-  controller: AbortController
-  applicationStarted: boolean
-  completed: Promise<void>
-  complete: () => void
-  fail: (error: unknown) => void
-  releaseScratch?: () => void
-}
-
-/** Owns passive native evidence and cold whole-round Undo, never forward Agent writes. */
+/** Owns passive native evidence and cold round / single-file Undo, never forward Agent writes. */
 export class WorkspaceChanges {
   private readonly owners = new Map<string, WorkspaceReservation>()
   private readonly runs = new Map<string, WorkspaceRun>()
   // At most five preparations and five Undo operations; no native execution is queued.
   private readonly preparingRuns = new Map<string, RecordingPreparation>()
   private readonly undoOperations = new Map<string, UndoOperation>()
+  private readonly pendingAnchorDeletions = new Map<
+    string,
+    { stagedFile: string; bytes: number; releaseScratch: () => void }
+  >()
   private pendingBlobBytes = 0
   // Reservations include every private capture, merge/patch output and candidate until cleanup
   // or transfer to the durable intent counter. Each caller owns its release in a finally block.
@@ -152,22 +126,21 @@ export class WorkspaceChanges {
     private readonly sessions: SessionRepository,
     private readonly projects: ProjectCatalogRepository,
     private readonly storageRoot: string,
-    private readonly directoryOperation?: (
-      input: DirectoryFileOperationInput,
-      signal: AbortSignal,
-    ) => Promise<DirectoryFileOperationResult>,
+    private readonly directoryOperation?: DirectoryOperationExecutor,
     private readonly liveDatabaseFile?: string,
   ) {}
 
   async initialize(): Promise<WorkspaceChangeSet[]> {
     await mkdir(join(this.storageRoot, 'objects'), { recursive: true, mode: 0o700 })
+    await mkdir(anchorStagingDir(this.storageRoot), { recursive: true, mode: 0o700 })
     const controller = new AbortController()
     const deadline = setTimeout(
       () => controller.abort(new Error('Workspace recovery timed out.')),
       WORKSPACE_OPERATION_TIMEOUT_MS,
     )
     try {
-      await this.pruneCaptures(controller.signal)
+      await pruneCaptureFiles(this.storageRoot, controller.signal)
+      await pruneAnchorStagingFiles(this.storageRoot, controller.signal)
       // No-write startup reconciliation. Uncertain filesystem effects never become an automatic restore.
       const summaries = new Map<string, WorkspaceChangeSet>()
       let cursor: string | undefined
@@ -242,7 +215,7 @@ export class WorkspaceChanges {
           'VALIDATION',
           'The registered Project root was replaced or redirected.',
         )
-      const key = this.key(root)
+      const key = workspaceKey(root)
       const previous = this.owners.get(key)
       if (exclusive && previous && previous.ownerId !== ownerId)
         throw new WorkspaceChangeError(
@@ -332,6 +305,9 @@ export class WorkspaceChanges {
       signal,
       retainedHashes: new Set(),
       operations: new Set(),
+      anchors: new Map(),
+      pendingAnchors: new Map(),
+      anchorBytes: 0,
       retainedBytes: 0,
       backupBytes: 0,
       queued: 0,
@@ -411,17 +387,258 @@ export class WorkspaceChanges {
   summary(runId: string): WorkspaceChangeSet | undefined {
     return this.repository.find(runId) ? this.repository.summary(runId) : undefined
   }
+
   setSignal(runId: string, signal: AbortSignal): void {
     const context = this.runs.get(runId)
     if (context) context.signal = signal
   }
+
   hasEffects(runId: string): boolean {
+    const record = this.repository.find(runId)
     return (
-      this.repository.find(runId) !== undefined &&
-      (this.repository.summary(runId).fileCount > 0 ||
-        Boolean(this.repository.summary(runId).undoUnavailableReason) ||
-        Boolean(this.repository.summary(runId).effectsUncertain))
+      record !== undefined &&
+      (record.fileCount > 0 ||
+        Boolean(record.undoUnavailableReason) ||
+        Boolean(record.effectsUncertain))
     )
+  }
+
+  /**
+   * Captures a passive pre-touch baseline snapshot of `relativePath` before the first native
+   * write/edit/delete tool mutates disk in `runId`. Never throws or blocks native execution.
+   * Unconfirmed anchor bytes remain in bounded temporary staging and are promoted to durable
+   * storage only if a finalized change requires them.
+   */
+  anchorBeforeFirstTouch(
+    runId: string,
+    relativePath: string,
+    sourceSignal: AbortSignal,
+  ): Promise<void> {
+    const context = this.runs.get(runId)
+    if (!context || context.closing || this.disposed) return Promise.resolve()
+    // Async ACP start notifications are auxiliary only; skip pre-touch anchoring for AGY.
+    if (context.run.agentId === 'agy') return Promise.resolve()
+    let normalized: string
+    try {
+      normalized = safeRelativePath(
+        isAbsolute(relativePath)
+          ? relative(context.reservation.root, relativePath).split(sep).join('/')
+          : relativePath,
+      )
+      buildValidatedDirectoryJobInput(
+        this.liveDatabaseFile,
+        context.reservation,
+        normalized,
+        'capture',
+      )
+    } catch {
+      return Promise.resolve()
+    }
+    const inFlight = context.pendingAnchors.get(normalized)
+    if (inFlight) return inFlight.task
+    if (context.anchors.has(normalized)) return Promise.resolve()
+    if (this.repository.find(runId) && this.repository.file(runId, normalized))
+      return Promise.resolve()
+    if (context.anchors.size + context.pendingAnchors.size >= WORKSPACE_CHANGE_FILES)
+      return Promise.resolve()
+    // Share the bounded 4-callback round queue with formal record operations.
+    if (context.queued + context.pendingAnchors.size >= TOOL_QUEUE_ITEMS) return Promise.resolve()
+
+    const controller = new AbortController()
+    const abort = (): void => controller.abort(sourceSignal.reason)
+    sourceSignal.addEventListener('abort', abort, { once: true })
+    if (sourceSignal.aborted) abort()
+    const deadline = setTimeout(() => controller.abort(), WORKSPACE_OPERATION_TIMEOUT_MS)
+
+    let cleaned = false
+    const cleanup = (): void => {
+      if (cleaned) return
+      cleaned = true
+      clearTimeout(deadline)
+      sourceSignal.removeEventListener('abort', abort)
+      if (context.pendingAnchors.get(normalized)?.task === task) {
+        context.pendingAnchors.delete(normalized)
+      }
+    }
+
+    const task = context.tail
+      .then(() => this.executeAnchorOperation(runId, context, normalized, controller.signal))
+      .catch(() => {
+        /* Pre-touch anchoring is passive and must never fail or block a native tool. */
+      })
+      .finally(cleanup)
+
+    context.pendingAnchors.set(normalized, {
+      task,
+      cancel: () => {
+        cleanup()
+        controller.abort()
+      },
+    })
+    context.tail = task
+    return task
+  }
+
+  private async executeAnchorOperation(
+    runId: string,
+    context: WorkspaceRun,
+    normalized: string,
+    signal: AbortSignal,
+  ): Promise<void> {
+    await this.retryPendingAnchorDeletions()
+    if (
+      context.closing ||
+      this.disposed ||
+      signal.aborted ||
+      context.anchors.has(normalized) ||
+      (this.repository.find(runId) && this.repository.file(runId, normalized))
+    )
+      return
+    const location = relative(context.reservation.root, await realpath(this.storageRoot))
+    if (!isAbsolute(location) && location !== '..' && !location.startsWith(`..${sep}`)) return
+    if (context.retainedBytes + context.backupBytes + context.anchorBytes >= WORKSPACE_ROUND_BYTES)
+      return
+    const anchorDir = anchorStagingDir(this.storageRoot)
+    await mkdir(anchorDir, { recursive: true, mode: 0o700 })
+    const stagedFile = join(anchorDir, `anchor-${randomUUID()}`)
+    const releaseCaptureScratch = this.reserveScratch(WORKSPACE_FILE_BYTES, signal)
+    let retained = false
+    try {
+      const result = await this.directoryJob(
+        context.reservation,
+        normalized,
+        'capture',
+        signal,
+        stagedFile,
+      )
+      if (!result.existed) {
+        context.anchors.set(normalized, {
+          version: EMPTY_VERSION,
+          stagedFile: null,
+          releaseScratch: null,
+          auxiliary: false,
+        })
+        return
+      }
+      const version: WorkspaceFileVersion = {
+        hash: result.hash,
+        bytes: result.bytes,
+        mode: result.mode,
+      }
+      await verifyFileVersion(stagedFile, version, signal)
+      if (
+        context.retainedBytes + context.backupBytes + context.anchorBytes + version.bytes >
+        WORKSPACE_ROUND_BYTES
+      )
+        return
+      const holdScratch = this.reserveScratch(version.bytes, signal)
+      context.anchorBytes += version.bytes
+      let anchorReleased = false
+      context.anchors.set(normalized, {
+        version,
+        stagedFile,
+        releaseScratch: () => {
+          if (anchorReleased) return
+          anchorReleased = true
+          context.anchorBytes -= version.bytes
+          holdScratch()
+        },
+        auxiliary: false,
+      })
+      retained = true
+    } finally {
+      if (retained) {
+        releaseCaptureScratch()
+      } else {
+        try {
+          await unlink(stagedFile)
+          releaseCaptureScratch()
+        } catch (error) {
+          if (isEnoent(error)) {
+            releaseCaptureScratch()
+          } else {
+            // Retain conservative scratch charge until a later unlink confirms file deletion.
+            this.pendingAnchorDeletions.set(stagedFile, {
+              stagedFile,
+              bytes: WORKSPACE_FILE_BYTES,
+              releaseScratch: releaseCaptureScratch,
+            })
+          }
+        }
+      }
+    }
+  }
+
+  private async releaseAnchor(context: WorkspaceRun, path: string): Promise<void> {
+    const entry = context.anchors.get(path)
+    if (!entry) return
+    const staged = entry.stagedFile
+    const release = entry.releaseScratch
+    const bytes = entry.version.bytes
+    entry.stagedFile = null
+    entry.releaseScratch = null
+    if (!staged) {
+      release?.()
+      return
+    }
+    try {
+      await unlink(staged)
+      this.pendingAnchorDeletions.delete(staged)
+      release?.()
+    } catch (error) {
+      if (isEnoent(error)) {
+        this.pendingAnchorDeletions.delete(staged)
+        release?.()
+      } else if (release) {
+        this.pendingAnchorDeletions.set(staged, {
+          stagedFile: staged,
+          bytes,
+          releaseScratch: release,
+        })
+      }
+    }
+  }
+
+  private async evictUnusedAnchors(
+    context: WorkspaceRun,
+    bytesNeeded: number,
+    excludePath?: string,
+  ): Promise<void> {
+    let freed = 0
+    for (const [anchorPath, entry] of context.anchors) {
+      if (freed >= bytesNeeded) break
+      if (anchorPath === excludePath || !entry.stagedFile) continue
+      const stagedPath = entry.stagedFile
+      const entryBytes = entry.version.bytes
+      await this.releaseAnchor(context, anchorPath)
+      if (!this.pendingAnchorDeletions.has(stagedPath)) freed += entryBytes
+    }
+  }
+
+  private async retryPendingAnchorDeletions(): Promise<void> {
+    for (const entry of this.pendingAnchorDeletions.values()) {
+      try {
+        await unlink(entry.stagedFile)
+        this.pendingAnchorDeletions.delete(entry.stagedFile)
+        entry.releaseScratch()
+      } catch (error) {
+        if (isEnoent(error)) {
+          this.pendingAnchorDeletions.delete(entry.stagedFile)
+          entry.releaseScratch()
+        }
+      }
+    }
+  }
+
+  private async releaseAllAnchors(context: WorkspaceRun): Promise<void> {
+    for (const pending of context.pendingAnchors.values()) {
+      pending.cancel()
+    }
+    for (const path of context.anchors.keys()) {
+      await this.releaseAnchor(context, path)
+    }
+    context.anchors.clear()
+    await this.retryPendingAnchorDeletions()
   }
 
   /** Recording is passive: no Project mutation or native-tool approval happens here. */
@@ -445,9 +662,19 @@ export class WorkspaceChanges {
       (sum, value) => sum + (typeof value === 'string' ? Buffer.byteLength(value) : 0),
       0,
     )
+    // Prioritize completed native records over speculative pending anchors within the shared 4-slot queue.
+    if (
+      context.queued < TOOL_QUEUE_ITEMS &&
+      context.queued + context.pendingAnchors.size >= TOOL_QUEUE_ITEMS
+    ) {
+      for (const pending of context.pendingAnchors.values()) {
+        pending.cancel()
+        if (context.queued + context.pendingAnchors.size < TOOL_QUEUE_ITEMS) break
+      }
+    }
     if (
       bytes > WORKSPACE_EVIDENCE_BYTES ||
-      context.queued >= TOOL_QUEUE_ITEMS ||
+      context.queued + context.pendingAnchors.size >= TOOL_QUEUE_ITEMS ||
       context.queueBytes + bytes > WORKSPACE_EVIDENCE_BYTES * 2
     ) {
       this.uncertain(
@@ -464,121 +691,9 @@ export class WorkspaceChanges {
     sourceSignal.addEventListener('abort', abort, { once: true })
     if (sourceSignal.aborted) abort()
     const deadline = setTimeout(() => controller.abort(), WORKSPACE_OPERATION_TIMEOUT_MS)
-    const operation = context.tail.then(async () => {
-      controller.signal.throwIfAborted()
-      if (change.invalidateOnly) {
-        this.recordUnavailableFile(context, change)
-        return undefined
-      }
-      await this.ensureStaging(context)
-      this.ensureRecord(context)
-      const path = this.safeRelative(
-        isAbsolute(change.path)
-          ? relative(context.reservation.root, change.path).split(sep).join('/')
-          : change.path,
-      )
-      const old = this.repository.file(runId, path)
-      if (this.repository.files(runId).length >= WORKSPACE_CHANGE_FILES && !old)
-        throw new Error('This round exceeded the native file recording limit.')
-      const current = await this.observe(context.reservation, path, controller.signal)
-      const mode = current.hash ? current.mode : 0o644
-      const beforeAvailable = change.before !== undefined
-      let afterAvailable = change.after !== undefined
-      const before = beforeAvailable
-        ? await this.saveText(context, change.before!, mode, controller.signal)
-        : EMPTY
-      let after = afterAvailable
-        ? await this.saveText(context, change.after!, mode, controller.signal)
-        : EMPTY
-      if (beforeAvailable && !afterAvailable && change.patch && !change.previousPath) {
-        // A complete native before + operation patch is sufficient to derive its after,
-        // without reading the current file as historical truth. Git owns the algorithm.
-        after = await this.nativePatchedVersion(
-          context,
-          path,
-          before,
-          change.patch,
-          mode,
-          controller.signal,
-        )
-        afterAvailable = true
-      }
-      let reason =
-        change.unavailableReason ??
-        (change.mixed
-          ? 'The native result includes simultaneous user edits; Undo is unavailable.'
-          : undefined)
-      // Native results prove text, not historical modes. Existing-file text Undo
-      // preserves independently observed current metadata; path changes need more proof.
-      if (beforeAvailable && afterAvailable && (!before.hash || !after.hash || change.previousPath))
-        reason ??=
-          'Native file results do not include complete path and filesystem metadata for safe Undo of additions, deletions or renames.'
-      if (
-        change.patch &&
-        /^(?:old mode |new mode |new file mode |deleted file mode |GIT binary patch|Binary files )/mu.test(
-          change.patch,
-        )
-      )
-        reason ??=
-          'Native mode or binary patch metadata needs complete original evidence. Undo is unavailable.'
-      if (afterAvailable && !this.equal(current, after))
-        reason ??=
-          'The file changed outside the recorded native operation. Undo is unavailable for this mixed round.'
-      if (
-        old &&
-        old.afterAvailable !== false &&
-        beforeAvailable &&
-        (old.modeKnown === false
-          ? old.after.hash !== before.hash || old.after.bytes !== before.bytes
-          : !this.equal(old.after, before))
-      )
-        reason ??= 'Native file versions do not form one continuous round. Undo is unavailable.'
-      if (change.previousPath)
-        reason ??=
-          'Native rename evidence does not include complete path metadata; Undo is unavailable.'
-      const patchVersions = change.patch
-        ? [await this.saveText(context, change.patch, 0o600, controller.signal)]
-        : undefined
-      const strategy = reason
-        ? 'unavailable'
-        : beforeAvailable && afterAvailable
-          ? 'three_way'
-          : 'unavailable'
-      if (strategy === 'unavailable')
-        reason ??=
-          'The Agent did not provide complete original and final file versions. A patch alone cannot safely identify this change for Undo.'
-      const stats =
-        beforeAvailable && afterAvailable
-          ? await this.statistics(
-              old?.before ?? before,
-              after,
-              context.stagingRoot,
-              controller.signal,
-            )
-          : { additions: null, deletions: null }
-      this.repository.recordFiles(
-        runId,
-        [
-          {
-            path,
-            previousPath: change.previousPath ?? null,
-            kind: change.kind,
-            before,
-            after,
-            beforeAvailable,
-            afterAvailable,
-            modeKnown: false,
-            undoStrategy: strategy,
-            ...(patchVersions ? { patchVersions } : {}),
-            ...stats,
-            hidden: false,
-            reason: reason ?? null,
-          },
-        ],
-        reason ?? context.unavailableReason,
-      )
-      return undefined
-    })
+    const operation = context.tail.then(() =>
+      this.executeRecordOperation(runId, context, change, controller.signal),
+    )
     context.tail = operation.catch((error: unknown) => {
       this.uncertain(
         runId,
@@ -596,6 +711,340 @@ export class WorkspaceChanges {
       context.queued -= 1
       context.queueBytes -= bytes
     }
+  }
+
+  private async executeRecordOperation(
+    runId: string,
+    context: WorkspaceRun,
+    change: NativeFileChange,
+    signal: AbortSignal,
+  ): Promise<void> {
+    signal.throwIfAborted()
+    if (change.invalidateOnly) {
+      try {
+        const invalidPath = safeRelativePath(
+          isAbsolute(change.path)
+            ? relative(context.reservation.root, change.path).split(sep).join('/')
+            : change.path,
+        )
+        await this.releaseAnchor(context, invalidPath)
+      } catch {
+        /* Ignore invalid paths when discarding unused anchors. */
+      }
+      this.recordUnavailableFile(context, change)
+      return
+    }
+    await this.ensureStaging(context)
+    this.ensureRecord(context)
+    const path = safeRelativePath(
+      isAbsolute(change.path)
+        ? relative(context.reservation.root, change.path).split(sep).join('/')
+        : change.path,
+    )
+    const previousPath = change.previousPath
+      ? safeRelativePath(
+          isAbsolute(change.previousPath)
+            ? relative(context.reservation.root, change.previousPath).split(sep).join('/')
+            : change.previousPath,
+        )
+      : undefined
+    const old = this.repository.file(runId, path)
+    if (this.repository.files(runId).length >= WORKSPACE_CHANGE_FILES && !old)
+      throw new Error('This round exceeded the native file recording limit.')
+
+    const anchorKey = previousPath ?? path
+    const anchorEntry = !old ? context.anchors.get(anchorKey) : undefined
+    const trustedAnchor = anchorEntry && !anchorEntry.auxiliary ? anchorEntry : undefined
+    const needsCapturedCurrent =
+      previousPath !== undefined && change.after === undefined && trustedAnchor !== undefined
+    const current = needsCapturedCurrent
+      ? await this.capture(context.reservation.root, path, context, signal, context.reservation)
+      : await this.observe(context.reservation, path, signal)
+    const observedMode = current.hash !== null ? current.mode : 0
+    const textMode = trustedAnchor?.version.hash ? trustedAnchor.version.mode : observedMode
+    // Text-only in-place edits on pre-existing files never attest POSIX mode ownership:
+    // keep modeKnown = false so Undo preserves current user permissions (e.g. chmod 0600).
+    const isPreExistingModify =
+      change.kind === 'modified' && previousPath === undefined && (!old || old.before.hash !== null)
+
+    let beforeAvailable = change.before !== undefined
+    let afterAvailable = change.after !== undefined
+    let usedAnchorForBefore = false
+    let modeKnown = false
+    let before = beforeAvailable
+      ? await this.saveText(context, change.before!, textMode, signal)
+      : EMPTY_VERSION
+    try {
+      if (
+        beforeAvailable &&
+        trustedAnchor &&
+        trustedAnchor.version.hash === before.hash &&
+        trustedAnchor.version.bytes === before.bytes
+      ) {
+        before = { ...before, mode: trustedAnchor.version.mode }
+        if (!isPreExistingModify) modeKnown = true
+      } else if (!beforeAvailable && trustedAnchor !== undefined && !change.mixed) {
+        if (trustedAnchor.version.hash === null) {
+          before = EMPTY_VERSION
+          beforeAvailable = true
+          usedAnchorForBefore = true
+          if (!isPreExistingModify) modeKnown = true
+        } else if (trustedAnchor.stagedFile !== null) {
+          before = await this.captureStaged(
+            trustedAnchor.stagedFile,
+            trustedAnchor.version.mode,
+            context,
+            signal,
+            trustedAnchor.version.bytes,
+            anchorKey,
+          )
+          beforeAvailable = true
+          usedAnchorForBefore = true
+          if (!isPreExistingModify) modeKnown = true
+        }
+      }
+    } finally {
+      if (anchorEntry) await this.releaseAnchor(context, anchorKey)
+    }
+
+    // Same-run continuous patch chain (e.g. Codex `added` B -> `update` patch B -> C):
+    // forward-apply onto the already-verified intermediate `old.after` in private staging
+    // instead of forcing `unavailable` when no pre-touch anchor applies to the 2nd operation.
+    if (
+      !beforeAvailable &&
+      !change.mixed &&
+      previousPath === undefined &&
+      change.patch !== undefined &&
+      old !== undefined &&
+      old.beforeAvailable !== false &&
+      old.afterAvailable !== false &&
+      old.undoStrategy !== 'unavailable' &&
+      old.after.hash !== null
+    ) {
+      before = old.after
+      beforeAvailable = true
+    }
+
+    // Preserve verified mode continuity for a file created earlier in this same run (added -> modified/deleted).
+    if (
+      old &&
+      old.before.hash === null &&
+      old.modeKnown === true &&
+      old.afterAvailable !== false &&
+      beforeAvailable &&
+      old.after.hash === before.hash &&
+      old.after.bytes === before.bytes
+    ) {
+      before = { ...before, mode: old.after.mode }
+      modeKnown = true
+    }
+
+    // Never absorb unattributed post-write disk mode changes into a mode-tracked rename or same-run added file:
+    // keep the proven mode so external chmod drift is caught by the versionsEqual(current, after) check.
+    const targetAfterMode =
+      modeKnown && (previousPath !== undefined || (old !== undefined && old.before.hash === null))
+        ? before.mode
+        : observedMode
+
+    let after = afterAvailable
+      ? await this.saveText(context, change.after!, targetAfterMode, signal)
+      : EMPTY_VERSION
+
+    let reason: string | undefined = change.unavailableReason
+    if (change.mixed)
+      reason ??= 'The native result includes simultaneous user edits; Undo is unavailable.'
+
+    const unsupportedPatch = change.patch !== undefined && hasUnsupportedPatchMetadata(change.patch)
+    if (unsupportedPatch)
+      reason ??=
+        'Native mode or binary patch metadata needs complete original evidence. Undo is unavailable.'
+
+    // Forward patch derivation: before + patch -> after (e.g. Claude Edit, Codex added, or chained same-run update).
+    if (beforeAvailable && !afterAvailable && change.patch && !previousPath && !unsupportedPatch) {
+      const releasePatchScratch = this.reserveScratch(
+        before.bytes + Buffer.byteLength(change.patch) + WORKSPACE_FILE_BYTES,
+        signal,
+      )
+      try {
+        after = await deriveAfterFromBeforeAndPatch({
+          storageRoot: this.storageRoot,
+          stagingRoot: context.stagingRoot,
+          path,
+          kind: change.kind,
+          before,
+          patch: change.patch,
+          mode: targetAfterMode,
+          captureStaged: (staged, fileMode, sig) =>
+            this.captureStaged(staged, fileMode, context, sig),
+          signal,
+        })
+        afterAvailable = true
+      } catch {
+        reason ??=
+          'The native patch could not be applied to its original version; Undo is unavailable.'
+      } finally {
+        releasePatchScratch()
+      }
+    }
+
+    // Deletion-only reverse-patch derivation (non-relocatable complete deletion patch when absent on disk).
+    // Relocatable reverse matching against disk bytes for `modified` or `renamed` is forbidden.
+    if (
+      change.kind === 'deleted' &&
+      !beforeAvailable &&
+      change.after === null &&
+      change.patch &&
+      !unsupportedPatch &&
+      !reason
+    ) {
+      const releaseRevPatchScratch = this.reserveScratch(
+        Buffer.byteLength(change.patch) + WORKSPACE_FILE_BYTES,
+        signal,
+      )
+      try {
+        before = await deriveBeforeFromCurrentAndPatch({
+          storageRoot: this.storageRoot,
+          stagingRoot: context.stagingRoot,
+          path,
+          kind: change.kind,
+          current,
+          patch: change.patch,
+          mode: 0,
+          captureStaged: (staged, fileMode, sig) =>
+            this.captureStaged(staged, fileMode, context, sig),
+          signal,
+        })
+        beforeAvailable = true
+        if (!afterAvailable) {
+          after = EMPTY_VERSION
+          afterAvailable = true
+        }
+      } catch {
+        reason ??=
+          'The native patch could not be reversed and verified against the current file; Undo is unavailable.'
+      } finally {
+        releaseRevPatchScratch()
+      }
+    }
+
+    // Pure rename backed by a trusted synchronous pre-touch anchor.
+    if (
+      previousPath &&
+      beforeAvailable &&
+      !afterAvailable &&
+      current.hash !== null &&
+      usedAnchorForBefore &&
+      !reason
+    ) {
+      after = modeKnown ? { ...current, mode: before.mode } : current
+      afterAvailable = true
+    }
+
+    if (previousPath) {
+      const prevCurrent = await this.observe(context.reservation, previousPath, signal)
+      if (prevCurrent.hash !== null)
+        reason ??= 'The original rename source path still exists on disk; Undo is unavailable.'
+    }
+
+    // Added files have no historical pre-existing mode; when final content matches disk, record verified final mode.
+    if (
+      change.kind === 'added' &&
+      !previousPath &&
+      beforeAvailable &&
+      before.hash === null &&
+      afterAvailable &&
+      current.hash !== null &&
+      current.hash === after.hash &&
+      current.bytes === after.bytes
+    ) {
+      after = { ...after, mode: current.mode }
+      modeKnown = true
+    }
+
+    if (change.kind === 'deleted' && !modeKnown)
+      reason ??=
+        'The original file permissions were not captured before deletion; Undo is unavailable.'
+    if ((change.kind === 'renamed' || previousPath !== undefined) && !modeKnown)
+      reason ??=
+        'The original file permissions were not captured before rename; Undo is unavailable.'
+
+    if (
+      afterAvailable &&
+      (modeKnown
+        ? !versionsEqual(current, after)
+        : current.hash !== after.hash || current.bytes !== after.bytes)
+    )
+      reason ??=
+        'The file changed outside the recorded native operation. Undo is unavailable for this mixed round.'
+
+    if (
+      old &&
+      old.afterAvailable !== false &&
+      beforeAvailable &&
+      (old.modeKnown === false || !modeKnown
+        ? old.after.hash !== before.hash || old.after.bytes !== before.bytes
+        : !versionsEqual(old.after, before))
+    )
+      reason ??= 'Native file versions do not form one continuous round. Undo is unavailable.'
+
+    // Reject binary/NUL or invalid UTF-8 endpoints before assigning `three_way` so summary counts
+    // and Undo preflight agree (requirements.md: binary evidence disables Undo visibly).
+    if (!reason && beforeAvailable && afterAvailable) {
+      const checkedHashes = new Set<string>()
+      for (const endpoint of [old?.before ?? before, before, after]) {
+        if (!endpoint.hash || checkedHashes.has(endpoint.hash)) continue
+        checkedHashes.add(endpoint.hash)
+        if (!(await isTextualBlob(this.storageRoot, endpoint, signal))) {
+          reason ??= 'Binary or non-UTF-8 file content cannot be undone safely.'
+          break
+        }
+      }
+    }
+
+    const patchVersions = change.patch
+      ? [await this.saveText(context, change.patch, 0o600, signal)]
+      : undefined
+    const strategy = reason
+      ? 'unavailable'
+      : beforeAvailable && afterAvailable
+        ? 'three_way'
+        : 'unavailable'
+    if (strategy === 'unavailable')
+      reason ??=
+        'The Agent did not provide complete original and final file versions. A patch alone cannot safely identify this change for Undo.'
+
+    const stats =
+      beforeAvailable && afterAvailable
+        ? await computeDiffStatistics({
+            storageRoot: this.storageRoot,
+            before: old?.before ?? before,
+            after,
+            workDir: context.stagingRoot,
+            signal,
+          })
+        : { additions: null, deletions: null }
+
+    this.repository.recordFiles(
+      runId,
+      [
+        {
+          path,
+          previousPath: previousPath ?? null,
+          kind: change.kind,
+          before,
+          after,
+          beforeAvailable,
+          afterAvailable,
+          modeKnown,
+          undoStrategy: strategy,
+          ...(patchVersions ? { patchVersions } : {}),
+          ...stats,
+          hidden: false,
+          reason: reason ?? null,
+        },
+      ],
+      context.unavailableReason,
+    )
   }
 
   uncertain(runId: string, reason: string): void {
@@ -631,7 +1080,7 @@ export class WorkspaceChanges {
   private recordUnavailableFile(context: WorkspaceRun, change: NativeFileChange): void {
     try {
       this.ensureRecord(context)
-      const path = this.safeRelative(
+      const path = safeRelativePath(
         isAbsolute(change.path)
           ? relative(context.reservation.root, change.path).split(sep).join('/')
           : change.path,
@@ -646,8 +1095,8 @@ export class WorkspaceChanges {
               path,
               previousPath: change.previousPath ?? null,
               kind: change.kind,
-              before: EMPTY,
-              after: EMPTY,
+              before: EMPTY_VERSION,
+              after: EMPTY_VERSION,
               beforeAvailable: false,
               hidden: false,
             }),
@@ -675,54 +1124,15 @@ export class WorkspaceChanges {
     mode: number,
     signal: AbortSignal,
   ): Promise<WorkspaceFileVersion> {
-    if (text === null) return EMPTY
+    if (text === null) return EMPTY_VERSION
     if (Buffer.byteLength(text) > WORKSPACE_FILE_BYTES)
       throw new Error('Native file evidence exceeds the complete-version limit.')
     const temporary = join(context.stagingRoot, `native-${randomUUID()}`)
     try {
-      await this.writeDurable(temporary, Buffer.from(text))
+      await writeDurableFile(temporary, Buffer.from(text))
       return await this.captureStaged(temporary, mode, context, signal)
     } finally {
       await unlink(temporary).catch(() => undefined)
-    }
-  }
-
-  private async nativePatchedVersion(
-    context: WorkspaceRun,
-    path: string,
-    before: WorkspaceFileVersion,
-    patch: string,
-    mode: number,
-    signal: AbortSignal,
-  ): Promise<WorkspaceFileVersion> {
-    const tree = join(context.stagingRoot, `native-patch-${randomUUID()}`)
-    const candidate = join(tree, path)
-    const patchFile = join(context.stagingRoot, `native-patch-input-${randomUUID()}`)
-    try {
-      await mkdir(dirname(candidate), { recursive: true, mode: 0o700 })
-      if (before.hash) await this.copyVersion(before, candidate, signal)
-      await this.writeDurable(patchFile, Buffer.from(patch))
-      const summary = await workspaceGit(
-        ['apply', '--numstat', '-z', '--', patchFile],
-        tree,
-        signal,
-      )
-      const entries = summary.output.split('\0').filter(Boolean)
-      if (
-        summary.code !== 0 ||
-        entries.length !== 1 ||
-        entries[0]!.split('\t').slice(2).join('\t') !== path
-      )
-        throw new Error('The native patch does not describe exactly its recorded file.')
-      const check = await workspaceGit(['apply', '--check', '--', patchFile], tree, signal)
-      if (check.code !== 0)
-        throw new Error('The native patch does not apply to its original version.')
-      const applied = await workspaceGit(['apply', '--', patchFile], tree, signal)
-      if (applied.code !== 0) throw new Error('Git could not derive the complete native version.')
-      return await this.captureStaged(candidate, mode, context, signal)
-    } finally {
-      await unlink(patchFile).catch(() => undefined)
-      await rm(tree, { recursive: true, force: true })
     }
   }
 
@@ -750,7 +1160,7 @@ export class WorkspaceChanges {
     return task
   }
 
-  hasPendingFinalization(scope: import('@pact/contracts').WorkspaceArchiveScope): boolean {
+  hasPendingFinalization(scope: WorkspaceArchiveScope): boolean {
     return this.scopeFinalizations(scope).length > 0
   }
 
@@ -766,13 +1176,11 @@ export class WorkspaceChanges {
     ]
   }
 
-  async awaitFinalization(scope: import('@pact/contracts').WorkspaceArchiveScope): Promise<void> {
+  async awaitFinalization(scope: WorkspaceArchiveScope): Promise<void> {
     await Promise.all(this.scopeFinalizations(scope))
   }
 
-  private scopeFinalizations(
-    scope: import('@pact/contracts').WorkspaceArchiveScope,
-  ): Promise<unknown>[] {
+  private scopeFinalizations(scope: WorkspaceArchiveScope): Promise<unknown>[] {
     return [
       ...this.finishing.values(),
       ...[...this.preparingRuns.values()].map((owner) => ({
@@ -809,20 +1217,29 @@ export class WorkspaceChanges {
       const deadline = setTimeout(() => controller.abort(), WORKSPACE_OPERATION_TIMEOUT_MS)
       try {
         for (const file of this.repository.files(runId)) {
-          if (this.repository.summary(runId).state === 'recovery_required') break
+          if (this.repository.state(runId) === 'recovery_required') break
           try {
             const current = await this.observe(context.reservation, file.path, controller.signal)
             if (
               file.afterAvailable !== false &&
               (file.modeKnown === false
                 ? current.hash !== file.after.hash || current.bytes !== file.after.bytes
-                : !this.equal(current, file.after))
-            )
-              this.repository.recordFiles(
-                runId,
-                [],
-                `The file ${file.path} changed while the Agent Run was active. Undo is unavailable for this mixed round.`,
-              )
+                : !versionsEqual(current, file.after))
+            ) {
+              // Unattributed disk drift during an active Run must never be promoted into `after`:
+              // keep the last confirmed native endpoint and disable Undo for the affected file.
+              // Keep reason fixed-length (<= 1024 chars) so a long path never aborts settlement.
+              const driftReason =
+                'This file changed while the Agent Run was active. Undo is unavailable for this file.'
+              this.repository.recordFiles(runId, [
+                {
+                  ...file,
+                  undoStrategy: 'unavailable',
+                  patchVersions: [],
+                  reason: file.reason ?? driftReason,
+                },
+              ])
+            }
           } catch {
             this.repository.recordFiles(
               runId,
@@ -858,6 +1275,7 @@ export class WorkspaceChanges {
       finalized = true
       return summary
     } finally {
+      await this.releaseAllAnchors(context)
       context.retainedHashes.clear()
       context.operations.clear()
       await this.release(context.reservation)
@@ -910,7 +1328,7 @@ export class WorkspaceChanges {
     if (version.hash) {
       try {
         const handle = await open(
-          this.blobPath(version.hash),
+          blobPathFor(this.storageRoot, version.hash),
           constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
         )
         try {
@@ -933,7 +1351,7 @@ export class WorkspaceChanges {
         )
       }
     }
-    if (bytes.length !== version.bytes || (version.hash && this.hash(bytes) !== version.hash))
+    if (bytes.length !== version.bytes || (version.hash && sha256Hex(bytes) !== version.hash))
       return unavailable('blob_corrupt')
     let content: string
     try {
@@ -947,7 +1365,7 @@ export class WorkspaceChanges {
       relativePath: input.path,
       absolutePath: join(changeSet.root, input.path),
       content,
-      contentHash: version.hash ?? this.hash(bytes),
+      contentHash: version.hash ?? sha256Hex(bytes),
       lineCount: content ? content.replace(/\r\n?/gu, '\n').split('\n').length : 0,
       updatedAt: changeSet.finalizedAt ?? changeSet.createdAt,
     }
@@ -963,8 +1381,23 @@ export class WorkspaceChanges {
 
   async undo(
     id: string,
-    projectBusy: (projectId: string) => boolean = () => false,
+    projectBusy?: (projectId: string) => boolean,
+    path?: string,
+  ): Promise<WorkspaceChangeSet>
+  async undo(
+    id: string,
+    path?: string,
+    projectBusy?: (projectId: string) => boolean,
+  ): Promise<WorkspaceChangeSet>
+  async undo(
+    id: string,
+    second?: ((projectId: string) => boolean) | string,
+    third?: string | ((projectId: string) => boolean),
   ): Promise<WorkspaceChangeSet> {
+    const projectBusy: (projectId: string) => boolean =
+      typeof second === 'function' ? second : typeof third === 'function' ? third : () => false
+    const path = typeof second === 'string' ? second : typeof third === 'string' ? third : undefined
+
     const changeSet = this.validateSet(id)
     const requireIdle = (): void => {
       if (projectBusy(changeSet.projectId))
@@ -982,11 +1415,28 @@ export class WorkspaceChanges {
         'WORKSPACE_BUSY',
         'An Agent is still running in this Project. No files were changed.',
       )
-    if (changeSet.state !== 'ready' || changeSet.undoUnavailableReason)
-      throw new WorkspaceChangeError(
-        'WORKSPACE_UNDO_UNAVAILABLE',
-        changeSet.undoUnavailableReason ?? 'This round cannot be undone again.',
-      )
+    const assertRoundUndoEligible = (
+      record: WorkspaceChangeSetRecord,
+      fallbackMessage: string,
+    ): void => {
+      if (path !== undefined) {
+        if (
+          record.undoUnavailableReason !== null ||
+          (record.state !== 'ready' && record.state !== 'mixed')
+        )
+          throw new WorkspaceChangeError(
+            'WORKSPACE_UNDO_UNAVAILABLE',
+            record.undoUnavailableReason ?? fallbackMessage,
+          )
+        return
+      }
+      if (record.state !== 'ready' || record.undoUnavailableReason !== null)
+        throw new WorkspaceChangeError(
+          'WORKSPACE_UNDO_UNAVAILABLE',
+          this.repository.summary(record.id).undoUnavailableReason ?? fallbackMessage,
+        )
+    }
+    assertRoundUndoEligible(changeSet, 'This round cannot be undone again.')
     if (this.undoOperations.has(changeSet.projectId) || this.undoOperations.size >= UNDO_OPERATIONS)
       throw new WorkspaceChangeError(
         'WORKSPACE_BUSY',
@@ -1035,11 +1485,7 @@ export class WorkspaceChanges {
         operation,
       )
       const latest = this.validateSet(id)
-      if (latest.state !== 'ready' || latest.undoUnavailableReason)
-        throw new WorkspaceChangeError(
-          'WORKSPACE_UNDO_UNAVAILABLE',
-          latest.undoUnavailableReason ?? 'This round is no longer available for Undo.',
-        )
+      assertRoundUndoEligible(latest, 'This round is no longer available for Undo.')
       if (reservation.root !== changeSet.root)
         throw new WorkspaceChangeError(
           'WORKSPACE_CONFLICT',
@@ -1053,136 +1499,28 @@ export class WorkspaceChanges {
           'WORKSPACE_CONFLICT',
           'The Project directory object was replaced. No files were changed.',
         )
+      const selection = selectUndoTargets(this.repository, id, path)
       operation.releaseScratch = this.reserveScratch(
         WORKSPACE_ROUND_BYTES + WORKSPACE_FILE_BYTES,
         controller.signal,
       )
-      await mkdir(work, { mode: 0o700 })
+      await mkdir(work, { recursive: true, mode: 0o700 })
       const staging = await stat(work, { bigint: true })
       if (staging.dev.toString() !== reservation.rootDevice)
         throw new WorkspaceChangeError(
           'WORKSPACE_UNDO_UNAVAILABLE',
           'The Project and protected storage are on different volumes. Saved changes remain readable, but Undo is unavailable. No Project files were changed.',
         )
-      const prepared: ApplyFile[] = []
-      const conflicts: string[] = []
-      let candidateBytes = 0
-      let backupBytes = 0
-      const retained = this.roundVersions(id)
-      for (const file of this.repository.files(id)) {
-        controller.signal.throwIfAborted()
-        try {
-          const current = await this.capture(
-            reservation.root,
-            file.path,
-            undefined,
-            controller.signal,
-            reservation,
-          )
-          let desired = file.before
-          const textOnly = file.modeKnown === false
-          if (textOnly) {
-            if (!current.hash || !file.before.hash || !file.after.hash || file.previousPath)
-              throw new Error('Path metadata is unavailable for Undo.')
-            desired = { ...file.before, mode: current.mode }
-          }
-          if (
-            file.undoStrategy === 'unavailable' ||
-            file.undoStrategy === 'patch' ||
-            file.beforeAvailable === false ||
-            file.afterAvailable === false
-          )
-            throw new Error('Complete original and final native file versions are unavailable.')
-          if (
-            textOnly
-              ? current.hash !== file.after.hash || current.bytes !== file.after.bytes
-              : !this.equal(current, file.after)
-          ) {
-            if (
-              !current.hash ||
-              !file.before.hash ||
-              !file.after.hash ||
-              (!textOnly && current.mode !== file.after.mode) ||
-              (!textOnly && file.before.mode !== file.after.mode) ||
-              file.previousPath
-            )
-              throw new Error('Path, type or metadata conflict.')
-            for (const version of [current, file.before, file.after])
-              await this.verifyVersion(this.blobPath(version.hash!), version, controller.signal)
-            if (
-              !(await this.textual(current, controller.signal)) ||
-              !(await this.textual(file.before, controller.signal)) ||
-              !(await this.textual(file.after, controller.signal))
-            )
-              throw new Error('Binary conflict.')
-            const merged = join(work, `merged-${prepared.length}`)
-            const result = await workspaceGit(
-              [
-                'merge-file',
-                '-p',
-                this.blobPath(current.hash),
-                this.blobPath(file.after.hash),
-                this.blobPath(file.before.hash),
-              ],
-              work,
-              controller.signal,
-              merged,
-            )
-            if (result.code !== 0) throw new Error('Text conflict.')
-            desired = await this.captureStaged(
-              merged,
-              textOnly ? current.mode : file.before.mode,
-              undefined,
-              controller.signal,
-            )
-            await unlink(merged)
-          }
-          candidateBytes += desired.bytes
-          backupBytes += current.bytes
-          for (const version of [current, desired]) {
-            if (version.hash && !retained.hashes.has(version.hash)) {
-              retained.hashes.add(version.hash)
-              retained.bytes += version.bytes
-            }
-          }
-          if (
-            candidateBytes + backupBytes > WORKSPACE_ROUND_BYTES ||
-            retained.bytes + backupBytes > WORKSPACE_ROUND_BYTES
-          )
-            throw new WorkspaceChangeError(
-              'VALIDATION',
-              'Undo candidates exceed the round temporary-storage budget.',
-            )
-          const stage = desired.hash ? join(work, `candidate-${prepared.length}`) : null
-          if (stage) {
-            await this.copyVersion(desired, stage, controller.signal)
-          }
-          prepared.push({
-            path: file.path,
-            before: current,
-            after: desired,
-            stage,
-            backup: join(work, `original-${prepared.length}`),
-          })
-        } catch (error) {
-          if (controller.signal.aborted) throw error
-          conflicts.push(file.path)
-        }
-      }
-      // Nothing above this line creates/removes/replaces any Project file.
-      if (conflicts.length)
-        throw new WorkspaceChangeError(
-          'WORKSPACE_CONFLICT',
-          `Undo was refused for the entire round. No files were changed. Conflicts: ${conflicts.slice(0, 5).join(', ')}${conflicts.length > 5 ? '…' : ''}`,
-        )
-      for (const file of prepared) {
-        const current = await this.observe(reservation, file.path, controller.signal)
-        if (!this.equal(current, file.before))
-          throw new WorkspaceChangeError(
-            'WORKSPACE_CONFLICT',
-            `Undo was refused because ${file.path} changed during checking. No files were changed.`,
-          )
-      }
+      const undoCtx = this.undoContext()
+      const plan = await planUndoOperations(
+        undoCtx,
+        reservation,
+        id,
+        work,
+        selection.targets,
+        selection.targetPath,
+        controller.signal,
+      )
       controller.signal.throwIfAborted()
       requireIdle()
       intentId = randomUUID()
@@ -1190,12 +1528,26 @@ export class WorkspaceChanges {
         id: intentId,
         changeSetId: id,
         kind: 'undo',
-        payload: { root: reservation.root, files: prepared },
-        retainedBytes: prepared.reduce((sum, file) => sum + file.before.bytes, 0),
+        payload: {
+          root: reservation.root,
+          ...(selection.targetPath ? { path: selection.targetPath } : {}),
+          files: plan.prepared,
+        },
+        retainedBytes: plan.prepared.reduce((sum, file) => sum + file.before.bytes, 0),
       })
       try {
-        await this.apply(reservation, prepared, controller.signal, intentId, operation, requireIdle)
-        return this.repository.completeUndo(intentId, id)
+        await applyUndoOperations(
+          undoCtx,
+          reservation,
+          plan,
+          controller.signal,
+          intentId,
+          operation,
+          requireIdle,
+        )
+        return selection.targetPath !== undefined
+          ? this.repository.markFileUndone(id, selection.targetPath, intentId)
+          : this.repository.completeUndo(intentId, id)
       } catch (error) {
         if (!operation.applicationStarted) {
           this.repository.cancelUnappliedUndo(intentId)
@@ -1222,6 +1574,46 @@ export class WorkspaceChanges {
     }
   }
 
+  private undoContext(): UndoExecutionContext {
+    return {
+      repository: this.repository,
+      storageRoot: this.storageRoot,
+      capture: (root, filePath, signal, reservation) =>
+        this.capture(root, filePath, undefined, signal, reservation),
+      observe: (reservation, filePath, signal) => this.observe(reservation, filePath, signal),
+      captureStaged: (stagedPath, mode, signal) =>
+        this.captureStaged(stagedPath, mode, undefined, signal),
+      validateDirectoryJob: (reservation, rawPath, operation, auxiliaryPath) => {
+        buildValidatedDirectoryJobInput(
+          this.liveDatabaseFile,
+          reservation,
+          rawPath,
+          operation,
+          auxiliaryPath,
+        )
+      },
+      directoryJob: (reservation, rawPath, operation, signal, auxiliaryPath) =>
+        this.directoryJob(reservation, rawPath, operation, signal, auxiliaryPath),
+      inspectParentDirs: (reservation, rawPath, signal) =>
+        inspectParentDirectoriesViaWorker(
+          this.directoryOperation,
+          this.liveDatabaseFile,
+          reservation,
+          rawPath,
+          signal,
+        ),
+      ensureParentDirs: (reservation, rawPath, signal) =>
+        ensureParentDirectoriesViaWorker(
+          this.directoryOperation,
+          this.liveDatabaseFile,
+          reservation,
+          rawPath,
+          signal,
+        ),
+      roundVersions: (changeSetId) => this.roundVersions(changeSetId),
+    }
+  }
+
   async dispose(): Promise<void> {
     this.disposed = true
     const undos = [...this.undoOperations.values()]
@@ -1236,6 +1628,7 @@ export class WorkspaceChanges {
       ...active.map((context) => this.finish(context.run.id)),
       ...[...this.finishing.values()].map((entry) => entry.promise),
     ])
+    await this.retryPendingAnchorDeletions()
     if (
       [...undoResults, ...preparations, ...finished].some(
         (result) => result.status === 'rejected',
@@ -1246,59 +1639,6 @@ export class WorkspaceChanges {
         'WORKSPACE_RECOVERY_REQUIRED',
         'Some file recording resources did not finish cleanup. Their ownership is retained until Pact exits.',
       )
-  }
-
-  private async apply(
-    reservation: WorkspaceReservation,
-    files: ApplyFile[],
-    signal: AbortSignal,
-    intentId: string,
-    operation: UndoOperation,
-    requireIdle: () => void,
-  ): Promise<void> {
-    let actualBackupBytes = 0
-    for (const file of files) {
-      signal.throwIfAborted()
-      requireIdle()
-      if (file.before.hash) {
-        let stashFailure: { error: unknown } | undefined
-        try {
-          operation.applicationStarted = true
-          await this.directoryJob(reservation, file.path, 'stash', signal, file.backup)
-        } catch (error) {
-          stashFailure = { error }
-        }
-        const saved = await lstat(file.backup).catch((error) => {
-          if (this.missing(error)) return undefined
-          throw error
-        })
-        if (saved) actualBackupBytes += saved.size
-        const intent = this.repository.findIntent(intentId)!
-        const remainingEstimate = files
-          .slice(files.indexOf(file) + 1)
-          .reduce((sum, later) => sum + later.before.bytes, 0)
-        const retainedBytes = Math.max(intent.retainedBytes, actualBackupBytes + remainingEstimate)
-        this.repository.intent({ ...intent, retainedBytes })
-        if (stashFailure) throw stashFailure.error
-        const actual = await this.captureStaged(file.backup, undefined, undefined, signal)
-        if (!this.equal(actual, file.before))
-          throw new Error(
-            'A source changed after Undo preflight; its actual object was preserved. Undo did not complete.',
-          )
-      }
-    }
-    for (const file of files) {
-      signal.throwIfAborted()
-      if (file.stage) {
-        requireIdle()
-        // Creating a hard link is exclusive: EEXIST preserves any external file that appeared.
-        operation.applicationStarted = true
-        await this.directoryJob(reservation, file.path, 'install', signal, file.stage)
-        await unlink(file.stage)
-      } else {
-        await this.directoryJob(reservation, file.path, 'absent', signal)
-      }
-    }
   }
 
   private async capture(
@@ -1317,11 +1657,12 @@ export class WorkspaceChanges {
         'PERMISSION_DENIED',
         'No directory-object authority is available for this file read.',
       )
-    const releaseScratch = this.reserveScratch(WORKSPACE_FILE_BYTES, signal)
     const temporary = join(this.storageRoot, `directory-capture-${randomUUID()}`)
+    buildValidatedDirectoryJobInput(this.liveDatabaseFile, authority, path, 'capture', temporary)
+    const releaseScratch = this.reserveScratch(WORKSPACE_FILE_BYTES, signal)
     try {
       const result = await this.directoryJob(authority, path, 'capture', signal, temporary)
-      if (!result.existed) return EMPTY
+      if (!result.existed) return EMPTY_VERSION
       const captured = await this.captureStaged(temporary, result.mode, context, signal)
       if (captured.hash !== result.hash || captured.bytes !== result.bytes)
         throw new WorkspaceChangeError(
@@ -1332,7 +1673,7 @@ export class WorkspaceChanges {
     } finally {
       try {
         await unlink(temporary).catch((error) => {
-          if (!this.missing(error)) throw error
+          if (!isEnoent(error)) throw error
         })
       } finally {
         releaseScratch()
@@ -1340,50 +1681,24 @@ export class WorkspaceChanges {
     }
   }
 
-  private async directoryJob(
+  private directoryJob(
     reservation: WorkspaceReservation,
     rawPath: string,
-    operation: DirectoryFileOperationInput['operation'],
+    operation: StandardDirectoryOperation,
     signal: AbortSignal,
     auxiliaryPath?: string,
     linkedCandidatePath?: string,
-  ) {
-    if (!this.directoryOperation)
-      throw new WorkspaceChangeError(
-        'PERMISSION_DENIED',
-        'Protected directory operations are unavailable; no Project file will be changed.',
-      )
-    signal.throwIfAborted()
-    const relativePath = this.safeRelative(rawPath)
-    if (this.liveDatabaseFile) {
-      const target = this.key(join(reservation.root, relativePath))
-      if (
-        ['', '-wal', '-shm', '-journal'].some(
-          (suffix) => target === this.key(`${this.liveDatabaseFile}${suffix}`),
-        )
-      )
-        throw new WorkspaceChangeError(
-          'PERMISSION_DENIED',
-          'Pact’s live database and journal files are not Project-editing targets.',
-        )
-    }
-    const parts = relativePath.split('/')
-    const result = await this.directoryOperation(
-      {
-        operation,
-        rootPath: reservation.root,
-        rootDevice: reservation.rootDevice,
-        rootInode: reservation.rootInode,
-        directories: parts.slice(0, -1),
-        name: parts.at(-1)!,
-        ...(auxiliaryPath ? { auxiliaryPath } : {}),
-        ...(linkedCandidatePath ? { linkedCandidatePath } : {}),
-        maximumBytes: WORKSPACE_FILE_BYTES,
-      },
+  ): Promise<Extract<DirectoryFileOperationResult, { ok: true }>> {
+    return executeDirectoryJob(
+      this.directoryOperation,
+      this.liveDatabaseFile,
+      reservation,
+      rawPath,
+      operation,
       signal,
+      auxiliaryPath,
+      linkedCandidatePath,
     )
-    if (!result.ok) throw new WorkspaceChangeError('VALIDATION', result.message)
-    return result
   }
 
   private async captureStaged(
@@ -1391,6 +1706,8 @@ export class WorkspaceChanges {
     mode: number | undefined,
     context: WorkspaceRun | undefined,
     signal: AbortSignal,
+    promotedAnchorBytes = 0,
+    excludeAnchorPath?: string,
   ): Promise<WorkspaceFileVersion> {
     signal.throwIfAborted()
     const metadata = await lstat(path)
@@ -1404,6 +1721,25 @@ export class WorkspaceChanges {
         'VALIDATION',
         'This file exceeds the 64 MiB complete-snapshot limit; Undo is unavailable.',
       )
+    const netRoundDelta = Math.max(0, metadata.size - promotedAnchorBytes)
+    if (context) {
+      const roundExcess =
+        context.retainedBytes +
+        context.backupBytes +
+        context.anchorBytes +
+        netRoundDelta -
+        WORKSPACE_ROUND_BYTES
+      const storageExcess =
+        this.repository.blobBytes() +
+        this.pendingBlobBytes +
+        this.scratchBytes +
+        metadata.size * 2 -
+        WORKSPACE_STORAGE_BYTES
+      const bytesToFree = Math.max(roundExcess, storageExcess)
+      if (bytesToFree > 0 && context.anchorBytes > 0) {
+        await this.evictUnusedAnchors(context, bytesToFree, excludeAnchorPath)
+      }
+    }
     if (
       this.repository.blobBytes() + this.pendingBlobBytes + this.scratchBytes + metadata.size * 2 >
       WORKSPACE_STORAGE_BYTES
@@ -1414,7 +1750,8 @@ export class WorkspaceChanges {
       )
     if (
       context &&
-      context.retainedBytes + context.backupBytes + metadata.size > WORKSPACE_ROUND_BYTES
+      context.retainedBytes + context.backupBytes + context.anchorBytes + netRoundDelta >
+        WORKSPACE_ROUND_BYTES
     )
       throw new WorkspaceChangeError(
         'VALIDATION',
@@ -1477,8 +1814,8 @@ export class WorkspaceChanges {
       await destination.close()
       destination = undefined
       const digest = hash.digest('hex')
-      await this.verifyVersion(temporary, { hash: digest, bytes: total, mode: 0 }, signal)
-      const stored = this.blobPath(digest)
+      await verifyFileVersion(temporary, { hash: digest, bytes: total, mode: 0 }, signal)
+      const stored = blobPathFor(this.storageRoot, digest)
       await mkdir(dirname(stored), { recursive: true, mode: 0o700 })
       // Admission precedes the persistent link: an abort cannot leave an uncharged blob.
       // A failed private installation may leave conservatively charged metadata; no caller
@@ -1487,11 +1824,11 @@ export class WorkspaceChanges {
       try {
         await link(temporary, stored)
         await chmod(stored, 0o400)
-        await this.syncDirectory(dirname(stored))
+        await syncDirectory(dirname(stored))
       } catch (error) {
-        if (!this.exists(error)) throw error
+        if (!isEexist(error)) throw error
       }
-      await this.verifyVersion(stored, { hash: digest, bytes: total, mode: 0 }, signal)
+      await verifyFileVersion(stored, { hash: digest, bytes: total, mode: 0 }, signal)
       const version = { hash: digest, bytes: total, mode: mode ?? metadata.mode & 0o7777 }
       if (context && !context.retainedHashes.has(digest)) {
         context.retainedHashes.add(digest)
@@ -1505,70 +1842,12 @@ export class WorkspaceChanges {
           ...(destination ? [destination.close()] : []),
         ])
         await unlink(temporary).catch((error) => {
-          if (!this.missing(error)) throw error
+          if (!isEnoent(error)) throw error
         })
       } finally {
         this.pendingBlobBytes -= metadata.size
         releaseScratch()
       }
-    }
-  }
-
-  private async statistics(
-    before: WorkspaceFileVersion,
-    after: WorkspaceFileVersion,
-    work: string,
-    signal: AbortSignal,
-  ): Promise<{ additions: number | null; deletions: number | null }> {
-    const empty = join(work, 'empty')
-    await this.writeDurable(empty, Buffer.alloc(0), true)
-    const result = await workspaceGit(
-      [
-        'diff',
-        '--no-index',
-        '--numstat',
-        '-z',
-        '--',
-        before.hash ? this.blobPath(before.hash) : empty,
-        after.hash ? this.blobPath(after.hash) : empty,
-      ],
-      work,
-      signal,
-    )
-    if (result.code > 1)
-      throw new WorkspaceChangeError('VALIDATION', 'Git could not inspect the saved change.')
-    if (!result.output) return { additions: 0, deletions: 0 }
-    const [added, removed] = result.output.split('\t')
-    return {
-      additions: added === '-' ? null : Number(added),
-      deletions: removed === '-' ? null : Number(removed),
-    }
-  }
-
-  private async textual(version: WorkspaceFileVersion, signal: AbortSignal): Promise<boolean> {
-    if (!version.hash) return false
-    const handle = await open(this.blobPath(version.hash), 'r')
-    const decoder = new TextDecoder('utf-8', { fatal: true })
-    const buffer = Buffer.alloc(64 * 1024)
-    try {
-      let position = 0
-      while (true) {
-        signal.throwIfAborted()
-        const read = await handle.read(buffer, 0, buffer.length, position)
-        if (!read.bytesRead) break
-        const bytes = buffer.subarray(0, read.bytesRead)
-        if (bytes.includes(0)) return false
-        decoder.decode(bytes, { stream: true })
-        position += bytes.length
-        if (position > WORKSPACE_FILE_BYTES) return false
-      }
-      decoder.decode()
-      return true
-    } catch {
-      signal.throwIfAborted()
-      return false
-    } finally {
-      await handle.close()
     }
   }
 
@@ -1597,36 +1876,19 @@ export class WorkspaceChanges {
     if (root.dev !== stage.dev)
       context.unavailableReason ??=
         'The Project and protected storage are on different volumes. Saved changes remain readable, but Undo is unavailable.'
-    await this.syncDirectory(dirname(context.stagingRoot))
+    await syncDirectory(dirname(context.stagingRoot))
     context.stagingReady = true
-  }
-
-  private safeRelative(path: string): string {
-    // oxlint-disable-next-line no-control-regex -- File names must reject control characters at this trust seam.
-    if (isAbsolute(path) || path.includes('\\') || /[\u0000-\u001f]/u.test(path))
-      throw new WorkspaceChangeError('VALIDATION', 'Use a regular Project-relative file path.')
-    const parts = path.split('/')
-    if (
-      parts.some(
-        (part) =>
-          !part ||
-          part === '.' ||
-          part === '..' ||
-          part.toLowerCase() === '.git' ||
-          (process.platform === 'win32' && /[:*?"<>|]|[ .]$/u.test(part)),
-      )
-    )
-      throw new WorkspaceChangeError(
-        'VALIDATION',
-        'This Project path is unsupported or targets protected repository metadata.',
-      )
-    return parts.join('/')
   }
 
   private validateSet(id: string) {
     const changeSet = this.repository.find(id)
     const session = changeSet ? this.sessions.find(changeSet.sessionId) : undefined
-    if (!changeSet || !session || session.status === 'archived')
+    if (
+      !changeSet ||
+      (changeSet.fileCount === 0 && changeSet.state !== 'recovery_required') ||
+      !session ||
+      session.status === 'archived'
+    )
       throw new WorkspaceChangeError('VALIDATION', 'This saved round is unavailable.')
     return changeSet
   }
@@ -1646,18 +1908,9 @@ export class WorkspaceChanges {
     })
   }
 
-  private async pruneWork(work: string, keep: Set<string>): Promise<void> {
-    const entries = await readdir(work).catch(() => [])
-    for (const name of entries) {
-      if (keep.has(name)) continue
-      await rm(join(work, name), { recursive: true, force: true })
-    }
-    if (!keep.size) await rm(work, { recursive: true, force: true })
-  }
-
   private intentFiles(intent: WorkspaceChangeIntent): ApplyFile[] {
     const raw = intent.payload['files']
-    if (!Array.isArray(raw) || raw.length > WORKSPACE_CHANGE_FILES)
+    if (!Array.isArray(raw) || raw.length > WORKSPACE_CHANGE_FILES * 2)
       throw new Error('The saved workspace operation has invalid file references.')
     return raw.map((file: unknown) => {
       if (!file || typeof file !== 'object') throw new Error('Invalid workspace recovery file.')
@@ -1672,7 +1925,7 @@ export class WorkspaceChanges {
       )
         throw new Error('Invalid workspace recovery paths.')
       return {
-        path: this.safeRelative(path),
+        path: safeRelativePath(path),
         before: workspaceFileVersionSchema.parse(Reflect.get(file, 'before')),
         after: workspaceFileVersionSchema.parse(Reflect.get(file, 'after')),
         backup,
@@ -1705,7 +1958,9 @@ export class WorkspaceChanges {
     if (intent) {
       const applicationConfirmed =
         intent.status === 'applied' &&
-        (intent.kind !== 'undo' || this.repository.find(intent.changeSetId)?.state === 'undone')
+        (intent.kind !== 'undo' ||
+          intent.reconciledAt !== null ||
+          this.repository.find(intent.changeSetId)?.state === 'undone')
       for (const file of this.intentFiles(intent)) {
         for (const path of [
           file.backup,
@@ -1714,7 +1969,7 @@ export class WorkspaceChanges {
           if (dirname(path) !== work)
             throw new Error('A saved private file escaped its operation directory.')
           const saved = await lstat(path).catch((error) => {
-            if (this.missing(error)) return undefined
+            if (isEnoent(error)) return undefined
             throw error
           })
           if (saved) {
@@ -1726,7 +1981,7 @@ export class WorkspaceChanges {
     }
     // Unreferenced Git inputs/outputs are never recovery evidence. Pending candidates and
     // displaced objects are retained and charged before their scratch reservation is released.
-    await this.pruneWork(work, keep)
+    await pruneWorkDirectory(work, keep)
     if (intent && retainedBytes > intent.retainedBytes)
       this.repository.intent({ ...intent, retainedBytes })
   }
@@ -1737,32 +1992,26 @@ export class WorkspaceChanges {
       intents.map((intent) => [dirname(this.intentFiles(intent)[0]?.backup ?? ''), intent.id]),
     )
     const entries = await readdir(record.stagingRoot).catch((error) => {
-      if (this.missing(error)) return []
+      if (isEnoent(error)) return []
       throw error
     })
     if (entries.length > RECOVERY_PATH_REFERENCES + 1)
       throw new Error('Workspace temporary directories exceed their round limit.')
     for (const name of entries) {
       signal.throwIfAborted()
-      if (!/^(operation|undo)-[a-f\d-]{36}$/u.test(name)) continue
       const work = join(record.stagingRoot, name)
-      await this.pruneIntentWork(work, byWork.get(work))
-    }
-  }
-
-  private async pruneCaptures(signal: AbortSignal): Promise<void> {
-    const directory = await opendir(this.storageRoot)
-    let count = 0
-    try {
-      for await (const entry of directory) {
-        signal.throwIfAborted()
-        count += 1
-        if (count > 4096) throw new Error('Workspace capture cleanup exceeded its entry budget.')
-        if (entry.isFile() && /^(directory-capture|capture)-[a-f\d-]{36}$/u.test(entry.name))
-          await unlink(join(this.storageRoot, entry.name))
+      if (/^(operation|undo)-[a-f\d-]{36}$/u.test(name)) {
+        await this.pruneIntentWork(work, byWork.get(work))
+        continue
       }
-    } finally {
-      await directory.close().catch(() => undefined)
+      if (
+        !byWork.has(work) &&
+        /^(native-patch|native-revpatch|native-patch-input|native-revpatch-input|native|anchor)-[a-f\d-]{36}$/u.test(
+          name,
+        )
+      ) {
+        await rm(work, { recursive: true, force: true })
+      }
     }
   }
 
@@ -1784,126 +2033,6 @@ export class WorkspaceChanges {
       if (released) return
       released = true
       this.scratchBytes -= bytes
-    }
-  }
-
-  private async copyVersion(
-    version: WorkspaceFileVersion,
-    destination: string,
-    signal: AbortSignal,
-  ): Promise<void> {
-    if (!version.hash) throw new Error('An absent version cannot be copied.')
-    signal.throwIfAborted()
-    await copyFile(this.blobPath(version.hash), destination, constants.COPYFILE_EXCL)
-    if (process.platform === 'win32') {
-      const named = await lstat(destination, { bigint: true })
-      if (!named.isFile() || named.isSymbolicLink() || named.nlink !== 1n)
-        throw new WorkspaceChangeError('VALIDATION', 'The copied version is unavailable.')
-      const original = await open(destination, 'r')
-      let writable: FileHandle | undefined
-      let verified = false
-      try {
-        const opened = await original.stat({ bigint: true })
-        if (opened.dev !== named.dev || opened.ino !== named.ino || opened.nlink !== 1n)
-          throw new WorkspaceChangeError('VALIDATION', 'The copied version changed.')
-        verified = true
-        // Windows fchmod operates on this verified object through ReOpenFile.
-        // A path replacement must never make an immutable blob temporarily writable.
-        await original.chmod(0o600)
-        writable = await open(destination, 'r+')
-        const next = await writable.stat({ bigint: true })
-        if (next.dev !== opened.dev || next.ino !== opened.ino || next.nlink !== 1n)
-          throw new WorkspaceChangeError('VALIDATION', 'The copied version changed.')
-        await original.chmod(version.mode)
-        await this.verifyVersion(destination, version, signal, true)
-        await writable.sync()
-        const current = await lstat(destination, { bigint: true })
-        if (
-          !current.isFile() ||
-          current.isSymbolicLink() ||
-          current.nlink !== 1n ||
-          current.dev !== opened.dev ||
-          current.ino !== opened.ino
-        )
-          throw new WorkspaceChangeError('VALIDATION', 'The copied version changed.')
-      } finally {
-        try {
-          if (verified) await original.chmod(version.mode)
-        } finally {
-          try {
-            await writable?.close()
-          } finally {
-            await original.close()
-          }
-        }
-      }
-    } else {
-      await chmod(destination, version.mode)
-      await this.verifyVersion(destination, version, signal, true)
-      const handle = await open(destination, 'r')
-      try {
-        await handle.sync()
-      } finally {
-        await handle.close()
-      }
-    }
-    await this.syncDirectory(dirname(destination))
-  }
-
-  private async verifyVersion(
-    path: string,
-    version: WorkspaceFileVersion,
-    signal: AbortSignal,
-    checkMode = false,
-  ): Promise<void> {
-    signal.throwIfAborted()
-    const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
-    try {
-      const before = await handle.stat({ bigint: true })
-      if (
-        !before.isFile() ||
-        before.size !== BigInt(version.bytes) ||
-        (checkMode && Number(before.mode & 0o7777n) !== version.mode)
-      )
-        throw new WorkspaceChangeError(
-          'VALIDATION',
-          'A saved version has incomplete bytes or metadata.',
-        )
-      const hash = createHash('sha256')
-      const buffer = Buffer.alloc(64 * 1024)
-      let offset = 0
-      while (offset < version.bytes) {
-        signal.throwIfAborted()
-        const read = await handle.read(
-          buffer,
-          0,
-          Math.min(buffer.length, version.bytes - offset),
-          offset,
-        )
-        if (!read.bytesRead)
-          throw new WorkspaceChangeError(
-            'VALIDATION',
-            'A saved version ended before its expected byte count.',
-          )
-        hash.update(buffer.subarray(0, read.bytesRead))
-        offset += read.bytesRead
-      }
-      const after = await handle.stat({ bigint: true })
-      const named = await lstat(path, { bigint: true })
-      if (
-        hash.digest('hex') !== version.hash ||
-        before.size !== after.size ||
-        before.mtimeNs !== after.mtimeNs ||
-        before.ctimeNs !== after.ctimeNs ||
-        named.dev !== before.dev ||
-        named.ino !== before.ino
-      )
-        throw new WorkspaceChangeError(
-          'VALIDATION',
-          'The saved file version failed its complete integrity check.',
-        )
-    } finally {
-      await handle.close()
     }
   }
 
@@ -1985,11 +2114,11 @@ export class WorkspaceChanges {
                 'The saved candidate escaped its private operation directory.',
               )
             const staged = await lstat(file.stage).catch((error) => {
-              if (this.missing(error)) return undefined
+              if (isEnoent(error)) return undefined
               throw error
             })
             if (staged?.nlink === 2) {
-              await this.verifyVersion(file.stage, file.after, signal, true)
+              await verifyFileVersion(file.stage, file.after, signal, true)
               linkedCandidate = file.stage
             }
           }
@@ -2000,7 +2129,7 @@ export class WorkspaceChanges {
             linkedCandidate,
             file.after,
           )
-          if (!this.equal(current, file.before) && !this.equal(current, file.after))
+          if (!versionsEqual(current, file.before) && !versionsEqual(current, file.after))
             throw new WorkspaceChangeError(
               'WORKSPACE_RECOVERY_REQUIRED',
               `The interrupted path ${file.path} has external content or metadata outside its saved versions. No Project files were changed; recovery evidence is retained.`,
@@ -2035,8 +2164,16 @@ export class WorkspaceChanges {
     linkedCandidatePath?: string,
     linkedCandidateVersion?: WorkspaceFileVersion,
   ): Promise<WorkspaceFileVersion> {
-    const releaseScratch = this.reserveScratch(WORKSPACE_FILE_BYTES, signal)
     const temporary = join(this.storageRoot, `directory-capture-${randomUUID()}`)
+    buildValidatedDirectoryJobInput(
+      this.liveDatabaseFile,
+      reservation,
+      path,
+      'capture',
+      temporary,
+      linkedCandidatePath,
+    )
+    const releaseScratch = this.reserveScratch(WORKSPACE_FILE_BYTES, signal)
     try {
       const result = await this.directoryJob(
         reservation,
@@ -2047,9 +2184,9 @@ export class WorkspaceChanges {
         linkedCandidatePath,
       )
       const version = { hash: result.hash, bytes: result.bytes, mode: result.mode }
-      if (result.existed) await this.verifyVersion(temporary, version, signal)
+      if (result.existed) await verifyFileVersion(temporary, version, signal)
       if (linkedCandidatePath) {
-        if (!linkedCandidateVersion || !this.equal(version, linkedCandidateVersion))
+        if (!linkedCandidateVersion || !versionsEqual(version, linkedCandidateVersion))
           throw new WorkspaceChangeError(
             'WORKSPACE_RECOVERY_REQUIRED',
             'The interrupted candidate changed before observation; all recovery evidence was retained.',
@@ -2067,65 +2204,17 @@ export class WorkspaceChanges {
         // Only the intent-owned private alias is released. Saved immutable bytes and
         // the Project name/object remain intact; unrelated hard links are never allowed.
         await unlink(linkedCandidatePath)
-        await this.syncDirectory(dirname(linkedCandidatePath))
+        await syncDirectory(dirname(linkedCandidatePath))
       }
       return version
     } finally {
       try {
         await unlink(temporary).catch((error) => {
-          if (!this.missing(error)) throw error
+          if (!isEnoent(error)) throw error
         })
       } finally {
         releaseScratch()
       }
     }
-  }
-
-  private async writeDurable(path: string, bytes: Buffer, allowExisting = false): Promise<void> {
-    let handle: Awaited<ReturnType<typeof open>>
-    try {
-      handle = await open(path, 'wx', 0o600)
-    } catch (error) {
-      if (allowExisting && this.exists(error)) return
-      throw error
-    }
-    try {
-      await handle.writeFile(bytes)
-      await handle.sync()
-    } finally {
-      await handle.close()
-    }
-    await this.syncDirectory(dirname(path))
-  }
-
-  private async syncDirectory(path: string): Promise<void> {
-    if (process.platform === 'win32') return
-    const directory = await open(path, 'r')
-    try {
-      await directory.sync()
-    } finally {
-      await directory.close()
-    }
-  }
-
-  private blobPath(hash: string): string {
-    if (!/^[a-f\d]{64}$/u.test(hash))
-      throw new WorkspaceChangeError('VALIDATION', 'Invalid saved file reference.')
-    return join(this.storageRoot, 'objects', hash.slice(0, 2), hash)
-  }
-  private hash(bytes: Buffer): string {
-    return createHash('sha256').update(bytes).digest('hex')
-  }
-  private key(path: string): string {
-    return process.platform === 'win32' ? path.toLowerCase() : path
-  }
-  private equal(a: WorkspaceFileVersion, b: WorkspaceFileVersion): boolean {
-    return a.hash === b.hash && a.bytes === b.bytes && a.mode === b.mode
-  }
-  private missing(error: unknown): boolean {
-    return Boolean(error && typeof error === 'object' && Reflect.get(error, 'code') === 'ENOENT')
-  }
-  private exists(error: unknown): boolean {
-    return Boolean(error && typeof error === 'object' && Reflect.get(error, 'code') === 'EEXIST')
   }
 }

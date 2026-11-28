@@ -10,7 +10,11 @@ import {
 } from '@pact/contracts'
 
 import { markdownProjectionRehypePlugin } from '../../../../shared/message-anchor-text'
-import { MessageSelectionSurface, type MessageTextSelection } from './MessageSelectionSurface'
+import {
+  MessageSelectionSurface,
+  type MessageTextSelection,
+  type DocumentSelectionAdapter,
+} from './MessageSelectionSurface'
 
 export interface ProjectFileTarget {
   path: string
@@ -30,6 +34,8 @@ interface MessageMarkdownProps {
   onOpenProjectFile: (target: ProjectFileTarget) => void
   messageId?: string | undefined
   onCreateComment?: ((selection: MessageTextSelection) => void) | undefined
+  onAskInSideChat?: ((selection: MessageTextSelection) => void) | undefined
+  documentSelection?: DocumentSelectionAdapter | undefined
 }
 
 export const MessageMarkdown = memo(function MessageMarkdown({
@@ -39,6 +45,8 @@ export const MessageMarkdown = memo(function MessageMarkdown({
   onOpenProjectFile,
   messageId,
   onCreateComment,
+  onAskInSideChat,
+  documentSelection,
 }: MessageMarkdownProps): React.JSX.Element {
   const openProjectFileRef = useRef(onOpenProjectFile)
   useLayoutEffect(() => {
@@ -64,11 +72,17 @@ export const MessageMarkdown = memo(function MessageMarkdown({
           )
           .map(([name, start, end]) => ({ name, start, end }))
       : []
+    const prefix = parseComposerCommandPrefix(decorationContent, selected)
     const ranges: SkillRange[] = []
-    for (const entry of [
-      ...parseComposerCommandPrefix(decorationContent, selected).skills,
-      ...selected,
-    ]) {
+    if (prefix.pact && !prefix.error) {
+      const leading = decorationContent.slice(0, prefix.argumentsStart)
+      const command = /(?:^|\s)\/(plan|review|build)(?=\s|$)/u.exec(leading)
+      if (command?.[1] === prefix.pact) {
+        const start = command.index + command[0].lastIndexOf('/')
+        ranges.push({ name: prefix.pact, start, end: start + prefix.pact.length + 1, pact: true })
+      }
+    }
+    for (const entry of [...prefix.skills, ...selected]) {
       if (
         decorationContent.slice(entry.start, entry.end) !== `/${entry.name}` ||
         ranges.some((range) => range.start === entry.start && range.end === entry.end)
@@ -106,7 +120,12 @@ export const MessageMarkdown = memo(function MessageMarkdown({
     [content, tree, markdownComponents, remarkPlugins, rehypePlugins],
   )
   return (
-    <MessageSelectionSurface messageId={messageId} onCreateComment={onCreateComment}>
+    <MessageSelectionSurface
+      messageId={messageId}
+      onCreateComment={onCreateComment}
+      onAskInSideChat={onAskInSideChat}
+      documentSelection={documentSelection}
+    >
       {renderedMarkdown}
     </MessageSelectionSurface>
   )
@@ -125,9 +144,20 @@ function renderProjectionTree(
   key = 'root',
 ): React.ReactNode {
   if (node.type === 'text') return node.value ?? ''
-  const children = (node.children ?? []).map((child, index) =>
-    renderProjectionTree(child, components, `${key}:${index}`),
-  )
+  const children = (node.children ?? []).map((child, index) => {
+    const properties = child.properties
+    const identity =
+      properties?.['data-pact-projection-start'] !== undefined
+        ? `text:${String(properties['data-pact-projection-start'])}:${String(properties['data-pact-projection-end'])}`
+        : properties?.['data-pact-source-start'] !== undefined
+          ? `alias:${String(properties['data-pact-source-start'])}:${String(properties['data-pact-source-end'])}`
+          : properties?.['data-pact-fragment-start'] !== undefined
+            ? `fragment:${String(properties['data-pact-fragment-start'])}:${String(properties['data-pact-fragment-end'])}`
+            : properties?.['data-pact-node-id'] !== undefined
+              ? `node:${String(properties['data-pact-node-id'])}`
+              : `child:${index}`
+    return renderProjectionTree(child, components, `${key}:${identity}`)
+  })
   if (node.type === 'root') return children
   const tag = node.tagName ?? 'span'
   const props: Record<string, unknown> = { ...node.properties, key }
@@ -186,15 +216,20 @@ function createMarkdownComponents(
         parts.push(
           <span
             key={`skill-${start}`}
-            title={`Skill · ${entry.name}`}
-            className="relative mx-0.5 inline-flex max-w-full items-baseline gap-1.5 rounded-control border border-border/60 bg-surface-raised/50 px-2 py-0.5 align-baseline text-caption font-medium leading-normal text-primary"
+            title={`${entry.pact ? 'Pact' : 'Skill'} · ${entry.name}`}
+            data-pact-command={entry.pact ? entry.name : undefined}
+            className={`relative mx-0.5 inline-flex max-w-full items-baseline gap-1.5 rounded-control border border-border/60 ${entry.pact ? 'bg-surface-muted' : 'bg-surface-raised/50'} px-2 py-0.5 align-baseline text-caption font-medium leading-normal text-primary`}
           >
             <BookOpen
               aria-hidden="true"
               className="size-3.5 shrink-0 self-center"
               strokeWidth={1.75}
             />
-            <span className="min-w-0 break-all">
+            <span
+              className={
+                entry.pact ? "min-w-0 break-all before:content-['pact:']" : 'min-w-0 break-all'
+              }
+            >
               <span
                 aria-hidden="true"
                 className="text-[0px]"
@@ -259,29 +294,28 @@ function createMarkdownComponents(
     h1: ({ children }) => <h1 className="mb-2 mt-4 text-subtitle font-medium">{children}</h1>,
     h2: ({ children }) => <h2 className="mb-2 mt-4 text-body font-medium">{children}</h2>,
     h3: ({ children }) => <h3 className="mb-1 mt-3 text-body font-medium">{children}</h3>,
-    p: ({ children }) => <p className="my-2 first:mt-0 last:mb-0">{children}</p>,
+    p: ({ children }) => <p className="my-2 leading-[1.65] first:mt-0 last:mb-0">{children}</p>,
     ul: ({ children }) => <ul className="my-2 list-disc space-y-1 pl-5">{children}</ul>,
     ol: ({ children, start }) => (
       <ol start={start} className="my-2 list-decimal space-y-1 pl-5">
         {children}
       </ol>
     ),
-    li: ({ children }) => <li className="pl-0.5">{children}</li>,
+    li: ({ children }) => <li className="pl-0.5 leading-[1.65]">{children}</li>,
     blockquote: ({ children }) => (
       <blockquote className="my-3 border-l border-border-strong pl-3 text-secondary">
         {children}
       </blockquote>
     ),
-    code: ({ className, children }) =>
-      className ? (
-        <code className={`${className} font-mono text-code`}>{children}</code>
-      ) : (
-        <code className="rounded-control bg-surface-raised/70 px-1.5 py-0.5 font-mono text-code">
-          {children}
-        </code>
-      ),
+    code: ({ className, children }) => (
+      <code
+        className={`box-decoration-clone rounded-[5px] bg-code-surface px-[5px] py-[1px] font-mono text-[0.875em] text-code-foreground ring-1 ring-inset ring-code-border ${className ?? ''}`.trim()}
+      >
+        {children}
+      </code>
+    ),
     pre: ({ children }) => (
-      <pre className="my-3 overflow-auto rounded-control bg-surface-raised/85 p-3 font-mono text-code leading-relaxed">
+      <pre className="my-3 overflow-auto rounded-control border border-code-border bg-code-block-surface p-3 font-mono text-code leading-relaxed text-code-foreground [&>code]:box-decoration-slice [&>code]:rounded-none [&>code]:border-0 [&>code]:bg-transparent [&>code]:p-0 [&>code]:text-[1em] [&>code]:text-inherit [&>code]:ring-0">
         {children}
       </pre>
     ),
@@ -291,7 +325,7 @@ function createMarkdownComponents(
       </div>
     ),
     th: ({ children }) => (
-      <th className="border-b border-border bg-surface-raised/60 px-3 py-2 font-medium">
+      <th className="border-b border-border bg-code-surface px-3 py-2 font-medium text-primary">
         {children}
       </th>
     ),
@@ -304,6 +338,7 @@ interface SkillRange {
   name: string
   start: number
   end: number
+  pact?: boolean
 }
 
 function safeMarkdownUrl(url: string): string {
@@ -318,27 +353,25 @@ function projectFileTarget(href: string): ProjectFileTarget | undefined {
   if (/^[a-z][a-z\d+.-]*:/iu.test(href) && !/^file:/iu.test(href) && !/^[a-z]:[\\/]/iu.test(href)) {
     return undefined
   }
-  let decoded: string
+  const hashIndex = href.lastIndexOf('#')
+  let path = hashIndex >= 0 ? href.slice(0, hashIndex) : href
+  if (!path) return undefined
+  let hash: string
   try {
-    decoded = decodeURIComponent(href)
+    hash = decodeURIComponent(hashIndex >= 0 ? href.slice(hashIndex + 1) : '')
   } catch {
     return undefined
   }
-  if (decoded.startsWith('file://')) {
-    try {
-      decoded = new URL(decoded).pathname
-    } catch {
-      return undefined
-    }
-  }
-  const hashIndex = decoded.lastIndexOf('#')
-  let path = hashIndex >= 0 ? decoded.slice(0, hashIndex) : decoded
-  if (!path) return undefined
-  const hash = hashIndex >= 0 ? decoded.slice(hashIndex + 1) : ''
   const range = /^L(\d+)(?:-L?(\d+))?$/u.exec(hash)
   if (hash && !range) return undefined
   const suffixRange = hash ? undefined : /^(.*):(\d+)(?::\d+)?(?:-(\d+))?$/u.exec(path)
   if (suffixRange?.[1]) path = suffixRange[1]
+  try {
+    // Utility decodes file URLs with the host platform's native path rules.
+    if (!/^file:/iu.test(path)) path = decodeURIComponent(path)
+  } catch {
+    return undefined
+  }
   const lineStart = range?.[1]
     ? Number(range[1])
     : suffixRange?.[2]

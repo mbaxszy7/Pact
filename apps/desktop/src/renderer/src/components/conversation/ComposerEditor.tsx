@@ -11,7 +11,7 @@ import {
 } from 'react'
 import { createPortal } from 'react-dom'
 
-import { skillSelectionsSchema, type SkillSelection } from '@pact/contracts'
+import { agentDisplayName, skillSelectionsSchema, type SkillSelection } from '@pact/contracts'
 
 import {
   assertComposerEditCapacity,
@@ -23,6 +23,7 @@ import {
 import { composerClipboardDigest } from './composer-clipboard-digest'
 import {
   composerDifference,
+  composerPactCommand,
   composerListCommand,
   formatComposerLists,
   indexComposerLists,
@@ -30,6 +31,7 @@ import {
   sameComposerDocument,
   wholeComposerAtoms,
   type ComposerDocument,
+  type ComposerAtom,
   type ComposerRange,
   type ComposerReplacement,
   type ComposerListIndex,
@@ -63,7 +65,7 @@ interface HistoryEntry {
 }
 interface Atom {
   host: HTMLSpanElement
-  skill: SkillSelection
+  token: ComposerAtom
   key: string
 }
 class ComposerAdmissionRefused extends Error {}
@@ -77,6 +79,7 @@ const CLIPBOARD_METADATA_BYTES = 64 * 1024
 export function ComposerEditor({
   value,
   disabled,
+  allowPactCommands = true,
   placeholder,
   onChange,
   admitEdit,
@@ -93,6 +96,7 @@ export function ComposerEditor({
 }: {
   value: ComposerDocument
   disabled: boolean
+  allowPactCommands?: boolean | undefined
   placeholder: string
   onChange: (value: ComposerDocument, cursor: number, composing: boolean) => boolean | void
   admitEdit?: ((nextChars: number) => boolean) | undefined
@@ -118,8 +122,9 @@ export function ComposerEditor({
     onImages,
     onNotice,
     disabled,
+    allowPactCommands,
   })
-  const ownedAtoms = useRef(new Map<Node, SkillSelection>())
+  const ownedAtoms = useRef(new Map<Node, ComposerAtom>())
   const ownedMarkers = useRef(new Map<Node, string>())
   const ownedRows = useRef(new Map<Node, boolean>())
   const ownedTailBreak = useRef<HTMLBRElement | undefined>(undefined)
@@ -345,33 +350,41 @@ export function ComposerEditor({
       ownedMarkers.current.clear()
       ownedRows.current.clear()
       ownedTailBreak.current = undefined
-      const skills = documentValue.skills.toSorted((a, b) => a.start - b.start)
-      let skillAt = 0
+      const pact = allowPactCommands ? composerPactCommand(documentValue) : undefined
+      const tokens: ComposerAtom[] = (
+        pact ? [...documentValue.skills, pact] : documentValue.skills
+      ).toSorted((a, b) => a.start - b.start)
+      let tokenAt = 0
       const append = (target: Node, start: number, end: number): void => {
         let cursor = start
-        while (skillAt < skills.length && skills[skillAt]!.start < end) {
-          const skill = skills[skillAt++]!
+        while (tokenAt < tokens.length && tokens[tokenAt]!.start < end) {
+          const token = tokens[tokenAt++]!
           if (
-            skill.start < cursor ||
-            skill.end > end ||
-            documentValue.text.slice(skill.start, skill.end) !== `/${skill.name}`
+            token.start < cursor ||
+            token.end > end ||
+            documentValue.text.slice(token.start, token.end) !== `/${token.name}`
           )
             continue
-          if (skill.start > cursor)
+          if (token.start > cursor)
             target.appendChild(
-              document.createTextNode(documentValue.text.slice(cursor, skill.start)),
+              document.createTextNode(documentValue.text.slice(cursor, token.start)),
             )
-          const number = occurrences.get(skill.id) ?? 0
-          occurrences.set(skill.id, number + 1)
-          const key = `${skill.id}:${number}`
-          const atom = previous.get(key) ?? { key, skill, host: document.createElement('span') }
-          atom.skill = skill
+          const identity = 'agentId' in token ? token.id : `pact:${token.name}`
+          const number = occurrences.get(identity) ?? 0
+          occurrences.set(identity, number + 1)
+          const key = `${identity}:${number}`
+          const atom = previous.get(key) ?? {
+            key,
+            token,
+            host: document.createElement('span'),
+          }
+          atom.token = token
           atom.host.contentEditable = 'false'
           atom.host.className = 'inline-block align-baseline'
-          ownedAtoms.current.set(atom.host, skill)
+          ownedAtoms.current.set(atom.host, token)
           nextAtoms.push(atom)
           target.appendChild(atom.host)
-          cursor = skill.end
+          cursor = token.end
         }
         target.appendChild(document.createTextNode(documentValue.text.slice(cursor, end)))
       }
@@ -380,7 +393,7 @@ export function ComposerEditor({
         index = indexComposerLists(documentValue.text)
         if (
           index.groups.length &&
-          index.rows.length * 4 + index.itemCount + skills.length * 8 > 10_000
+          index.rows.length * 4 + index.itemCount + tokens.length * 8 > 10_000
         )
           throw new Error('This draft exceeds the list projection capacity.')
         capacityNotice.current = false
@@ -440,7 +453,7 @@ export function ComposerEditor({
         selectAfterCommit.current = range
       }
     },
-    [select, notifyEditingFailure],
+    [allowPactCommands, select, notifyEditingFailure],
   )
   const remember = useCallback(
     (
@@ -543,7 +556,11 @@ export function ComposerEditor({
   )
   const replace = useCallback(
     (range: ComposerRange, text: string, skills: SkillSelection[] = []): void => {
-      const expandedRange = wholeComposerAtoms(model.current, range)
+      const expandedRange = wholeComposerAtoms(
+        model.current,
+        range,
+        callbacks.current.allowPactCommands,
+      )
       try {
         assertComposerReplacementCapacity(
           model.current.text,
@@ -647,7 +664,7 @@ export function ComposerEditor({
         if (skill) {
           const start = chars
           appendText(`/${skill.name}`)
-          skills.push({ ...skill, start, end: chars })
+          if ('agentId' in skill) skills.push({ ...skill, start, end: chars })
           return
         }
         if (node instanceof Text) appendText(node.data)
@@ -760,6 +777,7 @@ export function ComposerEditor({
       onImages,
       onNotice,
       disabled,
+      allowPactCommands,
     }
   })
   useLayoutEffect(() => {
@@ -888,7 +906,11 @@ export function ComposerEditor({
           range = event.inputType.endsWith('Backward')
             ? { start: Math.max(0, range.start - 1), end: range.end }
             : { start: range.start, end: Math.min(model.current.text.length, range.end + 1) }
-        const expandedRange = wholeComposerAtoms(model.current, range)
+        const expandedRange = wholeComposerAtoms(
+          model.current,
+          range,
+          callbacks.current.allowPactCommands,
+        )
         beforeRange.current = range
         if (event.cancelable) {
           event.preventDefault()
@@ -923,6 +945,13 @@ export function ComposerEditor({
         else {
           const edited = formatComposerLists(model.current, next.document, [next.edit], range)
           let repaint = edited.document.text !== next.document.text
+          const pact = callbacks.current.allowPactCommands
+            ? composerPactCommand(edited.document)
+            : undefined
+          repaint ||=
+            JSON.stringify(
+              [...ownedAtoms.current.values()].filter((atom) => !('agentId' in atom)),
+            ) !== JSON.stringify(pact ? [pact] : [])
           try {
             const index = indexComposerLists(edited.document.text)
             const markers = index.rows
@@ -986,10 +1015,20 @@ export function ComposerEditor({
         if (event.key === 'Enter' || event.key === ' ') return
         const skill = ownedAtoms.current.get(target)!
         const start = offsetAt(target, 0, 'start')
-        const current = model.current.skills.find(
-          (entry) => entry.id === skill.id && entry.name === skill.name && entry.start === start,
-        )
-        if (current && (event.key === 'Backspace' || event.key === 'Delete')) {
+        const current =
+          'agentId' in skill
+            ? model.current.skills.find(
+                (entry) =>
+                  entry.id === skill.id && entry.name === skill.name && entry.start === start,
+              )
+            : callbacks.current.allowPactCommands
+              ? composerPactCommand(model.current)
+              : undefined
+        if (
+          current &&
+          current.start === start &&
+          (event.key === 'Backspace' || event.key === 'Delete')
+        ) {
           event.preventDefault()
           replace({ start: current.start, end: current.end }, '')
           return
@@ -1036,7 +1075,11 @@ export function ComposerEditor({
       }
     }
     const copy = (event: ClipboardEvent): void => {
-      const range = wholeComposerAtoms(model.current, selection())
+      const range = wholeComposerAtoms(
+        model.current,
+        selection(),
+        callbacks.current.allowPactCommands,
+      )
       if (range.start === range.end) return
       event.preventDefault()
       const text = model.current.text.slice(range.start, range.end)
@@ -1198,22 +1241,40 @@ export function ComposerEditor({
       />
       {atoms.map((atom) =>
         createPortal(
-          <button
-            type="button"
-            contentEditable={false}
-            className="mx-0.5 inline-flex max-w-full items-baseline gap-1.5 rounded-control border border-border/60 bg-surface-muted px-2 py-0.5 align-baseline text-caption font-medium leading-normal text-primary hover:border-border-strong focus-visible:outline-2 focus-visible:outline-focus"
-            aria-label={`Open ${atom.skill.agentId === 'codex' ? 'Codex' : 'Claude Code'} Skill ${atom.skill.name}`}
-            title={`${atom.skill.agentId === 'codex' ? 'Codex' : 'Claude Code'} · ${atom.skill.name} · Open Skill document`}
-            onMouseDown={(event) => event.preventDefault()}
-            onClick={() => callbacks.current.onSkillOpen(atom.skill)}
-          >
-            <BookOpen
-              aria-hidden="true"
-              className="size-3.5 shrink-0 self-center"
-              strokeWidth={1.75}
-            />
-            <span className="min-w-0 break-all">{atom.skill.name}</span>
-          </button>,
+          'agentId' in atom.token ? (
+            <button
+              type="button"
+              contentEditable={false}
+              className="mx-0.5 inline-flex max-w-full items-baseline gap-1.5 rounded-control border border-border/60 bg-surface-muted px-2 py-0.5 align-baseline text-caption font-medium leading-normal text-primary hover:border-border-strong focus-visible:outline-2 focus-visible:outline-focus"
+              aria-label={`Open ${agentDisplayName(atom.token.agentId)} Skill ${atom.token.name}`}
+              title={`${agentDisplayName(atom.token.agentId)} · ${atom.token.name} · Open Skill document`}
+              onMouseDown={(event) => event.preventDefault()}
+              onClick={() => {
+                if ('agentId' in atom.token) callbacks.current.onSkillOpen(atom.token)
+              }}
+            >
+              <BookOpen
+                aria-hidden="true"
+                className="size-3.5 shrink-0 self-center"
+                strokeWidth={1.75}
+              />
+              <span className="min-w-0 break-all">{atom.token.name}</span>
+            </button>
+          ) : (
+            <span
+              contentEditable={false}
+              data-pact-command={atom.token.name}
+              title={`Pact · ${atom.token.name}`}
+              className="mx-0.5 inline-flex max-w-full items-baseline gap-1.5 rounded-control border border-border/60 bg-surface-muted px-2 py-0.5 align-baseline text-caption font-medium leading-normal text-primary"
+            >
+              <BookOpen
+                aria-hidden="true"
+                className="size-3.5 shrink-0 self-center"
+                strokeWidth={1.75}
+              />
+              <span className="min-w-0 break-all">pact:{atom.token.name}</span>
+            </span>
+          ),
           atom.host,
           atom.key,
         ),

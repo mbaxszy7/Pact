@@ -7,5 +7,12 @@
     "target": "ES2024",
     "types": ["node", "@playwright/test"]
   },
-  "include": ["./**/*.ts", "../playwright.config.ts", "../vitest.config.ts"]
+  "include": [
+    "./**/*.ts",
+    "../playwright.config.ts",
+    "../vitest.config.ts",
+    "../vitest.native.config.ts",
+    "../vitest.native-execution.config.ts",
+    "../vitest.agy.native.config.ts"
+  ]
 }

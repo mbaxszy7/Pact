@@ -1,4 +1,5 @@
 import { expect, type Locator } from '@playwright/test'
+import { randomUUID } from 'node:crypto'
 import { writeFileSync } from 'node:fs'
 import { open } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -52,8 +53,8 @@ test(
     try {
       const originalSettings = await sessionSettings(ctx)
       expect(originalSettings.session.settings.agents).toEqual({
-        claude: { model: null, effort: null },
-        codex: { model: null, effort: null },
+        claude: { model: null, effort: null, speed: 'native' },
+        codex: { model: null, effort: null, speed: 'native' },
       })
       const originalDefault = await appDefaults(ctx)
       const configuredModels = ctx.fixture.readConfigurationModels()
@@ -85,6 +86,7 @@ test(
       expect((await sessionSettings(ctx)).session.settings.agents.codex).toEqual({
         model: null,
         effort: null,
+        speed: 'native',
       })
       const codexDefaultEvidence = await findNativeRecord(
         ctx,
@@ -134,6 +136,7 @@ test(
       expect((await sessionSettings(ctx)).session.settings.agents.claude).toEqual({
         model: null,
         effort: null,
+        speed: 'native',
       })
       const claudeDefaultEvidence = await findNativeRecord(
         ctx,
@@ -159,7 +162,9 @@ test(
       const templateOne: DefaultSessionSettings = {
         ...originalDefault,
         primaryAgentId: 'codex',
+        secondaryAgentId: 'claude',
         agents: {
+          ...originalDefault.agents,
           codex: selection(choices.codex, 'first'),
           claude: selection(choices.claude, 'first'),
         },
@@ -179,7 +184,9 @@ test(
       const templateTwo: DefaultSessionSettings = {
         ...templateOne,
         primaryAgentId: 'claude',
+        secondaryAgentId: 'codex',
         agents: {
+          ...templateOne.agents,
           codex: selection(choices.codex, 'next'),
           claude: selection(choices.claude, 'next'),
         },
@@ -209,7 +216,7 @@ test(
       expect((await readRealConversation(ctx, futureSessionId)).runs).toHaveLength(0)
 
       const codexOld = await sessionSettings(ctx)
-      const codexMarker = authMarker('CODEX_FROZEN_SETTINGS')
+      const codexMarker = `CODEX_FROZEN_SETTINGS_${randomUUID()}`
       const codexFile = 'codex-settings-gate.txt'
       const codexCommand =
         process.platform === 'win32'
@@ -425,6 +432,7 @@ function selection(options: Selections, phase: 'first' | 'next'): AgentModelSele
   return {
     model: options.model,
     effort: phase === 'first' ? options.firstEffort : options.nextEffort,
+    speed: 'native',
   }
 }
 
@@ -490,6 +498,9 @@ async function changeSettingsFields(
 ): Promise<void> {
   const primary = settings.primaryAgentId === 'codex' ? /^Codex /u : /^Claude Code /u
   await scope.getByRole('radio', { name: primary }).check()
+  await scope
+    .getByRole('combobox', { name: 'Secondary agent', exact: true })
+    .selectOption(settings.secondaryAgentId)
   for (const agentId of ['codex', 'claude'] as const) {
     const region = scope.getByRole('region', {
       name: agentId === 'codex' ? 'Codex' : 'Claude Code',
@@ -506,16 +517,13 @@ async function changeSettingsFields(
       .selectOption(wanted.effort ?? '')
   }
   await scope
-    .getByRole('spinbutton', { name: 'Maximum discussion rounds', exact: true })
+    .getByRole('spinbutton', { name: 'Plan reviews', exact: true })
     .fill(String(settings.maxDiscussionRounds))
   await scope
-    .getByRole('combobox', { name: 'Messages sent during a run', exact: true })
-    .selectOption(settings.runningMessagePolicy)
-  await scope
-    .getByRole('spinbutton', { name: 'Maximum review cycles', exact: true })
+    .getByRole('spinbutton', { name: 'Code reviews', exact: true })
     .fill(String(settings.maxReviewCycles))
   await scope
-    .getByRole('spinbutton', { name: 'Repair attempts per task', exact: true })
+    .getByRole('spinbutton', { name: 'Repair attempts', exact: true })
     .fill(String(settings.maxRepairAttempts))
 }
 
@@ -553,9 +561,7 @@ function effortCommand(marker: string, filename: string): string {
 }
 
 function toolPrompt(command: string): string {
-  if (process.platform === 'win32')
-    return `Execute exactly the shell command below once, without adding punctuation:\n\n\`\`\`\n${command}\n\`\`\`\n\nThe destination is outside the project and inside my isolated test directory. Request sandbox escalation with justification when required. Use the Bash/shell tool; do not write a guessed value with a file-edit tool, rewrite the command, inspect other files, or change permissions. After successful execution reply briefly. Do not ask another Agent for help.`
-  return `Execute exactly this shell command once: ${command}. The destination is outside the project and inside my isolated test directory. Request sandbox escalation with justification when required. Use the Bash/shell tool; do not write a guessed value with a file-edit tool, rewrite the command, inspect other files, or change permissions. After successful execution reply briefly. Do not ask another Agent for help.`
+  return `Execute the exact shell command below once, without adding punctuation or changing any characters:\n\n\`\`\`\n${command}\n\`\`\`\n\nThe destination is outside the project and inside my isolated test directory. Request sandbox escalation with justification when required. Use the Bash/shell tool; do not write a guessed value with a file-edit tool, rewrite the command, inspect other files, or change permissions. After successful execution reply briefly. Do not ask another Agent for help.`
 }
 
 async function pendingActualCommand(

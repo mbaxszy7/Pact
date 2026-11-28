@@ -115,18 +115,32 @@ export class AgentStreamBuffer {
     return !this.failed
   }
 
+  peekNextCommittedSequence(): number | undefined {
+    return this.committed[0]?.patch.observation.sequence
+  }
+
+  publishNextCommitted(): boolean {
+    const entry = this.committed.shift()
+    if (!entry) return false
+    this.committedBytes -= entry.bytes
+    if (this.committed.length === 0) {
+      clearTimeout(this.visibleTimer)
+      this.visibleTimer = undefined
+    }
+    try {
+      this.publish(entry.patch)
+    } catch (error) {
+      this.fail(error)
+      return false
+    }
+    return true
+  }
+
   publishPending(): void {
     clearTimeout(this.visibleTimer)
     this.visibleTimer = undefined
     while (this.committed.length) {
-      const entry = this.committed.shift()!
-      this.committedBytes -= entry.bytes
-      try {
-        this.publish(entry.patch)
-      } catch (error) {
-        this.fail(error)
-        return
-      }
+      if (!this.publishNextCommitted()) return
     }
   }
 

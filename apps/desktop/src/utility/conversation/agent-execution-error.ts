@@ -1,5 +1,7 @@
 import type { RunFailureKind } from '@pact/contracts'
 
+import { readRunStopAbortReason } from '@pact/agent-runtime'
+
 export class AgentExecutionError extends Error {
   constructor(
     readonly kind: RunFailureKind,
@@ -9,6 +11,14 @@ export class AgentExecutionError extends Error {
   ) {
     super(message)
     this.name = 'AgentExecutionError'
+  }
+}
+
+/** The live workflow admission fence withheld the root input before native I/O. */
+export class NativeInputWithheldError extends AgentExecutionError {
+  constructor(message = 'Collaboration paused before this message was sent. Resume when ready.') {
+    super('user_stopped', message, false)
+    this.name = 'NativeInputWithheldError'
   }
 }
 
@@ -24,7 +34,7 @@ export class NativeThreadOccupiedError extends AgentExecutionError {
   constructor() {
     super(
       'native_session_occupied',
-      'Another Codex client owns this native session. This request was not submitted. Rebuild to continue in Pact; the other session remains unchanged.',
+      'Another Codex client is using this session. Your message wasn’t sent. Rebuild to continue in Pact without affecting the other session.',
       false,
     )
   }
@@ -37,28 +47,32 @@ export class NativeThreadArchivedError extends AgentExecutionError {
   }
 }
 
-/** Also recognizes the bounded, durable resume rejection saved by older builds. */
+/** Also recognizes the bounded, durable resume rejection saved by older and current builds. */
 export function isCodexArchivedSessionRejection(error: unknown, nativeSessionId: string): boolean {
+  const matchesArchivedMessage = (message: string): boolean =>
+    ['session', 'thread'].some((subject) => {
+      const statement = `${subject} ${nativeSessionId} is archived`
+      // Native errors can append recovery instructions after this exact statement.
+      return (
+        message === statement || message === `${statement}.` || message.startsWith(`${statement}. `)
+      )
+    })
+
   let payload = error
   if (typeof payload === 'string') {
     const prefix = 'Codex thread/resume rejected: '
     if (!payload.startsWith(prefix) || payload.length > 1024) return false
+    const rest = payload.slice(prefix.length)
     try {
-      payload = JSON.parse(payload.slice(prefix.length))
+      payload = JSON.parse(rest)
     } catch {
-      return false
+      return matchesArchivedMessage(rest)
     }
   }
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return false
   const message = Reflect.get(payload, 'message')
   if (typeof message !== 'string') return false
-  return ['session', 'thread'].some((subject) => {
-    const statement = `${subject} ${nativeSessionId} is archived`
-    // Native errors can append recovery instructions after this exact statement.
-    return (
-      message === statement || message === `${statement}.` || message.startsWith(`${statement}. `)
-    )
-  })
+  return matchesArchivedMessage(message)
 }
 
 /** This attempt created no native actor and dispatched no startup/model request. */
@@ -70,7 +84,7 @@ export class NativeCapacityError extends AgentExecutionError {
 
 export function classifyAgentError(error: unknown): AgentExecutionError {
   if (error instanceof AgentExecutionError) return error
-  const message = error instanceof Error ? error.message : 'The Agent process failed.'
+  const message = error instanceof Error ? error.message : 'The agent process failed.'
   const normalized = message.toLowerCase()
   if (
     /context(?:\s|-)?(?:window|length|limit)|too many tokens|(?:prompt|input) is too long/u.test(
@@ -92,4 +106,43 @@ export function classifyAgentError(error: unknown): AgentExecutionError {
     return new AgentExecutionError('transient_transport', message, true)
   }
   return new AgentExecutionError('agent_process_crash', message, true)
+}
+
+/** Shared predicate identifying cancellation errors caused by an explicit user Stop. */
+export function isUserStopCancellationError(
+  error: unknown,
+  signal: AbortSignal,
+  cancelledByUser?: boolean,
+): boolean {
+  if (!signal.aborted) return false
+  if (
+    cancelledByUser !== undefined
+      ? !cancelledByUser
+      : readRunStopAbortReason(signal)?.reason !== 'user_stop'
+  ) {
+    return false
+  }
+  if (
+    error instanceof PermissionModeRejectedError ||
+    error instanceof NativeCapacityError ||
+    error instanceof NativeThreadOccupiedError ||
+    error instanceof NativeThreadArchivedError ||
+    error instanceof NativeInputWithheldError
+  ) {
+    return false
+  }
+  if (error === signal.reason) return true
+  if (error instanceof AgentExecutionError) {
+    if (error.kind === 'user_stopped') return true
+    if (
+      error.kind === 'agent_process_crash' &&
+      (error.message === 'Codex was interrupted.' ||
+        error.message === 'Claude Code was interrupted.' ||
+        error.message === 'Antigravity was interrupted.')
+    ) {
+      return true
+    }
+    if (Reflect.get(error, 'cancelled') === true) return true
+  }
+  return error instanceof Error && error.name === 'AbortError'
 }

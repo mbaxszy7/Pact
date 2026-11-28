@@ -23,7 +23,7 @@ for (const firstUse of [false, true]) {
         })
         await expect(page.getByRole('heading', { name: 'About & updates' })).toBeVisible()
         await expect(page.getByText(desktopPackage.version, { exact: true })).toBeVisible()
-        await expect(page.getByRole('link', { name: 'Download on GitHub' })).toHaveAttribute(
+        await expect(page.getByRole('link', { name: 'View releases on GitHub' })).toHaveAttribute(
           'href',
           PACT_RELEASES_URL,
         )

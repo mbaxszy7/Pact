@@ -1,6 +1,11 @@
 import { ArrowLeft } from 'lucide-react'
 
-export type SettingsPage = 'session-defaults' | 'appearance' | 'updates' | null
+export type SettingsPage =
+  | 'session-defaults'
+  | 'appearance'
+  | 'decision-scheduling'
+  | 'updates'
+  | null
 
 interface SettingsNavigationProps {
   updateAvailable?: boolean
@@ -39,6 +44,15 @@ export function SettingsNavigation({
           </button>
           <button
             className="mt-1 block w-full rounded-control px-group py-2 text-left text-body text-secondary hover:bg-surface-raised data-[active=true]:bg-surface-raised data-[active=true]:font-medium data-[active=true]:text-primary"
+            data-active={settingsPage === 'decision-scheduling'}
+            aria-current={settingsPage === 'decision-scheduling' ? 'page' : undefined}
+            type="button"
+            onClick={() => onOpenSettings('decision-scheduling')}
+          >
+            Relay
+          </button>
+          <button
+            className="mt-1 block w-full rounded-control px-group py-2 text-left text-body text-secondary hover:bg-surface-raised data-[active=true]:bg-surface-raised data-[active=true]:font-medium data-[active=true]:text-primary"
             data-active={settingsPage === 'appearance'}
             aria-current={settingsPage === 'appearance' ? 'page' : undefined}
             type="button"
@@ -55,7 +69,7 @@ export function SettingsNavigation({
           >
             About &amp; updates
             {updateAvailable ? (
-              <span className="text-caption font-medium text-focus">New</span>
+              <span className="text-caption font-medium text-focus">Update</span>
             ) : null}
           </button>
         </nav>

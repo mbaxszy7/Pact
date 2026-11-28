@@ -4,9 +4,82 @@ import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { markdownVisibleProjection } from '../../../../shared/message-anchor-text'
+import { selectedTextRange } from './message-selection'
 import { MessageMarkdown, type ProjectFileTarget } from './MessageMarkdown'
 
 afterEach(cleanup)
+
+describe('MessageMarkdown Pact badges', () => {
+  it.each(['plan', 'review', 'build'])(
+    'decorates /%s while preserving original text and comment coordinates',
+    (command) => {
+      const content = `@codex /${command} Inspect this change.`
+      const { container, rerender } = render(
+        <MessageMarkdown content={content} skills={[]} onOpenProjectFile={() => undefined} />,
+      )
+      const badge = screen.getByTitle(`Pact · ${command}`)
+      expect(badge.textContent).toBe(`/${command}`)
+      const range = document.createRange()
+      range.selectNodeContents(badge)
+      const selection = window.getSelection()!
+      selection.removeAllRanges()
+      selection.addRange(range)
+      expect(selectedTextRange(container, selection)).toEqual({
+        startOffset: 7,
+        endOffset: 8 + command.length,
+        quote: `/${command}`,
+      })
+      expect(
+        [...container.querySelectorAll('[data-pact-projection-start]')]
+          .map((span) => span.textContent)
+          .join(''),
+      ).toBe(markdownVisibleProjection(content))
+
+      rerender(
+        <MessageMarkdown content={content} skills={[]} onOpenProjectFile={() => undefined} />,
+      )
+      expect(screen.getByTitle(`Pact · ${command}`)).toBe(badge)
+      expect(selection.toString()).toBe(`/${command}`)
+      selection.removeAllRanges()
+    },
+  )
+
+  it('decorates a completed command without trailing whitespace', () => {
+    render(<MessageMarkdown content="/review" skills={[]} onOpenProjectFile={() => undefined} />)
+    expect(screen.getByTitle('Pact · review').textContent).toBe('/review')
+  })
+
+  it.each([
+    'Use /plan in a message.',
+    '`/plan` example',
+    '```text\n/plan\n```',
+    '> /plan quoted',
+    '/plan /review conflicting commands',
+    '@all /plan conflicting route',
+  ])('does not decorate ordinary Markdown or invalid prefixes: %s', (content) => {
+    const { container } = render(
+      <MessageMarkdown content={content} skills={[]} onOpenProjectFile={() => undefined} />,
+    )
+    expect(container.querySelector('[data-pact-command]')).toBeNull()
+  })
+
+  it('keeps assistant content and same-named native Skills distinct from Pact commands', () => {
+    const content = '/plan inspect'
+    const { container, rerender } = render(
+      <MessageMarkdown content={content} onOpenProjectFile={() => undefined} />,
+    )
+    expect(container.querySelector('[data-pact-command]')).toBeNull()
+    rerender(
+      <MessageMarkdown
+        content={content}
+        skills={[{ id: 'a'.repeat(64), agentId: 'codex', name: 'plan', start: 0, end: 5 }]}
+        onOpenProjectFile={() => undefined}
+      />,
+    )
+    expect(screen.getByTitle('Skill · plan').textContent).toBe('/plan')
+    expect(container.querySelector('[data-pact-command]')).toBeNull()
+  })
+})
 
 describe('MessageMarkdown anchor projection', () => {
   it('keeps completed text stable across parent updates and renders changed content', () => {
@@ -128,6 +201,98 @@ describe('MessageMarkdown anchor projection', () => {
     fireEvent.mouseUp(document.body)
 
     expect(screen.getByRole('button', { name: 'Comment on selected text' })).not.toBeNull()
+  })
+})
+
+describe('MessageMarkdown local file navigation', () => {
+  it.each([
+    ['file:///C:/project/source.ts#L3-L5', 'file:///C:/project/source.ts', 3, 5],
+    ['FILE:///C:/project/source.ts#L3', 'FILE:///C:/project/source.ts', 3, 3],
+    ['/C:/project/source.ts#L3-L5', '/C:/project/source.ts', 3, 5],
+    ['C:/project/source.ts:3', 'C:/project/source.ts', 3, 3],
+    [
+      'file:///Users/person/My%20Project/source.ts#L3-L5',
+      'file:///Users/person/My%20Project/source.ts',
+      3,
+      5,
+    ],
+    [
+      'file:///Users/person/project/a%23b%25.ts#L3',
+      'file:///Users/person/project/a%23b%25.ts',
+      3,
+      3,
+    ],
+    ['file://localhost/C:/project/source.ts#L3', 'file://localhost/C:/project/source.ts', 3, 3],
+    ['src/a%20%23%25.ts#L3', 'src/a #%.ts', 3, 3],
+    ['src/a%2520.ts#L3', 'src/a%20.ts', 3, 3],
+    ['src/a%3A42#L3', 'src/a:42', 3, 3],
+    ['src/source.ts#L3-L5', 'src/source.ts', 3, 5],
+  ])('opens %s without losing the filename or line range', (href, path, lineStart, lineEnd) => {
+    const onOpenProjectFile = vi.fn<(target: ProjectFileTarget) => void>()
+    render(
+      <MessageMarkdown content={`[Source](<${href}>)`} onOpenProjectFile={onOpenProjectFile} />,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: /^Source$/u }))
+
+    expect(onOpenProjectFile).toHaveBeenCalledExactlyOnceWith({ path, lineStart, lineEnd })
+  })
+})
+
+describe('MessageMarkdown code surfaces and typography', () => {
+  it('applies distinct semantic code tokens, stacked line-height spacing, and pre > code reset', () => {
+    const content = [
+      'Inline `alphaToken` in a paragraph.',
+      '',
+      '- List `betaToken` entry.',
+      '',
+      '```',
+      'bare_fenced_line()',
+      '```',
+      '',
+      '```ts',
+      'const typed = 1',
+      '```',
+      '',
+      '| Col A | Col B |',
+      '| --- | --- |',
+      '| `cell` | ok |',
+    ].join('\n')
+
+    const { container } = render(
+      <MessageMarkdown content={content} onOpenProjectFile={() => undefined} />,
+    )
+
+    const paragraph = container.querySelector('p')
+    expect(paragraph?.className).toContain('leading-[1.65]')
+    const listItem = container.querySelector('li')
+    expect(listItem?.className).toContain('leading-[1.65]')
+
+    const inlineCode = Array.from(container.querySelectorAll('code')).find(
+      (node) => !node.closest('pre') && node.textContent === 'alphaToken',
+    )
+    expect(inlineCode).toBeDefined()
+    expect(inlineCode?.className).toContain('bg-code-surface')
+    expect(inlineCode?.className).toContain('text-code-foreground')
+    expect(inlineCode?.className).toContain('ring-code-border')
+    expect(inlineCode?.className).toContain('rounded-[5px]')
+    expect(inlineCode?.className).toContain('box-decoration-clone')
+    expect(inlineCode?.className).not.toContain('bg-surface-raised')
+
+    const pres = Array.from(container.querySelectorAll('pre'))
+    expect(pres).toHaveLength(2)
+    for (const pre of pres) {
+      expect(pre.className).toContain('bg-code-block-surface')
+      expect(pre.className).toContain('border-code-border')
+      expect(pre.className).toContain('[&>code]:bg-transparent')
+      expect(pre.className).toContain('[&>code]:p-0')
+      expect(pre.className).toContain('[&>code]:ring-0')
+      expect(pre.className).toContain('[&>code]:text-[1em]')
+    }
+    expect(pres[1]?.querySelector('code')?.className).toContain('language-ts')
+
+    const th = container.querySelector('th')
+    expect(th?.className).toContain('bg-code-surface')
   })
 })
 

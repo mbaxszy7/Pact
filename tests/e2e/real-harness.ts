@@ -3,10 +3,17 @@ import { randomUUID } from 'node:crypto'
 import { lstat, open, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 
-import type { ConversationSnapshot, DesktopBridge } from '../../packages/contracts/src/index.js'
+import type {
+  AgentModelCatalog,
+  AgentModelOption,
+  ConversationSnapshot,
+  DesktopBridge,
+  RuntimeAgentId,
+} from '../../packages/contracts/src/index.js'
 
 import { diagnosticRecordSchema } from '../../packages/contracts/src/diagnostics.js'
 import { quitPact, recordQuitFailure } from './native-quit.js'
+import { DEFAULT_REAL_AGY_MODEL } from './provider-environment.js'
 import { ReadonlyFixtureDatabase } from './readonly-fixture-database.js'
 import { resolveRealConfiguredModel } from './real-model-selection.js'
 import {
@@ -62,12 +69,15 @@ export interface RealWorkspace {
   projectId: string
   projectDirectory: string
   sessionId: string
+  activePair?: readonly [RuntimeAgentId, RuntimeAgentId]
+  strictInitialReadiness?: boolean
 }
 
-/** Observe the same readiness state that actually gates the Composer; allow one explicit UI Retry. */
+/** Observe the same readiness state that actually gates the Composer; allow one explicit UI Retry unless strict. */
 export async function waitForWindowsRuntimeReady(
   page: Page,
   fixture: RuntimeFixture,
+  options: { strictInitialReadiness?: boolean } = {},
 ): Promise<void> {
   const deadline = Date.now() + 30_000
   const remaining = (): number => Math.max(1, deadline - Date.now())
@@ -76,6 +86,9 @@ export async function waitForWindowsRuntimeReady(
   await enabled.or(notice).first().waitFor({ state: 'visible', timeout: remaining() })
   if (!(await enabled.count())) {
     const original = fixture.redactDiagnostic(await notice.innerText())
+    if (options.strictInitialReadiness) {
+      throw new Error(`Runtime preparation remained unavailable on strict startup: ${original}`)
+    }
     const path = test.info().outputPath('windows-initial-readiness.json')
     await writeFile(path, JSON.stringify({ initialNotice: original }))
     await test.info().attach('windows-initial-readiness', { path, contentType: 'application/json' })
@@ -91,28 +104,49 @@ export async function waitForWindowsRuntimeReady(
   await expect(notice).toHaveCount(0, { timeout: remaining() })
 }
 
+async function waitForPairReady(
+  page: Page,
+  pair: readonly [RuntimeAgentId, RuntimeAgentId],
+): Promise<void> {
+  await expect
+    .poll(
+      async () =>
+        page.evaluate(async (expected) => {
+          const bridge: DesktopBridge = Reflect.get(globalThis, 'pact')
+          const state = await bridge.getRuntimePreparation()
+          return state.ok
+            ? expected.map(
+                (id) => state.value.agents.find((agent) => agent.agentId === id)?.state ?? null,
+              )
+            : []
+        }, pair),
+      { timeout: 30_000 },
+    )
+    .toEqual(['ready', 'ready'])
+}
+
 export async function launchRealWorkspace(
   name: string,
-  options: Pick<RuntimeFixtureOptions, 'transportFault'> = {},
+  options: Pick<RuntimeFixtureOptions, 'transportFault' | 'activePair' | 'configuration'> & {
+    strictInitialReadiness?: boolean
+  } = {},
 ): Promise<RealWorkspace> {
-  const fixture = await createRuntimeFixture({ mode: 'real', ...options })
+  const { strictInitialReadiness, ...fixtureOptions } = options
+  const expectedPair: readonly [RuntimeAgentId, RuntimeAgentId] = options.activePair ?? [
+    'claude',
+    'codex',
+  ]
+  const fixture = await createRuntimeFixture({ mode: 'real', ...fixtureOptions })
   try {
     const projectDirectory = await fixture.createProjectDirectory(name)
     const app = await fixture.launch()
     const page = await app.firstWindow()
-    if (process.platform === 'win32') await waitForWindowsRuntimeReady(page, fixture)
-    else
-      await expect
-        .poll(
-          async () =>
-            page.evaluate(async () => {
-              const bridge: DesktopBridge = Reflect.get(globalThis, 'pact')
-              const state = await bridge.getRuntimePreparation()
-              return state.ok ? state.value.agents.map((agent) => agent.state) : []
-            }),
-          { timeout: 30_000 },
-        )
-        .toEqual(['ready', 'ready'])
+    await waitForWindowsRuntimeReady(
+      page,
+      fixture,
+      strictInitialReadiness ? { strictInitialReadiness: true } : {},
+    )
+    await waitForPairReady(page, expectedPair)
     await app.evaluate(({ dialog }, path) => {
       Reflect.set(dialog, 'showOpenDialog', async () => ({ canceled: false, filePaths: [path] }))
     }, projectDirectory)
@@ -161,7 +195,16 @@ export async function launchRealWorkspace(
       return catalog.value.sessions[0]!.id
     }, projectId)
     await expect(page.getByRole('combobox', { name: 'Message' })).toBeEnabled({ timeout: 15_000 })
-    return { fixture, app, page, projectId, projectDirectory, sessionId }
+    return {
+      fixture,
+      app,
+      page,
+      projectId,
+      projectDirectory,
+      sessionId,
+      activePair: expectedPair,
+      ...(strictInitialReadiness ? { strictInitialReadiness: true } : {}),
+    }
   } catch (error) {
     try {
       await fixture.dispose()
@@ -228,8 +271,11 @@ export async function selectRealSession(context: RealWorkspace, id: string): Pro
     if (++moves > 128 || Date.now() > deadline)
       throw new Error('Owned Session is unavailable in the paginated Catalog')
     const more = context.page
-      .locator(`[data-project-menu="${context.projectId}"]`)
-      .getByRole('button', { name: /^Load more Sessions in /u })
+      .locator(`[data-drop-project="${context.projectId}"][data-drop-group=""]`)
+      .getByRole('button', {
+        name: /^(?:Load more Sessions in |Refresh Sessions$|Load newer Sessions$)/u,
+      })
+      .first()
     // oxlint-disable-next-line no-await-in-loop -- Each real UI page must settle before the next Catalog action.
     if (await more.isVisible()) await more.click()
     else {
@@ -250,7 +296,7 @@ export async function selectRealSession(context: RealWorkspace, id: string): Pro
 export async function sendRealMessage(
   context: RealWorkspace,
   content: string,
-  route: 'primary' | 'all' | 'claude' | 'codex' = 'primary',
+  route: 'primary' | 'all' | 'claude' | 'codex' | 'agy' = 'primary',
 ): Promise<void> {
   if (content.length > 100_000) throw new Error('Real message exceeds the product input bound')
   const composer = context.page.getByRole('combobox', { name: 'Message' })
@@ -260,7 +306,14 @@ export async function sendRealMessage(
     await composer.fill('@' + route)
     await context.page
       .getByRole('option', {
-        name: route === 'all' ? /^All/u : route === 'claude' ? /^Claude Code/u : /^Codex/u,
+        name:
+          route === 'all'
+            ? /^All/u
+            : route === 'claude'
+              ? /^Claude Code/u
+              : route === 'codex'
+                ? /^Codex/u
+                : /^Antigravity/u,
       })
       .click()
     await expect.poll(() => composer.textContent()).toBe('@' + route + ' ')
@@ -268,8 +321,7 @@ export async function sendRealMessage(
       () => new Promise<void>((done) => requestAnimationFrame(() => done())),
     )
     await composer.press('End')
-    if (process.platform === 'win32' && /[\r\n]/u.test(content))
-      await context.page.keyboard.insertText(content)
+    if (/[\r\n]/u.test(content)) await context.page.keyboard.insertText(content)
     else await composer.pressSequentially(content)
   }
   await composer.press('Enter')
@@ -278,25 +330,62 @@ export async function sendRealMessage(
 /** Choose through the UI so Send observes the same committed Session revision. */
 export async function selectRealAskPermission(
   context: RealWorkspace,
-  agentId: 'claude' | 'codex',
+  agentId: RuntimeAgentId,
 ): Promise<void> {
-  const label = agentId === 'claude' ? 'Claude' : 'Codex'
-  const selected = context.page.getByRole('button', {
-    name: `${label} · Ask for approval`,
-    exact: true,
-  })
-  if (!(await selected.isVisible())) {
-    await context.page.getByRole('button', { name: new RegExp(`^${label} · `, 'u') }).click()
+  const fullName =
+    agentId === 'claude' ? 'Claude Code' : agentId === 'codex' ? 'Codex' : 'Antigravity'
+  const trigger = context.page.locator(
+    `button[popovertarget="permissions-${context.sessionId}-${agentId}"]`,
+  )
+  await expect(trigger).toBeVisible()
+  const expectedAria = `${fullName} permissions for the next task: Ask for approval`
+  if ((await trigger.getAttribute('aria-label')) !== expectedAria) {
+    await trigger.click()
     const menu = context.page.locator(`#permissions-${context.sessionId}-${agentId}`)
     await menu.getByRole('button', { name: /^Ask for approval/u }).click()
     await expect(menu).toBeHidden()
   }
-  await expect(selected).toBeVisible()
+  await expect(trigger).toHaveAttribute('aria-label', expectedAria)
+}
+
+const PREFERRED_UNCONFIGURED_MODELS: Record<RuntimeAgentId, (entry: AgentModelOption) => boolean> =
+  {
+    codex: (entry) => entry.id === 'gpt-6-luna' || entry.resolvedModel === 'gpt-6-luna',
+    claude: (entry) =>
+      entry.id === 'claude-haiku-5-5' ||
+      Boolean(entry.resolvedModel?.startsWith('claude-haiku-5-5')),
+    agy: (entry) => entry.id === DEFAULT_REAL_AGY_MODEL,
+  }
+
+/** Resolve the configured model (or preferred cheap default when unconfigured) and low effort. */
+export function resolveRealModelAndEffortTarget(
+  agentId: RuntimeAgentId,
+  catalog: AgentModelCatalog,
+  configuredModel: string | null,
+  currentModel: string | null,
+): { model: AgentModelOption; effort: string | null } {
+  const model = configuredModel
+    ? resolveRealConfiguredModel(catalog, configuredModel, currentModel)
+    : (() => {
+        if (catalog.status !== 'available' || catalog.models.length === 0) {
+          throw new Error(`Available CLI catalog is required for ${agentId}`)
+        }
+        return (
+          catalog.models.find(PREFERRED_UNCONFIGURED_MODELS[agentId]) ??
+          catalog.models.find((entry) => entry.id === currentModel) ??
+          catalog.models[0]!
+        )
+      })()
+  const effort = model.supportedEfforts.includes('low')
+    ? 'low'
+    : (model.supportedEfforts[0] ?? null)
+  return { model, effort }
 }
 
 export async function selectRealConfiguredEffort(
   ctx: RealWorkspace,
-  agentIds: readonly ('claude' | 'codex')[] = ['claude', 'codex'],
+  agentIds: readonly RuntimeAgentId[] = ['claude', 'codex'],
+  primaryAgentId?: RuntimeAgentId,
 ): Promise<void> {
   if (agentIds.length < 1 || agentIds.length > 2 || new Set(agentIds).size !== agentIds.length)
     throw new Error('Real effort selection requires one or two unique Agents')
@@ -310,14 +399,20 @@ export async function selectRealConfiguredEffort(
     agents = { ...previous.agents },
     models = ctx.fixture.readConfigurationModels()
   for (const agent of agentIds) {
-    const model = resolveRealConfiguredModel(
-      state.value.modelCatalogs[agent],
-      models[agent],
+    const catalog = state.value.modelCatalogs[agent]
+    if (!catalog) throw new Error(`Missing model catalog for ${agent}`)
+    const configuredModel =
+      agent === 'claude' ? models.claude : agent === 'codex' ? models.codex : (models.agy ?? null)
+    const { model, effort } = resolveRealModelAndEffortTarget(
+      agent,
+      catalog,
+      configuredModel,
       agents[agent].model,
     )
-    agents[agent] = {
-      model: model.id,
-      effort: model.supportedEfforts.includes('low') ? 'low' : (model.supportedEfforts[0] ?? null),
+    if (agent === 'agy') {
+      agents.agy = { ...agents.agy, model: model.id, effort }
+    } else {
+      agents[agent] = { model: model.id, effort }
     }
   }
   const saved = await ctx.page.evaluate(
@@ -331,10 +426,13 @@ export async function selectRealConfiguredEffort(
     {
       sessionId: ctx.sessionId,
       settings: {
-        primaryAgentId: previous.primaryAgentId,
+        primaryAgentId: primaryAgentId ?? previous.primaryAgentId,
+        secondaryAgentId:
+          (primaryAgentId ?? previous.primaryAgentId) === previous.secondaryAgentId
+            ? previous.primaryAgentId
+            : previous.secondaryAgentId,
         agents,
         maxDiscussionRounds: previous.maxDiscussionRounds,
-        runningMessagePolicy: previous.runningMessagePolicy,
         maxReviewCycles: previous.maxReviewCycles,
         maxRepairAttempts: previous.maxRepairAttempts,
       },
@@ -462,6 +560,12 @@ export async function restartRealWorkspace(context: RealWorkspace): Promise<void
   await quitPact(context.app)
   context.app = await context.fixture.launch()
   context.page = await context.app.firstWindow()
+  await waitForWindowsRuntimeReady(
+    context.page,
+    context.fixture,
+    context.strictInitialReadiness ? { strictInitialReadiness: true } : {},
+  )
+  await waitForPairReady(context.page, context.activePair ?? ['codex', 'claude'])
   await selectRealSession(context, context.sessionId)
 }
 

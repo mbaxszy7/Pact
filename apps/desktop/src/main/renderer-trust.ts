@@ -6,6 +6,7 @@ interface ManagedWebContents {
   readonly mainFrame: ManagedFrame
   getURL(): string
   isDestroyed(): boolean
+  isCrashed?(): boolean
   send(channel: string, ...args: unknown[]): void
 }
 

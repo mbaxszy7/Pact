@@ -1,5 +1,7 @@
 import { z } from 'zod'
 
+import { MAX_TOTAL_TERMINALS, terminalQuitSummaryRowSchema } from './terminal.js'
+
 export const WORKSPACE_ARCHIVE_TASK_LIMIT = 5
 export const WORKSPACE_ARCHIVE_PREVIEW_MS = 120_000
 export const WORKSPACE_ARCHIVE_STOP_MS = 15_000
@@ -33,6 +35,7 @@ export const workspaceArchivePreviewSchema = z.strictObject({
   title: z.string().min(1).max(4096),
   projectId: z.string().uuid(),
   tasks: z.array(workspaceArchiveTaskSchema).max(WORKSPACE_ARCHIVE_TASK_LIMIT),
+  terminals: z.array(terminalQuitSummaryRowSchema).max(MAX_TOTAL_TERMINALS).optional(),
   blockedReason: z.string().max(1024).optional(),
   expiresAt: z.string().datetime(),
 })

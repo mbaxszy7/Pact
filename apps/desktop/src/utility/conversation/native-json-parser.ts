@@ -32,12 +32,30 @@ export async function parseNativeJsonFrame(
   bytes: Buffer,
   signal: AbortSignal,
   ipcTraffic?: LogicalIpcWorkerTraffic,
+  observePhysicalCompletion?: (completion: Promise<void>) => void,
 ): Promise<{ message: unknown; heldBytes: number }> {
+  const physical = Promise.withResolvers<void>()
+  observePhysicalCompletion?.(physical.promise)
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), PARSER_DEADLINE_MS)
   const observed = AbortSignal.any([signal, controller.signal])
   let worker: Worker | undefined
   let acquired = false
+  let workerClosed = false,
+    readJoined = false,
+    released = false
+  const settlePhysical = (): void => {
+    if (released || !readJoined || (worker && !workerClosed)) return
+    released = true
+    if (acquired) {
+      activeWorkers -= 1
+      for (const notify of waiting) {
+        if (activeWorkers >= PARSER_WORKER_LIMIT) break
+        notify()
+      }
+    }
+    physical.resolve()
+  }
   try {
     observed.throwIfAborted()
     if (activeWorkers >= PARSER_WORKER_LIMIT) {
@@ -88,6 +106,10 @@ export async function parseNativeJsonFrame(
       workerData: initial,
       transferList: [data.buffer],
       resourceLimits: { maxOldGenerationSizeMb: 128, maxYoungGenerationSizeMb: 8, stackSizeMb: 4 },
+    })
+    worker.once('exit', () => {
+      workerClosed = true
+      settlePhysical()
     })
     if (initMeasurement)
       traffic?.recordMeasurement('utility-native-json.init', 'business', initMeasurement)
@@ -155,14 +177,15 @@ export async function parseNativeJsonFrame(
       if (observed.aborted) cancelled()
     })
   } finally {
-    if (worker) await worker.terminate()
-    clearTimeout(timer)
-    if (acquired) {
-      activeWorkers -= 1
-      for (const notify of waiting) {
-        if (activeWorkers >= PARSER_WORKER_LIMIT) break
-        notify()
+    try {
+      if (worker) {
+        await worker.terminate()
+        workerClosed = true
       }
+    } finally {
+      clearTimeout(timer)
+      readJoined = true
+      settlePhysical()
     }
   }
 }

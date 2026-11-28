@@ -216,7 +216,7 @@ export function ProjectContextMenu({
   const itemClass = 'pact-composer-menu-item'
 
   return (
-    <div className="pact-project-context ml-auto min-w-0 max-w-full text-caption">
+    <div className="pact-project-context ml-auto text-caption">
       <output className="sr-only" aria-live="polite">
         {copied === 'folder'
           ? 'Project path copied'

@@ -1,5 +1,5 @@
 import { ChevronLeft, ChevronRight, Image as ImageIcon, RotateCcw, X } from 'lucide-react'
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 
 import type { ConversationImage } from '@pact/contracts/images'
 
@@ -86,11 +86,11 @@ export function ImageThumbnail({
               : `Preview ${name}`
         }
         aria-busy={preparing || Boolean(image && !thumbnail.url && !thumbnail.error)}
-        disabled={preparing || (!image && !problem)}
+        disabled={preparing || !image}
         title={problem ?? name}
         onClick={() => {
           if (image && onOpen) onOpen()
-          else if (thumbnail.error) thumbnail.retry()
+          else if (image && thumbnail.error) thumbnail.retry()
         }}
       >
         {thumbnail.url ? (
@@ -104,7 +104,7 @@ export function ImageThumbnail({
           <span
             className={`grid h-full w-full place-items-center text-tertiary ${preparing || !problem ? 'pact-image-loading' : ''}`}
           >
-            {problem ? (
+            {image && thumbnail.error ? (
               <RotateCcw aria-hidden="true" className="size-4" strokeWidth={1.75} />
             ) : (
               <ImageIcon aria-hidden="true" className="size-5" strokeWidth={1.75} />
@@ -138,6 +138,38 @@ export function ImageThumbnail({
   )
 }
 
+interface ScrollNavState {
+  overflows: boolean
+  canScrollLeft: boolean
+  canScrollRight: boolean
+}
+
+const EMPTY_SCROLL_NAV: ScrollNavState = {
+  overflows: false,
+  canScrollLeft: false,
+  canScrollRight: false,
+}
+
+const SCROLL_OVERFLOW_EPSILON = 1
+
+function readScrollNav(node: HTMLDivElement): ScrollNavState {
+  const maxScrollLeft = Math.max(0, node.scrollWidth - node.clientWidth)
+  if (maxScrollLeft <= SCROLL_OVERFLOW_EPSILON) return EMPTY_SCROLL_NAV
+  return {
+    overflows: true,
+    canScrollLeft: node.scrollLeft > SCROLL_OVERFLOW_EPSILON,
+    canScrollRight: maxScrollLeft - node.scrollLeft > SCROLL_OVERFLOW_EPSILON,
+  }
+}
+
+function sameScrollNav(left: ScrollNavState, right: ScrollNavState): boolean {
+  return (
+    left.overflows === right.overflows &&
+    left.canScrollLeft === right.canScrollLeft &&
+    left.canScrollRight === right.canScrollRight
+  )
+}
+
 /** Horizontal windowing keeps at most sixteen image nodes mounted per strip. */
 export function ConversationImages({
   sessionId,
@@ -156,10 +188,33 @@ export function ConversationImages({
 }): React.JSX.Element | null {
   const scroll = useRef<HTMLDivElement>(null)
   const [start, setStart] = useState(0)
-  if (!images.length) return null
+  const [scrollNav, setScrollNav] = useState<ScrollNavState>(EMPTY_SCROLL_NAV)
   const step = draft ? 92 : 116
+
+  useLayoutEffect(() => {
+    const node = scroll.current
+    if (!node || !images.length) {
+      setScrollNav((prev) => (sameScrollNav(prev, EMPTY_SCROLL_NAV) ? prev : EMPTY_SCROLL_NAV))
+      return undefined
+    }
+    const sync = () => {
+      const nextNav = readScrollNav(node)
+      setScrollNav((prev) => (sameScrollNav(prev, nextNav) ? prev : nextNav))
+      const nextStart = Math.max(0, Math.floor(node.scrollLeft / step) - 1)
+      setStart((prev) => (prev === nextStart ? prev : nextStart))
+    }
+    sync()
+    if (typeof ResizeObserver === 'undefined') return undefined
+    const observer = new ResizeObserver(sync)
+    observer.observe(node)
+    return () => observer.disconnect()
+  }, [images.length, step])
+
+  if (!images.length) return null
   const beginning = Math.max(0, Math.min(start, Math.max(0, images.length - 1)))
   const visible = images.slice(beginning, beginning + 16)
+  const showArrows = images.length > 1 && scrollNav.overflows
+  const showFooter = images.length > 3 || showArrows
   const move = (direction: number) =>
     scroll.current?.scrollBy({ left: direction * step * 3, behavior: 'smooth' })
   return (
@@ -169,13 +224,17 @@ export function ConversationImages({
           ref={scroll}
           className="overflow-x-auto pb-1 pt-1"
           aria-label={draft ? 'Attached images' : 'Message images'}
-          onScroll={(event) =>
-            setStart(Math.max(0, Math.floor(event.currentTarget.scrollLeft / step) - 1))
-          }
+          onScroll={(event) => {
+            const node = event.currentTarget
+            const nextStart = Math.max(0, Math.floor(node.scrollLeft / step) - 1)
+            setStart((prev) => (prev === nextStart ? prev : nextStart))
+            const nextNav = readScrollNav(node)
+            setScrollNav((prev) => (sameScrollNav(prev, nextNav) ? prev : nextNav))
+          }}
         >
           <div
             className="relative"
-            style={{ width: images.length * step, height: draft ? 99 : 123 }}
+            style={{ width: Math.max(0, images.length * step - 8), height: draft ? 99 : 123 }}
           >
             {visible.map((entry, index) => (
               <div
@@ -206,27 +265,31 @@ export function ConversationImages({
           </div>
         </div>
       </div>
-      {images.length > 3 ? (
+      {showFooter ? (
         <div className="mt-0.5 flex items-center justify-between text-caption text-secondary">
           <span>{images.length} images</span>
-          <div className="flex gap-1">
-            <button
-              type="button"
-              className="grid size-7 place-items-center rounded-control hover:bg-surface-muted"
-              aria-label="Previous images"
-              onClick={() => move(-1)}
-            >
-              <ChevronLeft className="size-4" strokeWidth={1.75} />
-            </button>
-            <button
-              type="button"
-              className="grid size-7 place-items-center rounded-control hover:bg-surface-muted"
-              aria-label="Next images"
-              onClick={() => move(1)}
-            >
-              <ChevronRight className="size-4" strokeWidth={1.75} />
-            </button>
-          </div>
+          {showArrows ? (
+            <div className="flex gap-1">
+              <button
+                type="button"
+                className="grid size-7 cursor-pointer place-items-center rounded-control enabled:hover:bg-surface-muted enabled:hover:text-primary disabled:cursor-default disabled:opacity-35"
+                aria-label="Previous images"
+                disabled={!scrollNav.canScrollLeft}
+                onClick={() => move(-1)}
+              >
+                <ChevronLeft aria-hidden="true" className="size-4" strokeWidth={1.75} />
+              </button>
+              <button
+                type="button"
+                className="grid size-7 cursor-pointer place-items-center rounded-control enabled:hover:bg-surface-muted enabled:hover:text-primary disabled:cursor-default disabled:opacity-35"
+                aria-label="Next images"
+                disabled={!scrollNav.canScrollRight}
+                onClick={() => move(1)}
+              >
+                <ChevronRight aria-hidden="true" className="size-4" strokeWidth={1.75} />
+              </button>
+            </div>
+          ) : null}
         </div>
       ) : null}
     </div>

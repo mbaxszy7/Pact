@@ -5,6 +5,7 @@ import type { DesktopBridge } from '@pact/contracts'
 /** Typed native editing/catalog responders shared by tests that mount the Composer. */
 export function composerBridgeFixture() {
   return {
+    onConversationChanged: vi.fn<DesktopBridge['onConversationChanged']>(() => vi.fn<() => void>()),
     cancelSkillCatalog: vi.fn<DesktopBridge['cancelSkillCatalog']>().mockResolvedValue({
       ok: true,
       value: { ready: true },

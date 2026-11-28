@@ -11,7 +11,8 @@ import { PactDatabase } from '@pact/persistence'
 
 import { ProjectFileReader } from '../project-file/project-file-reader.js'
 import { RuntimePreparation } from '../runtime-preparation/runtime-preparation.js'
-import { AgentExecutionError } from './agent-execution-error.js'
+import { runDirectoryWorker } from '../workspace-changes/directory-worker.test-support.js'
+import { AgentExecutionError, NativeCapacityError } from './agent-execution-error.js'
 import { Conversation } from './conversation.js'
 
 const native = vi.hoisted(() => ({
@@ -19,7 +20,7 @@ const native = vi.hoisted(() => ({
   active: 0,
   maximumActive: 0,
   answer: 'current primary answer',
-  mode: 'complete' as 'complete' | 'fail' | 'wait',
+  mode: 'complete' as 'complete' | 'fail' | 'wait' | 'secondary_capacity',
 }))
 
 function adapter(agentId: RuntimeAgentId) {
@@ -30,6 +31,9 @@ function adapter(agentId: RuntimeAgentId) {
       native.active += 1
       native.maximumActive = Math.max(native.maximumActive, native.active)
       try {
+        if (native.mode === 'secondary_capacity' && native.inputs.length === 2) {
+          throw new NativeCapacityError('Secondary capacity reached before dispatch.')
+        }
         if (native.mode === 'fail')
           throw new AgentExecutionError('protocol_error', 'Fixture failed before dispatch.', false)
         if (native.mode === 'wait') {
@@ -40,9 +44,9 @@ function adapter(agentId: RuntimeAgentId) {
           signal.throwIfAborted()
         }
         const nativeSessionId = input.nativeSessionId ?? `${agentId}-native`
-        input.recordDispatch?.('possibly_sent', nativeSessionId)
+        input.host?.lifecycle?.recordDispatch?.('possibly_sent', nativeSessionId)
         yield { agentId, type: 'session.started', nativeSessionId }
-        input.recordDispatch?.('accepted', nativeSessionId)
+        input.host?.lifecycle?.recordDispatch?.('accepted', nativeSessionId)
         yield { agentId, type: 'turn.started', turnId: input.runId }
         yield {
           agentId,
@@ -52,6 +56,11 @@ function adapter(agentId: RuntimeAgentId) {
           text: native.answer,
         }
         yield { agentId, type: 'turn.completed', turnId: input.runId, outcome: 'completed' }
+        input.host?.effects?.reportNativeEffects?.({
+          runId: input.runId,
+          generation: input.nativeGeneration!,
+          state: 'settled',
+        })
       } finally {
         native.active -= 1
       }
@@ -102,9 +111,14 @@ async function fixture(primaryAgentId: RuntimeAgentId) {
     { id: sessionId, projectId, title: 'All', createdAt },
     {
       primaryAgentId,
-      agents: { codex: { model: null, effort: null }, claude: { model: null, effort: null } },
+      secondaryAgentId: primaryAgentId === 'claude' ? 'codex' : 'claude',
+      agents: {
+        codex: { model: null, effort: null },
+        claude: { model: null, effort: null },
+        agy: { model: null, effort: null },
+      },
       maxDiscussionRounds: 3,
-      runningMessagePolicy: 'next_round',
+
       maxReviewCycles: 3,
       maxRepairAttempts: 3,
     },
@@ -136,7 +150,11 @@ async function fixture(primaryAgentId: RuntimeAgentId) {
       owner.db.sessionRepository,
       owner.db.projectCatalogRepository,
       preparation,
-      new ProjectFileReader(owner.db.sessionRepository, owner.db.projectCatalogRepository),
+      new ProjectFileReader(
+        owner.db.sessionRepository,
+        owner.db.projectCatalogRepository,
+        runDirectoryWorker,
+      ),
     )
     return owner.flow
   }
@@ -283,6 +301,7 @@ it('resumes only an uncreated secondary after reopening the database and retains
   f.owner.db.sessionRepository.saveSettings(f.sessionId, {
     ...saved,
     primaryAgentId: 'codex',
+    secondaryAgentId: 'claude',
     agents: { ...saved.agents, codex: { model: 'changed-after-send', effort: 'high' } },
   })
   f.owner.db.close()
@@ -327,3 +346,62 @@ it.each(['fail', 'wait'] as const)(
     expect(f.owner.db.conversationRepository.pendingRoutedContinuations()).toEqual([])
   },
 )
+
+it('settles an already-created @all secondary cleanly on pre-dispatch NativeCapacityError and pre-adapter prep failure', async () => {
+  // 1. Secondary fails with NativeCapacityError before dispatching after Primary already delivered:
+  //    must NOT inherit Primary deliveryPossible and must settle with not_dispatched.
+  const f1 = await fixture('codex')
+  const flow1 = f1.openFlow()
+  native.mode = 'secondary_capacity'
+  expect((await flow1.send({ ...f1.input('task-cap'), route: { type: 'all' } })).ok).toBe(true)
+  await f1.idle()
+  expect(native.inputs).toHaveLength(2)
+  const runs1 = f1.owner.db.conversationRepository.read(f1.sessionId).runs
+  const primary1 = runs1.find((r) => r.agentId === 'codex')
+  const secondary1 = runs1.find((r) => r.agentId === 'claude')
+  expect(primary1).toMatchObject({ status: 'completed' })
+  expect(secondary1).toMatchObject({
+    status: 'failed',
+    dispatchPhase: 'not_sent',
+    nativeEffectsState: 'not_dispatched',
+  })
+  expect(f1.owner.db.conversationRepository.pendingRoutedContinuations()).toEqual([])
+
+  // 2. Secondary throws during pre-owner binding check after row creation:
+  //    must settle Secondary to failed (never stranded in starting) and allow follow-up sends.
+  const f2 = await fixture('codex')
+  const flow2 = f2.openFlow()
+  native.mode = 'complete'
+  const origNativeContext = f2.owner.db.conversationRepository.nativeContext.bind(
+    f2.owner.db.conversationRepository,
+  )
+  let claudeContextChecks = 0
+  const contextSpy = vi
+    .spyOn(f2.owner.db.conversationRepository, 'nativeContext')
+    .mockImplementation((sessionId, agentId) => {
+      if (
+        agentId === 'claude' &&
+        f2.owner.db.conversationRepository.latestAgentRun(sessionId, 'claude') !== undefined
+      ) {
+        claudeContextChecks += 1
+        if (claudeContextChecks >= 1) {
+          throw new Error('Secondary binding verification failed before owner registration')
+        }
+      }
+      return origNativeContext(sessionId, agentId)
+    })
+  try {
+    expect((await flow2.send({ ...f2.input('task-prep'), route: { type: 'all' } })).ok).toBe(true)
+    await f2.idle()
+    const runs2 = f2.owner.db.conversationRepository.read(f2.sessionId).runs
+    const secondary2 = runs2.find((r) => r.agentId === 'claude')
+    expect(runs2.find((r) => r.agentId === 'codex')).toMatchObject({ status: 'completed' })
+    expect(secondary2).toMatchObject({
+      status: 'failed',
+      dispatchPhase: 'not_sent',
+    })
+    expect(f2.owner.db.conversationRepository.pendingRoutedContinuations()).toEqual([])
+  } finally {
+    contextSpy.mockRestore()
+  }
+})

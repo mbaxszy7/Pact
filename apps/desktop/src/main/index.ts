@@ -22,6 +22,10 @@ import {
 import { ApplicationMenu } from './modules/application-menu'
 import { DiagnosticLogs } from './modules/diagnostics'
 import {
+  createNativeLastExitNoticeStore,
+  type NativeLastExitNoticeStore,
+} from './modules/native-last-exit-notice'
+import {
   developmentNativeInvocation,
   NativePresence,
   nativeLaunchData,
@@ -47,6 +51,7 @@ const rendererTrust = createRendererTrust({
 let removeDesktopModules: (() => void) | undefined
 let appearanceSettings: AppearanceController
 let diagnostics: DiagnosticLogs | undefined
+let lastExitNotice: NativeLastExitNoticeStore | undefined
 let applicationMenu: ApplicationMenu | undefined
 let applicationUpdates: ApplicationUpdates | undefined
 let nativePresence: NativePresence | undefined
@@ -157,10 +162,17 @@ async function bootstrap(): Promise<void> {
     traffic?.collector('main-utility'),
     traffic?.collector('main-diagnostic-log'),
   )
+  lastExitNotice = createNativeLastExitNoticeStore(paths.databaseFile)
   utilityClient.start({
     ...paths,
     diagnostics,
     onExit: () => {
+      if (!quitting && lastExitNotice) {
+        const openCount = utilityClient.trackedOpenTerminalCount?.() ?? 0
+        if (openCount > 0) {
+          void lastExitNotice.record('utility_exited_unconfirmed', openCount).catch(() => undefined)
+        }
+      }
       if (quitting) void finishQuit()
     },
     ...(traffic ? { traffic } : {}),
@@ -171,13 +183,15 @@ async function bootstrap(): Promise<void> {
         DATABASE_IN_USE:
           'Another Pact process is using this data. Close that process before opening this copy.',
         DATABASE_INCOMPATIBLE:
-          'This Pact version cannot safely open the existing data. Use a build with compatible migration history.',
+          failure.reason === 'newer-migration-history'
+            ? 'This version of Pact can’t open your existing data. Try opening it with a newer version of Pact.'
+            : 'This version of Pact can’t open your existing data.',
         DATABASE_BACKUP_FAILED:
-          'Pact could not create the required upgrade backup. Check storage space and folder permissions.',
+          'Pact couldn’t create a backup before upgrading your data. Check free disk space and folder permissions.',
         DATABASE_MIGRATION_FAILED:
-          'Pact could not complete the data upgrade. Existing data and recovery files have been preserved.',
+          'Pact couldn’t upgrade your data. Your existing data and backup are safe.',
         DATABASE_STORAGE_FAILED:
-          'Pact could not open its data. Check that the data folder is available and accessible.',
+          'Pact couldn’t open its data folder. Check that the folder exists and is accessible.',
       }
       const canReveal =
         isAbsolute(failure.dataFilePath) &&
@@ -186,16 +200,16 @@ async function bootstrap(): Promise<void> {
       void dialog
         .showMessageBox({
           type: 'error',
-          title: `${productIdentity.productName} could not start`,
+          title: `${productIdentity.productName} couldn’t start`,
           message:
             failure.stage === 'runtime'
-              ? 'Pact could not start its local runtime. Quit and check the data folder before trying again.'
+              ? 'Pact couldn’t start its background service. Quit and check your data folder before trying again.'
               : messages[failure.code],
           detail: failure.partialBackupFilePath
-            ? 'Your data was preserved. An incomplete backup was kept separately and must not replace the original data.'
+            ? 'Your original data is safe. An incomplete backup file was kept separately and should not replace it.'
             : failure.backupFilePath
-              ? 'Your data and recovery backup were preserved. Open the data folder to locate them.'
-              : 'Your data was preserved. Pact will quit without recreating or clearing it.',
+              ? 'Your data and a recovery backup were kept safe. Open the data folder to find them.'
+              : 'Your data is safe. Pact will quit without changing or clearing it.',
           buttons: canReveal ? ['Open data folder', 'Quit'] : ['Quit'],
           defaultId: canReveal ? 1 : 0,
           cancelId: canReveal ? 1 : 0,
@@ -219,7 +233,15 @@ async function bootstrap(): Promise<void> {
     () => applicationUpdates?.openFromMenu(),
   )
   appearanceSettings = createAppearanceController(utilityClient, nativeTheme)
-  removeDesktopModules = registerDesktopModules(rendererTrust, utilityClient, appearanceSettings)
+  if (!nativePresence) throw new Error('Pact native presence was not initialized.')
+  removeDesktopModules = registerDesktopModules(
+    rendererTrust,
+    utilityClient,
+    appearanceSettings,
+    nativePresence,
+    (event) => diagnostics?.record(event),
+    lastExitNotice,
+  )
 
   app.on('browser-window-created', (_, window) => {
     optimizer.watchWindowShortcuts(window)
@@ -263,9 +285,12 @@ void bootstrap().catch(() => {
 let quitting = false
 let quitReady = false
 let quitApproval: Promise<void> | undefined
+let quitNoticeTask: Promise<void> | undefined
 let quitCompletion: Promise<void> | undefined
 function finishQuit(): Promise<void> {
   quitCompletion ??= (async () => {
+    await utilityClient.settlement()
+    if (quitNoticeTask) await quitNoticeTask.catch(() => undefined)
     try {
       await diagnostics?.close()
     } catch {
@@ -304,8 +329,39 @@ app.on('before-quit', (event) => {
     if (!accepted) return
     quitting = true
     applicationUpdates?.stop()
-    const result = await utilityClient.shutdown()
-    if (!result.ok) console.error('Pact shutdown was not acknowledged:', result.error.code)
+    const openCount = utilityClient.trackedOpenTerminalCount?.() ?? 0
+    const noticeTask = (async () => {
+      const result = await utilityClient.shutdown()
+      if (!result.ok) console.error('Pact shutdown was not acknowledged:', result.error.code)
+      let noticeWriteFailed = false
+      if (result.ok && result.value.unconfirmedTerminals && result.value.unconfirmedTerminals > 0) {
+        const recorded = await (
+          lastExitNotice?.record('worker_cleanup_failed', result.value.unconfirmedTerminals) ??
+          Promise.resolve(true)
+        ).catch(() => false)
+        noticeWriteFailed = !recorded
+      } else if (!result.ok && openCount > 0) {
+        const reason =
+          result.error.code === 'TIMEOUT' ? 'shutdown_timeout' : 'utility_exited_unconfirmed'
+        const recorded = await (
+          lastExitNotice?.record(reason, openCount) ?? Promise.resolve(true)
+        ).catch(() => false)
+        noticeWriteFailed = !recorded
+      }
+      if (noticeWriteFailed && !(nativePresence?.isSystemEnding?.() ?? false)) {
+        await dialog
+          .showMessageBox({
+            type: 'warning',
+            title: 'Pact',
+            message: 'Background terminal cleanup could not be recorded cleanly.',
+            detail: 'Some terminal processes may still need manual inspection after Pact exits.',
+            buttons: ['Close'],
+          })
+          .catch(() => undefined)
+      }
+    })()
+    quitNoticeTask = noticeTask
+    await noticeTask
     if (!utilityClient.isRunning()) await finishQuit()
     else nativePresence?.shutdownUnconfirmed()
   })().finally(() => {

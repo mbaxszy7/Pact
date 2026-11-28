@@ -1,10 +1,11 @@
 import { ShieldQuestion } from 'lucide-react'
 import { useState } from 'react'
 
-import type {
-  NativePermissionDecision,
-  NativePermissionRequest,
-  RuntimeAgentId,
+import {
+  agentDisplayName,
+  type NativePermissionDecision,
+  type NativePermissionRequest,
+  type RuntimeAgentId,
 } from '@pact/contracts'
 
 import { useNativeInteractionDetails } from './useNativeInteractionDetails'
@@ -39,10 +40,11 @@ export function NativePermissionCard({
     setResponding(true)
     void onRespond(operationId, request.id, decision).finally(() => setResponding(false))
   }
+  const agentName = agentDisplayName(agentId)
   return (
     <section
       className="mt-group rounded-message border border-border bg-surface-raised p-group text-caption"
-      aria-label={`${agentId === 'codex' ? 'Codex' : 'Claude Code'} permission request`}
+      aria-label={`${agentName} permission request`}
       data-pact-native-permission={request.id}
       aria-busy={responding}
     >
@@ -55,13 +57,13 @@ export function NativePermissionCard({
         <div className="min-w-0 flex-1">
           <p className="font-medium text-primary">
             {confirmation
-              ? `Confirm ${agentId === 'codex' ? 'Codex' : 'Claude Code'} permission change`
-              : `${agentId === 'codex' ? 'Codex' : 'Claude Code'} needs approval`}
+              ? `Confirm ${agentName} permission change`
+              : `${agentName} needs approval`}
           </p>
           {!confirmation ? (
             <p className="mt-1 break-words text-primary">
               {details?.title ??
-                (reader.loading ? 'Loading native request…' : 'Native request unavailable')}
+                (reader.loading ? 'Loading request details…' : 'Request details unavailable')}
             </p>
           ) : null}
           {!confirmation && details?.detail ? (
@@ -79,7 +81,7 @@ export function NativePermissionCard({
             className="ml-2 cursor-pointer rounded-control px-2 font-medium text-primary hover:bg-surface-muted focus-visible:outline-2 focus-visible:outline-focus"
             onClick={reader.retry}
           >
-            Retry loading
+            Try again
           </button>
         </p>
       ) : null}

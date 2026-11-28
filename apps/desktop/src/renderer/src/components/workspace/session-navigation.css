@@ -1,0 +1,226 @@
+:root {
+  --pact-group-gray: #d9dce0;
+  --pact-group-blue: #8ab4f8;
+  --pact-group-red: #f28a82;
+  --pact-group-yellow: #fdd663;
+  --pact-group-green: #81c995;
+  --pact-group-rose: #ff8bcb;
+  --pact-group-purple: #c58af9;
+  --pact-group-cyan: #78d9ec;
+  --pact-group-orange: #fbad71;
+}
+
+[data-group-color='gray'] {
+  --pact-group-accent: var(--pact-group-gray);
+}
+[data-group-color='blue'] {
+  --pact-group-accent: var(--pact-group-blue);
+}
+[data-group-color='red'] {
+  --pact-group-accent: var(--pact-group-red);
+}
+[data-group-color='yellow'] {
+  --pact-group-accent: var(--pact-group-yellow);
+}
+[data-group-color='green'] {
+  --pact-group-accent: var(--pact-group-green);
+}
+[data-group-color='rose'] {
+  --pact-group-accent: var(--pact-group-rose);
+}
+[data-group-color='purple'] {
+  --pact-group-accent: var(--pact-group-purple);
+}
+[data-group-color='cyan'] {
+  --pact-group-accent: var(--pact-group-cyan);
+}
+[data-group-color='orange'] {
+  --pact-group-accent: var(--pact-group-orange);
+}
+
+.pact-group-color-choice {
+  position: relative;
+  display: grid;
+  min-block-size: 26px;
+  place-items: center;
+  border-radius: var(--radius-control);
+}
+
+.pact-group-color-choice > span {
+  inline-size: 16px;
+  block-size: 16px;
+  border-radius: 50%;
+  background: var(--pact-group-accent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, currentColor 16%, transparent);
+}
+
+.pact-group-color-choice[aria-pressed='true']::before {
+  position: absolute;
+  inline-size: 16px;
+  block-size: 16px;
+  border: 2px solid var(--pact-group-accent);
+  border-radius: 50%;
+  content: '';
+}
+
+.pact-group-color-choice[aria-pressed='true'] > span {
+  inline-size: 8px;
+  block-size: 8px;
+  box-shadow: none;
+}
+
+.pact-nav-group-dot {
+  background: var(--pact-group-accent);
+}
+/* The title retains its own shape. The member tint sits one level in. */
+.pact-nav-group-heading {
+  color: var(--pact-text-primary);
+}
+.pact-nav-group-heading > button[data-nav-primary] {
+  background: color-mix(in srgb, var(--pact-group-accent) 32%, var(--pact-surface-raised));
+}
+.pact-nav-group-heading:is(:hover, [data-group-drop='membership']) > button[data-nav-primary] {
+  background: color-mix(in srgb, var(--pact-group-accent) 38%, var(--pact-surface-raised));
+}
+.pact-nav-group-heading > div button {
+  color: inherit;
+}
+.pact-nav-group-heading > div button:hover {
+  background: color-mix(in srgb, currentColor 9%, transparent);
+}
+.pact-nav-group-body {
+  margin-inline-start: calc(var(--pact-space-group) + 10px);
+  background: color-mix(in srgb, var(--pact-group-accent) 10%, var(--pact-surface-muted));
+}
+.pact-nav-group-body[data-group-head='true'] {
+  border-start-start-radius: var(--radius-control);
+  border-start-end-radius: var(--radius-control);
+}
+.pact-nav-group-body[data-group-tail='true'] {
+  border-end-start-radius: var(--radius-control);
+  border-end-end-radius: var(--radius-control);
+}
+.pact-nav-group-body > button[data-nav-primary] {
+  background: transparent;
+  border-radius: inherit;
+}
+.pact-nav-group-body[data-session-menu] > button[data-nav-primary] {
+  padding-inline-end: 4rem;
+}
+.pact-nav-group-body:has(> button[data-selected='true']) {
+  background: color-mix(in srgb, var(--pact-group-accent) 20%, var(--pact-surface-muted));
+}
+nav:not([data-session-dragging]) .pact-nav-group-body:hover {
+  background: color-mix(in srgb, var(--pact-group-accent) 16%, var(--pact-surface-muted));
+}
+nav:not([data-session-dragging]) .pact-nav-group-body:has(> button[data-selected='true']):hover {
+  background: color-mix(in srgb, var(--pact-group-accent) 24%, var(--pact-surface-muted));
+}
+.pact-nav-group-body > button[data-nav-primary]:focus-visible {
+  outline-offset: -2px;
+}
+.pact-nav-drop-slot:not(.pact-nav-group-body)::before {
+  position: absolute;
+  inset: 2px 0;
+  border-radius: inherit;
+  background: var(--pact-navigation-selected);
+  pointer-events: none;
+  content: '';
+}
+.pact-nav-drop-slot.pact-nav-group-body {
+  background: color-mix(in srgb, var(--pact-group-accent) 15%, var(--pact-surface-muted));
+}
+[data-group-dragging='true'] > button,
+[data-group-dragging='true'] > div {
+  opacity: 0.22;
+}
+[data-session-dragging] {
+  cursor: grabbing;
+}
+[data-drag-invalid] {
+  cursor: not-allowed;
+}
+[data-session-dragging='session'] .pact-nav-group-body > button:not([data-selected='true']):hover {
+  background: transparent;
+}
+[data-group-drop='before']::after,
+[data-group-drop='after']::after {
+  position: absolute;
+  inset-inline: 0;
+  block-size: 2px;
+  border-radius: 2px;
+  background: var(--pact-focus);
+  pointer-events: none;
+  content: '';
+}
+[data-group-drop='before']::after {
+  inset-block-start: 0;
+}
+[data-group-drop='after']::after {
+  inset-block-end: 0;
+}
+[data-session-located='true']:not(.pact-nav-group-body) > button[data-nav-primary] {
+  animation: pact-session-located 1.5s ease-out;
+}
+
+@keyframes pact-session-located {
+  from {
+    background: var(--pact-navigation-selected);
+  }
+}
+
+.pact-nav-group-body[data-session-located='true'] {
+  animation: pact-group-session-located 720ms ease-out;
+}
+@keyframes pact-group-session-located {
+  from {
+    background: color-mix(in srgb, var(--pact-group-accent) 24%, var(--pact-surface-muted));
+  }
+}
+
+.pact-nav-drag-preview {
+  position: fixed;
+  inset: 0 auto auto 0;
+  z-index: 80;
+  pointer-events: none;
+  color: var(--pact-text-primary);
+  background: var(--pact-surface-raised);
+  border: 1px solid var(--pact-border);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgb(0 0 0 / 18%);
+  will-change: transform;
+}
+
+.pact-nav-drag-preview[data-group-color] {
+  background: color-mix(in srgb, var(--pact-group-accent) 32%, var(--pact-surface-raised));
+}
+.pact-nav-drag-preview[data-invalid] {
+  opacity: 0.64;
+}
+@media (forced-colors: active) {
+  .pact-nav-group-dot,
+  .pact-group-color-choice > span {
+    border: 1px solid CanvasText;
+  }
+  .pact-group-color-choice[aria-pressed='true']::before {
+    border-color: Highlight;
+  }
+  .pact-nav-group-heading[data-group-drop='membership'] > button {
+    outline: 1px solid Highlight;
+    outline-offset: -1px;
+  }
+  [data-group-drop='before']::after,
+  [data-group-drop='after']::after {
+    background: Highlight;
+    forced-color-adjust: none;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .pact-nav-group-body[data-session-located='true'] {
+    animation: none;
+  }
+  [data-session-located='true']:not(.pact-nav-group-body) > button[data-nav-primary] {
+    animation: none;
+    background: var(--pact-navigation-selected);
+  }
+}

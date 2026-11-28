@@ -1,402 +1,94 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 
-import type { SkillSelection } from '@pact/contracts'
 import type {
   AnchoredComment,
-  CommentAnchor,
+  CollaborationSession,
   ConversationPatch,
-  ConversationPage,
-  ConversationSendInput,
-  ConversationQueueActionInput,
-  RuntimeAgentId,
-  NativeInputValues,
-  NativePermissionRequest,
-  NativeContextRebuildInput,
   ConversationSnapshotView,
+  NativePermissionRequest,
+  RuntimeAgentId,
+  SkillSelection,
 } from '@pact/contracts'
 
 import {
   CONVERSATION_EXPAND_BYTES,
-  CONVERSATION_PAGE_ITEMS,
-  CONVERSATION_STREAM_BATCH_ITEMS,
   CONVERSATION_STREAM_BATCH_BYTES,
+  CONVERSATION_STREAM_BATCH_ITEMS,
   NATIVE_PERMISSION_REQUESTS,
   NATIVE_PERMISSION_TIMEOUT_MS,
   nativeInputValuesSchema,
 } from '@pact/contracts'
-import { IMAGE_REFERENCE_ITEMS, type ConversationImage } from '@pact/contracts/images'
+import { IMAGE_REFERENCE_ITEMS } from '@pact/contracts/images'
 
 import { conversationQueryKeys, RpcError, unwrapRpcResult } from '../../query-client'
 import { acceptSessionCatalogChange, patchCatalogSession } from '../workspace/session-catalog-cache'
 import {
   assertComposerEditCapacity,
-  assertComposerEditLengths,
-  composerEncodedTextBytes,
   COMPOSER_DRAFT_BYTES,
   COMPOSER_DRAFT_ITEMS,
 } from './composer-capacity'
 import { releaseComposerRoute } from './composer-document'
 import {
-  mergeActivityPage,
-  mergeRunArtifactPage,
+  bodyTextEncoder,
+  commentDraftSaveSucceeded,
+  emptyComposerDraft,
+  EMPTY_ACTIVITY_META,
+  EMPTY_COMPOSER_IMAGES,
+  EMPTY_COMPOSER_SKILLS,
+  formatDecisionAnswers,
+  hasDecisionAnswers,
+  INITIAL_SYNC_TIMEOUT_MS,
+  liveNativeDraft,
+  readActivityBody,
+  readSentComments,
+  sameDecision,
+  shouldClearComposerAfterAck,
+  type CommentDraftInputWithoutRevision,
+  type CommentDraftSaveOutcome,
+  type ConversationComposerDraft,
+  type ConversationComposerMention,
+  type ConversationFlow,
+  type ConversationHistoryControls,
+  type DecisionAnswerDraft,
+  type DecisionReplyContext,
+  type NativeInputDraft,
+  type PendingSubmission,
+  type ReturnedInputRead,
+  type SessionOperationState,
+} from './conversation-draft-helpers'
+import {
   closeRunArtifacts,
-  mergeConversationPatch,
-  mergeMessagePage,
-  mergeSentComments,
-  windowFromPage,
-  withCommentError,
-  nativeInputRequests,
   conversationWindowStartOrder,
   isRunResponseComplete,
+  mergeActivityPage,
+  mergeConversationPatch,
+  mergeMessagePage,
+  mergeRunArtifactPage,
+  mergeSentComments,
+  nativeInputRequests,
+  windowFromPage,
+  withCommentError,
   type ActivityBodySource,
   type ConversationWindow,
-  type ConversationViewProjection,
   type ExpandedActivityBody,
-  type LoadMoreActivityBody,
 } from './conversation-window'
-import { uploadConversationImage, releaseDraftImage, type DraftImage } from './image-client'
+import { releaseDraftImage, uploadConversationImage, type DraftImage } from './image-client'
+import { useConversationActions } from './useConversationActions'
 
-export interface ConversationHistoryControls {
-  collapseEarlierResponses?: ((runId: string) => Promise<void>) | undefined
-  setSnapshotFoldGuard?: ((guard: (() => boolean) | undefined) => void) | undefined
-  queueActions?: {
-    pending: boolean
-    steer: () => Promise<boolean>
-    remove: () => Promise<boolean>
-    returnToComposer: () => Promise<boolean>
-    restoreReturned: () => Promise<boolean>
-    resume: () => Promise<boolean>
-    checkStatus: () => Promise<boolean>
-    setEnabled: (enabled: boolean) => Promise<boolean>
-  }
-  admitComposerEdit?: ((nextChars: number) => boolean) | undefined
-  restoringInput?: boolean
-  restoreReturnedInput?: () => Promise<boolean>
-  discardReturnedInput?: () => Promise<boolean>
-  protectReading: (messageId: string | undefined) => void
-  readingPositionLost: boolean
-  readError?: string | undefined
-  retryRead: () => void
-  window?: ConversationWindow | undefined
-  loadingPage: boolean
-  gapRecoveryPending: boolean
-  loadingActivityRunId?: string | undefined
-  draftLimitExceeded: boolean
-  draftPage?: { hasMore: boolean; hasEarlier: boolean } | undefined
-  loadMoreDrafts?: (() => void) | undefined
-  firstDraftPage?: (() => void) | undefined
-  draftsLoading: boolean
-  draftError: boolean
-  retryDrafts: () => void
-  retryComments: () => void
-  commentPages?: Record<string, { hasMore: boolean; hasEarlier: boolean }> | undefined
-  loadingCommentsFor?: string | undefined
-  loadCommentPage?: ((messageId: string, first?: boolean) => void) | undefined
-  oversizedActivities: ConversationWindow['activityMeta']
-  pageError?: string | undefined
-  activityError?: { runId: string; message: string } | undefined
-  loadOlder: () => Promise<void>
-  loadLatest: () => Promise<void>
-  recoverLatest?: (() => Promise<void>) | undefined
-  recoverFromGap: (messageId: string) => Promise<void>
-  historyResyncToken: number
-  ensureMessage: (messageId: string) => Promise<void>
-  loadActivities: (runId: string, automatic?: boolean) => Promise<void>
-  setActivityReading?: ((runId: string, reading: boolean) => void) | undefined
-  loadRunArtifacts: (
-    userMessageId: string,
-    agentId: RuntimeAgentId,
-    before?: { createdAt: string; id: string },
-  ) => Promise<void>
-  closeRunArtifacts: () => void
-  loadingArtifacts?: { userMessageId: string; agentId: RuntimeAgentId } | undefined
-  artifactError?:
-    | {
-        userMessageId: string
-        agentId: RuntimeAgentId
-        message: string
-        before?: { createdAt: string; id: string } | undefined
-      }
-    | undefined
-  expandedActivityBody?: ExpandedActivityBody | undefined
-  loadMoreActivityBody: LoadMoreActivityBody
-}
-
-const EMPTY_ACTIVITY_META: ConversationWindow['activityMeta'] = {}
-const bodyTextEncoder = new TextEncoder()
-const MAX_SENT_COMMENTS = CONVERSATION_PAGE_ITEMS * 3
-const MAX_SENT_COMMENT_PAGES = Math.ceil(MAX_SENT_COMMENTS / CONVERSATION_PAGE_ITEMS)
-const MAX_SENT_COMMENT_BYTES = 48 * 1024 * 3
-const INITIAL_SYNC_TIMEOUT_MS = 15_000
-const INLINE_INPUT_BYTES = 64 * 1024
-const INPUT_UPLOAD_TIMEOUT_MS = 10_000
-const INPUT_UPLOAD_CHARS = 8192
-
-async function readActivityBody(
-  sessionId: string,
-  source: ActivityBodySource,
-  isCurrent: () => boolean,
-): Promise<string> {
-  if (source.bodyBytes > CONVERSATION_EXPAND_BYTES) {
-    throw new Error('This Work log detail exceeds the inline reading limit.')
-  }
-  const chunks = [source.preview]
-  let offset = source.previewChars
-  let loadedBytes = bodyTextEncoder.encode(source.preview).byteLength
-  const deadline = Date.now() + 30_000
-  for (let pageCount = 0; pageCount < 256; pageCount += 1) {
-    if (!isCurrent()) throw new Error('The content request was cancelled.')
-    if (Date.now() > deadline) throw new Error('Loading took too long. Try again.')
-    const page = unwrapRpcResult(
-      // oxlint-disable-next-line eslint/no-await-in-loop -- The next offset comes from this bounded page.
-      await window.pact.getConversation({
-        scope: 'activity-body',
-        sessionId,
-        activityId: source.activityId,
-        detailRevision: source.revision,
-        offset,
-      }),
-    )
-    if (
-      page.scope !== 'activity-body' ||
-      page.activityId !== source.activityId ||
-      page.detailRevision !== source.revision ||
-      page.offset !== offset
-    )
-      throw new Error('The Work log detail changed or could not load. Try again.')
-    if (!isCurrent()) throw new Error('The content request was cancelled.')
-    loadedBytes += bodyTextEncoder.encode(page.text).byteLength
-    if (loadedBytes > CONVERSATION_EXPAND_BYTES) {
-      throw new Error('This Work log detail exceeds the inline reading limit.')
-    }
-    chunks.push(page.text)
-    if (page.nextOffset === undefined) {
-      if (loadedBytes !== source.bodyBytes) {
-        throw new Error('The Work log detail changed while loading. Try again.')
-      }
-      return chunks.join('')
-    }
-    if (page.nextOffset <= offset) throw new Error('The content did not advance.')
-    offset = page.nextOffset
-  }
-  throw new Error('This Work log detail exceeds the inline page limit.')
-}
-
-async function readSentComments(
-  sessionId: string,
-  messageIds: string[],
-  isCurrent: () => boolean,
-): Promise<{ comments: AnchoredComment[]; hasMore: boolean }> {
-  const requested = new Set(messageIds)
-  const comments: AnchoredComment[] = []
-  const encoder = new TextEncoder()
-  const deadline = Date.now() + 10_000
-  let afterPosition: number | undefined
-  let bytes = 0
-  for (let pageCount = 0; pageCount <= MAX_SENT_COMMENT_PAGES; pageCount += 1) {
-    if (!isCurrent()) return { comments: [], hasMore: false }
-    if (Date.now() > deadline) throw new Error('Comment loading timed out.')
-    const page = unwrapRpcResult(
-      // oxlint-disable-next-line eslint/no-await-in-loop -- Every bounded page supplies the next cursor.
-      await window.pact.getConversation({
-        scope: 'comments',
-        sessionId,
-        messageIds,
-        ...(afterPosition === undefined ? {} : { afterPosition }),
-      }),
-    )
-    if (page.scope !== 'comments' || page.sessionId !== sessionId) {
-      throw new Error('The Comment response did not match this Session.')
-    }
-    if (!isCurrent()) return { comments: [], hasMore: false }
-    for (const comment of page.comments) {
-      if (!comment.sentWithMessageId || !requested.has(comment.sentWithMessageId)) {
-        throw new Error('The Comment response did not match the visible Messages.')
-      }
-      if (afterPosition !== undefined && comment.position <= afterPosition) {
-        throw new Error('The Comment response did not advance.')
-      }
-      bytes += encoder.encode(JSON.stringify(comment)).byteLength
-      if (comments.length >= MAX_SENT_COMMENTS || bytes > MAX_SENT_COMMENT_BYTES)
-        return { comments, hasMore: true }
-      comments.push(comment)
-      afterPosition = comment.position
-    }
-    if (!page.hasMore) return { comments, hasMore: false }
-    if (pageCount === MAX_SENT_COMMENT_PAGES - 1) return { comments, hasMore: true }
-    if (page.comments.length === 0) throw new Error('The Comment response did not advance.')
-  }
-  throw new Error('Visible Comments exceed the safe page limit.')
-}
-
-export interface ConversationFlow {
-  snapshot: ConversationViewProjection | undefined
-  composer: string
-  choosingImages: boolean
-  composerImages: readonly DraftImage[]
-  addComposerImages(this: void, files: readonly File[]): Promise<void>
-  chooseComposerImages(this: void): Promise<void>
-  removeComposerImage(this: void, id: string): void
-  setComposer(value: string): void
-  setComposerDocument(value: import('./composer-document').ComposerDocument): boolean
-  composerRoute: import('./composer-document').ComposerDocument['route']
-  composerReturnedInputOperationId: string | undefined
-  composerSkills: SkillSelection[]
-  setComposerSkills(value: SkillSelection[]): void
-  composerMention: ConversationComposerMention | undefined
-  setComposerMention(value: ConversationComposerMention | undefined): void
-  loading: boolean
-  sending: boolean
-  stopping: boolean
-  error: string | undefined
-  send(
-    content: string,
-    commentIds: string[],
-    route?: NonNullable<ConversationSendInput['route']>,
-    skills?: SkillSelection[],
-    planningAction?: ConversationSendInput['planningAction'],
-  ): Promise<boolean>
-  acceptPeerProposal(proposalId: string): Promise<boolean>
-  dismissPeerProposal(proposalId: string): Promise<boolean>
-  saveCommentDraft(input: CommentDraftInputWithoutRevision): Promise<CommentDraftSaveOutcome>
-  removeCommentDraft(commentId: string): Promise<boolean>
-  undoWorkspaceChanges(changeSetId: string): Promise<boolean>
-  respondNativePermission(
-    runId: string,
-    permissionId: string,
-    decision: import('@pact/contracts').NativePermissionDecision,
-  ): Promise<boolean>
-  respondNativeInput(input: import('@pact/contracts').NativeInputRespond): Promise<boolean>
-  nativeInputDrafts: Record<string, NativeInputDraft>
-  setNativeInputDraft(
-    this: void,
-    request: NativePermissionRequest,
-    draft: Pick<NativeInputDraft, 'values' | 'page'>,
-    initializeOnly?: boolean,
-  ): void
-  stop(): Promise<boolean>
-  checkNativeContext(agentId: RuntimeAgentId): Promise<boolean>
-  rebuildNativeContext(
-    agentId: RuntimeAgentId,
-    options?: Omit<NativeContextRebuildInput, 'sessionId' | 'agentId'>,
-  ): Promise<boolean>
-  history: ConversationHistoryControls
-}
-
-export interface NativeInputDraft {
-  operationId: string
-  agentId: RuntimeAgentId
-  bindingGeneration?: number | undefined
-  executorId?: string | undefined
-  expiresAt: number
-  values: NativeInputValues
-  page: number
-}
-
-function liveNativeDraft(
-  interaction: ReturnType<typeof nativeInputRequests>[number],
-  draft: NativeInputDraft,
-): boolean {
-  return (
-    interaction.request.operationId === draft.operationId &&
-    interaction.agentId === draft.agentId &&
-    interaction.bindingGeneration === draft.bindingGeneration &&
-    interaction.executorId === draft.executorId &&
-    Date.parse(interaction.request.createdAt) + NATIVE_PERMISSION_TIMEOUT_MS === draft.expiresAt &&
-    draft.expiresAt > Date.now()
-  )
-}
-
-export type ConversationComposerMention = import('./composer-document').ComposerMention
-
-interface ConversationComposerDraft {
-  text: string
-  images?: DraftImage[] | undefined
-  revision?: number
-  returnedInputOperationId?: string | undefined
-  queueReturnOperationId?: string | undefined
-  planningAction?: ConversationSendInput['planningAction'] | undefined
-  skills?: SkillSelection[] | undefined
-  mention?: ConversationComposerMention | undefined
-  route?: import('./composer-document').ComposerDocument['route']
-}
-
-export type CommentDraftInputWithoutRevision =
-  | {
-      mode: 'create'
-      requestId?: string | undefined
-      sessionId: string
-      commentId: string
-      body: string
-      anchor: CommentAnchor
-    }
-  | {
-      mode: 'edit'
-      requestId?: string | undefined
-      anchor?: import('@pact/contracts').TodoCommentAnchor | undefined
-      sessionId: string
-      commentId: string
-      body: string
-    }
-
-export type CommentDraftSaveOutcome = boolean | string | { conflict: true }
-export const commentDraftSaveSucceeded = (value: CommentDraftSaveOutcome): value is true | string =>
-  value === true || (typeof value === 'string' && value.length > 0)
-
-interface PendingSubmission {
-  planningAction?: ConversationSendInput['planningAction'] | undefined
-  sourceDocument: ConversationComposerDraft
-  imageIds: string[]
-  inputId?: string | undefined
-  inputPreparation?: AbortController | undefined
-  composerRevision?: number
-  returnedInputOperationId?: string | undefined
-  queueReturnOperationId?: string | undefined
-  acknowledgementError?: string
-  operationId: string
-  clientMessageId: string
-  content: string
-  composerSnapshot: string
-  skills?: SkillSelection[] | undefined
-  commentIds: string[]
-  expectedCommentsRevision: number
-  route?: NonNullable<ConversationSendInput['route']> | undefined
-}
-
-interface ReturnedInputRead {
-  sessionId: string
-  controller: AbortController
-  draft?: ConversationComposerDraft
-  commentBytes?: number
-}
-
-function emptyComposerDraft(value: ConversationComposerDraft): boolean {
-  return (
-    !value.images?.length &&
-    !value.text &&
-    !value.skills?.length &&
-    !value.mention &&
-    !value.returnedInputOperationId &&
-    !value.queueReturnOperationId &&
-    (!value.route || (value.route.type === 'primary' && !value.route.agentId))
-  )
-}
-
-export function shouldClearComposerAfterAck(
-  currentComposer: string,
-  pending: Pick<PendingSubmission, 'composerSnapshot'>,
-): boolean {
-  return currentComposer === pending.composerSnapshot
-}
-
-interface SessionOperationState {
-  choosingImages?: boolean | undefined
-  sendingOperationId?: string | undefined
-  stoppingOperationId?: string | undefined
-  queueOperationId?: string | undefined
-  nativeCheck?: { operationId: string; runId: string } | undefined
-  error?: string | undefined
+export {
+  commentDraftSaveSucceeded,
+  hasDecisionAnswers,
+  sameDecision,
+  shouldClearComposerAfterAck,
+  type CommentDraftInputWithoutRevision,
+  type CommentDraftSaveOutcome,
+  type ConversationComposerMention,
+  type ConversationFlow,
+  type ConversationHistoryControls,
+  type DecisionAnswerDraft,
+  type DecisionReplyContext,
+  type NativeInputDraft,
 }
 
 export function useConversation(
@@ -405,11 +97,29 @@ export function useConversation(
   visible = true,
   onErrorNotice: (message: string) => void = onNotice,
   onInfoNotice: (message: string) => void = onNotice,
+  hookOptions?: {
+    disableAutoInterest?: boolean | undefined
+    waitForInterest?: (() => Promise<boolean>) | undefined
+    onSessionRead?: ((session: CollaborationSession) => void) | undefined
+    projectionActive?: boolean | undefined
+  },
 ): ConversationFlow {
+  const onSessionReadRef = useRef(hookOptions?.onSessionRead)
+  useLayoutEffect(() => {
+    onSessionReadRef.current = hookOptions?.onSessionRead
+  }, [hookOptions?.onSessionRead])
+  const disableAutoInterest = Boolean(hookOptions?.disableAutoInterest)
+  const disableAutoInterestRef = useRef(disableAutoInterest)
+  const waitForInterestRef = useRef(hookOptions?.waitForInterest)
+  useLayoutEffect(() => {
+    disableAutoInterestRef.current = disableAutoInterest
+    waitForInterestRef.current = hookOptions?.waitForInterest
+  }, [disableAutoInterest, hookOptions?.waitForInterest])
   const queryClient = useQueryClient()
   const [operationsBySession, setOperationsBySession] = useState<
     Record<string, SessionOperationState>
   >({})
+  const operationsBySessionRef = useRef<Record<string, SessionOperationState>>({})
   const [composerDraftsBySession, setComposerDraftsBySession] = useState<
     Record<string, ConversationComposerDraft>
   >({})
@@ -423,11 +133,6 @@ export function useConversation(
   const imageChoosers = useRef(new Map<string, AbortController>())
   const draftCapacityNotified = useRef(false)
   const returnOperation = useRef<ReturnedInputRead | undefined>(undefined)
-  const queueOperation = useRef<
-    { sessionId: string; operationId: string; controller: AbortController } | undefined
-  >(undefined)
-  const [restoringInput, setRestoringInput] = useState(false)
-  const returnAttempt = useRef<string | undefined>(undefined)
   // Sensitive answers are bounded, ephemeral interaction state, never history/query data.
   const [nativeInputDrafts, setNativeInputDrafts] = useState<Record<string, NativeInputDraft>>({})
   const markedReadRef = useRef<{ sessionId: string; sequence: number } | undefined>(undefined)
@@ -466,7 +171,13 @@ export function useConversation(
               skills: value.skills,
               imageIds: value.imageIds,
               route: value.route,
+              routeIntent: value.routeIntent,
+              composerRevision: value.composerRevision,
               commentIds: value.commentIds,
+              replyToDecision: value.replyToDecision,
+              askOnly: value.askOnly,
+              replaceTask: value.replaceTask,
+              userInformation: value.userInformation,
             }),
           ).byteLength
         if (value.content !== value.sourceDocument.text) bytes += value.content.length * 2
@@ -491,13 +202,21 @@ export function useConversation(
               route: value.route,
               returnedInputOperationId: value.returnedInputOperationId,
               queueReturnOperationId: value.queueReturnOperationId,
+              decisionAnswers: value.decisionAnswers,
+              userInformation: value.userInformation,
             }),
           ).byteLength
+        if (value.decisionAnswers) bytes += JSON.stringify(value.decisionAnswers).length * 2
+        if (value.userInformation) bytes += JSON.stringify(value.userInformation).length * 2
         if (bytes > COMPOSER_DRAFT_BYTES || items > COMPOSER_DRAFT_ITEMS) break
       }
       if (textCandidate) {
         items += 1
         bytes += textCandidate.chars * 2 + 64 * 1024 + 1024
+        const answers = drafts[textCandidate.sessionId]?.decisionAnswers
+        if (answers) bytes += JSON.stringify(answers).length * 3
+        const declaration = JSON.stringify(drafts[textCandidate.sessionId]?.userInformation ?? null)
+        bytes += bodyTextEncoder.encode(declaration).byteLength + declaration.length * 2
       }
       const imageIdentities = new Set(
         [...documents].flatMap((value) =>
@@ -561,10 +280,13 @@ export function useConversation(
   const snapshotFoldGuardRef = useRef<(() => boolean) | undefined>(undefined)
   const [readingPositionLost, setReadingPositionLost] = useState(false)
   const [readPending, setReadPending] = useState(true)
+  const isProjectionActive = Boolean(visible || hookOptions?.projectionActive)
   const visibleRef = useRef(visible)
+  const projectionActiveRef = useRef(isProjectionActive)
   useLayoutEffect(() => {
     visibleRef.current = visible
-  }, [visible])
+    projectionActiveRef.current = isProjectionActive
+  }, [visible, isProjectionActive])
   const protectReading = useCallback((messageId: string | undefined): void => {
     readingMessageIdRef.current = messageId
     setReadingPositionLost(false)
@@ -673,7 +395,7 @@ export function useConversation(
         signal.throwIfAborted()
         if (
           expired ||
-          !visibleRef.current ||
+          !projectionActiveRef.current ||
           initialPatchesRef.current?.generation !== generation ||
           snapshotViewGeneration !== snapshotViewGenerationRef.current
         )
@@ -681,7 +403,13 @@ export function useConversation(
       }
       const read = async () => {
         checkCurrent()
-        unwrapRpcResult(await window.pact.setConversationInterest(sessionId ?? null, generation))
+        if (!disableAutoInterestRef.current) {
+          unwrapRpcResult(await window.pact.setConversationInterest(sessionId ?? null, generation))
+        } else if (waitForInterestRef.current) {
+          if (!(await waitForInterestRef.current())) {
+            throw new Error('Could not subscribe to active sessions.')
+          }
+        }
         checkCurrent()
         const aroundMessageId = readingMessageIdRef.current
         let result = await window.pact.getConversation({
@@ -728,7 +456,7 @@ export function useConversation(
         if (cancel) signal.removeEventListener('abort', cancel)
       }
     },
-    enabled: Boolean(sessionId && visible),
+    enabled: Boolean(sessionId && isProjectionActive),
     retry: 0,
     staleTime: Number.POSITIVE_INFINITY,
     gcTime: 0,
@@ -738,7 +466,7 @@ export function useConversation(
   useEffect(() => {
     // Selection changes must activate even a fresh cached page (gcTime:0 is
     // asynchronous). Join an existing fetch instead of duplicating its read.
-    if (sessionId && visible) void refetchConversation({ cancelRefetch: false })
+    if (sessionId && isProjectionActive) void refetchConversation({ cancelRefetch: false })
     else {
       initialPatchesRef.current = undefined
       requestGenerationRef.current += 1
@@ -760,19 +488,19 @@ export function useConversation(
           queryKey: conversationQueryKeys.session(sessionId),
           exact: true,
         })
-      void window.pact
-        .setConversationInterest(null, ++interestGenerationRef.current)
-        .catch(() => undefined)
+      if (!disableAutoInterestRef.current) {
+        void window.pact
+          .setConversationInterest(null, ++interestGenerationRef.current)
+          .catch(() => undefined)
+      }
     }
-  }, [queryClient, refetchConversation, sessionId, visible])
+  }, [queryClient, refetchConversation, sessionId, isProjectionActive])
   /* oxlint-enable react/set-state-in-effect */
   useEffect(
     () => () => {
       initialPatchesRef.current = undefined
       returnOperation.current?.controller.abort()
       returnOperation.current = undefined
-      queueOperation.current?.controller.abort()
-      queueOperation.current = undefined
       for (const owner of imageUploads.current.values()) owner.controller.abort()
       imageUploads.current.clear()
       for (const owner of imageChoosers.current.values()) owner.abort()
@@ -785,6 +513,7 @@ export function useConversation(
           )
             releaseDraftImage(ownerSessionId, entry.image.id)
       composerDraftsRef.current = {}
+      operationsBySessionRef.current = {}
       latestComposerDraft.current = undefined
       for (const [ownerSessionId, pending] of pendingBySessionRef.current) {
         pending.inputPreparation?.abort()
@@ -798,9 +527,11 @@ export function useConversation(
             .catch(() => undefined)
       }
       pendingBySessionRef.current.clear()
-      void window.pact
-        .setConversationInterest(null, ++interestGenerationRef.current)
-        .catch(() => undefined)
+      if (!disableAutoInterestRef.current) {
+        void window.pact
+          .setConversationInterest(null, ++interestGenerationRef.current)
+          .catch(() => undefined)
+      }
     },
     [],
   )
@@ -811,9 +542,46 @@ export function useConversation(
   const actionError = currentOperations?.error
   const composerDraft = sessionId ? composerDraftsBySession[sessionId] : undefined
   const composer = composerDraft?.text ?? ''
-  const composerImages = composerDraft?.images ?? []
+  const composerUserInformation = composerDraft?.userInformation
+  const setComposerUserInformation = (
+    userInformation: import('@pact/contracts').UserInformationDeclaration | undefined,
+  ): boolean => {
+    if (!sessionId || returnOperation.current?.sessionId === sessionId) return false
+    if (
+      userInformation &&
+      bodyTextEncoder.encode(JSON.stringify(userInformation)).byteLength > 4096
+    ) {
+      onNotice('This information is too long. Your previous draft was kept.')
+      return false
+    }
+    const previous = composerDraftsRef.current[sessionId] ?? { text: '' }
+    return putComposerDraft(sessionId, {
+      ...previous,
+      // Each field edit gets a fresh identity, including a change back to earlier text.
+      userInformation: userInformation ? { ...userInformation } : undefined,
+      revision: (previous.revision ?? 0) + 1,
+    })
+  }
+  const clearCancelledInformation = (
+    ownerSessionId: string,
+    expected: import('@pact/contracts').UserInformationDeclaration,
+  ): boolean => {
+    const previous = composerDraftsRef.current[ownerSessionId]
+    if (
+      !previous ||
+      expected.state.status !== 'unanswered' ||
+      previous.userInformation !== expected
+    )
+      return false
+    return putComposerDraft(ownerSessionId, {
+      ...previous,
+      userInformation: undefined,
+      revision: (previous.revision ?? 0) + 1,
+    })
+  }
+  const composerImages = composerDraft?.images ?? EMPTY_COMPOSER_IMAGES
   const composerMention = composerDraft?.mention
-  const composerSkills = composerDraft?.skills ?? []
+  const composerSkills = composerDraft?.skills ?? EMPTY_COMPOSER_SKILLS
   useLayoutEffect(() => {
     if (
       sessionId &&
@@ -839,14 +607,53 @@ export function useConversation(
         previous.returnedInputOperationId || previous.queueReturnOperationId
           ? editing.route
           : releaseComposerRoute(editing.route),
-      planningAction:
-        previous.text === editing.text &&
-        JSON.stringify(previous.route) === JSON.stringify(editing.route)
-          ? previous.planningAction
-          : undefined,
       revision: (previous.revision ?? 0) + 1,
     }
     return putComposerDraft(sessionId, draft)
+  }
+  const setDecisionDraft = (decisionAnswers: DecisionAnswerDraft): boolean => {
+    if (!sessionId || sending || returnOperation.current?.sessionId === sessionId) return false
+    const previous = composerDraftsRef.current[sessionId] ?? { text: '' }
+    if (
+      hasDecisionAnswers(previous.decisionAnswers) &&
+      !sameDecision(previous.decisionAnswers?.reference, decisionAnswers.reference)
+    )
+      return false
+    if (
+      (decisionAnswers.originalReply?.length ?? 0) > 4096 ||
+      (decisionAnswers.questions.length > 0 && Boolean(decisionAnswers.originalReply?.trim())) ||
+      decisionAnswers.questions.length > 3 ||
+      Object.keys(decisionAnswers.answers).length > 3 ||
+      Object.entries(decisionAnswers.answers).some(([id, answer]) => {
+        const question = decisionAnswers.questions.find((item) => item.id === id)
+        return (
+          !question ||
+          answer.text.length > 4096 ||
+          answer.optionIds.length > (question.selection === 'single' ? 1 : 6) ||
+          answer.optionIds.some(
+            (optionId) => !question.options?.some((option) => option.id === optionId),
+          )
+        )
+      })
+    )
+      return false
+    return putComposerDraft(sessionId, {
+      ...previous,
+      decisionAnswers,
+      revision: (previous.revision ?? 0) + 1,
+    })
+  }
+  const clearDecisionDraft = (keepInMessage: boolean): boolean => {
+    if (!sessionId || sending || returnOperation.current?.sessionId === sessionId) return false
+    const previous = composerDraftsRef.current[sessionId]
+    if (!previous?.decisionAnswers) return true
+    const saved = keepInMessage ? formatDecisionAnswers(previous.decisionAnswers) : ''
+    return putComposerDraft(sessionId, {
+      ...previous,
+      text: saved ? [previous.text, saved].filter(Boolean).join('\n\n') : previous.text,
+      decisionAnswers: undefined,
+      revision: (previous.revision ?? 0) + 1,
+    })
   }
   const setComposerSkills = (skills: SkillSelection[]): void => {
     if (!sessionId || returnOperation.current?.sessionId === sessionId) return
@@ -866,7 +673,6 @@ export function useConversation(
       putComposerDraft(sessionId, {
         ...previous,
         text: value,
-        planningAction: previous?.text === value ? previous.planningAction : undefined,
         revision: (previous?.revision ?? 0) + 1,
       })
     },
@@ -881,11 +687,108 @@ export function useConversation(
         ...previous,
         text: previous?.text ?? '',
         mention: value,
-        planningAction: undefined,
         revision: (previous?.revision ?? 0) + 1,
       })
     },
     [sessionId, putComposerDraft],
+  )
+  const seedComposerDraft = useCallback(
+    (
+      targetSessionId: string,
+      value: import('./composer-document').ComposerDocument,
+      options?: { onConflict?: (() => void) | undefined },
+    ): boolean => {
+      const existing =
+        latestComposerDraft.current?.sessionId === targetSessionId
+          ? latestComposerDraft.current.draft
+          : composerDraftsRef.current[targetSessionId]
+      const nextRoute = value.route ? releaseComposerRoute(value.route) : undefined
+      const hasExistingContent = Boolean(
+        existing &&
+        (existing.text.trim().length > 0 ||
+          (existing.skills?.length ?? 0) > 0 ||
+          Boolean(existing.mention) ||
+          (existing.images?.length ?? 0) > 0),
+      )
+      if (hasExistingContent && existing) {
+        const existingSkills = existing.skills ?? []
+        const sameSkills =
+          existingSkills.length === value.skills.length &&
+          existingSkills.every(
+            (skill, index) =>
+              skill.id === value.skills[index]?.id &&
+              skill.agentId === value.skills[index]?.agentId &&
+              skill.name === value.skills[index]?.name,
+          )
+        const sameMention =
+          JSON.stringify(existing.mention ?? null) === JSON.stringify(value.mention ?? null)
+        const sameRoute =
+          JSON.stringify(existing.route ?? null) === JSON.stringify(nextRoute ?? null)
+        const hasImages = (existing.images?.length ?? 0) > 0
+        if (
+          hasImages ||
+          existing.text !== value.text ||
+          !sameSkills ||
+          !sameMention ||
+          !sameRoute
+        ) {
+          options?.onConflict?.()
+          return false
+        }
+      }
+      const next: ConversationComposerDraft = {
+        ...existing,
+        text: value.text,
+        skills: value.skills.length ? value.skills : undefined,
+        mention: value.mention,
+        route: nextRoute,
+        returnedInputOperationId: undefined,
+        queueReturnOperationId: undefined,
+        revision: (existing?.revision ?? 0) + 1,
+      }
+      const admitted = putComposerDraft(targetSessionId, next)
+      if (admitted && activeSessionIdRef.current === targetSessionId) {
+        latestComposerDraft.current = { sessionId: targetSessionId, draft: next }
+      }
+      return admitted
+    },
+    [putComposerDraft],
+  )
+  const clearSubmittedComposerDraft = useCallback(
+    (
+      targetSessionId: string,
+      expectedRevision: number,
+      consumedImageIds: readonly string[] = [],
+    ): void => {
+      const latest =
+        latestComposerDraft.current?.sessionId === targetSessionId
+          ? latestComposerDraft.current.draft
+          : composerDraftsRef.current[targetSessionId]
+      if (!latest) return
+      const currentRevision = latest.revision ?? 0
+      const remainingImages = latest.images?.filter(
+        (entry) => !entry.image || !consumedImageIds.includes(entry.image.id),
+      )
+      const cleared: ConversationComposerDraft =
+        currentRevision === expectedRevision
+          ? {
+              ...(remainingImages?.length ? { images: remainingImages } : {}),
+              text: '',
+              revision: currentRevision + 1,
+            }
+          : {
+              ...latest,
+              ...(remainingImages !== undefined
+                ? { images: remainingImages.length ? remainingImages : undefined }
+                : {}),
+              revision: currentRevision + 1,
+            }
+      putComposerDraft(targetSessionId, cleared)
+      if (latestComposerDraft.current?.sessionId === targetSessionId) {
+        latestComposerDraft.current = { sessionId: targetSessionId, draft: cleared }
+      }
+    },
+    [putComposerDraft],
   )
 
   const updateImages = useCallback(
@@ -995,7 +898,7 @@ export function useConversation(
                 ? {
                     ...value,
                     status: 'failed',
-                    error: 'Image preparation took too long. Remove it and try again.',
+                    error: 'Adding this image took too long. Remove it and try again.',
                   }
                 : value,
             ),
@@ -1066,13 +969,35 @@ export function useConversation(
       ownerSessionId: string,
       update: (current: SessionOperationState) => SessionOperationState,
     ): void => {
-      setOperationsBySession((current) => ({
-        ...current,
-        [ownerSessionId]: update(current[ownerSessionId] ?? {}),
-      }))
+      const current = operationsBySessionRef.current,
+        next = { ...current, [ownerSessionId]: update(current[ownerSessionId] ?? {}) }
+      operationsBySessionRef.current = next
+      setOperationsBySession(next)
     },
     [],
   )
+
+  const clearOtherCancelledInformation = useCallback((exceptSessionId: string): void => {
+    const states = { ...operationsBySessionRef.current }
+    for (const [id, state] of Object.entries(states))
+      if (id !== exceptSessionId && state.cancelledInformationDecisionId)
+        states[id] = { ...state, cancelledInformationDecisionId: undefined }
+    operationsBySessionRef.current = states
+  }, [])
+
+  const getReturnOperation = useCallback(
+    (): ReturnedInputRead | undefined => returnOperation.current,
+    [],
+  )
+
+  const setReturnOperation = useCallback((value: ReturnedInputRead | undefined): void => {
+    returnOperation.current = value
+  }, [])
+
+  const bumpDraftReloadToken = useCallback((): void => {
+    draftReloadTokenRef.current += 1
+    setDraftReloadToken(draftReloadTokenRef.current)
+  }, [])
 
   const settleSubmission = useCallback(
     (ownerSessionId: string, clientMessageId: string): void => {
@@ -1082,6 +1007,20 @@ export function useConversation(
       const settleDraft = (
         draft: ConversationComposerDraft | undefined,
       ): ConversationComposerDraft | undefined => {
+        if (pending.askOnly) {
+          return draft &&
+            (draft.revision ?? 0) === (pending.composerRevision ?? 0) &&
+            shouldClearComposerAfterAck(draft.text, pending)
+            ? { ...draft, text: '', revision: (draft.revision ?? 0) + 1 }
+            : draft
+        }
+        if (pending.kind === 'decision') {
+          return draft?.decisionAnswers &&
+            JSON.stringify(draft.decisionAnswers) ===
+              JSON.stringify(pending.sourceDocument.decisionAnswers)
+            ? { ...draft, decisionAnswers: undefined, revision: (draft.revision ?? 0) + 1 }
+            : draft
+        }
         if (
           (draft?.revision ?? 0) === (pending.composerRevision ?? 0) &&
           shouldClearComposerAfterAck(draft?.text ?? '', pending)
@@ -1493,7 +1432,7 @@ export function useConversation(
     (patch: ConversationPatch): void => {
       acknowledgePatch(patch)
       patchCatalogSession(queryClient, patch.session)
-      if (!visible) return
+      if (!isProjectionActive) return
       if (patch.sessionId !== sessionId || patch.sessionId !== activeSessionIdRef.current) return
       if (patch.resync?.drafts) {
         setDraftsReadyRevision(undefined)
@@ -1549,7 +1488,7 @@ export function useConversation(
         if (windowRef.current?.activityView?.runId === runId) void loadActivities(runId, true)
       }
     },
-    [acknowledgePatch, commitWindow, queryClient, sessionId, visible, loadActivities],
+    [acknowledgePatch, commitWindow, queryClient, sessionId, isProjectionActive, loadActivities],
   )
 
   const markSelectedRead = useCallback(
@@ -1563,12 +1502,26 @@ export function useConversation(
         const change = unwrapRpcResult(
           await window.pact.markSessionRead({ sessionId, throughSequence: sequence }),
         )
+        const currentWindow = windowRef.current
+        if (
+          currentWindow?.view.sessionId === change.session.id &&
+          currentWindow.view.session.hasUnread !== change.session.hasUnread
+        ) {
+          commitWindow({
+            ...currentWindow,
+            view: {
+              ...currentWindow.view,
+              session: { ...currentWindow.view.session, hasUnread: change.session.hasUnread },
+            },
+          })
+        }
         acceptSessionCatalogChange(queryClient, change)
+        onSessionReadRef.current?.(change.session)
       } catch {
         if (markedReadRef.current === request) markedReadRef.current = undefined
       }
     },
-    [queryClient, sessionId, visible],
+    [commitWindow, queryClient, sessionId, visible],
   )
 
   useLayoutEffect(() => {
@@ -1593,7 +1546,12 @@ export function useConversation(
   }, [cachePatch, markSelectedRead, onErrorNotice])
 
   useEffect(() => {
-    if (!visible || query.data?.scope !== 'messages' || query.data.sessionId !== sessionId) return
+    if (
+      !isProjectionActive ||
+      query.data?.scope !== 'messages' ||
+      query.data.sessionId !== sessionId
+    )
+      return
     if (
       query.isError ||
       query.isFetching ||
@@ -1647,24 +1605,35 @@ export function useConversation(
         setGapRecoveryPending(true)
       }
     }
-    void markSelectedRead(query.data.sessionId, query.data.header.latestCompleteAssistantSequence)
+    const windowLatestAssistantSeq =
+      windowRef.current?.view.sessionId === sessionId
+        ? windowRef.current.view.messages.findLast(
+            (message) => message.role === 'assistant' && message.state === 'complete',
+          )?.sequence
+        : undefined
+    const readThroughSequence =
+      query.data.header.latestCompleteAssistantSequence !== undefined &&
+      windowLatestAssistantSeq !== undefined
+        ? Math.max(query.data.header.latestCompleteAssistantSequence, windowLatestAssistantSeq)
+        : (windowLatestAssistantSeq ?? query.data.header.latestCompleteAssistantSequence)
+    void markSelectedRead(query.data.sessionId, readThroughSequence)
   }, [
     cachePatch,
     commitWindow,
+    isProjectionActive,
     markSelectedRead,
     query.data,
     query.dataUpdatedAt,
     query.isFetching,
     query.isError,
     sessionId,
-    visible,
   ])
 
   const draftWindowSessionId = windowState?.view.sessionId
   const draftWindowRevision = windowState?.view.commentsRevision
   useEffect(() => {
     const revision = draftWindowSessionId === sessionId ? draftWindowRevision : undefined
-    if (!visible || !sessionId || revision === undefined) return undefined
+    if (!isProjectionActive || !sessionId || revision === undefined) return undefined
     const generation = requestGenerationRef.current
     const reloadToken = draftReloadToken
     let cancelled = false
@@ -1733,8 +1702,8 @@ export function useConversation(
     draftPageAfter,
     draftWindowRevision,
     draftWindowSessionId,
+    isProjectionActive,
     sessionId,
-    visible,
   ])
 
   const commentWindow = windowState?.view.sessionId === sessionId ? windowState : undefined
@@ -2267,1169 +2236,70 @@ export function useConversation(
     [sessionId],
   )
 
-  const send = async (
-    composerSnapshot: string,
-    commentIds: string[],
-    route?: NonNullable<ConversationSendInput['route']>,
-    skills?: SkillSelection[],
-    planningAction?: ConversationSendInput['planningAction'],
-  ): Promise<boolean> => {
-    if (!sessionId || sending || returnOperation.current?.sessionId === sessionId) return false
-    const content = composerSnapshot.trim()
-    const images = composerDraftsRef.current[sessionId]?.images ?? []
-    if (images.some((image) => image.status !== 'ready' || !image.image)) {
-      onNotice('Wait for images to finish preparing, or remove an image that could not be added.')
-      return false
-    }
-    const imageIds = images.map((entry) => entry.image!.id)
-    const currentRevision = windowRef.current?.view.commentsRevision
-    if (currentRevision === undefined) return false
-    if (draftsReadyRevision !== currentRevision) {
-      updateSessionOperations(sessionId, (current) => ({
-        ...current,
-        error: 'Comment drafts are still loading. Try again in a moment.',
-      }))
-      return false
-    }
-    const pending = pendingBySessionRef.current.get(sessionId)
-    if (
-      pending &&
-      (JSON.stringify(pending.imageIds) !== JSON.stringify(imageIds) ||
-        pending.content !== content ||
-        JSON.stringify(pending.route) !== JSON.stringify(route) ||
-        pending.planningAction !== planningAction ||
-        JSON.stringify(pending.skills ?? []) !== JSON.stringify(skills ?? []))
-    ) {
-      pending.acknowledgementError =
-        'Confirm the previous message before sending different content.'
-      updateSessionOperations(sessionId, (current) => ({
-        ...current,
-        error: 'Confirm the previous message before sending different content.',
-      }))
-      return false
-    }
-    const preserved = pending
-    const expectedCommentsRevision = preserved?.expectedCommentsRevision ?? currentRevision
-    const submissionCommentIds = preserved?.commentIds ?? commentIds
-    const submissionRoute = preserved?.route ?? route
-    const clientMessageId = preserved?.clientMessageId ?? crypto.randomUUID()
-    const operationId = crypto.randomUUID()
-    const sourceDocument =
-      preserved?.sourceDocument ??
-      (latestComposerDraft.current?.sessionId === sessionId
-        ? latestComposerDraft.current.draft
-        : (composerDraftsRef.current[sessionId] ?? { text: composerSnapshot }))
-    const frozen: PendingSubmission = {
-      sourceDocument,
-      imageIds: preserved?.imageIds ?? imageIds,
-      inputId: preserved?.inputId,
-      composerRevision:
-        (latestComposerDraft.current?.sessionId === sessionId
-          ? latestComposerDraft.current.draft
-          : composerDraftsBySession[sessionId]
-        )?.revision ?? 0,
-      returnedInputOperationId: composerDraftsBySession[sessionId]?.returnedInputOperationId,
-      queueReturnOperationId:
-        preserved?.queueReturnOperationId ?? sourceDocument.queueReturnOperationId,
-      operationId,
-      content,
-      composerSnapshot,
-      skills: preserved?.skills ?? skills,
-      commentIds: submissionCommentIds,
-      expectedCommentsRevision,
-      clientMessageId,
-      route: submissionRoute,
-      planningAction: preserved?.planningAction ?? planningAction ?? sourceDocument.planningAction,
-    }
-    if (!admitComposerResidency(composerDraftsRef.current, { sessionId, value: frozen }))
-      return false
-    pendingBySessionRef.current.set(sessionId, frozen)
-    updateSessionOperations(sessionId, (current) => ({
-      ...current,
-      sendingOperationId: operationId,
-      error: undefined,
-    }))
-    let didSubmit = false
-    const sendMetadata = {
-      sessionId,
-      clientMessageId,
-      ...(frozen.returnedInputOperationId
-        ? { returnedInputOperationId: frozen.returnedInputOperationId }
-        : {}),
-      ...(frozen.queueReturnOperationId
-        ? { queueReturnOperationId: frozen.queueReturnOperationId }
-        : {}),
-      expectedCommentsRevision,
-      commentIds: [],
-      freezeDrafts: true,
-      batchId: clientMessageId,
-      ...(submissionRoute ? { route: submissionRoute } : {}),
-      ...(frozen.skills?.length ? { skills: frozen.skills } : {}),
-      ...(frozen.planningAction ? { planningAction: frozen.planningAction } : {}),
-      ...(frozen.imageIds.length ? { imageIds: frozen.imageIds } : {}),
-    }
-    const inlineBytes =
-      bodyTextEncoder.encode(JSON.stringify({ ...sendMetadata, content: '' })).byteLength +
-      composerEncodedTextBytes(content)
-    try {
-      if (!frozen.inputId && inlineBytes > INLINE_INPUT_BYTES) {
-        const controller = new AbortController()
-        frozen.inputPreparation = controller
-        const timeout = window.setTimeout(() => controller.abort(), INPUT_UPLOAD_TIMEOUT_MS)
-        const write = (input: Parameters<typeof window.pact.writeConversationInput>[0]) =>
-          new Promise<Awaited<ReturnType<typeof window.pact.writeConversationInput>>>(
-            (resolve, reject) => {
-              const abort = () =>
-                reject(
-                  new Error('Input preparation was cancelled or timed out. Your draft was kept.'),
-                )
-              controller.signal.addEventListener('abort', abort, { once: true })
-              if (controller.signal.aborted) {
-                controller.signal.removeEventListener('abort', abort)
-                abort()
-                return
-              }
-              void window.pact.writeConversationInput(input).then(
-                (reply) => {
-                  controller.signal.removeEventListener('abort', abort)
-                  if (controller.signal.aborted) {
-                    if (reply.ok)
-                      void window.pact
-                        .writeConversationInput({
-                          type: 'release',
-                          sessionId,
-                          inputId: reply.value.inputId,
-                        })
-                        .catch(() => undefined)
-                    return undefined
-                  }
-                  resolve(reply)
-                  return undefined
-                },
-                (writeError: unknown) => {
-                  controller.signal.removeEventListener('abort', abort)
-                  reject(writeError)
-                  return undefined
-                },
-              )
-            },
-          )
-        try {
-          const initial = unwrapRpcResult(
-            await write({ type: 'begin', sessionId, clientMessageId }),
-          )
-          frozen.inputId = initial.inputId
-          if (initial.offset !== 0 || initial.sealed)
-            throw new Error('Input preparation returned an unexpected source.')
-          let offset = 0
-          while (offset < content.length) {
-            let end = Math.min(content.length, offset + INPUT_UPLOAD_CHARS)
-            const high = content.charCodeAt(end - 1),
-              low = content.charCodeAt(end)
-            if (
-              end < content.length &&
-              high >= 0xd800 &&
-              high <= 0xdbff &&
-              low >= 0xdc00 &&
-              low <= 0xdfff
-            )
-              end -= 1
-            const part: import('@pact/contracts').ConversationInputState = unwrapRpcResult(
-              // oxlint-disable-next-line no-await-in-loop -- Each bounded UTF-16 segment follows the acknowledged offset under one deadline.
-              await write({
-                type: 'append',
-                sessionId,
-                inputId: frozen.inputId,
-                offset,
-                text: content.slice(offset, end),
-              }),
-            )
-            if (part.inputId !== frozen.inputId || part.offset !== end || part.sealed)
-              throw new Error('Input preparation did not acknowledge the complete segment.')
-            offset = end
-          }
-          const sealed = unwrapRpcResult(
-            await write({ type: 'seal', sessionId, inputId: frozen.inputId }),
-          )
-          if (
-            !sealed.sealed ||
-            sealed.inputId !== frozen.inputId ||
-            sealed.offset !== content.length ||
-            sealed.chars !== content.length
-          )
-            throw new Error('Input preparation did not seal the complete text.')
-          if (controller.signal.aborted || pendingBySessionRef.current.get(sessionId) !== frozen)
-            throw new Error('Input preparation was cancelled. Your draft was kept.')
-        } finally {
-          window.clearTimeout(timeout)
-          frozen.inputPreparation = undefined
-        }
-      }
-      didSubmit = true
-      const result = await window.pact.sendConversationMessage({
-        ...sendMetadata,
-        content: frozen.inputId ? '' : content,
-        ...(frozen.inputId ? { inputId: frozen.inputId } : {}),
-      })
-      if (!result.ok) {
-        const outstanding = pendingBySessionRef.current.get(sessionId)
-        if (outstanding?.operationId !== operationId) return true
-        if (result.error.code === 'AGENT_CAPACITY') {
-          pendingBySessionRef.current.delete(sessionId)
-          onNotice(result.error.message)
-          return false
-        }
-        if (result.error.code === 'NATIVE_CONTEXT_RECOVERY_REQUIRED') {
-          pendingBySessionRef.current.delete(sessionId)
-          return false
-        }
-        if (result.error.code === 'NATIVE_CONTEXT_CHECK_FAILED') {
-          pendingBySessionRef.current.delete(sessionId)
-          onErrorNotice("Pact couldn't check the Agent's Native Session. Your draft is still here.")
-          return false
-        }
-        if (
-          result.error.code === 'CONTEXT_TOO_LARGE' ||
-          result.error.code === 'CONTEXT_UNAVAILABLE'
-        ) {
-          pendingBySessionRef.current.delete(sessionId)
-          onErrorNotice(
-            result.error.code === 'CONTEXT_TOO_LARGE'
-              ? 'The full context is too large to send. Your draft is still here.'
-              : "Pact couldn't load the required context. Your draft is still here.",
-          )
-          return false
-        }
-        if (result.error.code !== 'TIMEOUT' && result.error.code !== 'UNCERTAIN') {
-          pendingBySessionRef.current.delete(sessionId)
-        }
-        outstanding.acknowledgementError = result.error.message
-        updateSessionOperations(sessionId, (current) => ({
-          ...current,
-          error: result.error.message,
-        }))
-        return false
-      }
-      // An ok reply from this exact typed Send confirms its durable client-message intent,
-      // including when the bounded Patch carries resync instead of the oversized message.
-      if (
-        result.value.queuedInputIds?.includes(clientMessageId) &&
-        !result.value.messages.some((item) => item.message.id === clientMessageId)
-      )
-        onInfoNotice("Your message is queued until the current Agent's work finishes.")
-      if (result.value.sessionId === sessionId) settleSubmission(sessionId, clientMessageId)
-      cachePatch(result.value)
-      return true
-    } catch (error) {
-      const outstanding = pendingBySessionRef.current.get(sessionId)
-      if (outstanding?.operationId !== operationId) return true
-      if (!didSubmit) pendingBySessionRef.current.delete(sessionId)
-      outstanding.acknowledgementError =
-        error instanceof Error ? error.message : 'The message could not be sent.'
-      updateSessionOperations(sessionId, (current) => ({
-        ...current,
-        error: error instanceof Error ? error.message : 'The message could not be sent.',
-      }))
-      return false
-    } finally {
-      if (pendingBySessionRef.current.get(sessionId)?.clientMessageId !== clientMessageId)
-        for (const id of frozen.imageIds)
-          if (
-            !composerDraftsRef.current[sessionId]?.images?.some((entry) => entry.image?.id === id)
-          )
-            releaseDraftImage(sessionId, id)
-      if (
-        frozen.inputId &&
-        pendingBySessionRef.current.get(sessionId)?.clientMessageId !== clientMessageId
-      )
-        void window.pact
-          .writeConversationInput({ type: 'release', sessionId, inputId: frozen.inputId })
-          .catch(() => undefined)
-      updateSessionOperations(sessionId, (current) =>
-        current.sendingOperationId === operationId
-          ? { ...current, sendingOperationId: undefined }
-          : current,
-      )
-    }
-  }
-
-  const refreshConflictedDrafts = async (ownerSessionId: string): Promise<void> => {
-    if (activeSessionIdRef.current !== ownerSessionId || !visibleRef.current) return
-    setDraftsReadyRevision(undefined)
-    // A read started before the rejected save may itself contain the stale revision.
-    // Cancel that observation and obtain a new authoritative page after the conflict.
-    const result = await refetchConversation({ cancelRefetch: true })
-    if (activeSessionIdRef.current !== ownerSessionId || !visibleRef.current) return
-    draftReloadTokenRef.current += 1
-    setDraftReloadToken(draftReloadTokenRef.current)
-    if (result.isError)
-      throw new Error('Comment drafts could not be refreshed. Your input is kept.')
-  }
-
-  const saveCommentDraft = async (
-    input: CommentDraftInputWithoutRevision,
-  ): Promise<CommentDraftSaveOutcome> => {
-    if (!sessionId || input.sessionId !== sessionId || sending) return false
-    const expectedCommentsRevision = windowRef.current?.view.commentsRevision
-    if (expectedCommentsRevision === undefined) return false
-    updateSessionOperations(sessionId, (current) => ({ ...current, error: undefined }))
-    try {
-      const patch = unwrapRpcResult(
-        await window.pact.saveCommentDraft({ ...input, expectedCommentsRevision }),
-      )
-      cachePatch(patch)
-      return patch.commentDraftReceipt?.commentId ?? false
-    } catch (error) {
-      if (error instanceof RpcError && error.code === 'CONFLICT') {
-        let message = 'Comment drafts refreshed. Your input is kept; review it and add again.'
-        try {
-          await refreshConflictedDrafts(input.sessionId)
-        } catch (refreshError) {
-          message = refreshError instanceof Error ? refreshError.message : 'Comment refresh failed.'
-        }
-        updateSessionOperations(input.sessionId, (current) => ({ ...current, error: message }))
-        return { conflict: true }
-      }
-      updateSessionOperations(sessionId, (current) => ({
-        ...current,
-        error: error instanceof Error ? error.message : 'The Comment draft could not be saved.',
-      }))
-      return false
-    }
-  }
-
-  const removeCommentDraft = async (commentId: string): Promise<boolean> => {
-    if (!sessionId || sending) return false
-    const expectedCommentsRevision = windowRef.current?.view.commentsRevision
-    if (expectedCommentsRevision === undefined) return false
-    updateSessionOperations(sessionId, (current) => ({ ...current, error: undefined }))
-    try {
-      const patch = unwrapRpcResult(
-        await window.pact.removeCommentDraft({ sessionId, commentId, expectedCommentsRevision }),
-      )
-      cachePatch(patch)
-      return true
-    } catch (error) {
-      if (error instanceof RpcError && error.code === 'CONFLICT') {
-        let message = 'Comment drafts refreshed. Review the updated draft before removing it.'
-        try {
-          await refreshConflictedDrafts(sessionId)
-        } catch (refreshError) {
-          message = refreshError instanceof Error ? refreshError.message : 'Comment refresh failed.'
-        }
-        updateSessionOperations(sessionId, (current) => ({ ...current, error: message }))
-        return false
-      }
-      updateSessionOperations(sessionId, (current) => ({
-        ...current,
-        error: error instanceof Error ? error.message : 'The Comment draft could not be removed.',
-      }))
-      return false
-    }
-  }
-
-  const inspectNativeContext = async (runId: string, agentId: RuntimeAgentId): Promise<boolean> => {
-    if (!sessionId || checkingNativeTargetId) return false
-    const operationId = crypto.randomUUID()
-    updateSessionOperations(sessionId, (current) => ({
-      ...current,
-      nativeCheck: { operationId, runId },
-    }))
-    try {
-      cachePatch(
-        unwrapRpcResult(
-          await window.pact.retryConversationRun(runId, { intent: 'inspect', sessionId, agentId }),
-        ),
-      )
-      return true
-    } catch (error) {
-      if (error instanceof RpcError && error.code === 'NATIVE_CONTEXT_RECOVERY_REQUIRED')
-        return false
-      throw error
-    } finally {
-      updateSessionOperations(sessionId, (current) =>
-        current.nativeCheck?.operationId === operationId
-          ? { ...current, nativeCheck: undefined }
-          : current,
-      )
-    }
-  }
-
-  const undoWorkspaceChanges = async (changeSetId: string): Promise<boolean> => {
-    if (!sessionId) return false
-    try {
-      const result = await window.pact.undoWorkspaceChanges({ changeSetId })
-      if (!result.ok) {
-        onNotice(result.error.message)
-        return false
-      }
-      cachePatch(result.value)
-      return true
-    } catch (error) {
-      onNotice(error instanceof Error ? error.message : 'Undo could not finish.')
-      return false
-    }
-  }
-
-  const respondNativePermission = async (
-    runId: string,
-    permissionId: string,
-    decision: import('@pact/contracts').NativePermissionDecision,
-  ): Promise<boolean> => {
-    try {
-      const result = await window.pact.respondNativePermission({
-        operationId: runId,
-        permissionId,
-        decision,
-      })
-      if (!result.ok) {
-        onNotice(result.error.message)
-        return false
-      }
-      cachePatch(result.value)
-      return true
-    } catch {
-      onNotice('The permission decision could not be delivered. Nothing was approved.')
-      return false
-    }
-  }
-
-  const respondNativeInput = async (
-    input: import('@pact/contracts').NativeInputRespond,
-  ): Promise<boolean> => {
-    try {
-      const result = await window.pact.respondNativeInput(input)
-      if (!result.ok) {
-        onNotice(result.error.message)
-        return false
-      }
-      cachePatch(result.value)
-      return true
-    } catch {
-      onNotice('The native response could not be delivered.')
-      return false
-    }
-  }
-
-  const checkNativeContext = (agentId: RuntimeAgentId): Promise<boolean> => {
-    if (!sessionId) return Promise.resolve(false)
-    const current = windowRef.current
-    const context = current?.view.nativeContexts.find((item) => item.agentId === agentId)
-    const matching = context
-      ? current?.view.runs.filter(
-          (item) =>
-            item.agentId === agentId &&
-            item.controlDisposition !== 'abandoned' &&
-            item.nativeSessionId === context.nativeSessionId &&
-            item.bindingGeneration === context.bindingGeneration,
-        )
-      : undefined
-    const run = matching?.find((item) => item.id === context?.lastRunId) ?? matching?.at(-1)
-    return inspectNativeContext(run?.id ?? sessionId, agentId)
-  }
-
-  const checkQueuedDelivery = async (): Promise<boolean> => {
-    const entry = windowRef.current?.view.queue?.input
-    if (!entry?.delivery || entry.recipient === 'all') return false
-    try {
-      const checked = await inspectNativeContext(entry.delivery.runId, entry.recipient)
-      if (!checked || windowRef.current?.view.queue?.input?.id === entry.id) {
-        onNotice('The original delivery is still unconfirmed. Nothing was resent.')
-        return false
-      }
-      return true
-    } catch (error) {
-      onNotice(
-        error instanceof Error ? error.message : 'The original delivery could not be checked.',
-      )
-      return false
-    }
-  }
-
-  const rebuildNativeContext = async (
-    agentId: RuntimeAgentId,
-    options?: Omit<NativeContextRebuildInput, 'sessionId' | 'agentId'>,
-  ): Promise<boolean> => {
-    if (!sessionId) return false
-    try {
-      const result = await window.pact.rebuildNativeContext({ sessionId, agentId, ...options })
-      if (!result.ok && result.error.code === 'NATIVE_CONTEXT_RECOVERY_REQUIRED') return false
-      const patch = unwrapRpcResult(result)
-      cachePatch(patch)
-      return true
-    } catch (error) {
-      throw error instanceof Error
-        ? error
-        : new Error(
-            'The Native Session rebuild request could not be delivered. The binding was kept.',
-          )
-    }
-  }
-
-  const performQueueAction = async (
-    action: 'steer' | 'remove' | 'resume' | 'enabled',
-    enabled?: boolean,
-  ): Promise<boolean> => {
-    const queue = windowRef.current?.view.queue
-    if (
-      !sessionId ||
-      !queue ||
-      queueOperation.current ||
-      returnOperation.current ||
-      (action !== 'enabled' && !queue.input)
-    )
-      return false
-    const operationId = crypto.randomUUID()
-    const owner = { sessionId, operationId, controller: new AbortController() }
-    queueOperation.current = owner
-    updateSessionOperations(sessionId, (current) => ({ ...current, queueOperationId: operationId }))
-    const timer = window.setTimeout(() => owner.controller.abort(), 10_000)
-    try {
-      const input: ConversationQueueActionInput = {
-        sessionId,
-        inputId: queue.input?.id ?? crypto.randomUUID(),
-        expectedRevision: queue.revision,
-        operationId,
-      }
-      const request =
-        action === 'steer'
-          ? window.pact.steerQueuedConversationMessage(input)
-          : action === 'remove'
-            ? window.pact.removeQueuedConversationMessage(input)
-            : action === 'resume'
-              ? window.pact.resumeConversationQueue(input)
-              : window.pact.setConversationQueueEnabled({
-                  sessionId,
-                  enabled: enabled ?? true,
-                  expectedRevision: queue.revision,
-                  operationId,
-                })
-      const result = await new Promise<Awaited<typeof request>>((resolve, reject) => {
-        const abort = () =>
-          reject(
-            new Error(
-              'The queue action could not be confirmed. Check its status before trying again.',
-            ),
-          )
-        owner.controller.signal.addEventListener('abort', abort, { once: true })
-        if (owner.controller.signal.aborted) abort()
-        void request
-          .then(resolve, reject)
-          .finally(() => owner.controller.signal.removeEventListener('abort', abort))
-      })
-      if (owner.controller.signal.aborted) return false
-      cachePatch(unwrapRpcResult(result))
-      return true
-    } catch (error) {
-      if (activeSessionIdRef.current === sessionId) {
-        onNotice(
-          error instanceof Error ? error.message : 'The queue action could not be confirmed.',
-        )
-        void refetchConversation({ cancelRefetch: false })
-      }
-      return false
-    } finally {
-      window.clearTimeout(timer)
-      if (queueOperation.current === owner) queueOperation.current = undefined
-      updateSessionOperations(sessionId, (current) =>
-        current.queueOperationId === operationId
-          ? { ...current, queueOperationId: undefined }
-          : current,
-      )
-    }
-  }
-
-  const returnQueuedInputToComposer = async (fromQueue: boolean): Promise<boolean> => {
-    const current = windowRef.current
-    const queue = current?.view.queue
-    if (
-      !sessionId ||
-      current?.view.sessionId !== sessionId ||
-      !queue ||
-      returnOperation.current ||
-      queueOperation.current ||
-      pendingBySessionRef.current.has(sessionId) ||
-      (fromQueue && (!queue.input || ['dispatching', 'unknown'].includes(queue.input.state))) ||
-      (!fromQueue && !queue.returnedInput)
-    )
-      return false
-    const draft = composerDraftsRef.current[sessionId] ?? { text: '' }
-    const operationId = fromQueue ? crypto.randomUUID() : queue.returnedInput!.operationId
-    const inputId = fromQueue ? queue.input!.id : queue.returnedInput!.inputId
-    const expectedRevision = fromQueue ? queue.revision : queue.returnedInput!.expectedRevision
-    const commentsRevision = current.view.commentsRevision
-    const returned = queue.returnedInput
-    const replay =
-      !fromQueue &&
-      returned?.state === 'installed' &&
-      returned.installedCommentsRevision === commentsRevision
-    if (replay && !returned.claimId) {
-      onNotice('The original restoration receipt is unavailable. Your current draft was kept.')
-      return false
-    }
-    const claimId = replay
-      ? returned.claimId!
-      : fromQueue || returned?.state !== 'installed'
-        ? operationId
-        : crypto.randomUUID()
-    const owner: ReturnedInputRead = { sessionId, controller: new AbortController() }
-    returnOperation.current = owner
-    setRestoringInput(true)
-    const timeout = window.setTimeout(() => owner.controller.abort(), 10_000)
-    const bounded = async <T>(task: Promise<T>): Promise<T> =>
-      new Promise((resolve, reject) => {
-        const abort = () =>
-          reject(
-            new Error(
-              'Returning the message was cancelled or timed out. The message remains available to restore.',
-            ),
-          )
-        owner.controller.signal.addEventListener('abort', abort, { once: true })
-        if (owner.controller.signal.aborted) abort()
-        void task
-          .then(resolve, reject)
-          .finally(() => owner.controller.signal.removeEventListener('abort', abort))
-      })
-    let installed = false
-    try {
-      if (fromQueue) {
-        const patch = unwrapRpcResult(
-          await bounded(
-            window.pact.returnQueuedConversationMessage({
-              sessionId,
-              inputId,
-              operationId,
-              expectedRevision,
-              phase: 'return',
-            }),
-          ),
-        )
-        if (patch.queue?.returnedInput?.operationId !== operationId)
-          throw new Error(
-            'The returned message could not be confirmed. Refresh its status before restoring it.',
-          )
-        cachePatch(patch)
-      }
-      let chars = 0,
-        offset = 0,
-        afterPosition: number | undefined,
-        first = true
-      let restoredImages: ConversationImage[] = [],
-        restoredSkills: SkillSelection[] = []
-      let restoredRoute: import('@pact/contracts').ConversationMessageRoute | undefined
-      let planningAction: ConversationSendInput['planningAction'] | undefined
-      const chunks: string[] = []
-      while (true) {
-        if (owner.controller.signal.aborted)
-          throw new Error('Message restoration was cancelled or timed out.')
-        const page: ConversationPage = unwrapRpcResult(
-          // oxlint-disable-next-line no-await-in-loop -- Body and Comment cursors advance together under one ten-second owner.
-          await bounded(
-            window.pact.getConversation({
-              scope: 'queued-input',
-              source: 'returned',
-              sessionId,
-              inputId,
-              operationId,
-              offset,
-              ...(afterPosition === undefined ? {} : { commentsAfterPosition: afterPosition }),
-            }),
-          ),
-        )
-        if (
-          page.scope !== 'queued-input' ||
-          page.sessionId !== sessionId ||
-          page.source !== 'returned' ||
-          page.inputId !== inputId ||
-          page.operationId !== operationId ||
-          page.offset !== offset ||
-          page.nextOffset !== offset + page.text.length ||
-          (page.hasMore && (!page.text || page.nextOffset <= offset))
-        )
-          throw new Error('The returned message changed or could not load. Try restoring it again.')
-        if (first) {
-          restoredImages = page.images ?? []
-          restoredSkills = page.skills ?? []
-          restoredRoute = page.route
-          planningAction = page.planningAction
-          first = false
-        } else if (JSON.stringify(restoredRoute) !== JSON.stringify(page.route)) {
-          throw new Error('The returned message routing changed while loading.')
-        }
-        chars += page.text.length
-        assertComposerEditLengths(draft.text.length, chars)
-        chunks.push(page.text)
-        offset = page.nextOffset
-        for (const comment of page.comments) {
-          if (afterPosition !== undefined && comment.position <= afterPosition)
-            throw new Error('The returned Comments did not advance.')
-          afterPosition = comment.position
-        }
-        if (
-          page.commentsNextPosition !== null &&
-          (!page.comments.length || page.commentsNextPosition !== afterPosition)
-        )
-          throw new Error('The returned Comment cursor did not advance.')
-        if (!page.hasMore && page.commentsNextPosition === null) break
-      }
-      if (
-        owner.controller.signal.aborted ||
-        returnOperation.current !== owner ||
-        activeSessionIdRef.current !== sessionId ||
-        (composerDraftsRef.current[sessionId]?.revision ?? 0) !== (draft.revision ?? 0)
-      )
-        return false
-      const restoredDraft: ConversationComposerDraft = {
-        text: chunks.join(''),
-        revision: (draft.revision ?? 0) + 1,
-        queueReturnOperationId: operationId,
-        planningAction,
-        skills: restoredSkills,
-        route: restoredRoute,
-        images: restoredImages.map((image) => ({
-          id: image.id,
-          name: image.name,
-          status: 'ready',
-          image,
-        })),
-      }
-      owner.draft = restoredDraft
-      if (!admitComposerResidency({ ...composerDraftsRef.current, [sessionId]: restoredDraft }))
-        return false
-      const fresh = windowRef.current
-      if (
-        fresh?.view.sessionId !== sessionId ||
-        fresh.view.queue?.returnedInput?.operationId !== operationId ||
-        fresh.view.commentsRevision !== commentsRevision
-      )
-        throw new Error('The returned message or Comment drafts changed while loading.')
-      const patch = unwrapRpcResult(
-        await bounded(
-          window.pact.returnQueuedConversationMessage({
-            sessionId,
-            inputId,
-            operationId,
-            expectedRevision,
-            phase: 'claim',
-            claimId,
-            expectedCommentsRevision: commentsRevision,
-          }),
-        ),
-      )
-      const receipt = patch.queue?.returnedInput
-      if (
-        receipt?.operationId !== operationId ||
-        receipt.claimId !== claimId ||
-        receipt.state !== 'installed' ||
-        receipt.installedCommentsRevision === undefined
-      )
-        throw new Error('The original restoration could not be confirmed. Your draft was kept.')
-      cachePatch(patch)
-      if (
-        owner.controller.signal.aborted ||
-        returnOperation.current !== owner ||
-        activeSessionIdRef.current !== sessionId ||
-        windowRef.current?.view.commentsRevision !== receipt.installedCommentsRevision ||
-        (composerDraftsRef.current[sessionId]?.revision ?? 0) !== (draft.revision ?? 0)
-      )
-        return false
-      installed = putComposerDraft(sessionId, restoredDraft)
-      if (!installed) return false
-      for (const [id, upload] of imageUploads.current) {
-        if (upload.sessionId !== sessionId) continue
-        upload.controller.abort()
-        imageUploads.current.delete(id)
-      }
-      imageChoosers.current.get(sessionId)?.abort()
-      imageChoosers.current.delete(sessionId)
-      updateSessionOperations(sessionId, (value) => ({ ...value, choosingImages: false }))
-      const restoredImageIds = new Set(restoredImages.map((image) => image.id))
-      for (const image of draft.images ?? [])
-        if (image.image && !restoredImageIds.has(image.image.id))
-          releaseDraftImage(sessionId, image.image.id)
-      return installed
-    } catch (error) {
-      if (activeSessionIdRef.current === sessionId) {
-        onNotice(
-          error instanceof Error
-            ? error.message
-            : 'The returned message remains available to restore.',
-        )
-        void refetchConversation({ cancelRefetch: false })
-      }
-      return false
-    } finally {
-      window.clearTimeout(timeout)
-      if (returnOperation.current === owner) {
-        returnOperation.current = undefined
-        releaseSupersededQueueReturn(windowRef.current)
-        setRestoringInput(false)
-        if (!installed) {
-          const value = composerDraftsRef.current[sessionId]
-          const failed = value?.images?.some(
-            (image) => image.status === 'preparing' && !imageUploads.current.has(image.id),
-          )
-          if (failed)
-            putComposerDraft(sessionId, {
-              ...value!,
-              revision: (value?.revision ?? 0) + 1,
-              images: value!.images?.map((image) =>
-                image.status === 'preparing' && !imageUploads.current.has(image.id)
-                  ? Object.assign({}, image, {
-                      status: 'failed',
-                      error: 'Image preparation was cancelled. Remove it and try again.',
-                    })
-                  : image,
-              ),
-            })
-        }
-      }
-    }
-  }
-
-  const restoreReturnedInput = useCallback(
-    async (automatic = false): Promise<boolean> => {
-      const current = windowRef.current,
-        recovery = current?.view.rebuildInputRecovery
-      if (
-        !sessionId ||
-        current?.view.sessionId !== sessionId ||
-        !recovery ||
-        returnOperation.current ||
-        pendingBySessionRef.current.has(sessionId)
-      )
-        return false
-      const draft = composerDraftsBySession[sessionId]
-      if (draft?.queueReturnOperationId) return false
-      const attempt = `${sessionId}:${recovery.operationId}`
-      if (
-        automatic &&
-        (draft?.returnedInputOperationId === recovery.operationId ||
-          returnAttempt.current === attempt)
-      )
-        return false
-      if (
-        draft?.images?.length ||
-        draft?.text ||
-        draft?.mention ||
-        draftsReadyRevision !== current.view.commentsRevision ||
-        recovery.draftEligibility?.commentsRevision !== current.view.commentsRevision ||
-        !recovery.draftEligibility.canRestore
-      )
-        return false
-      const context = current.view.nativeContexts.find((item) => item.agentId === recovery.agentId)
-      if (
-        context?.bindingGeneration !== recovery.bindingGeneration ||
-        context.continuationState !== 'ready'
-      )
-        return false
-      if (automatic) returnAttempt.current = attempt
-      const owner: ReturnedInputRead = {
-        sessionId,
-        controller: new AbortController(),
-      }
-      returnOperation.current = owner
-      setRestoringInput(true)
-      const timeout = setTimeout(() => owner.controller.abort(), 10_000)
-      const bounded = async <T>(task: Promise<T>): Promise<T> =>
-        new Promise((resolve, reject) => {
-          const abort = () => reject(new Error('Input restoration was cancelled or timed out.'))
-          owner.controller.signal.addEventListener('abort', abort, { once: true })
-          if (owner.controller.signal.aborted) abort()
-          void task
-            .then(resolve, reject)
-            .finally(() => owner.controller.signal.removeEventListener('abort', abort))
-        })
-      try {
-        let restoredImages: ConversationImage[] = []
-        let restoredSkills: SkillSelection[] = []
-        let restoredRoute: import('@pact/contracts').ConversationMessageRoute | undefined
-        let explicitReturnedTarget = false
-        let chars = 0,
-          offset = 0
-        const chunks: string[] = []
-        let first = true
-        while (true) {
-          if (owner.controller.signal.aborted)
-            throw new Error('Input restoration was cancelled or timed out.')
-          const page = unwrapRpcResult(
-            // oxlint-disable-next-line no-await-in-loop -- Original input parts are ordered and share one ten-second owner.
-            await bounded(
-              window.pact.getConversation({
-                scope: 'rebuild-input',
-                sessionId,
-                operationId: recovery.operationId,
-                offset,
-              }),
-            ),
-          )
-          if (
-            page.scope !== 'rebuild-input' ||
-            page.operationId !== recovery.operationId ||
-            page.messageId !== recovery.messageId ||
-            page.nextOffset < offset ||
-            (page.hasMore && (page.nextOffset === offset || !page.text))
-          )
-            throw new Error('Invalid returned input page.')
-          if (first) {
-            restoredImages = page.images ?? []
-            restoredSkills = page.skills ?? []
-            restoredRoute = page.route
-            explicitReturnedTarget = page.route.type !== 'primary'
-            first = false
-          }
-          chars += page.text.length
-          assertComposerEditLengths(draft?.text.length ?? 0, chars)
-          chunks.push(page.text)
-          offset = page.nextOffset
-          if (!page.hasMore) break
-        }
-        const text = chunks.join('')
-        if (
-          owner.controller.signal.aborted ||
-          returnOperation.current !== owner ||
-          activeSessionIdRef.current !== sessionId
-        )
-          return false
-        const latest = composerDraftsRef.current[sessionId]
-        if (
-          (latest?.revision ?? 0) !== (draft?.revision ?? 0) ||
-          latest?.text ||
-          latest?.mention ||
-          latest?.images?.length
-        )
-          return false
-        let restoredMention: ConversationComposerMention | undefined
-        if (explicitReturnedTarget && restoredRoute && restoredRoute.type !== 'primary') {
-          const token =
-            restoredRoute.type === 'all'
-              ? '@all'
-              : restoredRoute.agentId === 'codex'
-                ? '@codex'
-                : '@claude'
-          let candidate: RegExpExecArray | undefined,
-            ambiguous = false
-          for (const entry of text.matchAll(/(?:^|\s)(@(claude|codex|all))(?=\s|$)/gu)) {
-            if (entry[1] !== token) continue
-            if (candidate) {
-              ambiguous = true
-              break
-            }
-            candidate = entry
-          }
-          if (candidate && !ambiguous) {
-            const start = candidate.index + candidate[0].length - token.length
-            restoredMention = {
-              route: restoredRoute.type === 'all' ? { type: 'all' } : restoredRoute,
-              token,
-              start,
-              end: start + token.length,
-            }
-          }
-        }
-        const restoredDraft: ConversationComposerDraft = {
-          text,
-          revision: (latest?.revision ?? 0) + 1,
-          returnedInputOperationId: recovery.operationId,
-          skills: restoredSkills,
-          images: restoredImages.map((image) => ({
-            id: image.id,
-            name: image.name,
-            status: 'ready',
-            image,
-          })),
-          route: restoredRoute,
-          mention: restoredMention,
-        }
-        if (!admitComposerResidency({ ...composerDraftsRef.current, [sessionId]: restoredDraft }))
-          return false
-        owner.draft = restoredDraft
-        const patch = unwrapRpcResult(
-          await bounded(
-            window.pact.rebuildNativeContext({
-              sessionId,
-              agentId: recovery.agentId,
-              intent: 'claim_input',
-              expectedRebuildId: recovery.operationId,
-              expectedGeneration: recovery.bindingGeneration,
-              expectedCommentsRevision: current.view.commentsRevision,
-            }),
-          ),
-        )
-        if (
-          owner.controller.signal.aborted ||
-          returnOperation.current !== owner ||
-          activeSessionIdRef.current !== sessionId
-        )
-          return false
-        cachePatch(patch)
-        const value = composerDraftsRef.current[sessionId]
-        if (
-          (value?.revision ?? 0) !== (draft?.revision ?? 0) ||
-          value?.text ||
-          value?.mention ||
-          value?.images?.length
-        )
-          return false
-        return putComposerDraft(sessionId, restoredDraft)
-      } catch (error) {
-        if (!owner.controller.signal.aborted)
-          onNotice(
-            error instanceof Error
-              ? error.message
-              : 'The previous input remains available to restore.',
-          )
-        return false
-      } finally {
-        clearTimeout(timeout)
-        if (returnOperation.current === owner) {
-          returnOperation.current = undefined
-          setRestoringInput(false)
-        }
-      }
-    },
-    [
-      sessionId,
-      composerDraftsBySession,
-      draftsReadyRevision,
-      cachePatch,
-      onNotice,
-      admitComposerResidency,
-      putComposerDraft,
-    ],
-  )
-
-  const recovery =
-    windowState?.view.sessionId === sessionId ? windowState?.view.rebuildInputRecovery : undefined
-  useEffect(() => {
-    if (!recovery || composer || composerMention || composerImages.length || !visible) return
-    if (draftsReadyRevision !== windowState?.view.commentsRevision) return
-    void restoreReturnedInput(true)
-  }, [
-    recovery,
-    composer,
-    composerMention,
-    composerImages.length,
-    visible,
-    draftsReadyRevision,
-    windowState?.view.commentsRevision,
+  const {
+    restoringInput,
+    checkInformationCancellation,
+    cancelPreparedInformation,
+    send,
+    syncToMain,
+    saveCommentDraft,
+    removeCommentDraft,
+    undoWorkspaceChanges,
+    respondNativePermission,
+    respondNativeInput,
+    checkNativeContext,
+    checkQueuedDelivery,
+    rebuildNativeContext,
+    performQueueAction,
+    returnQueuedInputToComposer,
     restoreReturnedInput,
-  ])
-
-  useEffect(() => {
-    const ownerSession = sessionId
-    return () => {
-      const current = returnOperation.current
-      if (current && current.sessionId === ownerSession) {
-        current.controller.abort()
-        returnOperation.current = undefined
-        setRestoringInput(false)
-      }
-      const queueOwner = queueOperation.current
-      if (queueOwner && queueOwner.sessionId === ownerSession) {
-        queueOwner.controller.abort()
-        queueOperation.current = undefined
-      }
-    }
-  }, [sessionId])
-
-  const discardReturnedInput = async (): Promise<boolean> => {
-    if (!sessionId || !recovery || returnOperation.current) return false
-    try {
-      cachePatch(
-        unwrapRpcResult(
-          await window.pact.rebuildNativeContext({
-            sessionId,
-            agentId: recovery.agentId,
-            intent: 'discard_input',
-            expectedRebuildId: recovery.operationId,
-          }),
-        ),
-      )
-      return true
-    } catch (error) {
-      onNotice(error instanceof Error ? error.message : 'Input recovery is still available.')
-      return false
-    }
-  }
-
-  const stop = async (): Promise<boolean> => {
-    if (!sessionId || stopping) return false
-    const preparing = pendingBySessionRef.current.get(sessionId)?.inputPreparation
-    if (preparing) {
-      preparing.abort()
-      return true
-    }
-    const operationId = crypto.randomUUID()
-    updateSessionOperations(sessionId, (current) => ({
-      ...current,
-      stoppingOperationId: operationId,
-      error: undefined,
-    }))
-    try {
-      const result = await window.pact.stopConversation({ sessionId })
-      if (!result.ok) {
-        updateSessionOperations(sessionId, (current) => ({
-          ...current,
-          stoppingOperationId: undefined,
-          error: result.error.message,
-        }))
-        return false
-      }
-      cachePatch(result.value)
-      updateSessionOperations(sessionId, (current) => ({
-        ...current,
-        stoppingOperationId: undefined,
-      }))
-      return true
-    } catch (error) {
-      updateSessionOperations(sessionId, (current) => ({
-        ...current,
-        stoppingOperationId: undefined,
-        error: error instanceof Error ? error.message : 'The Run could not be stopped.',
-      }))
-      return false
-    }
-  }
-
-  const acceptPeerProposal = async (proposalId: string): Promise<boolean> => {
-    if (!sessionId) return false
-    try {
-      const result = await window.pact.acceptPeerProposal({
-        sessionId,
-        proposalId,
-        clientMessageId: crypto.randomUUID(),
-      })
-      if (!result.ok) {
-        if (result.error.code === 'AGENT_CAPACITY') onNotice(result.error.message)
-        else if (result.error.code !== 'NATIVE_CONTEXT_RECOVERY_REQUIRED')
-          onErrorNotice(result.error.message)
-        return false
-      }
-      cachePatch(result.value)
-      return true
-    } catch (error) {
-      onErrorNotice(error instanceof Error ? error.message : 'The peer request could not start.')
-      return false
-    }
-  }
-
-  const dismissPeerProposal = async (proposalId: string): Promise<boolean> => {
-    if (!sessionId) return false
-    try {
-      const result = await window.pact.dismissPeerProposal({ sessionId, proposalId })
-      if (!result.ok) {
-        if (result.error.code !== 'NATIVE_CONTEXT_RECOVERY_REQUIRED')
-          onErrorNotice(result.error.message)
-        return false
-      }
-      cachePatch(result.value)
-      return true
-    } catch (error) {
-      onErrorNotice(error instanceof Error ? error.message : 'The peer request could not dismiss.')
-      return false
-    }
-  }
+    discardReturnedInput,
+    stop,
+    acceptPeerProposal,
+    dismissPeerProposal,
+  } = useConversationActions({
+    sessionId,
+    visible,
+    onNotice,
+    onErrorNotice,
+    onInfoNotice,
+    queryClient,
+    operationsBySessionRef,
+    clearOtherCancelledInformation,
+    composerDraftsBySession,
+    latestComposerDraft,
+    composerDraftsRef,
+    imageUploads,
+    imageChoosers,
+    getReturnOperation,
+    setReturnOperation,
+    pendingBySessionRef,
+    activeSessionIdRef,
+    admitComposerResidency,
+    putComposerDraft,
+    windowState,
+    windowRef,
+    projectionActiveRef,
+    draftHasMore,
+    draftHasEarlier,
+    draftsReadyRevision,
+    setDraftsReadyRevision,
+    bumpDraftReloadToken,
+    refetchConversation,
+    sending,
+    stopping,
+    checkingNativeTargetId,
+    composerDraft,
+    composer,
+    clearCancelledInformation,
+    composerImages,
+    composerMention,
+    clearSubmittedComposerDraft,
+    updateSessionOperations,
+    settleSubmission,
+    releaseSupersededQueueReturn,
+    cachePatch,
+  })
 
   const visibleWindow = windowState?.view.sessionId === sessionId ? windowState : undefined
   // Suppress only this exact check error, and only while its Agent has a
@@ -3437,6 +2307,8 @@ export function useConversation(
   return {
     snapshot: visibleWindow?.view,
     composer,
+    composerUserInformation,
+    setComposerUserInformation,
     composerImages,
     choosingImages: Boolean(currentOperations?.choosingImages),
     addComposerImages,
@@ -3451,6 +2323,10 @@ export function useConversation(
     setComposerSkills,
     composerMention,
     setComposerMention,
+    composerRevision: composerDraft?.revision ?? 0,
+    seedComposerDraft,
+    clearSubmittedComposerDraft,
+    syncToMain,
     loading: Boolean(sessionId && visible && (query.isFetching || (!query.isError && readPending))),
     sending,
     stopping,
@@ -3469,6 +2345,19 @@ export function useConversation(
     rebuildNativeContext,
     checkNativeContext,
     history: {
+      decisionDraft: composerDraft?.decisionAnswers,
+      setDecisionDraft,
+      clearDecisionDraft,
+      informationCancellation: currentOperations?.informationCancellation
+        ? {
+            request: currentOperations.informationCancellation.request,
+            status: currentOperations.informationCancellation.status,
+            error: currentOperations.informationCancellation.error,
+          }
+        : undefined,
+      cancelledInformationDecisionId: currentOperations?.cancelledInformationDecisionId,
+      cancelPreparedInformation,
+      checkInformationCancellation,
       queueActions: {
         pending: Boolean(currentOperations?.queueOperationId) || restoringInput,
         steer: () => performQueueAction('steer'),
@@ -3494,7 +2383,8 @@ export function useConversation(
       readingPositionLost: Boolean(visibleWindow && readingPositionLost),
       readError: query.error?.message,
       retryRead: () => {
-        if (sessionId && visibleRef.current) void refetchConversation({ cancelRefetch: false })
+        if (sessionId && projectionActiveRef.current)
+          void refetchConversation({ cancelRefetch: false })
       },
       window: visibleWindow,
       loadingPage: Boolean(visibleWindow && loadingPage),

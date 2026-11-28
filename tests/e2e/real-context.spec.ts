@@ -93,12 +93,42 @@ test.describe('real evidence', { tag: ['@real', '@real-extended'] }, () => {
         status: 'interrupted',
         failureKind: 'transient_transport',
       })
-      if (!primary?.nativeSessionId || !peer?.nativeSessionId)
+      if (!primary?.nativeSessionId || !primary.nativeTurnId || !peer?.nativeSessionId)
         throw new Error('Authentic primary/failed-peer identities are unavailable')
-      expect(answerFor(failed, primary.id)).toContain(marker)
-      expect((await findNativeRecord(ctx, 'codex', primary.nativeSessionId)).codexModelStarts).toBe(
-        1,
+      const primaryAnswer = answerFor(failed, primary.id)
+      const primaryNative = await findNativeRecord(ctx, 'codex', primary.nativeSessionId)
+      const primaryParity = primaryNative.answerParity({
+        nativeSessionId: primary.nativeSessionId,
+        nativeTurnId: primary.nativeTurnId,
+        text: primaryAnswer,
+        markers: [],
+      })
+      const numberedLines = [...primaryAnswer.matchAll(/^\s*(\d{1,3})[.)]\s+\S/gmu)].map((match) =>
+        Number(match[1]),
       )
+      const proof = {
+        currentNativeIdentity: primaryNative.nativeIds.has(primary.nativeSessionId),
+        nativeIdentities: primaryNative.nativeIds.size,
+        nativeInputs: primaryNative.codexModelStarts,
+        originalMarkerReceived: primaryNative.containsText(marker),
+        completeAuthenticAnswer: primaryParity.completeProjection && primaryParity.exactMatch,
+        numberedLines,
+        nativeHistorySha256: primaryNative.sha256,
+        parity: primaryParity,
+      }
+      await test.info().attach('failed-peer-primary-native-task-proof', {
+        body: Buffer.from(JSON.stringify(proof)),
+        contentType: 'application/json',
+      })
+      expect(proof).toMatchObject({
+        currentNativeIdentity: true,
+        nativeIdentities: 1,
+        nativeInputs: 1,
+        originalMarkerReceived: true,
+        completeAuthenticAnswer: true,
+      })
+      expect(primaryAnswer.trim().length).toBeGreaterThan(0)
+      expect(numberedLines).toEqual(Array.from({ length: 160 }, (_, index) => index + 1))
       await expect(ctx.page.getByRole('button', { name: 'Reexecute…', exact: true })).toHaveCount(0)
       await expect(ctx.page.getByRole('combobox', { name: 'Message' })).toBeDisabled()
 
@@ -130,7 +160,9 @@ test.describe('real evidence', { tag: ['@real', '@real-extended'] }, () => {
         timeout: 30_000,
       })
       await recovery.getByRole('button', { name: 'Rebuild…', exact: true }).click()
-      await expect(recovery).toContainText('previous task won’t be repeated')
+      await expect(recovery).toContainText(
+        'Chat history and drafts stay saved; the earlier task won’t run again.',
+      )
       await recovery.getByRole('button', { name: 'Confirm rebuild', exact: true }).click()
       await expect(ctx.page.getByRole('combobox', { name: 'Message' })).toBeEnabled({
         timeout: 120_000,
@@ -494,7 +526,12 @@ async function findOwnedAgentProcess(
   }
   if (!executable) throw new Error('Selected actual Agent executable is unavailable')
   if (process.platform === 'win32')
-    return findWindowsOwnedAgentProcess(utilityPid, executable, agentId)
+    return findWindowsOwnedAgentProcess(
+      utilityPid,
+      executable,
+      agentId,
+      ctx.fixture.observeWindowsProcessTree,
+    )
   const owner = { pid: utilityPid, executable }
   const pending = [{ pid: owner.pid, chain: [] as OwnedAgentProcess['chain'] }]
   const matches: OwnedAgentProcess[] = []
@@ -528,7 +565,8 @@ async function findOwnedAgentProcess(
       const chain = [...parent.chain, child]
       if (
         basename(child.executable) === basename(owner.executable) ||
-        basename(child.executable) === agentId
+        basename(child.executable) === agentId ||
+        basename(child.executable) === `${agentId}.exe`
       )
         matches.push({
           pid,

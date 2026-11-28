@@ -1,6 +1,7 @@
 appId: com.pact.desktop
 productName: Pact
 asar: true
+beforePack: build/before-pack.mjs
 afterPack: build/after-pack.mjs
 directories:
   buildResources: build
@@ -12,6 +13,7 @@ extraResources:
       - '**/*'
 files:
   - out/**
+  - '!out/native/**'
   - package.json
   - '!**/*.map'
   - '!**/.vscode/**'
@@ -28,6 +30,15 @@ mac:
   entitlements: build/entitlements.mac.plist
   entitlementsInherit: build/entitlements.mac.plist
   notarize: false
+  extraResources:
+    - from: out/native/agy-sqlite-file-darwin-${arch}.node
+      to: native/agy-sqlite-file-darwin-${arch}.node
+    - from: out/native/agy-sqlite-file-darwin-${arch}.node.json
+      to: native/agy-sqlite-file-darwin-${arch}.node.json
+    - from: out/native/terminal-darwin-${arch}
+      to: native/terminal-darwin-${arch}
+    - from: out/native/terminal-darwin-${arch}.json
+      to: native/terminal-darwin-${arch}.json
   target:
     - target: dmg
       arch:
@@ -38,6 +49,19 @@ mac:
 win:
   executableName: Pact
   icon: build/icon.ico
+  extraResources:
+    - from: out/native/owned-process-group-win32-${arch}.exe
+      to: native/owned-process-group-win32-${arch}.exe
+    - from: out/native/owned-process-group-win32-${arch}.exe.json
+      to: native/owned-process-group-win32-${arch}.exe.json
+    - from: out/native/agy-sqlite-file-win32-${arch}.node
+      to: native/agy-sqlite-file-win32-${arch}.node
+    - from: out/native/agy-sqlite-file-win32-${arch}.node.json
+      to: native/agy-sqlite-file-win32-${arch}.node.json
+    - from: out/native/terminal-win32-${arch}.exe
+      to: native/terminal-win32-${arch}.exe
+    - from: out/native/terminal-win32-${arch}.exe.json
+      to: native/terminal-win32-${arch}.exe.json
   extraFiles:
     - from: build/icon.ico
       to: uninstallerIcon.ico

@@ -17,6 +17,7 @@ import { mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
 import { createServer, type Socket } from 'node:net'
 import { tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
+import { setImmediate as preparationTurn } from 'node:timers/promises'
 
 const imageByteLimit = 64 * 1024
 const imageLifetimeMs = 10 * 60_000
@@ -295,6 +296,32 @@ export interface WindowsRootExit extends WindowsJobMembers {
   natural: boolean
   active: number
 }
+export const windowsProcessTreeLimits = {
+  nodes: 32,
+  depth: 3,
+  deadlineMs: 2_000,
+} as const
+
+export interface WindowsProcessTreeIdentity {
+  pid: number
+  parentPid: number
+  /** UTC ticks at the same microsecond precision as Win32_Process.CreationDate. */
+  started: string
+}
+
+export interface WindowsProcessTree {
+  root: WindowsProcessTreeIdentity
+  descendants: WindowsProcessTreeIdentity[]
+}
+
+export class WindowsProcessTreeError extends Error {
+  readonly reason: 'query' | 'tree-limit'
+  constructor(reason: 'query' | 'tree-limit') {
+    super('Owned Windows process tree could not be observed')
+    this.reason = reason
+  }
+}
+
 export interface WindowsLaunchOwner {
   executablePath: string
   directory: string
@@ -303,6 +330,7 @@ export interface WindowsLaunchOwner {
   empty: Promise<{ generation: string; active: 0; exitCode: number }>
   rootExit: Promise<WindowsRootExit>
   armStartup(deadline: number): void
+  observeProcessTree(rootPid: number, deadlineAt: number): Promise<WindowsProcessTree>
   cancel(): void
   disposeControl(): Promise<void>
   diagnostic(): {
@@ -365,11 +393,72 @@ function jobMembers(value: Record<string, unknown>): WindowsJobMembers {
   return { members, membersIncomplete: value.membersIncomplete }
 }
 
+function invalidJobProcessTree(): never {
+  throw new Error('Invalid Job process tree')
+}
+
+function processTree(value: Record<string, unknown>, requestedRoot: number): WindowsProcessTree {
+  const invalid = invalidJobProcessTree
+  const identity = (row: unknown): WindowsProcessTreeIdentity => {
+    if (!Array.isArray(row) || row.length !== 3) return invalid()
+    const [pid, parentPid, started] = row
+    if (
+      !Number.isSafeInteger(pid) ||
+      pid < 2 ||
+      pid > 0xffffffff ||
+      !Number.isSafeInteger(parentPid) ||
+      parentPid < 0 ||
+      parentPid > 0xffffffff ||
+      typeof started !== 'string' ||
+      !/^\d{1,20}$/u.test(started) ||
+      BigInt(started) < 1n
+    )
+      return invalid()
+    return { pid, parentPid, started }
+  }
+  const root = identity(value.root)
+  if (
+    root.pid !== requestedRoot ||
+    !Array.isArray(value.descendants) ||
+    value.descendants.length > windowsProcessTreeLimits.nodes
+  )
+    return invalid()
+  const descendants = value.descendants.map(identity)
+  const rows = new Map<number, WindowsProcessTreeIdentity>([[root.pid, root]])
+  for (const row of descendants) {
+    if (rows.has(row.pid)) return invalid()
+    rows.set(row.pid, row)
+  }
+  for (const row of descendants) {
+    let current = row
+    let depth = 0
+    while (current.pid !== root.pid) {
+      if (++depth > windowsProcessTreeLimits.depth) return invalid()
+      const parent = rows.get(current.parentPid)
+      if (!parent || BigInt(current.started) < BigInt(parent.started)) return invalid()
+      current = parent
+    }
+  }
+  return { root, descendants }
+}
+
 /** One authenticated Job receipt, independent of Electron and every provider/relay it launches. */
+export class WindowsLaunchPreparationError extends Error {
+  readonly preparationReleased: boolean
+  readonly directory: string | undefined
+  constructor(preparationReleased: boolean, directory?: string) {
+    super('Windows Job preparation failed')
+    this.name = 'WindowsLaunchPreparationError'
+    this.preparationReleased = preparationReleased
+    this.directory = directory
+  }
+}
+
 export async function writeWindowsObservedLauncher(
   root: string,
   executable: string,
   lifetimeMs: number,
+  preparation?: { deadlineAt: number; signal?: AbortSignal },
 ): Promise<WindowsLaunchOwner> {
   if (
     process.platform !== 'win32' ||
@@ -380,7 +469,35 @@ export async function writeWindowsObservedLauncher(
     lifetimeMs > 15 * 60_000
   )
     throw new Error('Invalid observed Windows launch')
-  const directory = await mkdtemp(join(await realpath(root), 'pact-owned-launch-'))
+  const preparationDeadlineAt = preparation?.deadlineAt ?? Infinity
+  const checkPreparation = (): void => {
+    if (
+      (preparation && !Number.isFinite(preparationDeadlineAt)) ||
+      preparation?.signal?.aborted ||
+      performance.now() >= preparationDeadlineAt
+    )
+      throw new Error('Windows Job preparation exceeded its caller deadline or was cancelled')
+  }
+  let directory: string | undefined
+  try {
+    checkPreparation()
+    const parent = await realpath(root)
+    checkPreparation()
+    directory = await mkdtemp(join(parent, 'pact-owned-launch-'))
+    checkPreparation()
+  } catch (error) {
+    let released = true
+    if (directory) {
+      try {
+        await rm(directory, { recursive: true, force: true })
+      } catch {
+        released = false
+      }
+    }
+    if (preparation) throw new WindowsLaunchPreparationError(released, directory)
+    throw error
+  }
+  if (!directory) throw new Error('Windows Job preparation has no directory')
   const generation = randomUUID(),
     token = randomUUID()
   const began = performance.now()
@@ -395,6 +512,18 @@ export async function writeWindowsObservedLauncher(
   let rootPid: number | undefined, rootExitFact: WindowsRootExit | undefined
   let membersBeforeStop: WindowsJobMembers | undefined
   let stoppingReason: ReturnType<WindowsLaunchOwner['diagnostic']>['stoppingReason']
+  let observation:
+    | {
+        requestId: number
+        rootPid: number
+        deadlineAt: number
+        settled: boolean
+        timer: ReturnType<typeof setTimeout> | undefined
+        resolve: (tree: WindowsProcessTree) => void
+        reject: (error: WindowsProcessTreeError) => void
+      }
+    | undefined
+  let observationSequence = 0
   const mark = (stage: keyof typeof stages): void => {
     stages[stage] = Math.round(performance.now() - began)
   }
@@ -415,6 +544,18 @@ export async function writeWindowsObservedLauncher(
   const pipeName = `pact-fixture-${process.pid}-${generation}`
   const server = createServer()
   server.maxConnections = 1
+  let listenStarted = false
+  const listenSettled = Promise.withResolvers<void>()
+  let serverClose: Promise<void> | undefined
+  let controlDisposal: Promise<void> | undefined
+  const closeServer = (): Promise<void> =>
+    (serverClose ??= (async () => {
+      if (listenStarted) await listenSettled.promise
+      if (server.listening)
+        await new Promise<void>((done, reject) =>
+          server.close((error) => (error ? reject(error) : done())),
+        )
+    })())
   let socket: Socket | undefined
   let buffer = Buffer.alloc(0)
   let authenticated = false,
@@ -424,6 +565,7 @@ export async function writeWindowsObservedLauncher(
     disposed = false
   let startupTimer: ReturnType<typeof setTimeout> | undefined
   let startupDeadline: number | undefined
+  let preparationDeadline: number | undefined
   let lifetimeTimer: ReturnType<typeof setTimeout> | undefined
   let resolveStarted!: (value: { generation: string; pid: number }) => void
   let rejectStarted!: (error: Error) => void
@@ -446,6 +588,16 @@ export async function writeWindowsObservedLauncher(
   void started.catch(() => undefined)
   void empty.catch(() => undefined)
   void rootExit.catch(() => undefined)
+  const rejectObservation = (release: boolean): void => {
+    if (!observation) return
+    clearTimeout(observation.timer)
+    observation.timer = undefined
+    if (!observation.settled) {
+      observation.settled = true
+      observation.reject(new WindowsProcessTreeError('query'))
+    }
+    if (release) observation = undefined
+  }
   const fail = (message: string): void => {
     if (firstFailure) return
     firstFailure = message
@@ -456,18 +608,80 @@ export async function writeWindowsObservedLauncher(
     rejectStarted(error)
     rejectEmpty(error)
     rejectRootExit(error)
+    rejectObservation(true)
     socket?.destroy()
-    if (server.listening) server.close()
+    void closeServer().catch(() => undefined)
   }
   const cancel = (): void => {
     if (cancelled) return
     cancelled = true
+    rejectObservation(false)
     if (authenticated && !didEmpty && socket && !socket.destroyed && !socket.writableEnded)
       // Windows named-pipe shutdown can end reads before the Job's final receipt arrives.
       socket.write('cancel\n')
   }
+  const observeProcessTree = (
+    requestedRoot: number,
+    deadlineAt: number,
+  ): Promise<WindowsProcessTree> => {
+    const remaining = Math.floor(deadlineAt - performance.now())
+    if (
+      !Number.isSafeInteger(requestedRoot) ||
+      requestedRoot < 2 ||
+      requestedRoot > 0xffffffff ||
+      !Number.isFinite(remaining) ||
+      remaining < 1 ||
+      remaining > windowsProcessTreeLimits.deadlineMs ||
+      !authenticated ||
+      !didStart ||
+      didEmpty ||
+      cancelled ||
+      disposed ||
+      firstFailure ||
+      rootExitFact ||
+      observation ||
+      observationSequence === 0x7fffffff ||
+      !socket ||
+      socket.destroyed ||
+      socket.writableEnded
+    )
+      return Promise.reject(new WindowsProcessTreeError('query'))
+    return new Promise<WindowsProcessTree>((resolveObservation, reject) => {
+      const request = {
+        requestId: ++observationSequence,
+        rootPid: requestedRoot,
+        deadlineAt,
+        settled: false,
+        timer: undefined as ReturnType<typeof setTimeout> | undefined,
+        resolve: resolveObservation,
+        reject,
+      }
+      observation = request
+      request.timer = setTimeout(() => {
+        if (observation === request) rejectObservation(false)
+      }, remaining)
+      try {
+        socket!.write(
+          `observe-v1 ${request.requestId} ${requestedRoot} ${remaining}\n`,
+          (error) => {
+            if (error && observation === request) fail('Windows Job observation transport failed')
+          },
+        )
+      } catch {
+        fail('Windows Job observation transport failed')
+      }
+    })
+  }
+  const watchForRelease = (): void => {
+    clearTimeout(lifetimeTimer)
+    lifetimeTimer = setTimeout(() => {
+      cancel()
+      fail('Windows Job lifetime ended without release confirmation')
+    }, lifetimeMs + 5000)
+  }
   const armStartup = (deadline: number): void => {
-    const remaining = deadline - performance.now()
+    const now = performance.now()
+    const remaining = deadline - now
     if (
       startupDeadline !== undefined ||
       disposed ||
@@ -475,9 +689,16 @@ export async function writeWindowsObservedLauncher(
       firstFailure ||
       !Number.isFinite(remaining) ||
       remaining <= 0 ||
-      remaining > 30_000
+      deadline > now + 30_000
     )
       throw new Error('Windows Job startup requires one live bounded caller deadline')
+    if (preparationDeadline === undefined || now >= preparationDeadline) {
+      cancel()
+      fail('Windows Job preparation expired before startup authorization')
+      throw new Error('Windows Job startup requires one live bounded caller deadline')
+    }
+    // Preparation, authorized startup and target runtime have separate deadlines.
+    clearTimeout(lifetimeTimer)
     startupDeadline = deadline
     mark('armed')
     startupTimer = setTimeout(() => {
@@ -507,11 +728,39 @@ export async function writeWindowsObservedLauncher(
       }
       if (startupDeadline === undefined || performance.now() >= startupDeadline)
         throw new Error('Windows Job admission is outside its caller deadline')
-      socket!.write('go\n')
+      // An attempted write may admit a Job even if the transport then fails.
       mark('go')
+      socket!.write('go\n')
       return
     }
     if (didEmpty) throw new Error('Job emitted data after its final receipt')
+    if (message.kind === 'tree') {
+      const request = observation
+      if (!request || message.version !== 1 || message.requestId !== request.requestId)
+        throw new Error('Unexpected Job tree receipt')
+      let tree: WindowsProcessTree | undefined
+      let reason: 'query' | 'tree-limit' | undefined
+      if (
+        exact(['kind', 'version', 'generation', 'requestId', 'reason']) &&
+        (message.reason === 'query' || message.reason === 'tree-limit')
+      ) {
+        reason = message.reason
+      } else if (exact(['kind', 'version', 'generation', 'requestId', 'root', 'descendants'])) {
+        tree = processTree(message, request.rootPid)
+      } else {
+        throw new Error('Invalid Job tree receipt')
+      }
+      clearTimeout(request.timer)
+      observation = undefined
+      if (!request.settled) {
+        request.settled = true
+        if (performance.now() >= request.deadlineAt)
+          request.reject(new WindowsProcessTreeError('query'))
+        else if (reason) request.reject(new WindowsProcessTreeError(reason))
+        else request.resolve(tree!)
+      }
+      return
+    }
     if (message.kind === 'started') {
       if (
         startupDeadline === undefined ||
@@ -530,6 +779,7 @@ export async function writeWindowsObservedLauncher(
       lastActive = 1
       mark('started')
       clearTimeout(startupTimer)
+      watchForRelease()
       resolveStarted({ generation, pid: message.pid })
     } else if (message.kind === 'root-exit') {
       if (
@@ -569,6 +819,7 @@ export async function writeWindowsObservedLauncher(
         ...jobMembers(message),
       }
       resolveRootExit({ ...rootExitFact, ...cloneMembers(rootExitFact) })
+      rejectObservation(false)
     } else if (message.kind === 'members') {
       if (
         !didStart ||
@@ -600,6 +851,7 @@ export async function writeWindowsObservedLauncher(
       // root observation on an error path. It cannot prove natural exit/takeover.
       // The helper keeps the pipe open until this ACK so a concurrent cancellation
       // cannot write into a closed peer and discard an unread empty receipt.
+      rejectObservation(true)
       socket!.end('received\n')
       resolveEmpty({ generation, active: 0, exitCode: message.exitCode })
     } else if (message.kind === 'counts') {
@@ -645,15 +897,18 @@ export async function writeWindowsObservedLauncher(
     mark('connected')
     connection.on('data', (chunk: Buffer) => {
       try {
-        if (buffer.length + chunk.length > 4096)
-          throw new Error('Job control frame exceeds 4096 bytes')
-        buffer = Buffer.concat([buffer, chunk])
+        let offset = 0
         for (;;) {
-          const end = buffer.indexOf(10)
+          const end = chunk.indexOf(10, offset)
+          const segment = end < 0 ? chunk.subarray(offset) : chunk.subarray(offset, end)
+          if (buffer.length + segment.length + (end < 0 ? 0 : 1) > 4096)
+            throw new Error('Job control frame exceeds 4096 bytes')
+          buffer = Buffer.concat([buffer, segment])
           if (end < 0) break
-          const line = buffer.subarray(0, end).toString('utf8')
-          buffer = buffer.subarray(end + 1)
+          const line = buffer.toString('utf8')
+          buffer = Buffer.alloc(0)
           receive(JSON.parse(line))
+          offset = end + 1
         }
       } catch {
         fail('Windows Job control validation failed')
@@ -667,33 +922,67 @@ export async function writeWindowsObservedLauncher(
     })
   })
   server.on('error', () => fail('Windows Job control server failed'))
-  const disposeControl = async (): Promise<void> => {
-    if (disposed) return
-    disposed = true
-    cancel()
-    clearTimeout(startupTimer)
-    clearTimeout(lifetimeTimer)
-    if (!didEmpty) fail('Windows Job control disposed before release was confirmed')
-    socket?.removeAllListeners()
-    socket?.destroy()
-    buffer = Buffer.alloc(0)
-    if (server.listening) await new Promise<void>((done) => server.close(() => done()))
-    server.removeAllListeners()
-  }
+  const disposeControl = (): Promise<void> =>
+    (controlDisposal ??= (async () => {
+      disposed = true
+      cancel()
+      clearTimeout(startupTimer)
+      clearTimeout(lifetimeTimer)
+      if (!didEmpty) fail('Windows Job control disposed before release was confirmed')
+      rejectObservation(true)
+      socket?.removeAllListeners()
+      socket?.destroy()
+      buffer = Buffer.alloc(0)
+      await closeServer()
+      server.removeAllListeners()
+    })())
   try {
+    checkPreparation()
     await new Promise<void>((done, reject) => {
-      const timer = setTimeout(() => reject(new Error('Windows Job pipe admission deadline')), 5000)
-      const failed = (error: Error): void => {
-        clearTimeout(timer)
-        reject(error)
+      const complete = (): void => {
+        server.off('listening', complete)
+        server.off('error', complete)
+        listenSettled.resolve()
       }
-      server.once('error', failed)
-      server.listen(`\\\\.\\pipe\\${pipeName}`, () => {
+      const cleanup = (): void => {
         clearTimeout(timer)
         server.off('error', failed)
-        done()
-      })
+        preparation?.signal?.removeEventListener('abort', aborted)
+      }
+      const failed = (error: unknown): void => {
+        cleanup()
+        reject(error)
+      }
+      const aborted = (): void => failed(new Error('Windows Job pipe preparation cancelled'))
+      const timer = setTimeout(
+        () => failed(new Error('Windows Job pipe admission deadline')),
+        Math.max(1, Math.min(5000, preparationDeadlineAt - performance.now())),
+      )
+      server.once('error', failed)
+      preparation?.signal?.addEventListener('abort', aborted, { once: true })
+      if (preparation?.signal?.aborted) {
+        aborted()
+        return
+      }
+      listenStarted = true
+      server.once('listening', complete)
+      server.once('error', complete)
+      try {
+        server.listen(`\\\\.\\pipe\\${pipeName}`, () => {
+          try {
+            checkPreparation()
+            cleanup()
+            done()
+          } catch (error) {
+            failed(error)
+          }
+        })
+      } catch (error) {
+        complete()
+        failed(error)
+      }
     })
+    checkPreparation()
     const executablePath = join(directory, 'owned-launch.exe')
     let target = executable
     const prefix: string[] = []
@@ -713,13 +1002,15 @@ export async function writeWindowsObservedLauncher(
         generation,
         timeout: lifetimeMs,
       }),
-      { flag: 'wx', mode: 0o600 },
+      { flag: 'wx', mode: 0o600, signal: preparation?.signal },
     )
-    installImage(executablePath)
-    lifetimeTimer = setTimeout(() => {
-      cancel()
-      fail('Windows Job lifetime ended without release confirmation')
-    }, lifetimeMs + 5000)
+    checkPreparation()
+    installImage(executablePath, preparationDeadlineAt)
+    if (preparation) await preparationTurn(undefined, { signal: preparation.signal })
+    checkPreparation()
+    // An owner that is never armed must still release its prepared control resources.
+    preparationDeadline = performance.now() + lifetimeMs + 5000
+    watchForRelease()
     mark('prepared')
     return {
       executablePath,
@@ -729,11 +1020,28 @@ export async function writeWindowsObservedLauncher(
       empty,
       rootExit,
       armStartup,
+      observeProcessTree,
       cancel,
       disposeControl,
       diagnostic,
     }
   } catch (error) {
+    if (preparation) {
+      let released = true
+      try {
+        await disposeControl()
+      } catch {
+        released = false
+      }
+      if (released) {
+        try {
+          await rm(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 250 })
+        } catch {
+          released = false
+        }
+      }
+      throw new WindowsLaunchPreparationError(released, directory)
+    }
     await disposeControl()
     await rm(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 250 })
     throw error
