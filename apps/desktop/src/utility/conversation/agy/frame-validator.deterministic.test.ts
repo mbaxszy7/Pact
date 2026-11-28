@@ -72,12 +72,68 @@ describe('agy/frame-validator (zero-I/O deterministic suite)', () => {
     )
 
     expect(validated.sessionAttribution).toBe('matching')
+    expect(validated.hasStructuralContradiction).toBe(false)
+    expect(validated.contradictsRootBoundary).toBe(false)
     expect(validated.rootEvidenceContradicted).toBe(false)
     expect(validated.toolCallId).toBe('tc-1')
     expect(validated.argsEvidence.kind).toBe('present')
 
     const rechecked = recheckValidatedFrameAgainstRootBoundary(validated, 'traj-1', 12)
+    expect(rechecked.hasStructuralContradiction).toBe(false)
+    expect(rechecked.contradictsRootBoundary).toBe(true)
     expect(rechecked.rootEvidenceContradicted).toBe(true)
+
+    const historicalStep = validateAgyFrame(
+      {
+        kind: 'notification',
+        seq: 6,
+        message: {
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: 'sess-1',
+            update: {
+              sessionUpdate: 'user_message_chunk',
+              stepIdx: 1,
+              executionId: 'exec-foreign',
+              content: { type: 'text', text: 'Historical turn' },
+            },
+          },
+        },
+      },
+      'sess-1',
+      'traj-1',
+      4,
+    )
+    expect(historicalStep.hasStructuralContradiction).toBe(false)
+    expect(historicalStep.contradictsRootBoundary).toBe(true)
+    expect(historicalStep.rootEvidenceContradicted).toBe(true)
+
+    const structurallyCorrupted = validateAgyFrame(
+      {
+        kind: 'notification',
+        seq: 7,
+        message: {
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: 'sess-1',
+            update: {
+              sessionUpdate: 'user_message_chunk',
+              stepIdx: 4,
+              progressToken: 'traj-1:9',
+              content: { type: 'text', text: 'Conflicting step/token' },
+            },
+          },
+        },
+      },
+      'sess-1',
+      'traj-1',
+      4,
+    )
+    expect(structurallyCorrupted.hasStructuralContradiction).toBe(true)
+    expect(structurallyCorrupted.contradictsRootBoundary).toBe(false)
+    expect(structurallyCorrupted.rootEvidenceContradicted).toBe(true)
   })
 
   it('rejects foreign or conflicting prompt terminal replies and accepts clean end_turn', () => {

@@ -5,6 +5,9 @@ import type { NativeMemoryReservation } from '../native-working-memory'
 import type { AgyAdapterRuntime } from './adapter-runtime'
 import type { AgyRunMcpServer } from './peer-mcp-server'
 
+import { recordDiagnostic } from '../../../diagnostics/utility-log'
+import { classifyAgentError } from '../agent-execution-error'
+import { nativeFileChangesSettled } from '../native-file-changes'
 import {
   buildCompactPostCutoffBackgroundRecord,
   estimateCompactBackgroundRecordBytes,
@@ -46,6 +49,7 @@ export interface AgyTurnBackgroundObserverHost {
   readonly ensureCompactEndedCommitted?: (() => boolean) | undefined
   readonly awaitRecordings?: (() => Promise<void>) | undefined
   readonly hasPendingRecordings?: (() => boolean) | undefined
+  readonly detachBeforeTerminalReport?: (() => void) | undefined
   readonly reportSettled: () => void
   readonly reportUnknown: (reason: string) => void
   readonly getForegroundDedupReservation: () => NativeMemoryReservation | undefined
@@ -304,6 +308,9 @@ export class AgyTurnBackgroundObserver {
         this.postCutoffBgQueuedCount = 0
         this.postCutoffBgQueuedBytes = 0
       }
+      // Carbon B-3: Detach activeRun BEFORE emitting terminal reportNativeEffects so
+      // `adapter.hasActiveBackgroundWork(runId)` is already false inside RunExecutor's release gate.
+      this.host.detachBeforeTerminalReport?.()
       if (activeRun && this.host.isRootTerminal()) {
         // B-F7: Settle strictly from final facts AFTER both background reports AND file recordings
         // have drained, regardless of whether tasks_drained, transport_closed, or disposal triggered teardown.
@@ -317,7 +324,8 @@ export class AgyTurnBackgroundObserver {
         } else if (
           activeRun.activeBackgroundTasks.size > 0 ||
           activeRun.backgroundUnconfirmed ||
-          this.host.hasPendingRecordings?.()
+          this.host.hasPendingRecordings?.() ||
+          !this.host.canSettleEffects()
         ) {
           this.host.reportUnknown(
             options.reason === 'transport_closed'
@@ -478,5 +486,187 @@ export class AgyTurnBackgroundObserver {
     this.unsubscribeBackground = undefined
     this.unsubscribeConnectionClose?.()
     this.unsubscribeConnectionClose = undefined
+  }
+}
+
+export interface AgyTurnCancelHost {
+  readonly runtime: AgyAdapterRuntime
+  readonly input: AgentRunInput
+  readonly getActiveRun: () => ActiveAgyRun | undefined
+  readonly getResolvedSessionId: () => string | undefined
+  readonly getActiveExecutorId: () => string
+  readonly getConnection: () => AgyAcpConnection | undefined
+  readonly hasActiveLease: () => boolean
+  readonly hasServerPromptReply: () => boolean
+  readonly isCancelEligible: () => boolean
+  readonly isTurnClosedForCancel: () => boolean
+}
+
+/** Idempotent per-Turn cancellation controller with first-byte `canDispatch` fence (Carbon B-4). */
+export class AgyTurnCancelController {
+  private sent = false
+
+  constructor(private readonly host: AgyTurnCancelHost) {}
+
+  requestCancel(options?: {
+    readonly allowDisposed?: boolean | undefined
+    readonly signal?: AbortSignal | undefined
+    readonly onError?: (() => void) | undefined
+  }): Promise<void> | undefined {
+    const activeRun = this.host.getActiveRun()
+    if (activeRun) activeRun.cancellationPending = true
+    const resolvedSessionId = this.host.getResolvedSessionId()
+    const connection = this.host.getConnection()
+    if (this.sent || !this.host.isCancelEligible() || !resolvedSessionId || !connection?.isOpen) {
+      return undefined
+    }
+    const allowDisposed = options?.allowDisposed === true
+    const canDispatch = (): boolean =>
+      allowDisposed
+        ? connection.isOpen && !this.host.hasServerPromptReply() && this.host.hasActiveLease()
+        : connection.isOpen &&
+          !this.host.isTurnClosedForCancel() &&
+          (!activeRun || (!activeRun.rootTerminal && !activeRun.promptRpcCompleted)) &&
+          !this.host.runtime.disposed &&
+          (!activeRun || this.host.runtime.activeRuns.get(this.host.input.runId) === activeRun)
+    if (!canDispatch()) return undefined
+    this.sent = true
+    return connection
+      .notify(
+        'session/cancel',
+        { sessionId: resolvedSessionId },
+        {
+          ...(options?.signal ? { signal: options.signal } : {}),
+          canDispatch,
+        },
+      )
+      .catch((err: unknown) => {
+        recordDiagnostic({
+          operation: 'native_check',
+          phase: 'failed',
+          level: 'warn',
+          scope: 'run',
+          sessionId: this.host.input.sessionId,
+          runId: this.host.input.runId,
+          agentId: 'agy',
+          executorId: this.host.getActiveExecutorId(),
+          nativeMethod: 'session/cancel',
+          code: classifyAgentError(err).kind,
+        })
+        options?.onError?.()
+      })
+  }
+}
+
+export interface AgyTurnEffectsReporterHost {
+  readonly runtime: AgyAdapterRuntime
+  readonly input: AgentRunInput
+  readonly getActiveRun: () => ActiveAgyRun | undefined
+}
+
+/** Enforces detach-before-terminal `reportNativeEffects` so `RunExecutor` always reclaims observations (Carbon B-3). */
+export class AgyTurnEffectsReporter {
+  private outcomeReported = false
+  private unknownReported = false
+  private unknownReason: string | undefined
+  private unknownWhileBackgroundActive = false
+
+  constructor(private readonly host: AgyTurnEffectsReporterHost) {}
+
+  get isOutcomeReported(): boolean {
+    return this.outcomeReported
+  }
+
+  get isUnknownReported(): boolean {
+    return this.unknownReported
+  }
+
+  get lastUnknownReason(): string | undefined {
+    return this.unknownReason
+  }
+
+  detachActiveRun(): void {
+    const activeRun = this.host.getActiveRun()
+    if (!activeRun) return
+    if (activeRun.controlDrainActive) {
+      activeRun.controlDrainActive = false
+      this.host.input.host?.effects?.backgroundWorkChanged?.()
+    }
+    this.host.runtime.activeRuns.delete(this.host.input.runId)
+  }
+
+  reportSettled(): void {
+    if (this.outcomeReported || this.unknownReported) return
+    this.outcomeReported = true
+    nativeFileChangesSettled(this.host.input, 'settled', 'native_work_drained')
+  }
+
+  reportUnknown(reason: string): void {
+    const activeRun = this.host.getActiveRun()
+    const activeBackgroundNow = Boolean(
+      activeRun &&
+      this.host.runtime.activeRuns.has(this.host.input.runId) &&
+      (activeRun.backgroundUnconfirmed ||
+        activeRun.activeBackgroundTasks.size > 0 ||
+        activeRun.controlDrainActive === true),
+    )
+    if (this.unknownReported) {
+      if (this.unknownWhileBackgroundActive && !activeBackgroundNow) {
+        this.unknownWhileBackgroundActive = false
+        nativeFileChangesSettled(this.host.input, 'unknown', this.unknownReason ?? reason)
+      }
+      return
+    }
+    this.unknownReported = true
+    this.outcomeReported = true
+    this.unknownReason = reason
+    this.unknownWhileBackgroundActive = activeBackgroundNow
+    nativeFileChangesSettled(this.host.input, 'unknown', reason)
+  }
+
+  settleNonRetainedTerminalEffects(state: {
+    readonly isEmergency: boolean
+    readonly fullyDrainedBeforeEmergency: boolean
+    readonly rootTerminal: boolean
+    readonly confirmedZeroBytesSent: boolean
+    readonly terminalEvidenceCommitted: boolean
+    readonly unknownReason?: string | undefined
+  }): void {
+    const activeRun = this.host.getActiveRun()
+    if (state.fullyDrainedBeforeEmergency) {
+      this.reportSettled()
+    } else if (
+      !state.isEmergency &&
+      activeRun &&
+      state.rootTerminal &&
+      !this.outcomeReported &&
+      activeRun.activeBackgroundTasks.size === 0 &&
+      !activeRun.backgroundUnconfirmed &&
+      !this.unknownReported &&
+      state.terminalEvidenceCommitted
+    ) {
+      this.reportSettled()
+    } else if (this.unknownReported) {
+      this.reportUnknown(
+        this.unknownReason ??
+          state.unknownReason ??
+          'Antigravity native Turn effects could not be confirmed.',
+      )
+    } else if (
+      !state.confirmedZeroBytesSent &&
+      (state.isEmergency ||
+        !state.terminalEvidenceCommitted ||
+        (activeRun &&
+          (activeRun.activeBackgroundTasks.size > 0 || activeRun.backgroundUnconfirmed)))
+    ) {
+      this.reportUnknown(
+        state.unknownReason ??
+          (state.isEmergency
+            ? 'Antigravity adapter disposed before native Turn cleanup could be confirmed.'
+            : !state.terminalEvidenceCommitted
+              ? 'Antigravity Turn ended without confirmed native terminal settlement.'
+              : 'Antigravity background observation ended before tasks could be confirmed.'),
+      )
+    }
   }
 }

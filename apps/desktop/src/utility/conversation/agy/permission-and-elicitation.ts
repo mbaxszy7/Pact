@@ -584,6 +584,7 @@ export interface AgyTurnInteractionRouterHost {
   readonly isRootTerminal: () => boolean
   readonly isReplayingHistory: () => boolean
   readonly getPromptCutoffSeq: () => number | undefined
+  readonly onRequestTurnCancel?: ((signal: AbortSignal) => Promise<void> | undefined) | undefined
   readonly pushPendingEvent: (event: NormalizedAgentEvent) => void
 }
 
@@ -827,6 +828,7 @@ export class AgyTurnInteractionRouter {
           isExecutionStillOwned,
           registerInteraction,
           unregisterInteraction,
+          onRequestTurnCancel: this.host.onRequestTurnCancel,
           pushEvent: this.host.pushPendingEvent,
           signal: this.host.signal,
         })

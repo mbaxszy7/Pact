@@ -60,7 +60,11 @@ import {
   parseAcpSessionDescriptor,
   prepareAgyTurnPromptBlocks,
 } from './permission-and-elicitation'
-import { AgyTurnBackgroundObserver } from './turn-background-observer'
+import {
+  AgyTurnBackgroundObserver,
+  AgyTurnCancelController,
+  AgyTurnEffectsReporter,
+} from './turn-background-observer'
 import {
   AgyPendingEventQueue,
   AgyPrePromptReplayTracker,
@@ -313,6 +317,21 @@ export class AgyTurnSession {
       },
     })
 
+    const cancelController = new AgyTurnCancelController({
+      runtime: this.runtime,
+      input,
+      getActiveRun: () => activeRun,
+      getResolvedSessionId: () => resolvedSessionId,
+      getActiveExecutorId: () => activeExecutorId,
+      getConnection: () => lease?.connection,
+      hasActiveLease: () => lease !== undefined,
+      hasServerPromptReply: () => promptRpcResolvedResponseRef !== undefined,
+      isCancelEligible: () =>
+        rootFirstByteWritten && !promptSettled && !promptRpcCompleted && !rootTerminal,
+      isTurnClosedForCancel: () => rootTerminal || promptSettled || promptRpcCompleted,
+    })
+    const requestTurnCancel = cancelController.requestCancel.bind(cancelController)
+
     let replayingHistory = false
     let promptCutoffSeq: number | undefined
     let pushPendingEventForRouter: ((event: NormalizedAgentEvent) => void) | undefined
@@ -343,6 +362,7 @@ export class AgyTurnSession {
       isRootTerminal: () => rootTerminal,
       isReplayingHistory: () => replayingHistory,
       getPromptCutoffSeq: () => promptCutoffSeq,
+      onRequestTurnCancel: (cancelSignal) => requestTurnCancel({ signal: cancelSignal }),
       pushPendingEvent: (ev) => pushPendingEventForRouter?.(ev),
     })
     const interactionControllers = interactionRouter.interactionControllers
@@ -350,23 +370,14 @@ export class AgyTurnSession {
     const abortOutstandingInteractions = (): void => interactionRouter.abortAll()
     const recordings = new Set<Promise<void>>()
     let recordingTail = Promise.resolve()
-    let effectsOutcomeReported = false
-    let unknownEffectsReported = false
-    let unknownEffectsReason: string | undefined
-
-    const reportSettled = (): void => {
-      if (effectsOutcomeReported || unknownEffectsReported) return
-      effectsOutcomeReported = true
-      nativeFileChangesSettled(input, 'settled', 'native_work_drained')
-    }
-
-    const reportUnknown = (reason: string): void => {
-      if (unknownEffectsReported) return
-      unknownEffectsReported = true
-      effectsOutcomeReported = true
-      unknownEffectsReason = reason
-      nativeFileChangesSettled(input, 'unknown', reason)
-    }
+    const effectsReporter = new AgyTurnEffectsReporter({
+      runtime: this.runtime,
+      input,
+      getActiveRun: () => activeRun,
+    })
+    const detachActiveRun = (): void => effectsReporter.detachActiveRun()
+    const reportSettled = (): void => effectsReporter.reportSettled()
+    const reportUnknown = (reason: string): void => effectsReporter.reportUnknown(reason)
 
     const recordHostBeforeRootStart = (): void => {
       if (resolvedSessionId && input.host?.recovery) {
@@ -420,7 +431,10 @@ export class AgyTurnSession {
 
     let emergencyCleanedUp = false
     let finalizationPromise: Promise<void> | undefined
-    const completeFinalTeardown = (options: { emergency: boolean }): Promise<void> => {
+    const completeFinalTeardown = (options: {
+      emergency: boolean
+      unknownReason?: string | undefined
+    }): Promise<void> => {
       if (options.emergency) {
         emergencyCleanedUp = true
       }
@@ -482,26 +496,11 @@ export class AgyTurnSession {
             isEmergency &&
             Boolean(activeRun) &&
             finalTerminalEvidenceCommitted &&
-            !unknownEffectsReported &&
+            !effectsReporter.isUnknownReported &&
             !activeRun!.backgroundUnconfirmed &&
             activeRun!.activeBackgroundTasks.size === 0 &&
             recordings.size === 0 &&
             !(backgroundObserver?.hasPendingWork() ?? false)
-          if (fullyDrainedBeforeEmergency) {
-            runIsolated(() => reportSettled())
-          } else if (
-            (isEmergency || (!compactTerminalCommitted && !finalTerminalEvidenceCommitted)) &&
-            !unknownEffectsReported &&
-            !isConfirmedZeroBytesSent()
-          ) {
-            runIsolated(() =>
-              reportUnknown(
-                isEmergency
-                  ? 'Antigravity adapter disposed before native Turn cleanup could be confirmed.'
-                  : 'Antigravity Turn ended without confirmed native terminal settlement.',
-              ),
-            )
-          }
           runIsolated(() =>
             this.runtime.invalidateNonTerminalEvidence(input.runId, resolvedSessionId),
           )
@@ -578,12 +577,13 @@ export class AgyTurnSession {
               foreignExecIdsMemoryReservation = undefined
               retireSourceReader()
               observation.abort()
-              this.runtime.activeRuns.delete(input.runId)
+              detachActiveRun()
               retainedLease?.release()
             }
             try {
               handoffOrderedStreamToBackground?.(cleanupRetained)
             } catch {
+              detachActiveRun()
               reportUnknown(
                 'Antigravity background observer handoff exceeded connection listener capacity.',
               )
@@ -625,26 +625,21 @@ export class AgyTurnSession {
             if (!isEmergency) {
               await recordingTail.catch(() => undefined)
               await backgroundObserver?.awaitTail().catch(() => undefined)
-              if (activeRun && rootTerminal && !effectsOutcomeReported) {
-                if (
-                  activeRun.activeBackgroundTasks.size === 0 &&
-                  !activeRun.backgroundUnconfirmed &&
-                  !unknownEffectsReported &&
-                  (compactTerminalCommitted || finalTerminalEvidenceCommitted)
-                ) {
-                  runIsolated(() => reportSettled())
-                } else if (
-                  activeRun.activeBackgroundTasks.size > 0 ||
-                  activeRun.backgroundUnconfirmed
-                ) {
-                  runIsolated(() =>
-                    reportUnknown(
-                      'Antigravity background observation ended before tasks could be confirmed.',
-                    ),
-                  )
-                }
-              }
             }
+            // Carbon B-3: Detach activeRun BEFORE reporting terminal effects so RunExecutor sees
+            // `hasActiveBackgroundWork(runId) === false` and deterministically reclaims nativeObservations.
+            runIsolated(() => detachActiveRun())
+            runIsolated(() =>
+              effectsReporter.settleNonRetainedTerminalEffects({
+                isEmergency,
+                fullyDrainedBeforeEmergency,
+                rootTerminal,
+                confirmedZeroBytesSent: isConfirmedZeroBytesSent(),
+                terminalEvidenceCommitted:
+                  compactTerminalCommitted || finalTerminalEvidenceCommitted,
+                unknownReason: options.unknownReason,
+              }),
+            )
             runIsolated(() =>
               backgroundObserver?.closeRetainedBackground({
                 reason: 'disposed',
@@ -657,7 +652,6 @@ export class AgyTurnSession {
             foreignExecIdsMemoryReservation = releaseRes(foreignExecIdsMemoryReservation)
             runIsolated(() => retireSourceReader())
             observation.abort()
-            if (activeRun) this.runtime.activeRuns.delete(input.runId)
             runIsolated(() => {
               lease?.release()
               lease = undefined
@@ -703,13 +697,16 @@ export class AgyTurnSession {
         foregroundReleased = true
         activeRun.foregroundReleased = true
         activeRun.controlDrainActive = true
+        mcpServer.notifyRootStateChanged()
         input.host?.effects?.backgroundWorkChanged?.()
         enableEventDiscardMode?.()
         abortOutstandingInteractions()
         controlDrainTimer = setTimeout(() => {
           if (!controlDrainActive) return
-          reportUnknown('Antigravity control-drain handoff exceeded its bounded timeout.')
-          void completeFinalTeardown({ emergency: true }).catch(() => undefined)
+          void completeFinalTeardown({
+            emergency: true,
+            unknownReason: 'Antigravity control-drain handoff exceeded its bounded timeout.',
+          }).catch(() => undefined)
         }, AGY_CONTROL_DRAIN_HANDOFF_MS)
         controlDrainTimer.unref?.()
         onControlSettled = () => {
@@ -751,18 +748,7 @@ export class AgyTurnSession {
           clearTimeout(cancelGraceTimer)
           cancelGraceTimer = undefined
         }
-        if (
-          rootFirstByteWritten &&
-          !promptRpcCompleted &&
-          !promptSettled &&
-          !rootTerminal &&
-          resolvedSessionId &&
-          lease?.connection.isOpen
-        ) {
-          void lease.connection
-            .notify('session/cancel', { sessionId: resolvedSessionId }, {})
-            .catch(() => undefined)
-        }
+        void requestTurnCancel({ allowDisposed: true })
         promptRpcAbort.abort()
       },
       closeZeroInputSession: (deadlineAt?: number): Promise<void> =>
@@ -1374,12 +1360,13 @@ export class AgyTurnSession {
         mcpServer,
         getActiveRun: () => activeRun,
         getResolvedSessionId: () => resolvedSessionId,
-        canSettleEffects: () => !unknownEffectsReported,
+        canSettleEffects: () => !effectsReporter.isUnknownReported,
         isRootTerminal: () => rootTerminal,
         hasVerifiedRootOutcome: () => liveTerminalOutcome !== undefined || rootTerminal,
         ensureCompactEndedCommitted,
         awaitRecordings: () => recordingTail,
         hasPendingRecordings: () => recordings.size > 0,
+        detachBeforeTerminalReport: detachActiveRun,
         reportSettled,
         reportUnknown,
         getForegroundDedupReservation: () => foregroundDedupMemoryReservation,
@@ -1400,12 +1387,14 @@ export class AgyTurnSession {
           return
         }
         if (promptSettled || promptRpcCompleted) return
-        void connection.notify('session/cancel', { sessionId: resolvedSessionId }, {}).catch(() => {
-          if (!rootTerminal) {
-            reportUnknown(
-              'Native Antigravity cancellation could not be confirmed; observation remains active.',
-            )
-          }
+        void requestTurnCancel({
+          onError: () => {
+            if (!rootTerminal) {
+              reportUnknown(
+                'Native Antigravity cancellation could not be confirmed; observation remains active.',
+              )
+            }
+          },
         })
         if (cancelGraceTimer === undefined) {
           cancelGraceTimer = setTimeout(() => {
@@ -1475,6 +1464,7 @@ export class AgyTurnSession {
 
       const settlePromptFromResponse = (res: object): void => {
         promptResponse = res
+        promptRpcResolvedResponseRef ??= res
         parsedPromptTerminalReply = parseAgyPromptTerminalReply(res, resolvedSessionId)
         promptSettled = true
         promptRpcCompleted = true
@@ -1864,9 +1854,7 @@ export class AgyTurnSession {
               settlePromptFromResponse(promptRpcResolvedResponse)
             } else if (!promptError) {
               if (!activeRun!.turnAccepted && connection.isOpen) {
-                void connection
-                  .notify('session/cancel', { sessionId: resolvedSessionId! }, {})
-                  .catch(() => undefined)
+                void requestTurnCancel()
               }
               failPromptControl(
                 new AgentExecutionError(
@@ -1982,9 +1970,7 @@ export class AgyTurnSession {
               const err = waitErr instanceof Error ? waitErr : new Error(String(waitErr))
               if (promptCutoffSeq === undefined) {
                 if (!activeRun.turnAccepted && connection.isOpen) {
-                  void connection
-                    .notify('session/cancel', { sessionId: resolvedSessionId }, {})
-                    .catch(() => undefined)
+                  void requestTurnCancel()
                 }
                 failPromptControl(err)
               }
@@ -2329,7 +2315,11 @@ export class AgyTurnSession {
         }
 
         // Promote collaboration artifacts ONLY after normal root completion & settlement (`B6`).
-        if (outcome === 'completed' && !unknownEffectsReported && !incompleteVisiblePrefix) {
+        if (
+          outcome === 'completed' &&
+          !effectsReporter.isUnknownReported &&
+          !incompleteVisiblePrefix
+        ) {
           if (planModeStage) {
             if (
               !hasUnresolvedBrainPlanWrite() &&
@@ -2388,7 +2378,7 @@ export class AgyTurnSession {
               outcome: 'failed',
             }
             if (
-              !unknownEffectsReported &&
+              !effectsReporter.isUnknownReported &&
               !activeRun.backgroundUnconfirmed &&
               activeRun.activeBackgroundTasks.size === 0
             ) {
@@ -2396,7 +2386,7 @@ export class AgyTurnSession {
             }
           } else {
             if (
-              !unknownEffectsReported &&
+              !effectsReporter.isUnknownReported &&
               !activeRun.backgroundUnconfirmed &&
               activeRun.activeBackgroundTasks.size === 0
             ) {
@@ -2446,14 +2436,14 @@ export class AgyTurnSession {
       this.runtime.invalidateNonTerminalEvidence(input.runId, resolvedSessionId)
       await recordingTail.catch(() => undefined)
       const confirmedZeroBytesSent = isConfirmedZeroBytesSent()
-      if (!unknownEffectsReported) {
+      if (!effectsReporter.isUnknownReported) {
         if (confirmedZeroBytesSent) {
           if (activeRun) {
             nativeFileChangesSettled(input, 'settled', 'native_work_drained')
           }
         } else {
           reportUnknown(
-            unknownEffectsReason ??
+            effectsReporter.lastUnknownReason ??
               'Antigravity failed before its native Turn effects could be confirmed.',
           )
         }

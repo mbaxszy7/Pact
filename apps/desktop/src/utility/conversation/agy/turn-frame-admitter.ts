@@ -249,7 +249,11 @@ export class AgyTurnFrameAdmitter {
   private *replayStagedFrame(staged: StagedPreBindFrame): Generator<NormalizedAgentEvent> {
     const { activeRun, mcpServer, prePromptReplay, hasCurrentRunTool, projectValidatedFrame } =
       this.host
-    const frame = staged.frame
+    const frame = recheckValidatedFrameAgainstRootBoundary(
+      staged.frame,
+      mcpServer.pinnedTrajectory,
+      mcpServer.minStepIdx,
+    )
     const update = frame.payload
     const sessionUpdate = frame.sessionUpdate
     if (update?.outOfTurn === true) {
@@ -273,12 +277,7 @@ export class AgyTurnFrameAdmitter {
         if (!hasVerifiedCurrentIdentity) return
       }
     }
-    const rechecked = recheckValidatedFrameAgainstRootBoundary(
-      frame,
-      mcpServer.pinnedTrajectory,
-      mcpServer.minStepIdx,
-    )
-    yield* projectValidatedFrame(rechecked)
+    yield* projectValidatedFrame(frame)
   }
 
   private *drainResolvedPreBindPrefix(): Generator<NormalizedAgentEvent> {
@@ -356,15 +355,16 @@ export class AgyTurnFrameAdmitter {
       (rawOutput ? asString(rawOutput.taskId ?? rawOutput.backgroundTaskId) : undefined)
     const toolCallId = validated.toolCallIdInvalid ? undefined : validated.toolCallId
     const explicitlyOwnedByCurrentRun =
-      (taskId !== undefined &&
+      !validated.contradictsRootBoundary &&
+      ((taskId !== undefined &&
         (activeRun.backgroundTaskAliases.has(taskId) ||
           activeRun.activeBackgroundTasks.has(taskId))) ||
-      (toolCallId !== undefined &&
-        (activeRun.backgroundTaskAliases.has(toolCallId) ||
-          activeRun.activeBackgroundTasks.has(toolCallId))) ||
-      (validated.executionId !== undefined &&
-        activeRun.providerExecutionId !== undefined &&
-        validated.executionId === activeRun.providerExecutionId)
+        (toolCallId !== undefined &&
+          (activeRun.backgroundTaskAliases.has(toolCallId) ||
+            activeRun.activeBackgroundTasks.has(toolCallId))) ||
+        (validated.executionId !== undefined &&
+          activeRun.providerExecutionId !== undefined &&
+          validated.executionId === activeRun.providerExecutionId))
     if (explicitlyOwnedByCurrentRun && isPlainObject(rawParams)) {
       this.host.onOwnedOutOfTurnUpdate?.(rawParams, update)
       return
@@ -408,12 +408,13 @@ export class AgyTurnFrameAdmitter {
     if (!update || !sessionUpdate) return
 
     const updateExecId = validated.executionId
-    // B-F1: Check structural/session contradictions FIRST (before outOfTurn or foreign-execution
-    // handling) so self-contradictory metadata can never mutate any Run's background state.
+    // B-F1 & Carbon B-2: Drop structurally self-contradictory or foreign-session frames FIRST,
+    // while allowing structurally valid historical-step / foreign-trajectory frames (`contradictsRootBoundary`)
+    // to drive `outOfTurn` uncertainty propagation and `user_message_chunk` foreign-turn isolation.
     const frameStructurallyContradicted =
       validated.hasForeignOrInvalidSessionMeta ||
       validated.executionIdInvalid ||
-      validated.rootEvidenceContradicted ||
+      validated.hasStructuralContradiction ||
       !validated.isAttributableToCurrentSession
     if (frameStructurallyContradicted) {
       if (
@@ -494,6 +495,23 @@ export class AgyTurnFrameAdmitter {
       return
     }
 
+    // Carbon B-2: Non-outOfTurn frames whose step/trajectory contradicts this Run's root boundary
+    // cannot enter foreground projection or root binding; only `user_message_chunk` proceeds below
+    // to arm foreign-turn isolation (`knownForeignExecutionIds` + `foreignTurnActiveUntilRootBound`).
+    if (validated.contradictsRootBoundary && sessionUpdate !== 'user_message_chunk') {
+      if (
+        validated.sessionAttribution !== 'pure_foreign' &&
+        (sessionUpdate === 'tool_call' || sessionUpdate === 'tool_call_update')
+      ) {
+        const disputedTokens = validated.tokens.allCanonicalTokens
+        const tcId = validated.toolCallIdInvalid ? undefined : validated.toolCallId
+        if (tcId !== undefined || disputedTokens.length > 0) {
+          mcpServer.revokeDisputedTokens(tcId, disputedTokens)
+        }
+      }
+      return
+    }
+
     if (
       activeRun.resumedExistingSession &&
       (sessionUpdate === 'tool_call' || sessionUpdate === 'tool_call_update') &&
@@ -533,9 +551,15 @@ export class AgyTurnFrameAdmitter {
           (isPlainObject(updateMeta) ? asString(updateMeta.pactSteerInputId) : undefined))
         : undefined
 
-    // Once root `providerExecutionId` is bound, strictly drop any update carrying a different `execution_id`.
+    // Once root `providerExecutionId` is bound, strictly drop any update carrying a different `execution_id`
+    // or contradicting this Run's pinned trajectory / step boundary.
     if (activeRun.providerExecutionId !== undefined) {
-      if (updateExecId !== undefined && updateExecId !== activeRun.providerExecutionId) return
+      if (
+        validated.contradictsRootBoundary ||
+        (updateExecId !== undefined && updateExecId !== activeRun.providerExecutionId)
+      ) {
+        return
+      }
       yield* projectValidatedFrame(validated)
       return
     }
@@ -554,7 +578,7 @@ export class AgyTurnFrameAdmitter {
 
     // Before root `providerExecutionId` is bound:
     if (sessionUpdate === 'user_message_chunk') {
-      if (steerId) {
+      if (steerId && !validated.contradictsRootBoundary) {
         yield* projectValidatedFrame(validated)
         return
       }
@@ -573,7 +597,8 @@ export class AgyTurnFrameAdmitter {
         expectedPromptContent.length > 0 &&
         normalizedChunkText === expectedPromptContent
       const matchesRootPrompt =
-        hasExactHostRunReceipt || hasExactFullPromptProof || hasExactPlainPromptProof
+        !validated.contradictsRootBoundary &&
+        (hasExactHostRunReceipt || hasExactFullPromptProof || hasExactPlainPromptProof)
       if (matchesRootPrompt) {
         activeRun.foreignTurnActiveUntilRootBound = false
         if (updateExecId && (hasExactHostRunReceipt || hasExactFullPromptProof)) {

@@ -2990,4 +2990,909 @@ describe('Final Astra Audit Antigravity regressions (B-F1..B-F12)', () => {
     }
     expect(nativeWorkingMemoryDiagnostics().chargedBytes).toBe(baselineBytes)
   })
+
+  it('Carbon B-2: historical-step user_message_chunk still isolates foreign turns and historical-step outOfTurn marks retained runs unknown', async () => {
+    const { cwd, appDataDir } = await createEnv()
+    const trajId = 'traj-b2-pinned'
+
+    // Part 1: Resumed session pinned at minStepIdx=4 receives stepIdx:1 user_message_chunk with exec-foreign.
+    {
+      const harness = createAcpHarness()
+      const sid = randomUUID()
+      const runId = randomUUID()
+      harness.onClientFrame((frame) => {
+        if (frame.method === 'initialize') {
+          harness.sendToClient({ jsonrpc: '2.0', id: frame.id, result: { protocolVersion: 1 } })
+        } else if (frame.method === 'session/load') {
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            id: frame.id,
+            result: { sessionId: sid, configOptions: defaultConfigOptions() },
+          })
+        } else if (
+          frame.method === 'session/set_mode' ||
+          frame.method === 'session/set_config_option'
+        ) {
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            id: frame.id,
+            result: { configOptions: defaultConfigOptions() },
+          })
+        } else if (frame.method === 'session/prompt') {
+          // Foreign historical user_message_chunk (stepIdx: 1 < minStepIdx: 4) MUST arm foreign isolation!
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: sid,
+              update: {
+                sessionUpdate: 'user_message_chunk',
+                stepIdx: 1,
+                trajectoryId: trajId,
+                execution_id: 'exec-foreign-b2',
+                content: { type: 'text', text: 'Historical foreign prompt' },
+              },
+            },
+          })
+          // Subsequent unscoped chunk during foreign turn MUST be isolated.
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: sid,
+              update: {
+                sessionUpdate: 'agent_message_chunk',
+                content: { type: 'text', text: 'LEAK_UNSCOPED' },
+              },
+            },
+          })
+          // Subsequent chunk carrying exec-foreign-b2 (without stepIdx) MUST NOT hijack binding or leak.
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: sid,
+              update: {
+                sessionUpdate: 'agent_message_chunk',
+                execution_id: 'exec-foreign-b2',
+                content: { type: 'text', text: 'LEAK_FOREIGN_EXEC' },
+              },
+            },
+          })
+          // Real current root turn (stepIdx: 4 >= minStepIdx: 4).
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: sid,
+              update: {
+                sessionUpdate: 'user_message_chunk',
+                stepIdx: 4,
+                trajectoryId: trajId,
+                execution_id: 'exec-root-b2',
+                content: { type: 'text', text: JSON.stringify({ pactRunId: runId }) },
+              },
+            },
+          })
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: sid,
+              update: {
+                sessionUpdate: 'agent_message_chunk',
+                stepIdx: 4,
+                trajectoryId: trajId,
+                execution_id: 'exec-root-b2',
+                content: { type: 'text', text: 'CLEAN_B2_ANSWER' },
+              },
+            },
+          })
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            id: frame.id,
+            result: { stopReason: 'end_turn', execution_id: 'exec-root-b2' },
+          })
+        }
+      })
+
+      const adapter = new AgyAgentAdapter({
+        appDataDir,
+        processFactory: () => harness.child,
+        storageClient: {
+          readTrajectoryIdentity: async () => ({
+            status: 'ok',
+            trajectoryId: trajId,
+            stepCount: 4,
+          }),
+        },
+      })
+      try {
+        const events = await collectEvents(
+          adapter.run(
+            makeRunInput(cwd, {
+              runId,
+              nativeSessionId: sid,
+              promptEnvelope: {
+                version: 'pact-agent-prompt-v1',
+                sessionId: randomUUID(),
+                message: { id: randomUUID(), content: 'Audit prompt B2' },
+                comments: [],
+                requestSessionTitle: true,
+              },
+            }),
+            new AbortController().signal,
+          ),
+        )
+        const text = events
+          .filter(
+            (e): e is Extract<NormalizedAgentEvent, { type: 'text.delta' }> =>
+              e.type === 'text.delta',
+          )
+          .map((e) => e.text)
+          .join('')
+        expect(text).toBe('CLEAN_B2_ANSWER')
+        expect(events).toContainEqual(
+          expect.objectContaining({ type: 'text.completed', text: 'CLEAN_B2_ANSWER' }),
+        )
+      } finally {
+        await adapter.dispose()
+      }
+    }
+
+    // Part 2: Retained Run A + Run B (minStepIdx=4) receives outOfTurn:true with stepIdx:1 -> Run A marked unknown!
+    {
+      const harness = createAcpHarness()
+      const sid = randomUUID()
+      let stepCount = 0
+      let promptCount = 0
+      harness.onClientFrame((frame) => {
+        if (frame.method === 'initialize') {
+          harness.sendToClient({ jsonrpc: '2.0', id: frame.id, result: { protocolVersion: 1 } })
+        } else if (frame.method === 'session/new' || frame.method === 'session/load') {
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            id: frame.id,
+            result: { sessionId: sid, configOptions: defaultConfigOptions() },
+          })
+        } else if (
+          frame.method === 'session/set_mode' ||
+          frame.method === 'session/set_config_option'
+        ) {
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            id: frame.id,
+            result: { configOptions: defaultConfigOptions() },
+          })
+        } else if (frame.method === 'session/prompt') {
+          promptCount += 1
+          if (promptCount === 1) {
+            harness.sendToClient({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: {
+                sessionId: sid,
+                update: {
+                  sessionUpdate: 'tool_call',
+                  toolCallId: 'bg-launch-b2',
+                  name: 'run_command',
+                  args: { CommandLine: 'sleep 10', IsDaemon: true },
+                  status: 'in_progress',
+                  stepIdx: 1,
+                  trajectoryId: trajId,
+                  execution_id: 'exec-run-a',
+                },
+              },
+            })
+            harness.sendToClient({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: {
+                sessionId: sid,
+                update: {
+                  sessionUpdate: 'tool_call_update',
+                  toolCallId: 'bg-launch-b2',
+                  name: 'run_command',
+                  status: 'completed',
+                  rawOutput: { taskId: 'task-b2-a' },
+                  stepIdx: 1,
+                  trajectoryId: trajId,
+                  execution_id: 'exec-run-a',
+                },
+              },
+            })
+            harness.sendToClient({
+              jsonrpc: '2.0',
+              id: frame.id,
+              result: { stopReason: 'end_turn', execution_id: 'exec-run-a' },
+            })
+          } else {
+            // Unattributable outOfTurn carrying historical stepIdx: 1 (< Run B minStepIdx: 4)
+            harness.sendToClient({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: {
+                sessionId: sid,
+                update: {
+                  sessionUpdate: 'agent_message_chunk',
+                  outOfTurn: true,
+                  stepIdx: 1,
+                  trajectoryId: trajId,
+                  content: { type: 'text', text: 'Unattributable historical background update' },
+                },
+              },
+            })
+            harness.sendToClient({
+              jsonrpc: '2.0',
+              id: frame.id,
+              result: { stopReason: 'end_turn', execution_id: 'exec-run-b' },
+            })
+          }
+        }
+      })
+
+      const adapter = new AgyAgentAdapter({
+        appDataDir,
+        processFactory: () => harness.child,
+        storageClient: {
+          readTrajectoryIdentity: async () => ({
+            status: 'ok',
+            trajectoryId: trajId,
+            stepCount,
+          }),
+        },
+      })
+      const effectsA: Array<{ state: string }> = []
+      const runAId = randomUUID()
+      try {
+        await collectEvents(
+          adapter.run(
+            makeRunInput(cwd, {
+              runId: runAId,
+              host: { effects: { reportNativeEffects: (r) => effectsA.push({ state: r.state }) } },
+            }),
+            new AbortController().signal,
+          ),
+        )
+        expect(adapter.hasActiveBackgroundWork(runAId)).toBe(true)
+
+        stepCount = 4
+        await collectEvents(
+          adapter.run(
+            makeRunInput(cwd, {
+              nativeSessionId: sid,
+              promptEnvelope: {
+                version: 'pact-agent-prompt-v1',
+                sessionId: randomUUID(),
+                message: { id: randomUUID(), content: 'Run B' },
+                comments: [],
+                requestSessionTitle: true,
+              },
+            }),
+            new AbortController().signal,
+          ),
+        )
+        expect(effectsA.some((e) => e.state === 'unknown')).toBe(true)
+      } finally {
+        await adapter.dispose()
+      }
+    }
+  })
+
+  it('Carbon B-3: adapter.hasActiveBackgroundWork(runId) is already false inside terminal reportNativeEffects across EOF, mid-run unconfirmed drain, and controlDrain emergency', async () => {
+    const { cwd, appDataDir } = await createEnv()
+
+    // Part 1: Retained daemon + ACP transport EOF
+    {
+      const harness = createAcpHarness()
+      const sid = randomUUID()
+      const runId = randomUUID()
+      harness.onClientFrame((frame) => {
+        if (frame.method === 'initialize') {
+          harness.sendToClient({ jsonrpc: '2.0', id: frame.id, result: { protocolVersion: 1 } })
+        } else if (frame.method === 'session/new') {
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            id: frame.id,
+            result: { sessionId: sid, configOptions: defaultConfigOptions() },
+          })
+        } else if (
+          frame.method === 'session/set_mode' ||
+          frame.method === 'session/set_config_option'
+        ) {
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            id: frame.id,
+            result: { configOptions: defaultConfigOptions() },
+          })
+        } else if (frame.method === 'session/prompt') {
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: sid,
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'bg-b3-eof',
+                name: 'run_command',
+                args: { CommandLine: 'sleep 10', IsDaemon: true },
+                status: 'in_progress',
+                execution_id: 'exec-b3-1',
+              },
+            },
+          })
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: sid,
+              update: {
+                sessionUpdate: 'tool_call_update',
+                toolCallId: 'bg-b3-eof',
+                name: 'run_command',
+                status: 'completed',
+                rawOutput: { taskId: 'task-b3-eof' },
+                execution_id: 'exec-b3-1',
+              },
+            },
+          })
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            id: frame.id,
+            result: { stopReason: 'end_turn', execution_id: 'exec-b3-1' },
+          })
+        }
+      })
+      const adapter = new AgyAgentAdapter({ appDataDir, processFactory: () => harness.child })
+      const observations: Array<{ state: string; activeInsideCallback: boolean }> = []
+      try {
+        await collectEvents(
+          adapter.run(
+            makeRunInput(cwd, {
+              runId,
+              host: {
+                effects: {
+                  reportNativeEffects: (r) =>
+                    observations.push({
+                      state: r.state,
+                      activeInsideCallback: adapter.hasActiveBackgroundWork(runId),
+                    }),
+                },
+              },
+            }),
+            new AbortController().signal,
+          ),
+        )
+        expect(adapter.hasActiveBackgroundWork(runId)).toBe(true)
+        harness.closeStdout()
+        await vi.waitFor(() => {
+          expect(observations.some((o) => o.state === 'unknown')).toBe(true)
+        })
+        const lastUnknown = observations.findLast((o) => o.state === 'unknown')
+        expect(lastUnknown?.activeInsideCallback).toBe(false)
+      } finally {
+        await adapter.dispose()
+      }
+    }
+
+    // Part 2: Mid-run backgroundUnconfirmed followed by task drain emits final terminal unknown with hasActiveBackgroundWork===false
+    {
+      const harness = createAcpHarness()
+      const sid = randomUUID()
+      const runAId = randomUUID()
+      let prompts = 0
+      harness.onClientFrame((frame) => {
+        if (frame.method === 'initialize') {
+          harness.sendToClient({ jsonrpc: '2.0', id: frame.id, result: { protocolVersion: 1 } })
+        } else if (frame.method === 'session/new' || frame.method === 'session/load') {
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            id: frame.id,
+            result: { sessionId: sid, configOptions: defaultConfigOptions() },
+          })
+        } else if (
+          frame.method === 'session/set_mode' ||
+          frame.method === 'session/set_config_option'
+        ) {
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            id: frame.id,
+            result: { configOptions: defaultConfigOptions() },
+          })
+        } else if (frame.method === 'session/prompt') {
+          prompts += 1
+          if (prompts === 1) {
+            harness.sendToClient({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: {
+                sessionId: sid,
+                update: {
+                  sessionUpdate: 'tool_call',
+                  toolCallId: 'bg-b3-mid',
+                  name: 'run_command',
+                  args: { CommandLine: 'sleep 10', IsDaemon: true },
+                  status: 'in_progress',
+                  execution_id: 'exec-b3-a',
+                },
+              },
+            })
+            harness.sendToClient({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: {
+                sessionId: sid,
+                update: {
+                  sessionUpdate: 'tool_call_update',
+                  toolCallId: 'bg-b3-mid',
+                  name: 'run_command',
+                  status: 'completed',
+                  rawOutput: { taskId: 'task-b3-mid' },
+                  execution_id: 'exec-b3-a',
+                },
+              },
+            })
+            harness.sendToClient({
+              jsonrpc: '2.0',
+              id: frame.id,
+              result: { stopReason: 'end_turn', execution_id: 'exec-b3-a' },
+            })
+          } else {
+            // Unattributable outOfTurn sets Run A backgroundUnconfirmed=true mid-run!
+            harness.sendToClient({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: {
+                sessionId: sid,
+                update: {
+                  sessionUpdate: 'agent_message_chunk',
+                  outOfTurn: true,
+                  content: { type: 'text', text: 'Mystery update' },
+                },
+              },
+            })
+            harness.sendToClient({
+              jsonrpc: '2.0',
+              id: frame.id,
+              result: { stopReason: 'end_turn', execution_id: 'exec-b3-b' },
+            })
+          }
+        }
+      })
+      const adapter = new AgyAgentAdapter({ appDataDir, processFactory: () => harness.child })
+      const observationsA: Array<{ state: string; activeInsideCallback: boolean }> = []
+      try {
+        await collectEvents(
+          adapter.run(
+            makeRunInput(cwd, {
+              runId: runAId,
+              host: {
+                effects: {
+                  reportNativeEffects: (r) =>
+                    observationsA.push({
+                      state: r.state,
+                      activeInsideCallback: adapter.hasActiveBackgroundWork(runAId),
+                    }),
+                },
+              },
+            }),
+            new AbortController().signal,
+          ),
+        )
+        await collectEvents(
+          adapter.run(makeRunInput(cwd, { nativeSessionId: sid }), new AbortController().signal),
+        )
+        // Mid-run unknown fired while Run A still owned task-b3-mid!
+        expect(observationsA.some((o) => o.state === 'unknown' && o.activeInsideCallback)).toBe(
+          true,
+        )
+        // Now complete task-b3-mid so Run A drains and detaches -> final unknown MUST fire with active===false!
+        harness.sendToClient({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: sid,
+            update: {
+              sessionUpdate: 'background_task_completed',
+              taskId: 'task-b3-mid',
+              execution_id: 'exec-b3-a',
+            },
+          },
+        })
+        await vi.waitFor(() => {
+          expect(observationsA.some((o) => o.state === 'unknown' && !o.activeInsideCallback)).toBe(
+            true,
+          )
+        })
+      } finally {
+        await adapter.dispose()
+      }
+    }
+
+    // Part 3: controlDrainActive emergency dispose reports unknown AFTER detaching activeRun
+    {
+      const harness = createAcpHarness()
+      const sid = randomUUID()
+      const runId = randomUUID()
+      const deltaArrived = Promise.withResolvers<void>()
+      harness.onClientFrame((frame) => {
+        if (frame.method === 'initialize') {
+          harness.sendToClient({ jsonrpc: '2.0', id: frame.id, result: { protocolVersion: 1 } })
+        } else if (frame.method === 'session/new') {
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            id: frame.id,
+            result: { sessionId: sid, configOptions: defaultConfigOptions() },
+          })
+        } else if (
+          frame.method === 'session/set_mode' ||
+          frame.method === 'session/set_config_option'
+        ) {
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            id: frame.id,
+            result: { configOptions: defaultConfigOptions() },
+          })
+        } else if (frame.method === 'session/prompt') {
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: sid,
+              update: {
+                sessionUpdate: 'agent_message_chunk',
+                content: { type: 'text', text: 'partial' },
+              },
+            },
+          })
+        }
+      })
+      const adapter = new AgyAgentAdapter({ appDataDir, processFactory: () => harness.child })
+      const observations: Array<{ state: string; activeInsideCallback: boolean }> = []
+      const stream = adapter.run(
+        makeRunInput(cwd, {
+          runId,
+          host: {
+            effects: {
+              reportNativeEffects: (r) =>
+                observations.push({
+                  state: r.state,
+                  activeInsideCallback: adapter.hasActiveBackgroundWork(runId),
+                }),
+            },
+          },
+        }),
+        new AbortController().signal,
+      )
+      for await (const ev of stream) {
+        if (ev.type === 'text.delta') {
+          deltaArrived.resolve()
+          break
+        }
+      }
+      await deltaArrived.promise
+      expect(adapter.hasActiveBackgroundWork(runId)).toBe(true)
+      await adapter.dispose()
+      const lastUnknown = observations.findLast((o) => o.state === 'unknown')
+      expect(lastUnknown?.activeInsideCallback).toBe(false)
+    }
+  })
+
+  it('Carbon B-4: agy-cancel sets cancellationPending + deduplicates session/cancel, queued cancel is fenced past promptRpcCompleted, and queued auto-allow is dropped on controlDrainActive', async () => {
+    const { cwd, appDataDir } = await createEnv()
+
+    // Part 1: 'agy-cancel' closes steer lease immediately and deduplicates with abort()+dispose() to 1 session/cancel.
+    {
+      const harness = createAcpHarness()
+      const sid = randomUUID()
+      const runId = randomUUID()
+      const permStarted = Promise.withResolvers<void>()
+      const releasePerm = Promise.withResolvers<string>()
+      let promptId: unknown
+      harness.onClientFrame((frame) => {
+        if (frame.method === 'initialize') {
+          harness.sendToClient({ jsonrpc: '2.0', id: frame.id, result: { protocolVersion: 1 } })
+        } else if (frame.method === 'session/new') {
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            id: frame.id,
+            result: { sessionId: sid, configOptions: defaultConfigOptions() },
+          })
+        } else if (
+          frame.method === 'session/set_mode' ||
+          frame.method === 'session/set_config_option'
+        ) {
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            id: frame.id,
+            result: { configOptions: defaultConfigOptions() },
+          })
+        } else if (frame.method === 'session/prompt') {
+          promptId = frame.id
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            id: 'perm-cancel-b4',
+            method: 'session/request_permission',
+            params: {
+              sessionId: sid,
+              toolCall: { toolCallId: 'tc-b4-1', name: 'run_command', title: 'Run cmd' },
+              options: [
+                { optionId: 'allow_once', name: 'Allow', kind: 'allow_once' },
+                { optionId: 'reject_once', name: 'Deny', kind: 'reject_once' },
+              ],
+            },
+          })
+        }
+      })
+      const adapter = new AgyAgentAdapter({ appDataDir, processFactory: () => harness.child })
+      const abort = new AbortController()
+      const runPromise = collectEvents(
+        adapter.run(
+          makeRunInput(cwd, {
+            runId,
+            host: {
+              interactions: {
+                requestPermission: async () => {
+                  permStarted.resolve()
+                  return releasePerm.promise
+                },
+              },
+            },
+          }),
+          abort.signal,
+        ),
+      )
+      try {
+        await permStarted.promise
+        releasePerm.resolve('agy-cancel')
+        await vi.waitFor(() => {
+          expect(harness.notifications.filter((n) => n.method === 'session/cancel')).toHaveLength(1)
+        })
+        // Steer MUST be refused immediately once 'agy-cancel' latched cancellationPending!
+        const lateSteerRes = await adapter.steer(
+          {
+            runId,
+            inputId: randomUUID(),
+            nativeSessionId: sid,
+            nativeTurnId: runId,
+            bindingGeneration: 1,
+            nativeGeneration: runId,
+            promptEnvelope: {
+              version: 'pact-agent-prompt-v1',
+              sessionId: randomUUID(),
+              message: { id: randomUUID(), content: 'Late steer' },
+              comments: [],
+            },
+            recordDispatch: () => undefined,
+            recordConsumption: () => undefined,
+          },
+          new AbortController().signal,
+        )
+        expect(lateSteerRes.status).toBe('rejected')
+        expect(harness.requests.filter((r) => r.method === 'session/prompt')).toHaveLength(1)
+        // Subsequent abort() + dispose() MUST NOT send a second session/cancel!
+        abort.abort()
+        harness.sendToClient({
+          jsonrpc: '2.0',
+          id: promptId,
+          result: { stopReason: 'cancelled' },
+        })
+        await runPromise.catch(() => undefined)
+        await adapter.dispose()
+        expect(harness.notifications.filter((n) => n.method === 'session/cancel')).toHaveLength(1)
+      } finally {
+        await adapter.dispose()
+      }
+    }
+
+    // Part 2: Queued Run 1 session/cancel behind paused stdin is dropped once promptRpcCompleted flips before Run 2 starts!
+    {
+      const harness = createAcpHarness({ highWaterMark: 16 })
+      const sid = randomUUID()
+      const prompt1Seen = Promise.withResolvers<unknown>()
+      const blockerSeen = Promise.withResolvers<void>()
+      let prompts = 0
+      harness.onClientFrame((frame) => {
+        if (frame.method === 'initialize') {
+          harness.sendToClient({ jsonrpc: '2.0', id: frame.id, result: { protocolVersion: 1 } })
+        } else if (frame.method === 'session/new' || frame.method === 'session/load') {
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            id: frame.id,
+            result: { sessionId: sid, configOptions: defaultConfigOptions() },
+          })
+        } else if (
+          frame.method === 'session/set_mode' ||
+          frame.method === 'session/set_config_option'
+        ) {
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            id: frame.id,
+            result: { configOptions: defaultConfigOptions() },
+          })
+        } else if (frame.method === 'session/prompt') {
+          prompts += 1
+          if (prompts === 1) {
+            prompt1Seen.resolve(frame.id)
+          } else {
+            harness.sendToClient({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: {
+                sessionId: sid,
+                update: {
+                  sessionUpdate: 'agent_message_chunk',
+                  content: { type: 'text', text: 'RUN2_OK' },
+                },
+              },
+            })
+            harness.sendToClient({
+              jsonrpc: '2.0',
+              id: frame.id,
+              result: { stopReason: 'end_turn', execution_id: 'exec-b4-run2' },
+            })
+          }
+        } else if (frame.id === 'perm-blk-b4-cancel') {
+          blockerSeen.resolve()
+        }
+      })
+      const adapter = new AgyAgentAdapter({ appDataDir, processFactory: () => harness.child })
+      const abort1 = new AbortController()
+      const run1 = collectEvents(adapter.run(makeRunInput(cwd), abort1.signal))
+      try {
+        const prompt1Id = await prompt1Seen.promise
+        harness.pauseStdin()
+        harness.sendToClient({
+          jsonrpc: '2.0',
+          id: 'perm-blk-b4-cancel',
+          method: 'session/request_permission',
+          params: {
+            sessionId: sid,
+            toolCall: { toolCallId: 'tc-blk-b4', name: 'run_command', title: 'Blocker' },
+            options: [{ optionId: 'reject_once', name: 'Deny', kind: 'reject_once' }],
+            _meta: { sessionId: 'sess-foreign-blk' },
+          },
+        })
+        await blockerSeen.promise
+        // Abort queues session/cancel behind perm-blk-b4-cancel in OutboundFrameQueue.
+        abort1.abort()
+        await new Promise((r) => setTimeout(r, 20))
+        expect(harness.notifications.filter((n) => n.method === 'session/cancel')).toHaveLength(0)
+        // Run 1 finishes on stdout BEFORE stdin resumes -> promptRpcCompleted=true invalidates queued cancel!
+        harness.sendToClient({
+          jsonrpc: '2.0',
+          id: prompt1Id,
+          result: { stopReason: 'end_turn', execution_id: 'exec-b4-run1' },
+        })
+        await run1
+        harness.resumeStdin()
+        const events2 = await collectEvents(
+          adapter.run(makeRunInput(cwd, { nativeSessionId: sid }), new AbortController().signal),
+        )
+        expect(harness.notifications.filter((n) => n.method === 'session/cancel')).toHaveLength(0)
+        expect(events2).toContainEqual(
+          expect.objectContaining({ type: 'text.completed', text: 'RUN2_OK' }),
+        )
+      } finally {
+        harness.resumeStdin()
+        await adapter.dispose()
+      }
+    }
+
+    // Part 3: Queued MCP auto-allow behind paused stdin is dropped once consumer enters controlDrainActive!
+    {
+      const harness = createAcpHarness({ highWaterMark: 16 })
+      const sid = randomUUID()
+      const blockerSeen = Promise.withResolvers<void>()
+      let mcpToolName = 'mcp_pact_peer_publish_session_title'
+      let promptId: unknown
+      harness.onClientFrame((frame) => {
+        if (frame.method === 'initialize') {
+          harness.sendToClient({ jsonrpc: '2.0', id: frame.id, result: { protocolVersion: 1 } })
+        } else if (frame.method === 'session/new') {
+          const params = frame.params as { mcpServers?: Array<{ name?: string }> }
+          const srvName = params.mcpServers?.[0]?.name
+          if (srvName) mcpToolName = `mcp_${srvName}_publish_session_title`
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            id: frame.id,
+            result: { sessionId: sid, configOptions: defaultConfigOptions() },
+          })
+        } else if (
+          frame.method === 'session/set_mode' ||
+          frame.method === 'session/set_config_option'
+        ) {
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            id: frame.id,
+            result: { configOptions: defaultConfigOptions() },
+          })
+        } else if (frame.method === 'session/prompt') {
+          promptId = frame.id
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: sid,
+              update: {
+                sessionUpdate: 'agent_message_chunk',
+                content: { type: 'text', text: 'trigger-yield' },
+              },
+            },
+          })
+        } else if (frame.id === 'perm-blk-b4-allow') {
+          blockerSeen.resolve()
+        }
+      })
+      const adapter = new AgyAgentAdapter({ appDataDir, processFactory: () => harness.child })
+      const sessionId = randomUUID()
+      const stream = adapter.run(
+        makeRunInput(cwd, {
+          sessionId,
+          promptEnvelope: {
+            version: 'pact-agent-prompt-v1',
+            sessionId,
+            message: { id: randomUUID(), content: 'Auto allow fence test' },
+            comments: [],
+            requestSessionTitle: true,
+          },
+        }),
+        new AbortController().signal,
+      )
+      try {
+        for await (const ev of stream) {
+          if (ev.type === 'text.delta') {
+            harness.pauseStdin()
+            harness.sendToClient({
+              jsonrpc: '2.0',
+              id: 'perm-blk-b4-allow',
+              method: 'session/request_permission',
+              params: {
+                sessionId: sid,
+                toolCall: { toolCallId: 'tc-blk-allow', name: 'run_command', title: 'Blocker' },
+                options: [{ optionId: 'reject_once', name: 'Deny', kind: 'reject_once' }],
+                _meta: { sessionId: 'sess-foreign-blk' },
+              },
+            })
+            await blockerSeen.promise
+            harness.sendToClient({
+              jsonrpc: '2.0',
+              id: 'perm-mcp-auto-b4',
+              method: 'session/request_permission',
+              params: {
+                sessionId: sid,
+                toolCall: {
+                  toolCallId: 'tc-mcp-auto-b4',
+                  name: mcpToolName,
+                  args: { title: 'Fenced title' },
+                },
+                options: [
+                  { optionId: 'allow_once', name: 'Allow', kind: 'allow_once' },
+                  { optionId: 'reject_once', name: 'Deny', kind: 'reject_once' },
+                ],
+              },
+            })
+            await new Promise((r) => setTimeout(r, 20))
+            // Consumer exits early -> enters controlDrainActive (`foregroundReleased = true`) BEFORE stdin resumes!
+            break
+          }
+        }
+        harness.resumeStdin()
+        await vi.waitFor(() => {
+          expect(harness.responses.some((r) => r.id === 'perm-mcp-auto-b4')).toBe(true)
+        })
+        const autoResp = harness.responses.find((r) => r.id === 'perm-mcp-auto-b4')
+        // Queued allow_once MUST be aborted by isFenceCurrent and fall back to cancelled (NEVER allow_once)!
+        expect(autoResp?.result).toEqual({ outcome: { outcome: 'cancelled' } })
+        harness.sendToClient({
+          jsonrpc: '2.0',
+          id: promptId,
+          result: { stopReason: 'end_turn' },
+        })
+      } finally {
+        harness.resumeStdin()
+        await adapter.dispose()
+      }
+    }
+  })
 })

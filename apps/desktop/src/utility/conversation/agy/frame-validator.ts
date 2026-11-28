@@ -747,17 +747,18 @@ export function validateAgyFrame(
       ? firstParsedToken
       : undefined
 
-  // 5. Intra-frame root consistency + pinned trajectory / minStepIdx check (BEFORE any pinning!).
-  let rootEvidenceContradicted =
+  // 5. Intra-frame structural consistency vs pinned trajectory / minStepIdx root-boundary check.
+  let hasStructuralContradiction =
     trajStep.contradicted || executionIdInvalid || hasInvalidToken || hasConflictingTokens
+  let contradictsRootBoundary = false
   if (trajStep.trajectoryId !== undefined && pinnedTrajectory !== undefined) {
     if (trajStep.trajectoryId !== pinnedTrajectory) {
-      rootEvidenceContradicted = true
+      contradictsRootBoundary = true
     }
   }
   if (trajStep.stepIdx !== undefined && minStepIdx !== undefined) {
     if (trajStep.stepIdx < minStepIdx) {
-      rootEvidenceContradicted = true
+      contradictsRootBoundary = true
     }
   }
   if (resolvedToken?.structured) {
@@ -765,26 +766,22 @@ export function validateAgyFrame(
       trajStep.trajectoryId !== undefined &&
       resolvedToken.structured.trajectoryId !== trajStep.trajectoryId
     ) {
-      rootEvidenceContradicted = true
+      hasStructuralContradiction = true
     }
     if (trajStep.stepIdx !== undefined && resolvedToken.structured.stepIdx !== trajStep.stepIdx) {
-      rootEvidenceContradicted = true
+      hasStructuralContradiction = true
     }
     if (
       pinnedTrajectory !== undefined &&
       resolvedToken.structured.trajectoryId !== pinnedTrajectory
     ) {
-      rootEvidenceContradicted = true
+      contradictsRootBoundary = true
     }
     if (minStepIdx !== undefined && resolvedToken.structured.stepIdx < minStepIdx) {
-      rootEvidenceContradicted = true
+      contradictsRootBoundary = true
     }
   }
-  // Even when a token is conflicted/leading-zero, check if any normalizable structured token conflicts
-  // with trajectory/step to ensure full intra-frame contradiction detection.
-  if (hasConflictingTokens || hasInvalidToken) {
-    rootEvidenceContradicted = true
-  }
+  const rootEvidenceContradicted = hasStructuralContradiction || contradictsRootBoundary
 
   // 6. Tool call ID extraction.
   let toolCallId: string | undefined
@@ -873,6 +870,8 @@ export function validateAgyFrame(
     executionIdInvalid,
     ...(trajStep.trajectoryId !== undefined ? { trajectoryId: trajStep.trajectoryId } : {}),
     ...(trajStep.stepIdx !== undefined ? { stepIdx: trajStep.stepIdx } : {}),
+    hasStructuralContradiction,
+    contradictsRootBoundary,
     rootEvidenceContradicted,
     tokens: {
       suppliedCount,
@@ -905,7 +904,7 @@ export function recheckValidatedFrameAgainstRootBoundary(
   pinnedTrajectory: string | undefined,
   minStepIdx: number | undefined,
 ): ValidatedAgyFrame {
-  if (validated.rootEvidenceContradicted) return validated
+  if (validated.contradictsRootBoundary && validated.rootEvidenceContradicted) return validated
   let contradicted = false
   if (
     validated.trajectoryId !== undefined &&
@@ -931,7 +930,7 @@ export function recheckValidatedFrameAgainstRootBoundary(
     }
   }
   if (!contradicted) return validated
-  return { ...validated, rootEvidenceContradicted: true }
+  return { ...validated, contradictsRootBoundary: true, rootEvidenceContradicted: true }
 }
 
 export type ParsedAgyPromptTerminalReply =

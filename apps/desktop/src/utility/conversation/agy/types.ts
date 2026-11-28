@@ -731,6 +731,8 @@ export interface ValidatedAgyFrame {
   readonly executionIdInvalid: boolean
   readonly trajectoryId?: string | undefined
   readonly stepIdx?: number | undefined
+  readonly hasStructuralContradiction: boolean
+  readonly contradictsRootBoundary: boolean
   readonly rootEvidenceContradicted: boolean
   readonly tokens: ValidatedAgyTokenEvidence
   readonly toolCallId?: string | undefined

@@ -103,6 +103,7 @@ export class AgyNotificationProjector {
     isExecutionStillOwned?: (() => boolean) | undefined
     registerInteraction?: ((controller: AbortController) => void) | undefined
     unregisterInteraction?: ((controller: AbortController) => void) | undefined
+    onRequestTurnCancel?: ((signal: AbortSignal) => Promise<void> | undefined) | undefined
     pushEvent: (event: NormalizedAgentEvent) => void
     signal: AbortSignal
   }): Promise<void> {
@@ -132,6 +133,7 @@ export class AgyNotificationProjector {
       isExecutionStillOwned,
       registerInteraction,
       unregisterInteraction,
+      onRequestTurnCancel,
       pushEvent,
       signal,
     } = context
@@ -222,7 +224,7 @@ export class AgyNotificationProjector {
     const fenceEpoch = activeRun?.turnEpoch
     const fenceExecutor = activeRun?.executorId
     const fenceGen = activeRun?.bindingGeneration
-    const isFenceCurrent = (): boolean =>
+    const isCancelFenceCurrent = (): boolean =>
       !this.runtime.disposed &&
       !signal.aborted &&
       connection.isOpen &&
@@ -241,14 +243,21 @@ export class AgyNotificationProjector {
                 activeRun.providerExecutionId !== validated.executionId))
           )
         : true)
+    // Carbon B-4: Affirmative approvals (MCP auto-allow, Brain Plan auto-allow, interactive select)
+    // also require foreground ownership and no pending cancellation right before the first byte writes.
+    const isFenceCurrent = (): boolean =>
+      isCancelFenceCurrent() &&
+      (activeRun
+        ? !activeRun.foregroundReleased &&
+          !activeRun.rootReleasing &&
+          !activeRun.cancellationPending
+        : true)
 
     // Auto-allow ONLY verified current-root Pact MCP tools matching this Run's active allowed list.
     if (
       activeRun &&
-      !activeRun.promptRpcCompleted &&
-      !activeRun.promptReplyReceived &&
+      isFenceCurrent() &&
       mcpServer.isRootActive() &&
-      !signal.aborted &&
       !hasInvalidOrContradictedPermFrame &&
       isAuthorizedPactTool
     ) {
@@ -462,21 +471,31 @@ export class AgyNotificationProjector {
       const mappedResponse = card.responses.get(decisionId) ?? {
         outcome: { outcome: 'cancelled' },
       }
+      // Carbon B-4: Atomically latch cancellationPending when the user cancels the turn via the
+      // permission card so steer & auto-allow close immediately while still sending the cancel reply.
+      const isCancelDecision = decisionId === 'agy-cancel'
+      if (isCancelDecision && activeRun) {
+        activeRun.cancellationPending = true
+      }
       // B-F2: Enforce ownership fence at physical outbound write boundary, not just JS enqueue.
       await connection.respond(rpcId, mappedResponse, {
         signal: combinedSignal,
-        canDispatch: isFenceCurrent,
+        canDispatch: isCancelDecision ? isCancelFenceCurrent : isFenceCurrent,
       })
-      if (decisionId === 'agy-cancel') {
-        const cancelSessionId = activeRun?.nativeSessionId ?? getSessionId()
-        if (cancelSessionId) {
-          await connection
-            .notify(
-              'session/cancel',
-              { sessionId: cancelSessionId },
-              { signal: combinedSignal, canDispatch: isFenceCurrent },
-            )
-            .catch(() => undefined)
+      if (isCancelDecision) {
+        if (onRequestTurnCancel) {
+          await onRequestTurnCancel(combinedSignal)
+        } else {
+          const cancelSessionId = activeRun?.nativeSessionId ?? getSessionId()
+          if (cancelSessionId) {
+            await connection
+              .notify(
+                'session/cancel',
+                { sessionId: cancelSessionId },
+                { signal: combinedSignal, canDispatch: isCancelFenceCurrent },
+              )
+              .catch(() => undefined)
+          }
         }
       }
     } catch (err) {
@@ -587,6 +606,9 @@ export class AgyNotificationProjector {
         ? !activeRun.promptRpcCompleted &&
           !activeRun.promptReplyReceived &&
           !activeRun.rootTerminal &&
+          !activeRun.foregroundReleased &&
+          !activeRun.rootReleasing &&
+          !activeRun.cancellationPending &&
           activeRun.turnEpoch === fenceEpoch &&
           activeRun.executorId === fenceExecutor &&
           activeRun.bindingGeneration === fenceGen &&
