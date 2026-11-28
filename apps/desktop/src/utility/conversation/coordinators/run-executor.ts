@@ -628,12 +628,17 @@ export class RunExecutor {
     let ownerRef!: NativeObservation
     const stillOwned = (): boolean =>
       !this.core.disposed && this.core.nativeObservations.get(run.id) === ownerRef
+    // A-3: Keep already-queued archive/background-report persistence alive during close() drain
+    // while `this.core.disposed = true` rejects new external requests.
+    const canDrainObservation = (): boolean =>
+      (!this.core.disposed || this.core.drainingForClose) &&
+      this.core.nativeObservations.get(run.id) === ownerRef
 
     const archiver = new RunOutputArchiver({
       run,
       peerAssistanceAllowed,
-      isOwned: stillOwned,
-      isDisposed: () => this.core.disposed,
+      isOwned: canDrainObservation,
+      isDisposed: () => this.core.disposed && !this.core.drainingForClose,
       ownsCurrentControl: ownsForegroundOutput,
       ownsAdmittedForegroundBatch,
       isRunEnded: () => this.core.conversations.findRun(run.id)?.dispatchPhase === 'ended',
@@ -1158,15 +1163,25 @@ export class RunExecutor {
               return
             }
             const task = (async () => {
+              const recordUnavailableBestEffort = (): void => {
+                try {
+                  const patch = this.core.conversations.recordBackgroundReportUnavailable(report)
+                  if (patch && stillOwned()) this.core.publish(patch)
+                } catch {
+                  // Repository may be closed or conflict-locked; failure flag remains latched.
+                }
+              }
               try {
-                // A-F6: Validate full repository identity and durably admit the pending/incomplete
-                // report row BEFORE awaiting `archiveTail`, so shutdown during archiveTail wait
-                // always leaves at least an incomplete record (or completes within quit deadline).
-                this.core.conversations.admitBackgroundReportPending(report)
+                // A-3: Strictly await root answer `archiveTail` BEFORE allocating a background
+                // report sequence so background reports never invert ahead of a large root answer.
                 if (archiver.archiveTail) {
                   await archiver.archiveTail.catch(() => undefined)
                 }
-                if (owner.observationController.signal.aborted) return
+                if (owner.observationController.signal.aborted || !canDrainObservation()) {
+                  owner.backgroundReportFailed = true
+                  recordUnavailableBestEffort()
+                  return
+                }
                 const patch = await this.core.conversations.recordBackgroundReport(
                   report,
                   (bodySignal) => RunOutputArchiver.answerParts(report.text, bodySignal),
@@ -1174,20 +1189,23 @@ export class RunExecutor {
                 )
                 if (patch && stillOwned()) this.core.publish(patch)
               } catch (error) {
-                if (!stillOwned() || owner.observationController.signal.aborted) return
-                const patch = this.core.conversations.recordBackgroundReportUnavailable(report)
-                if (patch) this.core.publish(patch)
-                recordDiagnostic({
-                  operation: 'native_check',
-                  phase: 'failed',
-                  level: 'warn',
-                  scope: 'run',
-                  sessionId: run.sessionId,
-                  runId: run.id,
-                  agentId: run.agentId,
-                  runtimeBoundary: 'archive',
-                  code: classifyAgentError(error).kind,
-                })
+                owner.backgroundReportFailed = true
+                if (!(error instanceof RunOperationConflictError)) {
+                  recordUnavailableBestEffort()
+                }
+                if (!this.core.disposed) {
+                  recordDiagnostic({
+                    operation: 'native_check',
+                    phase: 'failed',
+                    level: 'warn',
+                    scope: 'run',
+                    sessionId: run.sessionId,
+                    runId: run.id,
+                    agentId: run.agentId,
+                    runtimeBoundary: 'archive',
+                    code: classifyAgentError(error).kind,
+                  })
+                }
               }
             })()
             owner.backgroundReportTasks?.add(task)
@@ -1256,14 +1274,40 @@ export class RunExecutor {
               return
             }
             if (!stillOwned() || report.runId !== run.id || report.generation !== generation) return
-            if (owner.backgroundStop && report.state !== 'pending') {
+            // A-4: Never write `settled` to SQLite when archive output persistence failed or
+            // failed to record; retry recording output failure and converge effects to `unknown`.
+            let effectiveState = report.state
+            let effectiveReason = report.reason
+            if (
+              report.state === 'settled' &&
+              (owner.archiver.outputFailure !== undefined ||
+                owner.archiver.failureRecordingError !== undefined)
+            ) {
+              effectiveState = 'unknown'
+              effectiveReason =
+                owner.archiver.outputFailure?.message ??
+                'Output archive persistence failed before native effects settled.'
+              if (owner.archiver.failureRecordingError !== undefined) {
+                try {
+                  const failure =
+                    owner.archiver.outputFailure ??
+                    classifyAgentError(owner.archiver.failureRecordingError)
+                  this.core.publish(this.core.conversations.recordOutputFailure(run.id, failure))
+                  owner.archiver.clearFailureRecordingError()
+                  this.core.unrecordedArchiveFailures.delete(run.id)
+                } catch {
+                  // Keep unrecordedArchiveFailures / failureRecordingError latched fail-closed.
+                }
+              }
+            }
+            if (owner.backgroundStop && effectiveState !== 'pending') {
               this.core.recovery.clearBackgroundStop(owner)
-              if (report.state === 'unknown') owner.backgroundStopUnconfirmed = true
+              if (effectiveState === 'unknown') owner.backgroundStopUnconfirmed = true
             }
             this.core.publish(
-              this.core.conversations.recordNativeEffects(run.id, report.state, report.reason),
+              this.core.conversations.recordNativeEffects(run.id, effectiveState, effectiveReason),
             )
-            if (report.state === 'unknown') {
+            if (effectiveState === 'unknown') {
               this.core.workspaceChanges?.observeUncertainEffects(run.id)
               const queued = this.core.conversations.receivedCollaborationInput(run.sessionId)
               if (
@@ -1281,11 +1325,11 @@ export class RunExecutor {
                 )
               }
             }
-            if (report.state !== 'pending') {
+            if (effectiveState !== 'pending') {
               const saved = this.core.conversations.findRun(run.id)
               if (
-                report.state === 'settled' &&
-                report.reason === 'workflow_input_withheld' &&
+                effectiveState === 'settled' &&
+                effectiveReason === 'workflow_input_withheld' &&
                 saved &&
                 !saved.nativeTurnId &&
                 !saved.nativeOutcome &&
@@ -1404,8 +1448,10 @@ export class RunExecutor {
         )
       } else {
         this.core.publish(this.core.conversations.settleKnownNativeEnding(run.id))
+        const settledRun = this.core.conversations.findRun(run.id)
         const titleBinding = this.core.conversations.nativeContext(run.sessionId, run.agentId)
         if (
+          settledRun?.status === 'completed' &&
           titleBinding?.nativeSessionId &&
           titleBinding.bindingGeneration === (run.bindingGeneration ?? 1) &&
           currentControl()

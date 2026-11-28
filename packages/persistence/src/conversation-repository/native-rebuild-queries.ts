@@ -494,15 +494,16 @@ export function recordNativeEvidence(
         ...(evidence.kind === 'ended' ? { outcome: evidence.outcome } : {}),
         ...(evidence.kind === 'no_evidence' ? { reason: evidence.reason } : {}),
       })
-    if (run && evidence.kind === 'ended')
-      repo.database
-        .update(agentRuns)
-        .set({
-          ...(evidence.outcome ? { nativeOutcome: evidence.outcome } : {}),
-          dispatchPhase: 'ended',
-        })
-        .where(eq(agentRuns.id, run.id))
-        .run()
+    if (run && evidence.kind === 'ended') {
+      const outcome =
+        run.dispatchPhase === 'ended' && run.nativeOutcome === 'completed'
+          ? 'completed'
+          : evidence.outcome
+      const patch = outcome
+        ? { nativeOutcome: outcome, dispatchPhase: 'ended' as const }
+        : { dispatchPhase: 'ended' as const }
+      repo.database.update(agentRuns).set(patch).where(eq(agentRuns.id, run.id)).run()
+    }
     if (
       run &&
       ((evidence.kind === 'ended' && evidence.planUnavailable) ||
@@ -928,21 +929,21 @@ export function settleKnownNativeEnding(
   if (!run || run.dispatchPhase !== 'ended')
     throw new RunOperationConflictError('The native ending has no evidence.')
   if (failure) recordOutputFailure(repo, runId, failure)
-  const completeResponse = hasCompleteResponse(repo, runId)
+  const complete = hasCompleteResponse(repo, runId)
+  const status: AgentRun['status'] =
+    run.status === 'failed' && !complete ? 'failed' : (run.nativeOutcome ?? 'interrupted')
+  const ok = status === 'completed' && complete
   nativeMetadataTransaction(repo, run.sessionId, () => {
     repo.database
       .update(agentRuns)
       .set({
-        status: run.nativeOutcome ?? 'interrupted',
-        failureKind:
-          run.nativeOutcome === 'completed' && completeResponse
+        status,
+        failureKind: ok ? null : (failure?.kind ?? run.failureKind ?? null),
+        failureMessage: !run.nativeOutcome
+          ? 'The Turn ended, but its outcome was not recorded.'
+          : ok
             ? null
-            : (failure?.kind ?? run.failureKind ?? null),
-        failureMessage: run.nativeOutcome
-          ? run.nativeOutcome === 'completed' && completeResponse
-            ? null
-            : (failure?.message ?? run.failureMessage ?? null)
-          : 'The Turn ended, but its outcome was not recorded.',
+            : (failure?.message ?? run.failureMessage ?? null),
       })
       .where(eq(agentRuns.id, runId))
       .run()
@@ -958,26 +959,25 @@ export function settleKnownNativeEnding(
           ),
         )
         .run()
-    repo.recordSchedulingBusinessActivity(runId, completeResponse)
+    repo.recordSchedulingBusinessActivity(runId, complete)
   })
-  const hasExplicitOutputFailure =
-    failure !== undefined ||
-    Boolean(
-      repo.database
-        .select({ sequence: agentEventJournal.sequence })
-        .from(agentEventJournal)
-        .where(
-          and(
-            eq(agentEventJournal.runId, runId),
-            eq(agentEventJournal.eventType, 'pact.output_unavailable'),
-          ),
-        )
-        .limit(1)
-        .get(),
-    )
+  const hasFail = Boolean(
+    failure ??
+    repo.database
+      .select({ sequence: agentEventJournal.sequence })
+      .from(agentEventJournal)
+      .where(
+        and(
+          eq(agentEventJournal.runId, runId),
+          eq(agentEventJournal.eventType, 'pact.output_unavailable'),
+        ),
+      )
+      .limit(1)
+      .get(),
+  )
   repo.finishCollaboration(
     runId,
-    run.nativeOutcome === 'completed' && (completeResponse || !hasExplicitOutputFailure),
+    status === 'completed' && (complete || !hasFail),
     failure?.message ?? run.failureMessage,
   )
   return repo.runPatch(runId)

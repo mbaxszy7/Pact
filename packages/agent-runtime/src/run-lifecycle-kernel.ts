@@ -143,16 +143,16 @@ export function classifyBindingRejection(input: {
 export const NATIVE_TERMINAL_FAILURE_MAX_CHARS = 240
 
 const HEADER_LINE_SECRET_PATTERNS: readonly RegExp[] = [
-  /(?:^|[\r\n])\s*["']?(?:set-cookie|cookie|(?:proxy-)?authorization)["']?\s*[:=]\s*[^\r\n]+/giu,
-  /["']?(?:set-cookie|cookie|(?:proxy-)?authorization)["']?\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\r\n}\]]+)/giu,
+  /(?:^|[\r\n])\s*["']?(?:set-cookie|cookie|(?:proxy-)?authorization|(?:www|proxy)-authenticate)["']?\s*[:=]\s*[^\r\n]+/giu,
+  /["']?(?:set-cookie|cookie|(?:proxy-)?authorization|(?:www|proxy)-authenticate)["']?\s*[:=]\s*(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|(?:[^\r\n"'}\]{[]|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\{[^}\r\n]*\}|\[[^\]\r\n]*\])+)/giu,
 ]
 
 const REDACT_SECRET_PATTERNS: readonly RegExp[] = [
-  /\b(?:Bearer|Basic|Digest|ApiKey)\s+[A-Za-z0-9._~+/=-]{4,}(?:\s*,\s*[A-Za-z0-9._-]+=(?:"[^"]*"|[^\s,;}\]]+))*/giu,
+  /\b(?:Bearer|Basic|Digest|ApiKey)\s+(?:[A-Za-z0-9._-]+=(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;}\]]+)|[A-Za-z0-9._~+/=-]{4,})(?:\s*,\s*[A-Za-z0-9._-]+=(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;}\]]+))*/giu,
   /\bToken\s+(?=[A-Za-z0-9._~+/=-]*[0-9._+/=-])[A-Za-z0-9._~+/=-]{8,}/gu,
   /\bsk-[A-Za-z0-9_-]{12,}/gu,
   /\bAIza[0-9A-Za-z_-]{20,}/gu,
-  /["']?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|client[_-]?secret|x-api-key|password|passwd|pwd|secret|token)["']?\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s"',;}\]]+)/giu,
+  /["']?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|client[_-]?secret|x-api-key|password|passwd|pwd|secret|token)["']?\s*[:=]\s*(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s"',;}\]]+)/giu,
 ]
 
 /**

@@ -107,6 +107,10 @@ export class RunOutputArchiver {
     return this.failureRecordingErrorValue
   }
 
+  clearFailureRecordingError(): void {
+    this.failureRecordingErrorValue = undefined
+  }
+
   get archiveBuffer(): AgentStreamBuffer | undefined {
     return this.archiveBufferValue
   }

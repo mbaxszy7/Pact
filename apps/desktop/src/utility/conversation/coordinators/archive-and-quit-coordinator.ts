@@ -303,6 +303,12 @@ export class ArchiveAndQuitCoordinator {
         identities.add(owner.sessionId)
       for (const owner of this.core.conversations.pendingCollaborationInputs())
         identities.add(owner.sessionId)
+      for (const entry of this.core.unrecordedArchiveFailures.values())
+        identities.add(entry.sessionId)
+      for (const owner of this.core.nativeObservations.values()) {
+        if (owner.archiver.failureRecordingError !== undefined)
+          identities.add(owner.archiver.sessionId)
+      }
       const unsettled = this.core.conversations.nativeQuitUnsettled([...identities])
       const activeCount =
         identities.size +
@@ -312,7 +318,11 @@ export class ArchiveAndQuitCoordinator {
             this.core.decisionRecoveryOwner?.sessionId === null ||
             this.core.conversations.activeSchedulingRuntimeOwner()?.sessionId === null,
         ) +
-        Number(otherPreparationActive && identities.size === 0 && unsettled.count === 0)
+        Number(
+          (otherPreparationActive || this.core.unrecordedArchiveFailureOverflow) &&
+            identities.size === 0 &&
+            unsettled.count === 0,
+        )
       const listed = [...new Set([...identities, ...unsettled.sessionIds])]
         .slice(0, 5)
         .flatMap<NativeQuitSessionRow>((id) => {
@@ -448,6 +458,29 @@ export class ArchiveAndQuitCoordinator {
     )
   }
 
+  private scopeHasUnrecordedArchiveFailure(scope: WorkspaceArchiveScope): boolean {
+    if (this.core.unrecordedArchiveFailureOverflow) return true
+    const projectId = this.core.conversations.archives.context(scope).projectId
+    const belongs = (sessionId: string): boolean => {
+      if (scope.kind === 'session') {
+        return (
+          sessionId === scope.sessionId ||
+          this.core.sessions.find(sessionId)?.parentSessionId === scope.sessionId
+        )
+      }
+      return this.core.conversations.archives.sessionMetadata(sessionId)?.projectId === projectId
+    }
+    for (const entry of this.core.unrecordedArchiveFailures.values()) {
+      if (belongs(entry.sessionId)) return true
+    }
+    for (const owner of this.core.nativeObservations.values()) {
+      if (owner.archiver.failureRecordingError !== undefined && belongs(owner.archiver.sessionId)) {
+        return true
+      }
+    }
+    return false
+  }
+
   private archiveWork(scope: WorkspaceArchiveScope): {
     tasks: WorkspaceArchiveTask[]
     blockedReason?: string
@@ -513,6 +546,7 @@ export class ArchiveAndQuitCoordinator {
           !foreground || Boolean(this.core.conversations.findRun(foreground.run.id)?.nativeOutcome)
         )
       }) ||
+      this.scopeHasUnrecordedArchiveFailure(scope) ||
       this.core.conversations.archives.hasNativeWork(scope, runs)
     const blockingTerminals =
       scope.kind === 'project'
@@ -706,15 +740,7 @@ export class ArchiveAndQuitCoordinator {
           outcome: unresolved ? 'unresolved' : failures.has(task.sessionId) ? 'failed' : 'stopped',
         })
       }
-      const scopeArchiveFailure =
-        [...this.core.unrecordedArchiveFailures.values()].some((entry) =>
-          scopeSessionIds.has(entry.sessionId),
-        ) ||
-        [...this.core.nativeObservations.values()].some(
-          (owner) =>
-            scopeSessionIds.has(owner.archiver.sessionId) &&
-            owner.archiver.failureRecordingError !== undefined,
-        )
+      const scopeArchiveFailure = this.scopeHasUnrecordedArchiveFailure(scope)
       if (
         this.core.disposed ||
         performance.now() >= deadline ||
@@ -935,6 +961,7 @@ export class ArchiveAndQuitCoordinator {
 
   private async close(shutdown?: { flushDeadlineAt?: number }): Promise<void> {
     this.core.disposed = true
+    this.core.drainingForClose = true
     if (this.core.pendingContinuationImmediate)
       clearImmediate(this.core.pendingContinuationImmediate)
     this.core.pendingContinuationImmediate = undefined
@@ -1073,28 +1100,43 @@ export class ArchiveAndQuitCoordinator {
     this.core.adapters.clear()
     const agyPoolEntries = [...this.core.agyConnectionPools.entries()]
     const agyForkFiles = this.core.agyForkFiles
-    const pendingBackgroundReports: Promise<void>[] = []
+    // A-3: Sequentially drain already-queued root archive tails and background report tasks
+    // BEFORE aborting observation/archive controllers (both bounded shutdown and unbounded dispose).
+    const preAbortDrains: Promise<unknown>[] = []
     for (const owner of this.core.nativeObservations.values()) {
+      if (owner.archiver.archiveTail) preAbortDrains.push(owner.archiver.archiveTail)
       if (owner.backgroundReportTasks) {
-        for (const task of owner.backgroundReportTasks) pendingBackgroundReports.push(task)
+        for (const task of owner.backgroundReportTasks) preAbortDrains.push(task)
       }
     }
-    if (pendingBackgroundReports.length > 0 && flushDeadlineAt !== undefined) {
-      const remainingMs = Math.max(0, flushDeadlineAt - Date.now())
-      if (remainingMs > 0) {
-        let reportTimer: ReturnType<typeof setTimeout> | undefined
-        try {
-          await Promise.race([
-            Promise.allSettled(pendingBackgroundReports),
-            new Promise<void>((resolve) => {
-              reportTimer = setTimeout(resolve, remainingMs)
-            }),
-          ])
-        } finally {
-          clearTimeout(reportTimer)
+    if (preAbortDrains.length > 0) {
+      if (flushDeadlineAt !== undefined) {
+        const remainingMs = Math.max(0, flushDeadlineAt - Date.now())
+        if (remainingMs <= 0) {
+          flushed = false
+        } else {
+          let reportTimer: ReturnType<typeof setTimeout> | undefined
+          let timedOut = false
+          try {
+            await Promise.race([
+              Promise.allSettled(preAbortDrains),
+              new Promise<void>((resolve) => {
+                reportTimer = setTimeout(() => {
+                  timedOut = true
+                  resolve()
+                }, remainingMs)
+              }),
+            ])
+          } finally {
+            clearTimeout(reportTimer)
+          }
+          if (timedOut) flushed = false
         }
+      } else {
+        await Promise.allSettled(preAbortDrains)
       }
     }
+    this.core.drainingForClose = false
     for (const owner of this.core.nativeObservations.values()) {
       owner.sourceReader?.retire()
       this.core.recovery.clearBackgroundStop(owner)
@@ -1109,10 +1151,17 @@ export class ArchiveAndQuitCoordinator {
       }
     }
     await Promise.allSettled(observationDrains)
-    if (this.core.unrecordedArchiveFailures.size > 0) flushed = false
+    if (
+      this.core.unrecordedArchiveFailures.size > 0 ||
+      this.core.unrecordedArchiveFailureOverflow
+    ) {
+      flushed = false
+    }
     for (const owner of this.core.nativeObservations.values()) {
       try {
-        if (owner.archiver.failureRecordingError !== undefined) flushed = false
+        if (owner.archiver.failureRecordingError !== undefined || owner.backgroundReportFailed) {
+          flushed = false
+        }
         if (owner.archiver.archiveBuffer && !owner.archiver.archiveBuffer.dispose()) flushed = false
       } catch {
         flushed = false
@@ -1190,10 +1239,23 @@ export class ArchiveAndQuitCoordinator {
       Promise.allSettled(retryablePhysicalTasks),
     ])
     clearTimeout(shutdownTimer)
+    // A-4: Re-check failures latched during `baseCleanupTasks` BEFORE clearing runtime maps.
+    if (
+      this.core.unrecordedArchiveFailures.size > 0 ||
+      this.core.unrecordedArchiveFailureOverflow
+    ) {
+      flushed = false
+    }
+    for (const owner of this.core.nativeObservations.values()) {
+      if (owner.archiver.failureRecordingError !== undefined || owner.backgroundReportFailed) {
+        flushed = false
+      }
+    }
     if (shutdownOwners.some((owner) => owner.shutdown?.failed)) flushed = false
     for (const owner of shutdownOwners) delete owner.shutdown
     this.core.nativeObservations.clear()
     this.core.unrecordedArchiveFailures.clear()
+    this.core.unrecordedArchiveFailureOverflow = false
     this.core.activeExecutions.clear()
     this.core.preparingSends.clear()
     this.core.preparingContinuations.clear()

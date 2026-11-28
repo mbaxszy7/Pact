@@ -113,34 +113,10 @@ export async function completeAnswer(
   )
 }
 
-const preAdmittedBackgroundReports = new WeakMap<ConversationRepositoryHost, Set<string>>()
-
-export function admitBackgroundReportPending(
-  repo: ConversationRepositoryHost,
-  report: BackgroundReportIdentity,
-): ConversationPatch | undefined {
-  const id = backgroundReportId(report)
-  const existingInput = repo.database
-    .select({ committed: conversationBodyInputs.committedMessageId })
-    .from(conversationBodyInputs)
-    .where(eq(conversationBodyInputs.id, id))
-    .get()
-  if (existingInput) return undefined
-  const existingMessage = repo.database
-    .select({ id: conversationMessages.id })
-    .from(conversationMessages)
-    .where(eq(conversationMessages.id, id))
-    .get()
-  if (existingMessage) return undefined
-  const patch = commitBackgroundReport(repo, report, id, undefined, 'pending')
-  let pending = preAdmittedBackgroundReports.get(repo)
-  if (!pending) {
-    pending = new Set<string>()
-    preAdmittedBackgroundReports.set(repo, pending)
-  }
-  pending.add(id)
-  return patch
-}
+const inFlightBackgroundReports = new WeakMap<
+  ConversationRepositoryHost,
+  Map<string, { digest: string; promise: Promise<ConversationPatch | undefined> }>
+>()
 
 export async function recordBackgroundReport(
   repo: ConversationRepositoryHost,
@@ -151,8 +127,15 @@ export async function recordBackgroundReport(
   signal.throwIfAborted()
   const run = backgroundReportRun(repo, report)
   const id = backgroundReportId(report)
-  const preAdmitted = preAdmittedBackgroundReports.get(repo)?.delete(id) ?? false
   const digest = createHash('sha256').update(report.text).digest('hex')
+  let inFlight = inFlightBackgroundReports.get(repo)
+  const active = inFlight?.get(id)
+  if (active) {
+    if (active.digest !== digest) {
+      throw new RunOperationConflictError('A background update repeated with a different source.')
+    }
+    return active.promise
+  }
   const previous = repo.database
     .select({
       hash: conversationBodyInputs.hash,
@@ -172,31 +155,33 @@ export async function recordBackgroundReport(
     return undefined
   }
   // A prior complete or unavailable admission is already durable. Never re-seal a replay
-  // after its uncommitted body was discarded on cancellation or cold startup; only consume
-  // a live in-process one-shot pre-admission created by `admitBackgroundReportPending`.
+  // after its uncommitted body was discarded on cancellation or cold startup.
   const existingMessage = repo.database
-    .select({
-      id: conversationMessages.id,
-      state: conversationMessages.state,
-      revision: conversationMessages.contentRevision,
-    })
+    .select({ id: conversationMessages.id })
     .from(conversationMessages)
     .where(eq(conversationMessages.id, id))
     .get()
-  if (
-    existingMessage &&
-    !(preAdmitted && existingMessage.state === 'incomplete' && existingMessage.revision === 0)
-  ) {
-    return undefined
+  if (existingMessage) return undefined
+  if (!inFlight) {
+    inFlight = new Map()
+    inFlightBackgroundReports.set(repo, inFlight)
   }
-  if (!existingMessage) {
+  const sealing = (async (): Promise<ConversationPatch | undefined> => {
     commitBackgroundReport(repo, report, id, undefined, 'pending')
+    return sealAnswerBody(repo, run, id, report.nativeMessageId, source, signal, (body) => {
+      if (body.sha256 !== digest)
+        throw new RunOperationConflictError('The complete background update source changed.')
+      return commitBackgroundReport(repo, report, id, body)
+    })
+  })()
+  inFlight.set(id, { digest, promise: sealing })
+  try {
+    return await sealing
+  } finally {
+    if (inFlight.get(id)?.promise === sealing) {
+      inFlight.delete(id)
+    }
   }
-  return sealAnswerBody(repo, run, id, report.nativeMessageId, source, signal, (body) => {
-    if (body.sha256 !== digest)
-      throw new RunOperationConflictError('The complete background update source changed.')
-    return commitBackgroundReport(repo, report, id, body)
-  })
 }
 
 export function recordBackgroundReportUnavailable(
@@ -1338,7 +1323,12 @@ function applyEventWithinTransaction(
       .where(eq(sessions.id, sessionId))
       .get()?.status
     const existingRunOutcome = transaction
-      .select({ dispatchPhase: agentRuns.dispatchPhase, nativeOutcome: agentRuns.nativeOutcome })
+      .select({
+        dispatchPhase: agentRuns.dispatchPhase,
+        nativeOutcome: agentRuns.nativeOutcome,
+        failureKind: agentRuns.failureKind,
+        failureMessage: agentRuns.failureMessage,
+      })
       .from(agentRuns)
       .where(eq(agentRuns.id, runId))
       .get()
@@ -1351,14 +1341,18 @@ function applyEventWithinTransaction(
       existingRunOutcome.nativeOutcome === 'completed'
         ? 'completed'
         : event.outcome
+    // A-2: Preserve recorded failure diagnostics when `turn.completed` settles non-completed.
+    const clearFailureDiagnostics = event.outcome === 'completed'
     transaction
       .update(agentRuns)
       .set({
         status: event.outcome,
         nativeOutcome: nextNativeOutcome,
         dispatchPhase: 'ended',
-        failureKind: null,
-        failureMessage: null,
+        failureKind: clearFailureDiagnostics ? null : (existingRunOutcome?.failureKind ?? null),
+        failureMessage: clearFailureDiagnostics
+          ? null
+          : (existingRunOutcome?.failureMessage ?? null),
         updatedAt: now,
       })
       .where(eq(agentRuns.id, runId))
@@ -1433,7 +1427,7 @@ function applyEventWithinTransaction(
         const replacesArchivedSource =
           archive &&
           previous?.runId === runId &&
-          previous.state === 'incomplete' &&
+          (previous.state === 'incomplete' || previous.state === 'streaming') &&
           repo.ownsNativeControl(runId)
         if (previous && (!archive || replacesArchivedSource)) {
           preserveMessagesBeforeCutoffMutation(transaction, [previous.id])

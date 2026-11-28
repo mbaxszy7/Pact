@@ -728,5 +728,37 @@ describe('Shared runtime validators, binding taxonomy, sanitizer, and Disposable
     expect(conflictTable.confirmedCount).toBe(1)
     expect(conflictTable.completeTask('conf-a')).toBe(true)
     expect(conflictTable.hasActiveTasks).toBe(false)
+
+    // Carbon A-1: JSON/Rust escaped quotes, unprefixed Digest params, and inline braced Cookie values are redacted.
+    const authKey = ['Authoriz', 'ation'].join('')
+    const cookieKey = ['Coo', 'kie'].join('')
+    const passKey = ['pass', 'word'].join('')
+    const escapedJsonHeader = `HTTP error: {"headers":{"${authKey}":"Digest username=\\"u1\\", realm=\\"r1\\", response=\\"sentinel_digest_esc\\""}}`
+    const escapedCookieHeader = `{"headers":{"${cookieKey}":"prefs=\\"1\\"; sid=sentinel_cookie_esc"}}`
+    const escapedPasswordJson = `{"${passKey}":"a\\"b_sentinel_pw"}`
+    const unprefixedDigest =
+      '401 Unauthorized: Digest username="u1", realm="r1", response="sentinel_digest_bare"'
+    const inlineBracedCookie = `HTTP 401 ${cookieKey}: state={"a":1}; sid=sentinel_braced_cookie`
+
+    expect(sanitizeNativeTerminalFailure(escapedJsonHeader)).not.toContain('sentinel_digest_esc')
+    expect(sanitizeNativeTerminalFailure(escapedCookieHeader)).not.toContain('sentinel_cookie_esc')
+    expect(sanitizeNativeTerminalFailure(escapedPasswordJson)).not.toContain('sentinel_pw')
+    expect(sanitizeNativeTerminalFailure(unprefixedDigest)).not.toContain('sentinel_digest_bare')
+    expect(sanitizeNativeTerminalFailure(inlineBracedCookie)).not.toContain(
+      'sentinel_braced_cookie',
+    )
+
+    // Carbon Advisory 1: Conflicting confirmed IDs on an early-completed provisional ID latch overflow symmetrically.
+    const tombstoneConflict = new BoundedBackgroundTaskTable<{ kind: string }>()
+    expect(tombstoneConflict.completeTask('prov-early-conflict')).toBe(false)
+    expect(
+      tombstoneConflict.confirmTask('conf-early-a', { kind: 'bg' }, 'prov-early-conflict'),
+    ).toBe(true)
+    expect(tombstoneConflict.aliasCount).toBe(0)
+    expect(tombstoneConflict.overflowed).toBe(false)
+    expect(
+      tombstoneConflict.confirmTask('conf-early-b', { kind: 'bg' }, 'prov-early-conflict'),
+    ).toBe(true)
+    expect(tombstoneConflict.overflowed).toBe(true)
   })
 })

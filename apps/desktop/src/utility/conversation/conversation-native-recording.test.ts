@@ -1278,13 +1278,13 @@ it('A-F6 & A-Advisory2: preserves pending/complete background report on shutdown
           executorId,
         },
       })
-      // Queue a large archived answer so archiveTail is actively running
+      // Queue a genuinely large (>64 KiB) archived answer so archiveTail is actively running
       input.host?.effects?.recordArchivedEvent?.({
         type: 'text.completed',
         agentId,
         turnId: `turn:${input.runId}`,
         outputId: 'answer',
-        text: 'Root answer body.',
+        text: 'Root answer body. '.repeat(4500),
       })
       await holdRootBody.promise
     }
@@ -1304,8 +1304,8 @@ it('A-F6 & A-Advisory2: preserves pending/complete background report on shutdown
     if (!sent.ok) throw new Error('Expected send to succeed')
     const runId = sent.value.runs[0]!.id
     await vi.waitFor(() => expect(savedInput).toBeDefined())
-    const reportCall = savedInput!.host!.effects!.recordBackgroundReport!({
-      agentId: 'claude',
+    const reportPayload = {
+      agentId: 'claude' as const,
       runId,
       nativeSessionId: savedNativeSessionId,
       nativeTurnId: `turn:${runId}`,
@@ -1314,15 +1314,31 @@ it('A-F6 & A-Advisory2: preserves pending/complete background report on shutdown
       frameId: randomUUID(),
       nativeMessageId: 'bg-report-shutdown-behind-archive-tail',
       text: 'Background update during shutdown.',
-    })
+    }
+    // Carbon A-3: Fire two concurrent identical recordBackgroundReport calls while >64 KiB archiveTail runs!
+    const reportCallA = savedInput!.host!.effects!.recordBackgroundReport!(reportPayload)
+    const reportCallB = savedInput!.host!.effects!.recordBackgroundReport!(reportPayload)
     holdRootBody.resolve()
     await f1.flow.dispose({ flushDeadlineAt: Date.now() + 2000 })
-    await reportCall
-    const persisted = f1.db.conversationRepository
-      .read(f1.sessionId)
-      .messages.find((m) => isConversationBackgroundReport(m))
+    await Promise.all([reportCallA, reportCallB])
+    const messages1 = f1.db.conversationRepository.read(f1.sessionId).messages
+    const rootMsg = messages1.find(
+      (m) => m.role === 'assistant' && !isConversationBackgroundReport(m),
+    )
+    const persisted = messages1.find((m) => isConversationBackgroundReport(m))
+    expect(rootMsg).toBeDefined()
     expect(persisted).toBeDefined()
-    expect(['complete', 'incomplete']).toContain(persisted?.state)
+    expect(persisted?.state).toBe('complete')
+    // Carbon A-3 #1: Background report MUST strictly follow the large root answer in session timeline!
+    expect(rootMsg!.sequence).toBeLessThan(persisted!.sequence)
+    // Carbon A-3 #2: Concurrent duplicate report must NOT emit fake background.report_unavailable!
+    const unavailableEvents = f1.db.drizzle
+      .select()
+      .from(agentEventJournal)
+      .where(eq(agentEventJournal.runId, runId))
+      .all()
+      .filter((e) => e.eventType === 'background.report_unavailable')
+    expect(unavailableEvents).toHaveLength(0)
   } finally {
     await f1.dispose()
   }
@@ -1387,6 +1403,16 @@ it('A-F6 & A-Advisory2: preserves pending/complete background report on shutdown
         state: 'settled',
       })
       await vi.waitFor(() => expect(failSpy).toHaveBeenCalled())
+      // Carbon A-4: SQLite MUST record `unknown` (never `settled`) after output archive failure,
+      // and archive preview MUST block even before shutdown!
+      expect(f2.db.conversationRepository.findRun(runId2)?.nativeEffectsState).toBe('unknown')
+      const preview2 = f2.flow.prepareWorkspaceArchive({
+        operationId: randomUUID(),
+        scope: { kind: 'session', sessionId: f2.sessionId },
+      })
+      expect(preview2.ok && Boolean(preview2.value.blockedReason)).toBe(true)
+      const quitPrep2 = f2.flow.prepareNativeQuit({ operationId: randomUUID() })
+      expect(quitPrep2.ok && quitPrep2.value.state).toBe('confirmation_required')
       await expect(f2.flow.dispose({ flushDeadlineAt: Date.now() + 2000 })).rejects.toThrow(
         /could not finish all output commits/u,
       )
@@ -1426,5 +1452,97 @@ it('A-F6 & A-Advisory2: preserves pending/complete background report on shutdown
     }
   } finally {
     await f3.dispose()
+  }
+
+  // 4. Carbon A-2 / B-1: Through real RunExecutor + settleKnownNativeEnding, a truncated visible prefix
+  // with verified `ended(completed)` + `turn.completed(failed)` keeps `status='failed'` and
+  // `nativeOutcome='completed'` while still allowing valid background reports.
+  const f4 = await fixture('claude')
+  try {
+    let savedInput4: AgentRunInput | undefined
+    let savedExecutor4 = ''
+    let savedNativeSession4 = ''
+    native.customRun = async function* (agentId, executorId, input) {
+      native.actors += 1
+      native.inputs.set(input.runId, input)
+      savedInput4 = input
+      savedExecutor4 = executorId
+      savedNativeSession4 = `native:${input.sessionId}`
+      input.host?.lifecycle?.recordExecutor?.(executorId)
+      input.host?.lifecycle?.recordDispatch?.('possibly_sent', savedNativeSession4, executorId)
+      yield { type: 'session.started', agentId, nativeSessionId: savedNativeSession4 }
+      input.host?.lifecycle?.recordDispatch?.('accepted', savedNativeSession4, executorId)
+      yield { type: 'turn.started', agentId, turnId: `turn:${input.runId}` }
+      native.background.add(input.runId)
+      yield {
+        type: 'text.delta',
+        agentId,
+        turnId: `turn:${input.runId}`,
+        outputId: 'answer',
+        text: 'Truncated prefix before stop',
+      }
+      input.host?.lifecycle?.recordNativeEvidence?.({
+        kind: 'ended',
+        source: 'live_terminal',
+        outcome: 'completed',
+        identity: {
+          sessionId: input.sessionId,
+          agentId,
+          runId: input.runId,
+          requestId: input.runId,
+          nativeSessionId: savedNativeSession4,
+          nativeTurnId: `turn:${input.runId}`,
+          bindingGeneration: input.bindingGeneration!,
+          executorId,
+        },
+      })
+      yield { type: 'turn.completed', agentId, turnId: `turn:${input.runId}`, outcome: 'failed' }
+    }
+    const drafts4 = f4.db.conversationRepository.readPage({
+      scope: 'drafts',
+      sessionId: f4.sessionId,
+    })
+    if (drafts4.scope !== 'drafts') throw new Error('Missing drafts')
+    const sent4 = await f4.flow.send({
+      sessionId: f4.sessionId,
+      clientMessageId: randomUUID(),
+      content: 'Truncated stop through real RunExecutor',
+      expectedCommentsRevision: drafts4.commentsRevision,
+      commentIds: [],
+      route: { type: 'agent', agentId: 'claude' },
+    })
+    if (!sent4.ok) throw new Error('Expected send to succeed')
+    const runId4 = sent4.value.runs[0]!.id
+    await vi.waitFor(() => expect(f4.flow.diagnostics().activeExecutions).toBe(0))
+    const settledRun4 = f4.db.conversationRepository.findRun(runId4)
+    expect(settledRun4?.status).toBe('failed')
+    expect(settledRun4?.nativeOutcome).toBe('completed')
+    const assistantMsg4 = f4.db.drizzle
+      .select()
+      .from(conversationMessages)
+      .where(eq(conversationMessages.runId, runId4))
+      .all()
+      .find((m) => m.role === 'assistant')
+    expect(assistantMsg4?.state).toBe('incomplete')
+    // Background report still succeeds under monotonic nativeOutcome === 'completed'!
+    await savedInput4!.host!.effects!.recordBackgroundReport!({
+      agentId: 'claude',
+      runId: runId4,
+      nativeSessionId: savedNativeSession4,
+      nativeTurnId: `turn:${runId4}`,
+      bindingGeneration: savedInput4!.bindingGeneration!,
+      executorId: savedExecutor4,
+      frameId: randomUUID(),
+      nativeMessageId: 'bg-report-after-truncated-stop',
+      text: 'Late report after truncated stop.',
+    })
+    const bgMsg4 = f4.db.conversationRepository
+      .read(f4.sessionId)
+      .messages.find((m) => isConversationBackgroundReport(m))
+    expect(bgMsg4?.state).toBe('complete')
+    expect(bgMsg4?.content).toContain('Late report after truncated stop.')
+    native.background.delete(runId4)
+  } finally {
+    await f4.dispose()
   }
 })

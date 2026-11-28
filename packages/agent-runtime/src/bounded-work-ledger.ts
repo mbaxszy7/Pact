@@ -38,6 +38,7 @@ export class BoundedBackgroundTaskTable<TMeta = undefined> {
   private readonly confirmed = new Map<string, BackgroundTaskRecord<TMeta>>()
   private readonly provisionalToConfirmed = new Map<string, string>()
   private readonly confirmedToProvisional = new Map<string, Set<string>>()
+  private readonly retiredProvisionalAliases = new Map<string, string>()
   private readonly ambientIds = new Set<string>()
   private readonly earlyCompletedIds = new Set<string>()
   private overflowedFlag = false
@@ -154,7 +155,8 @@ export class BoundedBackgroundTaskTable<TMeta = undefined> {
 
     const existingMapped =
       provisionalLaunchId !== undefined
-        ? this.provisionalToConfirmed.get(provisionalLaunchId)
+        ? (this.provisionalToConfirmed.get(provisionalLaunchId) ??
+          this.retiredProvisionalAliases.get(provisionalLaunchId))
         : undefined
     const conflictingConfirmedAlias =
       existingMapped !== undefined && existingMapped !== confirmedTaskId
@@ -184,6 +186,11 @@ export class BoundedBackgroundTaskTable<TMeta = undefined> {
       }
       if (provisionalLaunchId !== undefined && !conflictingConfirmedAlias) {
         this.unlinkProvisionalAlias(provisionalLaunchId)
+        if (this.retiredProvisionalAliases.size >= this.maxEarlyTombstones) {
+          const oldest = this.retiredProvisionalAliases.keys().next().value
+          if (oldest !== undefined) this.retiredProvisionalAliases.delete(oldest)
+        }
+        this.retiredProvisionalAliases.set(provisionalLaunchId, confirmedTaskId)
         this.recordCompletedId(provisionalLaunchId)
       }
       this.recordCompletedId(confirmedTaskId)
@@ -295,6 +302,7 @@ export class BoundedBackgroundTaskTable<TMeta = undefined> {
     this.confirmed.clear()
     this.provisionalToConfirmed.clear()
     this.confirmedToProvisional.clear()
+    this.retiredProvisionalAliases.clear()
     this.earlyCompletedIds.clear()
     this.ambientIds.clear()
     if (hadAny) this.onChange?.()

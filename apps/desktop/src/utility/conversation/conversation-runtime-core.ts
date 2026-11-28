@@ -186,6 +186,7 @@ export class ConversationRuntimeCore {
   skillDocumentOwner: SkillDocumentOwner | undefined
   readonly nativeObservations = new Map<string, NativeObservation>()
   readonly unrecordedArchiveFailures = new Map<string, { sessionId: string; error: unknown }>()
+  unrecordedArchiveFailureOverflow = false
   readonly nativeChecks = new Map<string, ActiveNativeCheck>()
   adapterSlotTail: Promise<void> = Promise.resolve()
   pendingContinuationScheduled = false
@@ -200,6 +201,7 @@ export class ConversationRuntimeCore {
   markdownTail: Promise<void> = Promise.resolve()
   markdownWorker: Worker | undefined
   disposed = false
+  drainingForClose = false
   readonly permissions = new Map<string, PendingPermissionEntry>()
   disposal: Promise<void> | undefined
   baseShutdownDone = false
@@ -1589,6 +1591,7 @@ export class ConversationRuntimeCore {
 
   recordUnrecordedArchiveFailure(runId: string, sessionId: string, error: unknown): void {
     if (this.unrecordedArchiveFailures.size >= 64 && !this.unrecordedArchiveFailures.has(runId)) {
+      this.unrecordedArchiveFailureOverflow = true
       const oldest = this.unrecordedArchiveFailures.keys().next().value
       if (oldest !== undefined) this.unrecordedArchiveFailures.delete(oldest)
     }
