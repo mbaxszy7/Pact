@@ -430,12 +430,13 @@ export function isCodexMissingThreadError(
     /\binvalid\s+params?\b/iu.test(rawMessage) ||
     /\bmissing\s+(?:required\s+)?(?:param(?:eter)?|field|argument|threadid)\b|\bthreadid\b[^\n]*\b(?:missing|required)\b/iu.test(
       rawMessage,
-    )
+    ) ||
+    /\b(?:mcp|oauth|auth|http|cookie|login|browser)\b[^\n]*\bsession\b/iu.test(rawMessage)
   ) {
     return false
   }
   if (
-    !/no rollout found|unknown thread|thread\b[^\n]*\b(?:not found|does not exist)|rollout\b[^\n]*\b(?:not found|does not exist)|saved native session[^\n]*not found|session\b[^\n]*\b(?:not found|does not exist)|conversation\b[^\n]*\bnot found/iu.test(
+    !/no rollout found|unknown thread|thread\b[^\n]*\b(?:not found|does not exist)|rollout\b[^\n]*\b(?:not found|does not exist)|saved native session[^\n]*not found|conversation\b[^\n]*\bnot found/iu.test(
       rawMessage,
     )
   ) {
@@ -443,7 +444,8 @@ export function isCodexMissingThreadError(
   }
   if (expectedThreadId) {
     const idPatterns = [
-      /(?:for\s+)?(?:thread|rollout|session|conversation)(?:\s+id)?\s*[:=]?\s*["'`]?([A-Za-z0-9._:-]+)["'`]?/giu,
+      /(?:thread|rollout|session|conversation)(?:\s+(?:id|for|of|in))*\s*[:=]?\s*["'`]?([A-Za-z0-9._:-]+)["'`]?/giu,
+      /\bfor\s+(?:(?:thread|rollout|session|conversation)\s+)?id\s*[:=]?\s*["'`]?([A-Za-z0-9._:-]+)["'`]?/giu,
       /(?:not found|does not exist)\s*[:=]\s*["'`]?([A-Za-z0-9._:-]+)["'`]?/giu,
     ]
     for (const pattern of idPatterns) {

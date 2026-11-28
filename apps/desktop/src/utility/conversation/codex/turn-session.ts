@@ -430,13 +430,17 @@ export class CodexTurnSession {
     let rootTerminalOutcome: 'completed' | 'failed' | 'interrupted' | undefined
     let foregroundTurnCompletedYielded = false
     let archivedTurnCompletedEmitted = false
-    const releaseRootStartupEarly = (): void => {
+    const releaseRootStartupEarly = (releaseUnboundStartupHooks = false): void => {
       if (!background.early.length) return
       const kept: EarlyNativeFact[] = []
       let keptBytes = 0
       for (const entry of background.early) {
-        // A-F4: Only drop root-Turn startup candidates on rejection; keep startup hooks & child facts.
-        if (entry.candidateKind === 'root_turn') {
+        // A-F4 & Carbon A-5: Drop root-Turn startup candidates on rejection; also release
+        // unbound startup hooks when thread startup itself failed without binding a thread.
+        if (
+          entry.candidateKind === 'root_turn' ||
+          (releaseUnboundStartupHooks && entry.candidateKind === 'startup_hook')
+        ) {
           entry.reservation.release()
         } else {
           kept.push(entry)
@@ -453,7 +457,7 @@ export class CodexTurnSession {
     const markRootNotStartedIfUnsent = (targetThreadId?: string): void => {
       if (background.rootNotStarted) return
       background.rootNotStarted = true
-      releaseRootStartupEarly()
+      releaseRootStartupEarly(!background.primaryThreadId)
       this.kernel.recordDispatch(
         'rejected',
         targetThreadId ?? threadId ?? input.nativeSessionId,
@@ -551,13 +555,25 @@ export class CodexTurnSession {
         return false
       }
       const child =
-        params && typeof params === 'object' ? Reflect.get(params, 'threadId') : undefined
-      const isChildOrSpawn = Boolean(
-        background.spawns.size || (typeof child === 'string' && background.parents.has(child)),
-      )
+        params && typeof params === 'object'
+          ? (Reflect.get(params, 'threadId') ?? Reflect.get(params, 'conversationId'))
+          : undefined
+      const isPrimaryThread =
+        typeof child === 'string' &&
+        background.primaryThreadId !== undefined &&
+        child === background.primaryThreadId
+      // Carbon A-5: Never re-buffer a root_turn candidate or primary-thread event as child/spawn
+      // just because pre-ACK `spawnAgent` already populated `background.spawns`.
+      const isChildOrSpawn =
+        retained?.candidateKind !== 'root_turn' &&
+        !isPrimaryThread &&
+        Boolean(
+          background.spawns.size || (typeof child === 'string' && background.parents.has(child)),
+        )
       const isStartupHookWindow =
         threadStartupDispatched &&
         !background.primaryThreadId &&
+        !background.rootNotStarted &&
         ['hook/started', 'hook/completed'].includes(String(Reflect.get(event, 'method')))
       const isPossiblyDeliveredWindow =
         (!background.foregroundReleased &&
@@ -1461,6 +1477,12 @@ export class CodexTurnSession {
         }
         return false
       })
+      const rejectServerRequest = (req: object, message: string): void => {
+        const requestId = Reflect.get(req, 'id')
+        if (typeof requestId === 'string' || typeof requestId === 'number') {
+          void nativeConnection.respondError(requestId, message).catch(() => undefined)
+        }
+      }
       releaseNativeRequests = nativeConnection.subscribeServerRequests((request) => {
         if (handleOwnedNativeEvent(request)) return true
         const method = Reflect.get(request, 'method'),
@@ -1475,36 +1497,33 @@ export class CodexTurnSession {
           background.foregroundReleased ||
           background.rootTerminal ||
           background.rootNotStarted ||
-          // A-F2: During before_dispatch startup, accept ONLY turn-less mcpServer/elicitation/request;
-          // a request carrying a turnId belongs to another Turn and must never self-authorize here.
-          (delivery.phase === 'before_dispatch' &&
-            (method !== 'mcpServer/elicitation/request' || requestedTurn != null)) ||
           typeof nativeThread !== 'string' ||
           !nativeThread ||
           nativeThread.length > 1024 ||
           ((threadId ?? provisionalThreadId) && nativeThread !== (threadId ?? provisionalThreadId))
         )
           return false
+        if (
+          delivery.phase === 'before_dispatch' &&
+          (method !== 'mcpServer/elicitation/request' || requestedTurn != null)
+        ) {
+          rejectServerRequest(request, 'This native request is not valid before Turn dispatch.')
+          return true
+        }
         provisionalThreadId ??= nativeThread
-        if (delivery.phase !== 'before_dispatch' && typeof requestedTurn === 'string') {
-          // S3-F2: Never adopt an unconfirmed pre-ACK Turn ID as root `turnId` (it may belong
-          // to an older unretired Turn on the same thread). Buffer pre-ACK candidates until
-          // `turn/start` ACK (or matching `clientUserMessageId`) confirms exact root ownership.
-          if (!turnId) {
-            return bufferEarly(request)
+        if (delivery.phase !== 'before_dispatch') {
+          if (!turnId) return bufferEarly(request)
+          if (typeof requestedTurn === 'string' && turnId !== requestedTurn) {
+            rejectServerRequest(request, 'This native request does not belong to the active Turn.')
+            return true
           }
-          if (turnId !== requestedTurn) return false
         }
         if (background.interactions.size >= 8) {
           reportUnknown('Native interactions exceeded their bounded request owner.')
-          const requestId = Reflect.get(request, 'id')
-          if (typeof requestId === 'string' || typeof requestId === 'number')
-            void nativeConnection
-              .respondError(
-                requestId,
-                'Pact cannot display another native interaction within its request budget. No approval response was sent.',
-              )
-              .catch(() => undefined)
+          rejectServerRequest(
+            request,
+            'Pact cannot display another native interaction within its request budget. No approval response was sent.',
+          )
           return true
         }
         const interaction = this.runtime.connections
@@ -1578,6 +1597,12 @@ export class CodexTurnSession {
               background.primaryThreadId = lateThreadId
               drainPendingOwnedFacts(false)
               markRootNotStartedIfUnsent(lateThreadId)
+              maybeSettle()
+            } else {
+              reportUnknown(
+                'Codex late thread startup reply carried an invalid or mismatched thread identity.',
+              )
+              markRootNotStartedIfUnsent(input.nativeSessionId)
               maybeSettle()
             }
           },
@@ -1800,7 +1825,12 @@ export class CodexTurnSession {
             lateResult && typeof lateResult === 'object' ? Reflect.get(lateResult, 'turn') : null
           const lateTurnId =
             lateTurn && typeof lateTurn === 'object' ? Reflect.get(lateTurn, 'id') : undefined
-          if (typeof lateTurnId !== 'string' || !lateTurnId || lateTurnId.length > 1024) return
+          if (typeof lateTurnId !== 'string' || !lateTurnId || lateTurnId.length > 1024) {
+            reportUnknown('Codex late turn/start reply carried an invalid Turn identity.')
+            releaseRootStartupEarly()
+            maybeSettle()
+            return
+          }
           bindRootTurn(lateTurnId, 'late_ack')
         },
       })
@@ -1966,7 +1996,16 @@ export class CodexTurnSession {
           (notificationThreadId !== threadId || notificationTurnId !== turnId)
         )
           continue
-        if (typeof notificationTurnId === 'string' && notificationTurnId !== turnId) continue
+        if (typeof notificationTurnId === 'string' && notificationTurnId !== turnId) {
+          const requestId = Reflect.get(message, 'id')
+          if (typeof requestId === 'string' || typeof requestId === 'number')
+            // oxlint-disable-next-line no-await-in-loop -- Explicitly reject an unowned native request.
+            await connection.respondError(
+              requestId,
+              'This native request does not belong to the active Turn.',
+            )
+          continue
+        }
         if (method === 'thread/name/updated') {
           const eventThreadId = Reflect.get(params, 'threadId')
           const rawTitle = Reflect.get(params, 'threadName')
@@ -2348,14 +2387,15 @@ export class CodexTurnSession {
       // A foreground deadline/error does not prove native commands or descendants stopped.
       // Actual connection loss is retired by detachConnection, not by killing a healthy server.
       if (
-        delivery.phase === 'possibly_delivered' ||
-        (delivery.phase === 'accepted' &&
-          [
-            'transient_transport',
-            'agent_process_crash',
-            'protocol_error',
-            'response_too_large',
-          ].includes(failure.kind))
+        !background.rootTerminal &&
+        (delivery.phase === 'possibly_delivered' ||
+          (delivery.phase === 'accepted' &&
+            [
+              'transient_transport',
+              'agent_process_crash',
+              'protocol_error',
+              'response_too_large',
+            ].includes(failure.kind)))
       ) {
         throw new AgentExecutionError(
           'unknown_delivery',

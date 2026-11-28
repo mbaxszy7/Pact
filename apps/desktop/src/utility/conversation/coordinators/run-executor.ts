@@ -1274,30 +1274,24 @@ export class RunExecutor {
               return
             }
             if (!stillOwned() || report.runId !== run.id || report.generation !== generation) return
-            // A-4: Never write `settled` to SQLite when archive output persistence failed or
-            // failed to record; retry recording output failure and converge effects to `unknown`.
+            // A-4: When `recordOutputFailure` failed to persist into SQLite (`failureRecordingError`),
+            // retry recording it before settling effects; if it still cannot persist, converge to `unknown`
+            // so SQLite never shows clean `settled` with zero persistence-failure evidence.
             let effectiveState = report.state
             let effectiveReason = report.reason
-            if (
-              report.state === 'settled' &&
-              (owner.archiver.outputFailure !== undefined ||
-                owner.archiver.failureRecordingError !== undefined)
-            ) {
-              effectiveState = 'unknown'
-              effectiveReason =
-                owner.archiver.outputFailure?.message ??
-                'Output archive persistence failed before native effects settled.'
-              if (owner.archiver.failureRecordingError !== undefined) {
-                try {
-                  const failure =
-                    owner.archiver.outputFailure ??
-                    classifyAgentError(owner.archiver.failureRecordingError)
-                  this.core.publish(this.core.conversations.recordOutputFailure(run.id, failure))
-                  owner.archiver.clearFailureRecordingError()
-                  this.core.unrecordedArchiveFailures.delete(run.id)
-                } catch {
-                  // Keep unrecordedArchiveFailures / failureRecordingError latched fail-closed.
-                }
+            if (report.state === 'settled' && owner.archiver.failureRecordingError !== undefined) {
+              try {
+                const failure =
+                  owner.archiver.outputFailure ??
+                  classifyAgentError(owner.archiver.failureRecordingError)
+                this.core.publish(this.core.conversations.recordOutputFailure(run.id, failure))
+                owner.archiver.clearFailureRecordingError()
+                this.core.unrecordedArchiveFailures.delete(run.id)
+              } catch {
+                effectiveState = 'unknown'
+                effectiveReason =
+                  owner.archiver.outputFailure?.message ??
+                  'Output archive failure could not be recorded before native effects settled.'
               }
             }
             if (owner.backgroundStop && effectiveState !== 'pending') {

@@ -1498,6 +1498,27 @@ describe('CodexTurnSession Astra Shard 3 audit regressions', () => {
       expectedKind: 'protocol_error',
     },
     {
+      name: 'MCP startup session not found does NOT mark saved thread missing',
+      response: {
+        error: { code: -32_000, message: 'MCP server startup failed: session not found' },
+      },
+      expectedKind: 'agent_process_crash',
+    },
+    {
+      name: 'Foreign thread after preposition ("thread for th-other") does NOT mark saved thread missing',
+      response: {
+        error: { code: -32_600, message: 'thread for th-completely-other does not exist' },
+      },
+      expectedKind: 'agent_process_crash',
+    },
+    {
+      name: 'Foreign rollout after "for id" ("no rollout found for id th-other") does NOT mark saved thread missing',
+      response: {
+        error: { code: -32_600, message: 'no rollout found for id th-completely-other' },
+      },
+      expectedKind: 'agent_process_crash',
+    },
+    {
       name: 'Rollout missing error naming a DIFFERENT thread ID does NOT mark saved thread missing',
       response: {
         error: { code: -32_600, message: 'no rollout found for thread id th-completely-other' },
@@ -1530,5 +1551,346 @@ describe('CodexTurnSession Astra Shard 3 audit regressions', () => {
     expect(caught).toBeInstanceOf(AgentExecutionError)
     expect((caught as AgentExecutionError).kind).toBe(expectedKind)
     expect(harness.sent.filter((msg) => msg.method === 'turn/start')).toHaveLength(0)
+  })
+
+  it('Carbon A-5: evicts stale pre-ACK root_turn requests even when pre-ACK spawnAgent activates spawns, and clears unbound startup_hook on thread/start error', async () => {
+    // Part 1: Pre-ACK stale `turn-old` request + pre-ACK `turn-new` spawnAgent -> stale request
+    // immediately receives respondError and Run settles immediately (zero 30s hang / zero unknown).
+    {
+      const effects: Array<{ state: string; reason?: string | undefined }> = []
+      const harness = createFakeCodexProcess((request, respond, notify) => {
+        if (request.method === 'thread/start') {
+          respond({ id: request.id, result: defaultThreadStartResult('th-ca5') })
+        } else if (request.method === 'turn/start') {
+          // 1) Stale old-turn request arrives pre-ACK on primary thread.
+          notify({
+            id: 'stale-ca5-req',
+            method: 'item/commandExecution/requestApproval',
+            params: {
+              threadId: 'th-ca5',
+              turnId: 'turn-old-ca5',
+              itemId: 'cmd-old',
+              command: 'echo stale',
+            },
+          })
+          // 2) Pre-ACK spawnAgent for the NEW turn activates `background.spawns`.
+          notify({
+            method: 'item/started',
+            params: {
+              threadId: 'th-ca5',
+              turnId: 'turn-new-ca5',
+              item: {
+                id: 'spawn-ca5',
+                type: 'collabAgentToolCall',
+                tool: 'spawnAgent',
+                status: 'inProgress',
+                senderThreadId: 'th-ca5',
+                receiverThreadIds: ['child-ca5'],
+                agentsStates: { 'child-ca5': { status: 'running' } },
+              },
+            },
+          })
+          respond({ id: request.id, result: { turn: { id: 'turn-new-ca5' } } })
+          notify({
+            method: 'item/completed',
+            params: {
+              threadId: 'th-ca5',
+              turnId: 'turn-new-ca5',
+              item: {
+                id: 'spawn-ca5',
+                type: 'collabAgentToolCall',
+                tool: 'spawnAgent',
+                status: 'completed',
+                senderThreadId: 'th-ca5',
+                receiverThreadIds: ['child-ca5'],
+                agentsStates: { 'child-ca5': { status: 'completed' } },
+              },
+            },
+          })
+          notify({
+            method: 'turn/completed',
+            params: { threadId: 'th-ca5', turn: { id: 'turn-new-ca5', status: 'completed' } },
+          })
+        }
+      })
+      const adapter = new CodexAgentAdapter('/fake/codex', () => harness.child)
+      openAdapters.push(adapter)
+      const input = baseRunInput({
+        host: {
+          effects: {
+            reportNativeEffects: (r) => effects.push({ state: r.state, reason: r.reason }),
+          },
+        },
+      })
+      for await (const ev of adapter.run(input, new AbortController().signal)) {
+        void ev
+      }
+      await vi.waitFor(() => {
+        expect(harness.sent.some((m) => m.id === 'stale-ca5-req' && 'error' in m)).toBe(true)
+        expect(adapter.hasActiveBackgroundWork(input.runId)).toBe(false)
+      })
+      expect(effects.some((e) => e.state === 'unknown')).toBe(false)
+      expect(effects.at(-1)).toMatchObject({ state: 'settled' })
+    }
+
+    // Part 2: thread/start emits hook/started then returns RPC error -> releases immediately with 0 unknown!
+    {
+      const effects: Array<{ state: string; reason?: string | undefined }> = []
+      const harness = createFakeCodexProcess((request, respond, notify) => {
+        if (request.method === 'thread/start') {
+          notify({
+            method: 'hook/started',
+            params: { threadId: 'th-ca5-fail', run: { id: 'hook-ca5-fail', status: 'running' } },
+          })
+          respond({ id: request.id, error: { code: -32_000, message: 'Startup failed cleanly' } })
+        }
+      })
+      const adapter = new CodexAgentAdapter('/fake/codex', () => harness.child)
+      openAdapters.push(adapter)
+      const input = baseRunInput({
+        host: {
+          effects: {
+            reportNativeEffects: (r) => effects.push({ state: r.state, reason: r.reason }),
+          },
+        },
+      })
+      await expect(
+        (async () => {
+          for await (const ev of adapter.run(input, new AbortController().signal)) void ev
+        })(),
+      ).rejects.toThrow(/Startup failed cleanly/u)
+      await vi.waitFor(() => expect(adapter.hasActiveBackgroundWork(input.runId)).toBe(false))
+      expect(effects.some((e) => e.state === 'unknown')).toBe(false)
+    }
+  })
+
+  it('Carbon A-6: explicitly rejects before_dispatch non-elicitation execCommandApproval & stale turnId elicitation without leaking into notificationQueue', async () => {
+    const requestPermission = vi.fn<() => Promise<string>>(async () => 'allow')
+    const requestUserInput = vi.fn<
+      () => Promise<{ action: 'accept'; values: Record<string, string> }>
+    >(async () => ({ action: 'accept', values: {} }))
+    const harness = createFakeCodexProcess((request, respond, notify) => {
+      if (request.method === 'thread/resume') {
+        // Inject both turn-less legacy execCommandApproval and stale-turnId elicitation BEFORE turn/start!
+        notify({
+          id: 'before-dispatch-exec',
+          method: 'execCommandApproval',
+          params: { conversationId: 'th-ca6', callId: 'c1', command: ['rm', '-rf', '/'] },
+        })
+        notify({
+          id: 'before-dispatch-stale-elic',
+          method: 'mcpServer/elicitation/request',
+          params: { threadId: 'th-ca6', turnId: 'turn-old-ca6', message: 'Stale form' },
+        })
+        respond({ id: request.id, result: defaultThreadStartResult('th-ca6') })
+      } else if (request.method === 'turn/start') {
+        respond({ id: request.id, result: { turn: { id: 'turn-ca6' } } })
+        notify({
+          method: 'item/completed',
+          params: {
+            threadId: 'th-ca6',
+            turnId: 'turn-ca6',
+            item: { id: 'msg-ca6', type: 'agentMessage', text: 'Clean answer.' },
+          },
+        })
+        notify({
+          method: 'turn/completed',
+          params: { threadId: 'th-ca6', turn: { id: 'turn-ca6', status: 'completed' } },
+        })
+      }
+    })
+    const adapter = new CodexAgentAdapter('/fake/codex', () => harness.child)
+    openAdapters.push(adapter)
+    const input = baseRunInput({
+      nativeSessionId: 'th-ca6',
+      host: {
+        interactions: {
+          requestPermission,
+          requestUserInput,
+        },
+      },
+    })
+    for await (const ev of adapter.run(input, new AbortController().signal)) void ev
+    expect(requestPermission).not.toHaveBeenCalled()
+    expect(requestUserInput).not.toHaveBeenCalled()
+    expect(harness.sent.some((m) => m.id === 'before-dispatch-exec' && 'error' in m)).toBe(true)
+    expect(harness.sent.some((m) => m.id === 'before-dispatch-stale-elic' && 'error' in m)).toBe(
+      true,
+    )
+  })
+
+  it('Carbon A-7: archived terminal snapshot replaces streaming prefix in SQLite, and error(willRetry:false) after rootTerminal preserves exact error kind', async () => {
+    // Part 1: Real SQLite — streaming prefix `M1` (`state='streaming'`) is replaced by archived complete snapshot `M2`!
+    {
+      const { repo, sessionId } = await openTestDatabase()
+      const started = repo.beginRun({
+        sessionId,
+        clientMessageId: randomUUID(),
+        content: 'Streaming prefix + archived snapshot replacement',
+        expectedCommentsRevision: 0,
+        commentIds: [],
+        agentId: 'codex',
+        settingsRevision: 1,
+        model: null,
+        effort: null,
+      })
+      const unblockFile = Promise.withResolvers<void>()
+      const fileStarted = Promise.withResolvers<void>()
+      const terminalObserved = Promise.withResolvers<void>()
+      let notifyRef: Send | undefined
+      const harness = createFakeCodexProcess((request, respond, notify) => {
+        notifyRef = notify
+        if (request.method === 'thread/start') {
+          respond({ id: request.id, result: defaultThreadStartResult('th-ca7') })
+        } else if (request.method === 'turn/start') {
+          respond({ id: request.id, result: { turn: { id: 'turn-ca7' } } })
+        }
+      })
+      const adapter = new CodexAgentAdapter('/fake/codex', () => harness.child)
+      openAdapters.push(adapter)
+      const abort = new AbortController()
+      const input = baseRunInput({
+        runId: started.run.id,
+        sessionId,
+        nativeGeneration: started.run.id,
+        bindingGeneration: started.run.bindingGeneration ?? 1,
+        host: {
+          lifecycle: {
+            recordExecutor: (ex) => repo.recordExecutor(started.run.id, ex),
+            recordDispatch: (p, sid, ex) => repo.recordDispatch(started.run.id, p, sid, ex),
+            recordNativeEvidence: (entry) => {
+              repo.recordNativeEvidence(entry)
+              if (entry.kind === 'ended') terminalObserved.resolve()
+            },
+          },
+          effects: {
+            recordFileChange: async () => {
+              fileStarted.resolve()
+              await unblockFile.promise
+            },
+            recordArchivedEvent: (ev) => {
+              repo.applyArchivedEvent(sessionId, started.run.id, ev)
+            },
+          },
+        },
+      })
+      const runPromise = (async () => {
+        for await (const ev of adapter.run(input, abort.signal)) {
+          repo.applyEvent(sessionId, started.run.id, ev)
+          if (ev.type === 'turn.started') {
+            notifyRef?.({
+              method: 'item/agentMessage/delta',
+              params: {
+                threadId: 'th-ca7',
+                turnId: 'turn-ca7',
+                itemId: 'ans-ca7',
+                delta: 'Prefix ',
+              },
+            })
+            notifyRef?.({
+              method: 'item/completed',
+              params: {
+                threadId: 'th-ca7',
+                turnId: 'turn-ca7',
+                item: {
+                  id: 'fc-ca7',
+                  type: 'fileChange',
+                  status: 'completed',
+                  changes: [{ path: '/project/a.ts', kind: { type: 'update' } }],
+                },
+              },
+            })
+            notifyRef?.({
+              method: 'item/completed',
+              params: {
+                threadId: 'th-ca7',
+                turnId: 'turn-ca7',
+                item: {
+                  id: 'ans-ca7',
+                  type: 'agentMessage',
+                  text: 'Prefix and full final answer.',
+                },
+              },
+            })
+            notifyRef?.({
+              method: 'turn/completed',
+              params: { threadId: 'th-ca7', turn: { id: 'turn-ca7', status: 'completed' } },
+            })
+          }
+        }
+      })()
+      await fileStarted.promise
+      await terminalObserved.promise
+      abort.abort()
+      unblockFile.resolve()
+      await expect(runPromise).rejects.toThrow(/interrupted/u)
+      const page = repo.readPage({ scope: 'messages', sessionId })
+      expect(page.scope).toBe('messages')
+      if (page.scope !== 'messages') throw new Error('expected messages page')
+      const visibleAssistant = page.messages.filter((entry) => entry.message.role === 'assistant')
+      expect(visibleAssistant).toHaveLength(1)
+      expect(visibleAssistant[0]?.kind).toBe('complete')
+      expect(visibleAssistant[0]?.message.state).toBe('complete')
+      expect(
+        visibleAssistant[0]?.kind === 'complete' ? visibleAssistant[0].message.content : undefined,
+      ).toBe('Prefix and full final answer.')
+    }
+
+    // Part 2: `error(willRetry:false)` + `turn/completed(failed)` arriving together preserves exact error kind (NOT unknown_delivery)!
+    {
+      const terminalObserved = Promise.withResolvers<void>()
+      const harness = createFakeCodexProcess((request, respond) => {
+        if (request.method === 'thread/start') {
+          respond({ id: request.id, result: defaultThreadStartResult('th-ca7-err') })
+        } else if (request.method === 'turn/start') {
+          respond({ id: request.id, result: { turn: { id: 'turn-ca7-err' } } })
+        }
+      })
+      const adapter = new CodexAgentAdapter('/fake/codex', () => harness.child)
+      openAdapters.push(adapter)
+      let caught: unknown
+      try {
+        for await (const ev of adapter.run(
+          baseRunInput({
+            host: {
+              lifecycle: {
+                recordNativeEvidence: (entry) => {
+                  if (entry.kind === 'ended' && entry.outcome === 'failed') {
+                    terminalObserved.resolve()
+                  }
+                },
+              },
+            },
+          }),
+          new AbortController().signal,
+        )) {
+          if (ev.type === 'turn.started') {
+            ;(harness.child.stdout as PassThrough).write(
+              `${JSON.stringify({
+                method: 'error',
+                params: {
+                  threadId: 'th-ca7-err',
+                  turnId: 'turn-ca7-err',
+                  willRetry: false,
+                  error: { message: 'Upstream gateway 503', codexErrorInfo: 'other' },
+                },
+              })}\n${JSON.stringify({
+                method: 'turn/completed',
+                params: {
+                  threadId: 'th-ca7-err',
+                  turn: { id: 'turn-ca7-err', status: 'failed' },
+                },
+              })}\n`,
+            )
+            await terminalObserved.promise
+          }
+        }
+      } catch (err) {
+        caught = err
+      }
+      expect(caught).toBeInstanceOf(AgentExecutionError)
+      expect((caught as AgentExecutionError).kind).toBe('transient_transport')
+      expect((caught as AgentExecutionError).message).toContain('Upstream gateway 503')
+    }
   })
 })
