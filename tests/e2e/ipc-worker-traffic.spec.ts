@@ -150,7 +150,7 @@ test(
         })
         expect(during.ok).toBe(true)
         if (!during.ok) throw new Error('Missing measured health.')
-        expect(during.value.ipcTraffic?.owners).toHaveLength(9)
+        expect(during.value.ipcTraffic?.owners).toHaveLength(10)
         const monaco = during.value.ipcTraffic?.owners.find(
           (owner) => owner.owner === 'renderer-monaco',
         )

@@ -289,9 +289,14 @@ export function WorkspaceShell({
       ? centerPanelElement?.getBoundingClientRect().left
       : undefined
     if (!isNavigationVisible) {
-      const currentWidth =
-        navigationPanelElement?.getBoundingClientRect().width || panel.getSize().inPixels
-      freezePanelContent(navigationPanelElement, currentWidth, lastNavigationPanelWidthRef)
+      const frozenWidth = navigationPanelElement?.style
+        .getPropertyValue('--workspace-panel-content-width')
+        .trim()
+      if (!frozenWidth) {
+        const currentWidth =
+          navigationPanelElement?.getBoundingClientRect().width || panel.getSize().inPixels
+        freezePanelContent(navigationPanelElement, currentWidth, lastNavigationPanelWidthRef)
+      }
       panel.collapse()
     } else if (viewport === 'wide' && navigationPanelElement) {
       navigationPanelElement.style.removeProperty('--workspace-panel-content-width')
@@ -460,6 +465,11 @@ export function WorkspaceShell({
 
   const closeNavigation = (): void => {
     if (!navigationAvailable) return
+    const currentWidth =
+      navigationPanelElement?.getBoundingClientRect().width ||
+      navigationPanelRef.current?.getSize().inPixels ||
+      0
+    freezePanelContent(navigationPanelElement, currentWidth, lastNavigationPanelWidthRef)
     restoreNavigationToggleFocus.current = true
     setLayoutState((state) => ({ ...state, navigationPanel: 'closed' }))
   }

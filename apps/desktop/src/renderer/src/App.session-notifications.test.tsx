@@ -384,4 +384,33 @@ describe('App Session notification visibility & Settings toggle', () => {
     )
     await screen.findByText('Pact 0.5.0 is available. See About & updates.')
   })
+
+  it('reconciles window focus on focusin when focus was acquired without a DOM window focus event', async () => {
+    let focused = false
+    vi.spyOn(document, 'hasFocus').mockImplementation(() => focused)
+    const context = setup()
+    const [, sessionB] = context.sessions
+
+    const openA = await screen.findByRole('button', { name: 'Open Session Session A' })
+    fireEvent.click(openA)
+
+    // Window becomes focused without dispatching a window-level focus event; interacting inside
+    // the document reconciles windowFocused via focusin so background reminders are not hidden.
+    focused = true
+    fireEvent.focusIn(openA)
+    context.pushReminder(
+      {
+        id: 'rem-reconciled',
+        sessionId: sessionB!.id,
+        sessionTitle: 'Session B',
+        agentId: 'codex',
+        category: 'completed',
+        priority: 1,
+        createdAt: timestamp,
+      },
+      1,
+      1,
+    )
+    expect(screen.getByText('Codex · Finished')).not.toBeNull()
+  })
 })

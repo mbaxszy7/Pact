@@ -283,6 +283,14 @@ test(
       await expect(window.locator('.agent-activity-reveal li')).toHaveCount(50)
       const collapse = window.getByRole('button', { name: 'Collapse work log' })
       await expect(collapse).toBeVisible()
+      await window.waitForFunction(() => {
+        const reveal = document.querySelector<HTMLElement>('.agent-activity-reveal')
+        const inner = reveal?.firstElementChild
+        if (!reveal || !(inner instanceof HTMLElement)) return false
+        return (
+          inner.scrollHeight > 0 && reveal.getBoundingClientRect().height >= inner.scrollHeight - 1
+        )
+      })
       await collapse.scrollIntoViewIfNeeded()
       await expect(collapse).toBeInViewport()
       const headerBounds = await workLog.boundingBox()

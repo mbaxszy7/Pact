@@ -628,6 +628,22 @@ function journey(
           ],
         }
       : {}),
+    ...(file === 'workspace-shell.spec.ts' &&
+    title === 'keeps Project navigation left of the workspace at the minimum supported width'
+      ? {
+          contractUpdates: [
+            {
+              originalLine: 134,
+              reason:
+                'The accepted floating porcelain sheet layout applies --pact-sheet-gap (8px) left inset to the workspace when navigation collapses. Preserve exact sheet-gap value and collapsed workspace-left alignment; navigation x=0, zero separator width, zero root scroll, and reopen overflow obligations remain unchanged.',
+              replacementAssertions: [
+                'expect(collapsed.sheetGap).toBe(8)',
+                'expect(collapsed.workspace[0]).toBeCloseTo(collapsed.sheetGap, 0)',
+              ],
+            },
+          ],
+        }
+      : {}),
     ...(file === 'agent-handoff.spec.ts' &&
     title === '@all preserves ordered distinct Agent rows while the second response is pending'
       ? {

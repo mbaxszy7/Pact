@@ -65,8 +65,12 @@ export function useWindowPresence({
   const nativeOpeningQueueRef = useRef<NativeOpeningQueue>({ active: true, pending: [] })
 
   useEffect(() => {
-    const updateVisibility = (): void => setDocumentVisible(!document.hidden)
+    const updateVisibility = (): void => {
+      setDocumentVisible(!document.hidden)
+      setWindowFocused(document.hasFocus())
+    }
     const updateFocus = (): void => setWindowFocused(document.hasFocus())
+    updateVisibility()
     const refreshRuntime = (): void => {
       if (document.hidden) return
       const state = queryClient.getQueryState<RuntimePreparation>(
@@ -83,11 +87,13 @@ export function useWindowPresence({
       )
     }
     document.addEventListener('visibilitychange', updateVisibility)
+    document.addEventListener('focusin', updateFocus)
     window.addEventListener('focus', updateFocus)
     window.addEventListener('blur', updateFocus)
     window.addEventListener('focus', refreshRuntime)
     return () => {
       document.removeEventListener('visibilitychange', updateVisibility)
+      document.removeEventListener('focusin', updateFocus)
       window.removeEventListener('focus', updateFocus)
       window.removeEventListener('blur', updateFocus)
       window.removeEventListener('focus', refreshRuntime)

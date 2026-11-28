@@ -699,10 +699,14 @@ for (const width of [1440, 1000])
         f.page.getByRole('button', { name: 'Implement plan · Claude Code', exact: true }),
       ).toBeEnabled()
       await closeContextOverlay(f.page)
+      const plan = f.page.getByRole('region', { name: 'Current plan', exact: true })
+      if (width === 1440 && (await plan.isVisible())) {
+        await f.page.getByRole('button', { name: 'Plan', exact: true }).click()
+        await expect(plan).toHaveCount(0)
+      }
       const composer = f.page.getByRole('combobox', { name: 'Message', exact: true })
       await composer.fill('Ordinary message draft must survive Plan reading.')
       await f.page.getByRole('button', { name: 'Plan', exact: true }).click()
-      const plan = f.page.getByRole('region', { name: 'Current plan', exact: true })
       await expect(plan).toContainText('Keep cancellation with its owner.')
       if (width === 1440) {
         await f.page.getByRole('button', { name: 'Hide navigation panel', exact: true }).click()

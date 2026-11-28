@@ -115,6 +115,7 @@ test(
         navigation: number[]
         rootScroll: number[]
         workspace: number[]
+        sheetGap: number
       }> =>
         window.evaluate(() => {
           const navigation = document.querySelector<HTMLElement>('[aria-label="Navigation"]')
@@ -122,10 +123,14 @@ test(
           if (!navigation || !workspace) throw new Error('Constrained topology target missing.')
           const navigationBounds = navigation.getBoundingClientRect()
           const workspaceBounds = workspace.getBoundingClientRect()
+          const sheetGap = Number.parseFloat(
+            getComputedStyle(document.documentElement).getPropertyValue('--pact-sheet-gap'),
+          )
           return {
             navigation: [navigationBounds.left, navigationBounds.right],
             workspace: [workspaceBounds.left, workspaceBounds.right],
             rootScroll: [document.documentElement.scrollLeft, document.documentElement.scrollTop],
+            sheetGap: Number.isFinite(sheetGap) ? sheetGap : 0,
           }
         })
 
@@ -148,7 +153,8 @@ test(
         .toBeLessThan(1)
       await expect(separator).toHaveCSS('width', '0px')
       const collapsed = await readTopology()
-      expect(collapsed.workspace[0]).toBeCloseTo(0, 0)
+      expect(collapsed.sheetGap).toBe(8)
+      expect(collapsed.workspace[0]).toBeCloseTo(collapsed.sheetGap, 0)
       expect(collapsed.rootScroll).toEqual([0, 0])
 
       await window.getByRole('button', { name: 'Show navigation panel' }).click()
