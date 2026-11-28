@@ -35,12 +35,12 @@ vi.mock('node:worker_threads', async (original) => {
   }
 })
 
-import type {
-  AgentNativeProbeInput,
-  AgentNativeContextRebuildInput,
-  AgentRunInput,
+import {
+  createRunStopAbortReason,
+  type AgentNativeProbeInput,
+  type AgentNativeContextRebuildInput,
+  type AgentRunInput,
 } from '@pact/agent-runtime'
-
 import { collaborationSourceWireResultSchema } from '@pact/contracts'
 import { PactDatabase } from '@pact/persistence'
 
@@ -5715,4 +5715,92 @@ it('roundtrips actual immutable current and historical Sources through SDK and n
     await fixture?.dispose()
     db.close()
   }
+})
+
+describe('Claude Clean User Stop settlement (L1 & PID lock release)', () => {
+  it('awaits both interrupted terminal receipt and physical child PID close(1, null) before resolving cleanly', async () => {
+    const f = cancellationFixture()
+    try {
+      await f.ready()
+      let resolved = false
+      const done = f.outcome.then((value) => {
+        resolved = true
+        return value
+      })
+      f.controller.abort(createRunStopAbortReason('user_stop'))
+      f.finishResult({
+        done: false,
+        value: {
+          type: 'result',
+          subtype: 'error_during_execution',
+          is_error: true,
+          terminal_reason: 'aborted_tools',
+          errors: ['Interrupted'],
+          session_id: 'claude-session-1',
+          user_message_uuid: runInput().runId,
+        } as SDKMessage,
+      })
+      await vi.waitFor(() =>
+        expect(f.evidence).toHaveBeenCalledWith(
+          expect.objectContaining({ kind: 'ended', outcome: 'interrupted' }),
+        ),
+      )
+      // Child PID has NOT exited yet (~/.claude/sessions/<pid>.json still locked) -> run MUST NOT resolve!
+      await new Promise((r) => setTimeout(r, 40))
+      expect(resolved).toBe(false)
+
+      // Child exits with code 1 and signal null (L1) -> now run settles cleanly with ZERO spurious unknown!
+      f.child.emit('close', 1, null)
+      await expect(done).resolves.toBeUndefined()
+      expect(f.adapter.diagnostics()).toEqual({ activeQueries: 0, activeSessions: 0 })
+      expect(f.report.mock.calls.some(([entry]) => entry && entry.state === 'unknown')).toBe(false)
+      expect(f.report).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'settled' }))
+    } finally {
+      await f.dispose()
+    }
+  })
+
+  it('locks L3 unknown on SIGKILL exit or expired monotonic user_stop deadline', async () => {
+    // 1. SIGKILL (non-null signal) MUST NOT satisfy L1 normal settlement.
+    const f1 = cancellationFixture()
+    try {
+      await f1.ready()
+      f1.controller.abort(createRunStopAbortReason('user_stop'))
+      f1.finishResult({
+        done: false,
+        value: {
+          type: 'result',
+          subtype: 'error_during_execution',
+          is_error: true,
+          terminal_reason: 'aborted_tools',
+          errors: ['Interrupted'],
+          session_id: 'claude-session-1',
+          user_message_uuid: runInput().runId,
+        } as SDKMessage,
+      })
+      await vi.waitFor(() =>
+        expect(f1.evidence).toHaveBeenCalledWith(
+          expect.objectContaining({ kind: 'ended', outcome: 'interrupted' }),
+        ),
+      )
+      f1.child.emit('close', null, 'SIGKILL')
+      await vi.waitFor(() =>
+        expect(f1.report).toHaveBeenCalledWith(expect.objectContaining({ state: 'unknown' })),
+      )
+    } finally {
+      await f1.dispose()
+    }
+
+    // 2. Expired monotonic deadline when child hangs -> reports unknown and does not hang.
+    const f2 = cancellationFixture()
+    try {
+      await f2.ready()
+      f2.controller.abort(createRunStopAbortReason('user_stop', performance.now() + 80))
+      const result = await f2.outcome
+      expect(result).toMatchObject({ kind: 'unknown_delivery' })
+      expect(f2.report).toHaveBeenCalledWith(expect.objectContaining({ state: 'unknown' }))
+    } finally {
+      await f2.dispose()
+    }
+  })
 })

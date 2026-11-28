@@ -108,7 +108,7 @@ export const normalizedAgentEventSchema = z.discriminatedUnion('type', [
     toolName: z.string().trim().min(1).max(120),
     title: z.string().trim().min(1).max(160),
     detail: z.string().trim().max(500).optional(),
-    outcome: z.enum(['completed', 'failed']),
+    outcome: z.enum(['completed', 'failed', 'interrupted']),
   }),
   z.strictObject({
     ...turnEvent,

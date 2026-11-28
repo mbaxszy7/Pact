@@ -823,15 +823,26 @@ export class CodexConnectionManager implements CodexConnectionManagerPort {
     commands: Map<string, string | undefined>,
     stopSignal?: AbortSignal,
     terminalsOnly = false,
-  ): Promise<void> {
+    options?: {
+      deadlineAt?: number
+      onCommandTerminated?: (id: string) => void
+    },
+  ): Promise<ReadonlySet<string>> {
     const interruptingChild =
       threadId !== background.primaryThreadId ? { threadId, turnId, terminal: false } : undefined
     if (interruptingChild && background.interruptingChild)
       throw new Error('An exact Codex child interruption is already pending.')
     if (interruptingChild) background.interruptingChild = interruptingChild
     const deadline = new AbortController()
+    const externalDeadlineAt = options?.deadlineAt
+    const remainingBudgetMs = (): number =>
+      externalDeadlineAt !== undefined
+        ? Math.max(0, Math.ceil(externalDeadlineAt - performance.now()))
+        : Math.max(0, expiresAt - Date.now())
     const expiresAt = Date.now() + CODEX_STOP_TIMEOUT_MS
-    const timer = setTimeout(() => deadline.abort(), CODEX_STOP_TIMEOUT_MS)
+    const initialBudgetMs =
+      externalDeadlineAt !== undefined ? Math.max(1, remainingBudgetMs()) : CODEX_STOP_TIMEOUT_MS
+    const timer = setTimeout(() => deadline.abort(), initialBudgetMs)
     const signal = AbortSignal.any([
       deadline.signal,
       background.observation.signal,
@@ -858,10 +869,14 @@ export class CodexConnectionManager implements CodexConnectionManagerPort {
       connection.isOpen
     const request = async (method: string, params: object): Promise<object | undefined> => {
       if (!current()) throw new Error('Native interruption ownership is no longer current.')
+      const rpcTimeoutMs =
+        externalDeadlineAt !== undefined
+          ? Math.max(1, remainingBudgetMs())
+          : Math.max(1, Math.min(2_000, remainingBudgetMs()))
       let response: object
       try {
         response = await connection.request(method, params, {
-          timeoutMs: Math.max(1, Math.min(2_000, expiresAt - Date.now())),
+          timeoutMs: rpcTimeoutMs,
           signal,
           canDispatch: current,
         })
@@ -889,7 +904,7 @@ export class CodexConnectionManager implements CodexConnectionManagerPort {
       cursorBytes = 0
     try {
       if (!terminalsOnly) await request('turn/interrupt', { threadId, turnId })
-      if (!commands.size) return
+      if (!commands.size) return new Set<string>()
       for (let page = 0; ; page += 1) {
         if (page >= CODEX_STOP_COMMANDS)
           throw new Error('Native terminal discovery exceeded its page limit.')
@@ -948,22 +963,36 @@ export class CodexConnectionManager implements CodexConnectionManagerPort {
       for (const id of commands.keys())
         if (!handles.has(id) && background.operations.has(JSON.stringify([threadId, turnId, id])))
           throw new Error('A stopped native command has no authoritative terminal handle.')
-      for (const handle of handles.values()) {
+      const confirmedTerminatedIds = new Set<string>()
+      let firstTerminateError: unknown
+      for (const [id, handle] of handles.entries()) {
         // One write per authoritative handle, no retries after unknown delivery.
-        // oxlint-disable-next-line no-await-in-loop -- Native writes are deliberately serial, owned, and never retried after unknown delivery.
-        const response = await request('thread/backgroundTerminals/terminate', {
-          threadId,
-          processId: handle,
-        })
-        const result = response && Reflect.get(response, 'result')
-        if (
-          !result ||
-          typeof result !== 'object' ||
-          typeof Reflect.get(result, 'terminated') !== 'boolean'
-        )
-          throw new Error('Native command termination returned an invalid acknowledgement.')
+        // Record each positive `{ terminated: true }` proof immediately so a later sibling
+        // RPC failure cannot erase already-confirmed command terminations.
+        try {
+          // oxlint-disable-next-line no-await-in-loop -- Native writes are deliberately serial, owned, and never retried after unknown delivery.
+          const response = await request('thread/backgroundTerminals/terminate', {
+            threadId,
+            processId: handle,
+          })
+          const result = response && Reflect.get(response, 'result')
+          if (
+            !result ||
+            typeof result !== 'object' ||
+            typeof Reflect.get(result, 'terminated') !== 'boolean'
+          )
+            throw new Error('Native command termination returned an invalid acknowledgement.')
+          if (Reflect.get(result, 'terminated') === true) {
+            confirmedTerminatedIds.add(id)
+            options?.onCommandTerminated?.(id)
+          }
+        } catch (error) {
+          firstTerminateError ??= error
+        }
         // Only real item/turn receipts can release effects and record an ending.
       }
+      if (firstTerminateError !== undefined) throw firstTerminateError
+      return confirmedTerminatedIds
     } finally {
       if (background.interruptingChild === interruptingChild)
         background.interruptingChild = undefined

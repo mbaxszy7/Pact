@@ -12,7 +12,14 @@ import type {
   RuntimeAgentId,
 } from '@pact/contracts'
 
-import { RunLifecycleKernel, validateSourceGrant } from '@pact/agent-runtime'
+import {
+  awaitWithinStopBudget,
+  readRunStopAbortReason,
+  remainingStopBudgetMs,
+  RunLifecycleKernel,
+  type RunStopAbortReason,
+  validateSourceGrant,
+} from '@pact/agent-runtime'
 import {
   collaborationOpenPlanPublishAllowed,
   collaborationPlanRetentionAllowed,
@@ -26,6 +33,7 @@ import { recordDiagnostic } from '../../../diagnostics/utility-log'
 import {
   AgentExecutionError,
   classifyAgentError,
+  isUserStopCancellationError,
   NativeCapacityError,
   NativeInputWithheldError,
   PermissionModeRejectedError,
@@ -149,6 +157,11 @@ export class ClaudeTurnSession {
 
   private readonly recordings = new Set<Promise<void>>()
   private recordingTail = Promise.resolve()
+  private readonly actorExitWaiters = new Set<() => void>()
+  private actorExitCode: number | null = null
+  private actorExitSignal: NodeJS.Signals | null = null
+  private interruptConfirmed = false
+  private drainTask: Promise<void> | undefined
   private readonly reasoningBlocks = new Map<
     number,
     { activityId: string; text: string; bytes: number; emitted: boolean }
@@ -398,14 +411,20 @@ export class ClaudeTurnSession {
   }
 
   private readonly onAbort = (): void => {
-    this.kernel.requestAbort()
+    const stopAbort = readRunStopAbortReason(this.signal)
+    this.kernel.requestAbort(stopAbort?.reason, stopAbort?.deadlineAt)
     this.skillInput?.resolve(false)
     this.speedInput?.resolve(false)
     this.confirmPermissionInput?.(false)
-    this.closeInput()
+    if (!this.terminalKnown || !this.nativeWork.active || this.iteratorDone) this.closeInput()
     const activeSession = this.session
-    if (!activeSession || !this.deliveryAttempted || this.interruptRequested) return
+    if (!activeSession || !this.deliveryAttempted || this.interruptRequested || this.terminalKnown)
+      return
     this.interruptRequested = true
+    const interruptTimeoutMs =
+      stopAbort?.reason === 'user_stop'
+        ? Math.max(1, Math.min(remainingStopBudgetMs(stopAbort), 10_000))
+        : NATIVE_INTERRUPT_TIMEOUT_MS
     // Stop cancels the foreground/permission wait while this independent SDK
     // lifetime remains open to receive the real matching termination receipt.
     this.interruptTask = withDeadline(
@@ -419,6 +438,7 @@ export class ClaudeTurnSession {
         const receipt = this.unfinishedSteering()
           ? await interrupt.call(activeSession, { cancelQueued: true })
           : await activeSession.interrupt()
+        this.interruptConfirmed = true
         const cancelled = receipt?.cancelled
         const queued = receipt?.still_queued
         const cancel = Reflect.get(activeSession, 'cancelAsyncMessage')
@@ -442,10 +462,10 @@ export class ClaudeTurnSession {
         if (this.unfinishedSteering() && !Array.isArray(cancelled) && !Array.isArray(queued))
           this.reportUnknown()
       })(),
-      NATIVE_INTERRUPT_TIMEOUT_MS,
+      interruptTimeoutMs,
       this.abortController.signal,
     ).catch(() => {
-      if (!this.terminalKnown) {
+      if (!this.terminalKnown && stopAbort?.reason !== 'user_stop') {
         this.runtime.recordEvidence(this.input, this.resolvedSessionId, {
           kind: 'no_evidence',
           reason:
@@ -1445,7 +1465,11 @@ export class ClaudeTurnSession {
                   ? `${activity.title} · ${block.is_error ? 'Invocation failed' : 'Loaded'}`
                   : activity.title,
               ...(activity.detail ? { detail: activity.detail } : {}),
-              outcome: block.is_error ? 'failed' : 'completed',
+              outcome: block.is_error
+                ? this.interruptRequested || this.signal.aborted
+                  ? 'interrupted'
+                  : 'failed'
+                : 'completed',
             }
           }
         }
@@ -1605,7 +1629,8 @@ export class ClaudeTurnSession {
           'errors' in message && message.errors.length > 0
             ? message.errors.join('\n')
             : 'Claude Code could not complete the Run.'
-        if (!this.foregroundReleased) throw classifyAgentError(new Error(detail))
+        if (!this.foregroundReleased && !(this.interruptRequested && outcome === 'interrupted'))
+          throw classifyAgentError(new Error(detail))
         yield { agentId: 'claude', type: 'turn.completed', turnId: this.input.runId, outcome }
         return
       }
@@ -1750,14 +1775,18 @@ export class ClaudeTurnSession {
       this.signal.removeEventListener('abort', this.onAbort)
       if (this.session) this.runtime.activeSessions.delete(this.session)
       this.runtime.activeControllers.delete(this.abortController)
+      const validInterruptedExit =
+        this.actorObserved &&
+        this.actorExited &&
+        this.interruptedReaderClosed &&
+        this.actorExitSignal === null &&
+        (this.actorExitCode === 0 || this.actorExitCode === 1)
       const workConfirmed =
         (this.terminalKnown || this.permissionRefused || this.nativeNotStarted) &&
         !terminalPlanProjectionFailed &&
         !this.planCapture.workflowProjectionFailed &&
         !this.rootObservationUnknown &&
-        (!this.session ||
-          this.readerEof ||
-          (this.actorObserved && this.actorExited && this.interruptedReaderClosed)) &&
+        (!this.session || this.readerEof || validInterruptedExit) &&
         !this.unfinishedSteering() &&
         !this.nativeWork.pending &&
         !this.permissionWait.waiting
@@ -1779,6 +1808,9 @@ export class ClaudeTurnSession {
         : this.permissionRefused || this.nativeNotStarted
           ? 'native_turn_not_started'
           : 'native_observation_released'
+      if (!workConfirmed) {
+        nativeEffectsUncertain(this.input, 'Native background completion could not be confirmed.')
+      }
       this.kernel.reportNativeEffects(workConfirmed ? 'settled' : 'unknown', settleReason)
       await this.kernel.settle()
       nativeFileChangesSettled(this.input, workConfirmed ? 'settled' : 'unknown', settleReason)
@@ -1789,6 +1821,137 @@ export class ClaudeTurnSession {
       this.runtime.backgroundDrains.delete(this.releaseExitedTask!),
     )
     return this.releaseExitedTask
+  }
+
+  private waitForActorExit(stopAbort: RunStopAbortReason): Promise<boolean> {
+    if (!this.actorObserved || this.actorExited) return Promise.resolve(true)
+    const remainingMs = remainingStopBudgetMs(stopAbort)
+    if (remainingMs <= 0) return Promise.resolve(false)
+    return new Promise<boolean>((resolve) => {
+      const done = (): void => {
+        clearTimeout(timer)
+        this.actorExitWaiters.delete(done)
+        resolve(this.actorExited)
+      }
+      const timer = setTimeout(done, remainingMs)
+      this.actorExitWaiters.add(done)
+      if (this.actorExited) done()
+    })
+  }
+
+  /** Bounded `user_stop` exit: awaits drain, Claude 2.1 PID exit (lock release), and query release. */
+  private async awaitUserStopSettlement(stopAbort: RunStopAbortReason): Promise<boolean> {
+    this.foregroundReleased = true
+    this.closeInput()
+    const drainPromise =
+      this.session && this.iterator && !this.iteratorDone
+        ? this.startDrain(this.iterator)
+        : Promise.resolve()
+    const drainedInTime = await awaitWithinStopBudget(drainPromise, stopAbort)
+    const exitedInTime = await this.waitForActorExit(stopAbort)
+    let releasedInTime = true
+    if (this.releaseExitedTask) {
+      releasedInTime = await awaitWithinStopBudget(this.releaseExitedTask, stopAbort)
+    }
+    const settledCleanly =
+      this.terminalKnown &&
+      drainedInTime &&
+      exitedInTime &&
+      releasedInTime &&
+      !this.rootObservationUnknown &&
+      !this.unfinishedSteering() &&
+      !this.nativeWork.pending &&
+      !this.permissionWait.waiting
+    if (!settledCleanly) {
+      // L3: Monotonic 10s deadline expired or child still holds lock -> keep recovery gate closed.
+      this.reportUnknown(true)
+    }
+    return settledCleanly
+  }
+
+  private startDrain(ownedIterator: AsyncIterator<SDKMessage>): Promise<void> {
+    if (this.drainTask) return this.drainTask
+    const drain = (async () => {
+      let effectsKnown = false
+      let readingNative = false
+      let rootOutputTransferred = false
+      try {
+        while (true) {
+          if (this.terminalKnown && !rootOutputTransferred) {
+            // oxlint-disable-next-line no-await-in-loop -- One-time barrier precedes the first post-terminal SDK read.
+            await this.input.host?.lifecycle?.waitForRootOutput?.()
+            this.answer.discardProjection()
+            rootOutputTransferred = true
+          }
+          readingNative = true
+          const next = this.pendingRead ?? ownedIterator.next()
+          this.pendingRead = undefined
+          // oxlint-disable-next-line no-await-in-loop -- The native stream remains owned until actual EOF.
+          const result = await next
+          readingNative = false
+          if (result.done) {
+            // oxlint-disable-next-line no-await-in-loop -- Native EOF must include the one bounded Stop receipt before settling queued inputs.
+            await this.interruptTask
+            if (this.deferredResult && !this.unfinishedSteering()) {
+              this.nativeResultAssistantText = this.deferredResultHasText
+              for (const event of this.projectMessage(this.deferredResult))
+                this.input.host?.effects?.recordArchivedEvent?.(event)
+            } else if (this.deferredEnding && !this.unfinishedSteering()) {
+              this.recordEnding(this.deferredEnding)
+            }
+            if (!this.terminalKnown && !this.permissionRefused && !this.nativeNotStarted)
+              this.runtime.recordEvidence(this.input, this.resolvedSessionId, {
+                kind: 'no_evidence',
+                reason: 'The native stream closed without a matching Turn termination receipt.',
+              })
+            effectsKnown = true
+            break
+          }
+          const hadEnded = this.terminalKnown
+          for (const event of this.projectMessage(result.value))
+            this.input.host?.effects?.recordArchivedEvent?.(event)
+          if (hadEnded) {
+            // oxlint-disable-next-line no-await-in-loop -- One background body is durably sealed before reading the next SDK frame.
+            await this.backgroundReport(result.value)
+          }
+        }
+      } catch {
+        // L1: Exit code 0/1 (signal=null) after confirmed interrupt + matched interrupted result
+        // + stdin close is normal settlement. A completed root exiting nonzero without EOF
+        // stays unknown. Defer unknown/effectsUncertain to releaseExitedQuery on `close`.
+        this.interruptedReaderClosed =
+          readingNative &&
+          this.terminalOutcome === 'interrupted' &&
+          this.interruptRequested &&
+          this.interruptConfirmed &&
+          (!this.actorExited ||
+            (this.actorExitSignal === null &&
+              (this.actorExitCode === 0 || this.actorExitCode === 1))) &&
+          !this.unfinishedSteering() &&
+          !this.nativeWork.pending &&
+          !this.permissionWait.waiting
+        if (!this.interruptedReaderClosed) {
+          nativeEffectsUncertain(this.input, 'Native background completion could not be confirmed.')
+          if (!this.terminalKnown && !this.permissionRefused && !this.nativeNotStarted)
+            this.runtime.recordEvidence(this.input, this.resolvedSessionId, {
+              kind: 'no_evidence',
+              reason: 'The native stream ended without a matching terminal receipt.',
+            })
+          this.reportUnknown(true)
+        }
+      } finally {
+        this.closeInput()
+        await Promise.allSettled(this.recordings)
+        this.signal.removeEventListener('abort', this.onAbort)
+        this.readerSettled = true
+        this.readerEof = effectsKnown
+        await this.releaseExitedQuery()
+      }
+    })()
+    this.drainTask = drain
+    this.runtime.backgroundDrains.add(drain)
+    void drain.finally(() => this.runtime.backgroundDrains.delete(drain))
+    return drain
   }
 
   private async *createRootPromptStream(): AsyncIterable<SDKUserMessage> {
@@ -1921,8 +2084,12 @@ export class ClaudeTurnSession {
             this.nativeActor = child
             drainStderr(child)
             this.actorObserved = true
-            child.once('close', () => {
+            child.once('close', (code, sig) => {
+              this.actorExitCode = code
+              this.actorExitSignal = sig
               this.actorExited = true
+              for (const wake of this.actorExitWaiters) wake()
+              this.actorExitWaiters.clear()
               void this.releaseExitedQuery()
             })
             return child
@@ -2156,10 +2323,14 @@ export class ClaudeTurnSession {
             (!settings ||
               JSON.stringify(settings) !==
                 JSON.stringify(this.input.host.recovery.expected.settings))
-          )
-            throw new NativeInputWithheldError(
+          ) {
+            this.inputWithheldError = new NativeInputWithheldError(
               'The native execution settings could not be confirmed unchanged. The replacement input was withheld.',
             )
+            this.nativeNotStarted = true
+            this.kernel.recordDispatch('rejected', this.resolvedSessionId, this.nativeExecutorId)
+            throw this.inputWithheldError
+          }
           this.recoveryInput.resolve(true)
         } catch (error) {
           if (this.input.host?.recovery?.expected || this.signal.aborted) throw error
@@ -2199,11 +2370,19 @@ export class ClaudeTurnSession {
             this.recordEnding(this.deferredEnding)
           }
           this.iteratorDone = true
-          if (this.terminalKnown) return
           break
         }
         yield* this.projectMessage(next.value)
-        if (this.terminalKnown) return
+        if (this.terminalKnown) {
+          break
+        }
+      }
+      if (this.terminalKnown) {
+        const stopAbort = readRunStopAbortReason(this.signal)
+        if (stopAbort?.reason === 'user_stop' && this.deliveryAttempted) {
+          await this.awaitUserStopSettlement(stopAbort)
+        }
+        return
       }
       throw new AgentExecutionError(
         this.turnStarted ? 'unknown_delivery' : 'agent_process_crash',
@@ -2237,6 +2416,35 @@ export class ClaudeTurnSession {
           false,
         )
       }
+      const stopAbort = readRunStopAbortReason(this.signal)
+      const isUserStopCancelError = isUserStopCancellationError(error, this.signal)
+      if (
+        stopAbort?.reason === 'user_stop' &&
+        isUserStopCancelError &&
+        !this.permissionRefused &&
+        !this.projectionFailure
+      ) {
+        if (!this.deliveryAttempted) {
+          this.nativeNotStarted = true
+          this.kernel.recordDispatch('rejected', this.resolvedSessionId, this.nativeExecutorId)
+          this.closeInput()
+          if (this.actorObserved && !this.actorExited) {
+            this.abortController.abort()
+            if (!(await this.waitForActorExit(stopAbort))) {
+              this.reportUnknown(true)
+              throw new AgentExecutionError(
+                'unknown_delivery',
+                'Claude Code did not exit before the Stop deadline.',
+                false,
+              )
+            }
+          }
+          return
+        }
+        if (await this.awaitUserStopSettlement(stopAbort)) {
+          return
+        }
+      }
       if (!this.terminalKnown && !this.permissionRefused && !this.nativeNotStarted)
         this.runtime.recordEvidence(this.input, this.resolvedSessionId, {
           kind: 'no_evidence',
@@ -2268,81 +2476,7 @@ export class ClaudeTurnSession {
         !this.recordings.size &&
         !this.permissionWait.waiting
       if (this.session && this.iterator && !this.iteratorDone && !emptyRejectedOwner) {
-        const ownedIterator = this.iterator
-        const drain = (async () => {
-          let effectsKnown = false
-          let readingNative = false
-          let rootOutputTransferred = false
-          try {
-            while (true) {
-              if (this.terminalKnown && !rootOutputTransferred) {
-                // oxlint-disable-next-line no-await-in-loop -- One-time barrier precedes the first post-terminal SDK read.
-                await this.input.host?.lifecycle?.waitForRootOutput?.()
-                this.answer.discardProjection()
-                rootOutputTransferred = true
-              }
-              readingNative = true
-              const next = this.pendingRead ?? ownedIterator.next()
-              this.pendingRead = undefined
-              // oxlint-disable-next-line no-await-in-loop -- The native stream remains owned until actual EOF.
-              const result = await next
-              readingNative = false
-              if (result.done) {
-                // oxlint-disable-next-line no-await-in-loop -- Native EOF must include the one bounded Stop receipt before settling queued inputs.
-                await this.interruptTask
-                if (this.deferredResult && !this.unfinishedSteering()) {
-                  this.nativeResultAssistantText = this.deferredResultHasText
-                  for (const event of this.projectMessage(this.deferredResult))
-                    this.input.host?.effects?.recordArchivedEvent?.(event)
-                } else if (this.deferredEnding && !this.unfinishedSteering()) {
-                  this.recordEnding(this.deferredEnding)
-                }
-                if (!this.terminalKnown && !this.permissionRefused && !this.nativeNotStarted)
-                  this.runtime.recordEvidence(this.input, this.resolvedSessionId, {
-                    kind: 'no_evidence',
-                    reason: 'The native stream closed without a matching Turn termination receipt.',
-                  })
-                effectsKnown = true
-                break
-              }
-              const hadEnded = this.terminalKnown
-              for (const event of this.projectMessage(result.value))
-                this.input.host?.effects?.recordArchivedEvent?.(event)
-              if (hadEnded) {
-                // oxlint-disable-next-line no-await-in-loop -- One background body is durably sealed before reading the next SDK frame.
-                await this.backgroundReport(result.value)
-              }
-            }
-          } catch {
-            nativeEffectsUncertain(
-              this.input,
-              'Native background completion could not be confirmed.',
-            )
-            if (!this.terminalKnown && !this.permissionRefused && !this.nativeNotStarted)
-              this.runtime.recordEvidence(this.input, this.resolvedSessionId, {
-                kind: 'no_evidence',
-                reason: 'The native stream ended without a matching terminal receipt.',
-              })
-            // L1: Exit code 1 after confirmed interrupt + terminal result + stdin close is normal.
-            this.interruptedReaderClosed =
-              readingNative &&
-              this.terminalOutcome === 'interrupted' &&
-              this.interruptRequested &&
-              !this.unfinishedSteering() &&
-              !this.nativeWork.pending &&
-              !this.permissionWait.waiting
-            this.reportUnknown(!this.interruptedReaderClosed)
-          } finally {
-            this.closeInput()
-            await Promise.allSettled(this.recordings)
-            this.signal.removeEventListener('abort', this.onAbort)
-            this.readerSettled = true
-            this.readerEof = effectsKnown
-            await this.releaseExitedQuery()
-          }
-        })()
-        this.runtime.backgroundDrains.add(drain)
-        void drain.finally(() => this.runtime.backgroundDrains.delete(drain))
+        void this.startDrain(this.iterator)
       } else {
         this.signal.removeEventListener('abort', this.onAbort)
         await Promise.allSettled(this.recordings)

@@ -10,15 +10,16 @@ import { join, resolve } from 'node:path'
 import { PassThrough, Writable } from 'node:stream'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import type { AgentRunInput } from '@pact/agent-runtime'
 import type {
   NativeBackgroundReport,
   NativeProbeResult,
   NormalizedAgentEvent,
 } from '@pact/contracts'
 
+import { createRunStopAbortReason, type AgentRunInput } from '@pact/agent-runtime'
 import { agentRuns, conversationMessages, PactDatabase } from '@pact/persistence'
 
+import { NativeInputWithheldError } from '../agent-execution-error.js'
 import { AgyAcpConnectionPool } from '../agy-acp-connection.js'
 import { AgyAgentAdapter } from '../agy-agent-adapter.js'
 import {
@@ -2066,7 +2067,7 @@ describe('Final Astra Audit Antigravity regressions (B-F1..B-F12)', () => {
       })
 
       const adapter = new AgyAgentAdapter({ appDataDir, processFactory: () => harness.child })
-      const effects: Array<{ state: string; reason?: string }> = []
+      const effects: Array<{ state: string; reason?: string | undefined }> = []
       try {
         const stream = adapter.run(
           makeRunInput(cwd, {
@@ -2283,7 +2284,7 @@ describe('Final Astra Audit Antigravity regressions (B-F1..B-F12)', () => {
       const fileChangeStarted = Promise.withResolvers<void>()
       const releaseFileChange = Promise.withResolvers<void>()
       let fileChangeSignalAborted = false
-      const effects: Array<{ state: string; reason?: string }> = []
+      const effects: Array<{ state: string; reason?: string | undefined }> = []
 
       harness.onClientFrame((frame) => {
         if (frame.method === 'initialize') {
@@ -4219,6 +4220,579 @@ describe('Final Astra Audit Antigravity regressions (B-F1..B-F12)', () => {
       } finally {
         releaseWait.resolve()
         harness.resumeStdin()
+        await adapter.dispose()
+      }
+    }
+  })
+
+  it('Clean User Stop: shares single monotonic deadline, suppresses late reasoning.summary.completed, and maps cancel-caused tool failed to interrupted', async () => {
+    const { cwd, appDataDir } = await createEnv()
+    // 1. Settled cancel: maps tool failed -> interrupted, suppresses post-Stop reasoning.summary.completed, preserves runtime reuse.
+    {
+      const harness = createAcpHarness()
+      const sid = randomUUID()
+      const promptSeen = Promise.withResolvers<unknown>()
+      harness.onClientFrame((frame) => {
+        if (frame.method === 'initialize') {
+          harness.sendToClient({ jsonrpc: '2.0', id: frame.id, result: { protocolVersion: 1 } })
+        } else if (frame.method === 'session/new') {
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            id: frame.id,
+            result: { sessionId: sid, configOptions: defaultConfigOptions() },
+          })
+        } else if (
+          frame.method === 'session/set_mode' ||
+          frame.method === 'session/set_config_option'
+        ) {
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            id: frame.id,
+            result: { configOptions: defaultConfigOptions() },
+          })
+        } else if (frame.method === 'session/prompt') {
+          promptSeen.resolve(frame.id)
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: sid,
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId: 'tc-agy-stop',
+                title: 'Run shell command',
+                kind: 'execute',
+                status: 'in_progress',
+              },
+            },
+          })
+          // Open thought right before Stop so A4 suppression of post-Stop reasoning.summary.completed is exercised.
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: sid,
+              update: {
+                sessionUpdate: 'agent_thought_chunk',
+                content: { type: 'text', text: 'Thinking while tool runs before stop' },
+              },
+            },
+          })
+        } else if (frame.method === 'session/cancel') {
+          void promptSeen.promise.then((promptId) => {
+            harness.sendToClient({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: {
+                sessionId: sid,
+                update: {
+                  sessionUpdate: 'tool_call_update',
+                  toolCallId: 'tc-agy-stop',
+                  status: 'failed',
+                },
+              },
+            })
+            harness.sendToClient({
+              jsonrpc: '2.0',
+              id: promptId,
+              result: { stopReason: 'cancelled', execution_id: 'exec-agy-stop' },
+            })
+            return undefined
+          })
+        }
+      })
+      const adapter = new AgyAgentAdapter({ appDataDir, processFactory: () => harness.child })
+      const abort = new AbortController()
+      const archived: NormalizedAgentEvent[] = []
+      const effects: string[] = []
+      const runPromise = collectEvents(
+        adapter.run(
+          makeRunInput(cwd, {
+            host: {
+              effects: {
+                recordArchivedEvent: (ev) => archived.push(ev),
+                reportNativeEffects: (r) => effects.push(r.state),
+              },
+            },
+          }),
+          abort.signal,
+        ),
+      )
+      try {
+        await promptSeen.promise
+        await new Promise((r) => setTimeout(r, 20))
+        abort.abort(createRunStopAbortReason('user_stop'))
+        const events = await runPromise
+        const allEvents = [...events, ...archived]
+        expect(allEvents.some((e) => e.type === 'reasoning.summary.completed')).toBe(false)
+        expect(allEvents).toContainEqual(
+          expect.objectContaining({
+            type: 'tool.completed',
+            toolCallId: 'tc-agy-stop',
+            outcome: 'interrupted',
+          }),
+        )
+        expect(effects.at(-1)).toBe('settled')
+      } finally {
+        await adapter.dispose()
+      }
+    }
+
+    // 2. Unresponsive prompt after user_stop respects single monotonic deadline (no extra 1.5s overflow).
+    {
+      const harness = createAcpHarness()
+      const sid = randomUUID()
+      const promptSeen = Promise.withResolvers<void>()
+      harness.onClientFrame((frame) => {
+        if (frame.method === 'initialize') {
+          harness.sendToClient({ jsonrpc: '2.0', id: frame.id, result: { protocolVersion: 1 } })
+        } else if (frame.method === 'session/new') {
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            id: frame.id,
+            result: { sessionId: sid, configOptions: defaultConfigOptions() },
+          })
+        } else if (
+          frame.method === 'session/set_mode' ||
+          frame.method === 'session/set_config_option'
+        ) {
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            id: frame.id,
+            result: { configOptions: defaultConfigOptions() },
+          })
+        } else if (frame.method === 'session/prompt') {
+          promptSeen.resolve()
+        }
+      })
+      const adapter = new AgyAgentAdapter({ appDataDir, processFactory: () => harness.child })
+      const abort = new AbortController()
+      const timeoutEffects: string[] = []
+      const runPromise = collectEvents(
+        adapter.run(
+          makeRunInput(cwd, {
+            host: {
+              effects: { reportNativeEffects: (r) => timeoutEffects.push(r.state) },
+            },
+          }),
+          abort.signal,
+        ),
+      ).catch((error: unknown) => error)
+      try {
+        await promptSeen.promise
+        const startedAt = performance.now()
+        abort.abort(createRunStopAbortReason('user_stop', startedAt + 120))
+        const error = await runPromise
+        const elapsedMs = performance.now() - startedAt
+        expect(error).toMatchObject({ kind: 'agent_process_crash' })
+        expect(timeoutEffects).toContain('unknown')
+        // Must NOT add an extra 1500ms awaitPhysicalCompletionBounded wait past the monotonic deadline!
+        expect(elapsedMs).toBeLessThan(900)
+      } finally {
+        await adapter.dispose()
+      }
+    }
+  })
+
+  it('Plan A+: Agy Carbon F2 reasons, Astra #3 post-Stop hidden answer retention, and B2 10s recordingTail budget', async () => {
+    const { cwd, appDataDir } = await createEnv()
+
+    // 1. Carbon F2: 0-byte exit after session.started reports 'workflow_input_withheld' on guard withhold
+    // and 'native_turn_not_started' on user_stop before first byte.
+    for (const mode of ['withheld', 'user_stop'] as const) {
+      const harness = createAcpHarness()
+      const sid = randomUUID()
+      const abort = new AbortController()
+      harness.onClientFrame((frame) => {
+        if (frame.method === 'initialize') {
+          harness.sendToClient({ jsonrpc: '2.0', id: frame.id, result: { protocolVersion: 1 } })
+        } else if (frame.method === 'session/new') {
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            id: frame.id,
+            result: { sessionId: sid, configOptions: defaultConfigOptions() },
+          })
+        } else if (
+          frame.method === 'session/set_mode' ||
+          frame.method === 'session/set_config_option'
+        ) {
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            id: frame.id,
+            result: { configOptions: defaultConfigOptions() },
+          })
+        } else if (frame.method === 'session/close') {
+          harness.sendToClient({ jsonrpc: '2.0', id: frame.id, result: {} })
+        }
+      })
+      const adapter = new AgyAgentAdapter({ appDataDir, processFactory: () => harness.child })
+      const effects: Array<{ state: string; reason?: string | undefined }> = []
+      try {
+        await expect(
+          (async () => {
+            for await (const ev of adapter.run(
+              makeRunInput(cwd, {
+                host: {
+                  recovery: {
+                    inputSha256: 'sha-f2',
+                    canDispatch: () => mode !== 'withheld',
+                    recordEffectiveSettings: () => {},
+                    recordConfirmedUnsent: () => {},
+                  },
+                  effects: {
+                    reportNativeEffects: (r) => effects.push(r),
+                  },
+                },
+              }),
+              abort.signal,
+            )) {
+              if (mode === 'user_stop' && ev.type === 'session.started') {
+                abort.abort(createRunStopAbortReason('user_stop'))
+              }
+            }
+          })(),
+        ).rejects.toThrow(mode === 'withheld' ? /withheld/u : /./u)
+        expect(effects.at(-1)).toMatchObject({
+          state: 'settled',
+          reason: mode === 'withheld' ? 'workflow_input_withheld' : 'native_turn_not_started',
+        })
+      } finally {
+        await adapter.dispose()
+      }
+    }
+
+    // 2. Astra #3: explicit user_stop freezes foreground delta while retaining valid root suffix in hidden answer.
+    {
+      const harness = createAcpHarness()
+      const sid = randomUUID()
+      const firstDeltaSeen = Promise.withResolvers<void>()
+      let promptId: unknown
+      harness.onClientFrame((frame) => {
+        if (frame.method === 'initialize') {
+          harness.sendToClient({ jsonrpc: '2.0', id: frame.id, result: { protocolVersion: 1 } })
+        } else if (frame.method === 'session/new') {
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            id: frame.id,
+            result: { sessionId: sid, configOptions: defaultConfigOptions() },
+          })
+        } else if (
+          frame.method === 'session/set_mode' ||
+          frame.method === 'session/set_config_option'
+        ) {
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            id: frame.id,
+            result: { configOptions: defaultConfigOptions() },
+          })
+        } else if (frame.method === 'session/prompt') {
+          promptId = frame.id
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: sid,
+              update: {
+                sessionUpdate: 'agent_message_chunk',
+                content: { type: 'text', text: 'Prefix ' },
+              },
+            },
+          })
+        } else if (frame.method === 'session/cancel') {
+          void firstDeltaSeen.promise.then(() => {
+            harness.sendToClient({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: {
+                sessionId: sid,
+                update: {
+                  sessionUpdate: 'agent_message_chunk',
+                  content: { type: 'text', text: 'Hidden suffix' },
+                },
+              },
+            })
+            harness.sendToClient({
+              jsonrpc: '2.0',
+              id: promptId,
+              result: { stopReason: 'end_turn', execution_id: 'exec-agy-hidden' },
+            })
+            return undefined
+          })
+        }
+      })
+      const adapter = new AgyAgentAdapter({ appDataDir, processFactory: () => harness.child })
+      const abort = new AbortController()
+      const recordedOutputs: string[] = []
+      const foregroundDeltas: string[] = []
+      const completedTexts: string[] = []
+      try {
+        for await (const ev of adapter.run(
+          makeRunInput(cwd, {
+            host: {
+              lifecycle: {
+                recordNativeEvidence: (evidence) => {
+                  if (evidence.kind === 'ended' && evidence.output?.text) {
+                    recordedOutputs.push(evidence.output.text)
+                  }
+                },
+              },
+            },
+          }),
+          abort.signal,
+        )) {
+          if (ev.type === 'text.delta') {
+            foregroundDeltas.push(ev.text)
+            if (!abort.signal.aborted) {
+              abort.abort(createRunStopAbortReason('user_stop'))
+              firstDeltaSeen.resolve()
+            }
+          } else if (ev.type === 'text.completed') {
+            completedTexts.push(ev.text)
+          }
+        }
+        expect(foregroundDeltas).toEqual(['Prefix '])
+        expect(completedTexts).toEqual(['Prefix Hidden suffix'])
+        expect(recordedOutputs).toEqual(['Prefix Hidden suffix'])
+      } finally {
+        await adapter.dispose()
+      }
+    }
+
+    // 3. B2-first-half: prompt returns cancelled quickly while workspace recording blocks past Stop deadline ->
+    // foreground exits at Stop deadline with `unknown` while recording finishes safely in background.
+    {
+      const harness = createAcpHarness()
+      const sid = randomUUID()
+      const recordingStarted = Promise.withResolvers<void>()
+      const releaseRecording = Promise.withResolvers<void>()
+      let recordingSignalAborted = false
+      let promptId: unknown
+      harness.onClientFrame((frame) => {
+        if (frame.method === 'initialize') {
+          harness.sendToClient({ jsonrpc: '2.0', id: frame.id, result: { protocolVersion: 1 } })
+        } else if (frame.method === 'session/new') {
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            id: frame.id,
+            result: { sessionId: sid, configOptions: defaultConfigOptions() },
+          })
+        } else if (
+          frame.method === 'session/set_mode' ||
+          frame.method === 'session/set_config_option'
+        ) {
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            id: frame.id,
+            result: { configOptions: defaultConfigOptions() },
+          })
+        } else if (frame.method === 'session/prompt') {
+          promptId = frame.id
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: sid,
+              update: {
+                sessionUpdate: 'tool_call_update',
+                toolCallId: 'tc-slow-rec',
+                name: 'edit_file',
+                status: 'completed',
+                args: { Path: join(cwd, 'slow.txt') },
+                content: [
+                  {
+                    type: 'diff',
+                    path: join(cwd, 'slow.txt'),
+                    oldText: 'before',
+                    newText: 'after',
+                  },
+                ],
+              },
+            },
+          })
+        } else if (frame.method === 'session/cancel') {
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            id: promptId,
+            result: { stopReason: 'cancelled', execution_id: 'exec-slow-rec' },
+          })
+        }
+      })
+      const adapter = new AgyAgentAdapter({ appDataDir, processFactory: () => harness.child })
+      const abort = new AbortController()
+      const effects: string[] = []
+      const runInput = makeRunInput(cwd, {
+        host: {
+          effects: {
+            recordFileChange: async (_change, sig) => {
+              sig?.addEventListener('abort', () => {
+                recordingSignalAborted = true
+              })
+              recordingStarted.resolve()
+              await releaseRecording.promise
+            },
+            reportNativeEffects: (r) => effects.push(r.state),
+          },
+        },
+      })
+      try {
+        const runPromise = collectEvents(adapter.run(runInput, abort.signal))
+        await recordingStarted.promise
+        const startedAt = performance.now()
+        abort.abort(createRunStopAbortReason('user_stop', startedAt + 150))
+        await runPromise
+        const elapsedMs = performance.now() - startedAt
+        expect(elapsedMs).toBeLessThan(900)
+        expect(effects).toContain('unknown')
+        expect(recordingSignalAborted).toBe(false)
+        expect(adapter.hasActiveBackgroundWork(runInput.runId)).toBe(true)
+        releaseRecording.resolve()
+        await vi.waitFor(() => expect(adapter.hasActiveBackgroundWork(runInput.runId)).toBe(false))
+      } finally {
+        releaseRecording.resolve()
+        await adapter.dispose()
+      }
+    }
+  })
+
+  it('Carbon Final Finding 1: preserves NativeInputWithheldError and workflow_input_withheld across onDispatch and pre-activeRun guards', async () => {
+    const { cwd, appDataDir } = await createEnv()
+
+    // Path A: Regular workflow run without host.recovery.canDispatch where recordDispatch('possibly_sent')
+    // throws NativeInputWithheldError before first byte is written.
+    {
+      const harness = createAcpHarness()
+      const sid = randomUUID()
+      harness.onClientFrame((frame) => {
+        if (frame.method === 'initialize') {
+          harness.sendToClient({ jsonrpc: '2.0', id: frame.id, result: { protocolVersion: 1 } })
+        } else if (frame.method === 'session/new') {
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            id: frame.id,
+            result: { sessionId: sid, configOptions: defaultConfigOptions() },
+          })
+        } else if (
+          frame.method === 'session/set_mode' ||
+          frame.method === 'session/set_config_option' ||
+          frame.method === 'session/close'
+        ) {
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            id: frame.id,
+            result: { configOptions: defaultConfigOptions() },
+          })
+        }
+      })
+      const adapter = new AgyAgentAdapter({ appDataDir, processFactory: () => harness.child })
+      const dispatches: string[] = []
+      const effects: Array<{ state: string; reason?: string | undefined }> = []
+      try {
+        await expect(
+          collectEvents(
+            adapter.run(
+              makeRunInput(cwd, {
+                host: {
+                  lifecycle: {
+                    recordDispatch: (phase) => {
+                      dispatches.push(phase)
+                      if (phase === 'possibly_sent') {
+                        throw new NativeInputWithheldError('Workflow paused before dispatch.')
+                      }
+                    },
+                  },
+                  effects: {
+                    reportNativeEffects: (r) => effects.push({ state: r.state, reason: r.reason }),
+                  },
+                },
+              }),
+              new AbortController().signal,
+            ),
+          ),
+        ).rejects.toThrowError(NativeInputWithheldError)
+        expect(harness.requests.filter((r) => r.method === 'session/prompt')).toHaveLength(0)
+        expect(dispatches).toEqual(['possibly_sent', 'rejected'])
+        expect(effects.at(-1)).toEqual({ state: 'settled', reason: 'workflow_input_withheld' })
+      } finally {
+        await adapter.dispose()
+      }
+    }
+
+    // Path B: Pre-activeRun recovery.expected mismatch throws NativeInputWithheldError, records rejected,
+    // and reports settled(workflow_input_withheld) even before activeRun is initialized.
+    {
+      const harness = createAcpHarness()
+      const sid = randomUUID()
+      harness.onClientFrame((frame) => {
+        if (frame.method === 'initialize') {
+          harness.sendToClient({ jsonrpc: '2.0', id: frame.id, result: { protocolVersion: 1 } })
+        } else if (frame.method === 'session/new') {
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            id: frame.id,
+            result: { sessionId: sid, configOptions: defaultConfigOptions() },
+          })
+        } else if (
+          frame.method === 'session/set_mode' ||
+          frame.method === 'session/set_config_option' ||
+          frame.method === 'session/close'
+        ) {
+          harness.sendToClient({
+            jsonrpc: '2.0',
+            id: frame.id,
+            result: { configOptions: defaultConfigOptions() },
+          })
+        }
+      })
+      const adapter = new AgyAgentAdapter({ appDataDir, processFactory: () => harness.child })
+      const dispatches: string[] = []
+      const effects: Array<{ state: string; reason?: string | undefined }> = []
+      let unsentCount = 0
+      try {
+        await expect(
+          collectEvents(
+            adapter.run(
+              makeRunInput(cwd, {
+                host: {
+                  lifecycle: {
+                    recordDispatch: (phase) => {
+                      dispatches.push(phase)
+                    },
+                  },
+                  recovery: {
+                    inputSha256: 'expected-mismatch-sha',
+                    expected: {
+                      executorId: 'different-executor',
+                      nativeSessionId: 'different-sid',
+                      settings: {
+                        version: 1,
+                        provider: 'agy',
+                        model: 'gemini-4-carbon',
+                        effort: { known: true, value: 'high' },
+                        speed: 'native',
+                        permissionMode: 'native',
+                        configurationSha256: '0'.repeat(64),
+                        provenance: 'agy_applied_settings',
+                      },
+                    },
+                    recordEffectiveSettings: () => undefined,
+                    recordConfirmedUnsent: () => {
+                      unsentCount += 1
+                    },
+                  },
+                  effects: {
+                    reportNativeEffects: (r) => effects.push({ state: r.state, reason: r.reason }),
+                  },
+                },
+              }),
+              new AbortController().signal,
+            ),
+          ),
+        ).rejects.toThrowError(NativeInputWithheldError)
+        expect(harness.requests.filter((r) => r.method === 'session/prompt')).toHaveLength(0)
+        expect(unsentCount).toBe(1)
+        expect(dispatches).toContain('rejected')
+        expect(effects.at(-1)).toEqual({ state: 'settled', reason: 'workflow_input_withheld' })
+      } finally {
         await adapter.dispose()
       }
     }

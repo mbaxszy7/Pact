@@ -63,6 +63,7 @@ export interface CodexTurnNativeObserverHost {
     readonly reviewResult: CollaborationReviewObservation | undefined
     readonly inputResult: CollaborationInputObservation | undefined
   }
+  readonly onStateChanged?: (() => void) | undefined
 }
 
 /**
@@ -83,6 +84,10 @@ export class CodexTurnNativeObserver {
   private rootTerminalOutcome: 'completed' | 'failed' | 'interrupted' | undefined
   private archivedTurnCompletedEmitted = false
   private lastBackgroundWork: 'working' | 'stoppable' | undefined
+  private rootInterruptTask: Promise<boolean> | undefined
+  private rootInterruptConfirmed = false
+  private readonly rootInterruptCommandIds = new Set<string>()
+  private readonly confirmedTerminatedCommandIds = new Set<string>()
 
   constructor(private readonly host: CodexTurnNativeObserverHost) {}
 
@@ -145,6 +150,76 @@ export class CodexTurnNativeObserver {
       targetThreadId ?? this.host.getThreadId() ?? input.nativeSessionId,
       this.host.getConnection()?.executorId,
     )
+    this.host.onStateChanged?.()
+  }
+
+  hasRootOperations(): boolean {
+    const { background } = this.host
+    const threadId = background.primaryThreadId
+    const turnId = background.primaryTurnId
+    if (!threadId || !turnId || !background.operations.size) return false
+    const prefix = `[${JSON.stringify(threadId)},${JSON.stringify(turnId)},`
+    for (const key of background.operations) {
+      if (key.startsWith(prefix)) return true
+    }
+    return false
+  }
+
+  getRootInterruptState(): {
+    readonly promise: Promise<boolean> | undefined
+    readonly confirmed: boolean
+    readonly commandIds: ReadonlySet<string>
+    readonly confirmedTerminatedIds: ReadonlySet<string>
+  } {
+    return {
+      promise: this.rootInterruptTask,
+      confirmed: this.rootInterruptConfirmed,
+      commandIds: this.rootInterruptCommandIds,
+      confirmedTerminatedIds: this.confirmedTerminatedCommandIds,
+    }
+  }
+
+  hasStillOpenStoppedCommands(): boolean {
+    const { background } = this.host
+    const threadId = background.primaryThreadId
+    const turnId = background.primaryTurnId
+    const ids = this.rootInterruptConfirmed
+      ? this.confirmedTerminatedCommandIds
+      : this.rootInterruptCommandIds
+    if (!threadId || !turnId || !ids.size) return false
+    for (const id of ids) {
+      if (background.operations.has(JSON.stringify([threadId, turnId, id]))) return true
+    }
+    return false
+  }
+
+  /**
+   * C2 fallback: after a confirmed `turn/interrupt` + `thread/backgroundTerminals/terminate`
+   * returning `{ terminated: true }` + `turn/completed(interrupted)` and a bounded grace
+   * window for late `item/completed`, close ONLY the commands with positive termination proof.
+   * Unconfirmed commands (`terminated: false`), `fileChange`, `mcpToolCall`, and
+   * `dynamicToolCall` items keep their own independent completion/recording proof.
+   */
+  clearConfirmedStoppedRootCommands(): void {
+    const { background } = this.host
+    const threadId = background.primaryThreadId
+    const turnId = background.primaryTurnId
+    if (
+      !threadId ||
+      !turnId ||
+      !background.rootTerminal ||
+      this.rootTerminalOutcome !== 'interrupted' ||
+      !this.confirmedTerminatedCommandIds.size
+    )
+      return
+    let removed = false
+    for (const id of this.confirmedTerminatedCommandIds) {
+      const key = JSON.stringify([threadId, turnId, id])
+      if (background.operations.delete(key)) {
+        removed = true
+      }
+    }
+    if (removed) this.maybeSettle()
   }
 
   emitArchivedTerminalSnapshot(status: 'completed' | 'failed' | 'interrupted'): void {
@@ -264,6 +339,7 @@ export class CodexTurnNativeObserver {
       !background.untrackedWork
     )
       runtime.settleNativeBackground(background)
+    this.host.onStateChanged?.()
   }
 
   bufferEarly(
@@ -446,7 +522,9 @@ export class CodexTurnNativeObserver {
   maybeInterruptRoot(
     commands?: Map<string, string | undefined>,
     registerAsBackgroundInteraction = true,
-  ): Promise<void> | undefined {
+    deferUnknownOnRpcFailure = false,
+    stopDeadlineAt?: number,
+  ): Promise<boolean> | undefined {
     const { background, runtime } = this.host
     const targetConnection = this.host.getConnection()
     const targetThreadId = this.host.getThreadId() ?? background.primaryThreadId
@@ -468,6 +546,9 @@ export class CodexTurnNativeObserver {
     }
     if (background.rootTerminal && remainingCommands.size === 0) return undefined
     background.rootInterruptAttempted = true
+    this.rootInterruptCommandIds.clear()
+    this.confirmedTerminatedCommandIds.clear()
+    for (const id of remainingCommands.keys()) this.rootInterruptCommandIds.add(id)
     const interruptWork = runtime.connections
       .interruptForegroundCommands(
         background,
@@ -477,21 +558,40 @@ export class CodexTurnNativeObserver {
         remainingCommands,
         undefined,
         background.rootTerminal,
+        {
+          ...(stopDeadlineAt !== undefined ? { deadlineAt: stopDeadlineAt } : {}),
+          onCommandTerminated: (id) => {
+            this.confirmedTerminatedCommandIds.add(id)
+            this.host.onStateChanged?.()
+          },
+        },
       )
-      .catch(() => {
-        const hasStillOpenStoppedCommands = [...remainingCommands.keys()].some((id) =>
-          background.operations.has(JSON.stringify([targetThreadId, targetTurnId, id])),
-        )
-        if (!background.rootTerminal || hasStillOpenStoppedCommands) {
-          this.reportUnknown(
-            'Codex interruption could not be confirmed. Native observation remains active.',
-          )
-        }
+      .then((terminatedIds) => {
+        for (const id of terminatedIds) this.confirmedTerminatedCommandIds.add(id)
+        this.rootInterruptConfirmed = true
+        this.host.onStateChanged?.()
+        return true
       })
+      .catch(() => {
+        if (!deferUnknownOnRpcFailure) {
+          const hasStillOpenStoppedCommands = [...remainingCommands.keys()].some((id) =>
+            background.operations.has(JSON.stringify([targetThreadId, targetTurnId, id])),
+          )
+          if (!background.rootTerminal || hasStillOpenStoppedCommands) {
+            this.reportUnknown(
+              'Codex interruption could not be confirmed. Native observation remains active.',
+            )
+          }
+        }
+        this.host.onStateChanged?.()
+        return false
+      })
+    this.rootInterruptTask = interruptWork
     if (registerAsBackgroundInteraction) {
-      background.interactions.add(interruptWork)
-      void interruptWork.finally(() => {
-        background.interactions.delete(interruptWork)
+      const tracked = interruptWork.then(() => undefined)
+      background.interactions.add(tracked)
+      void tracked.finally(() => {
+        background.interactions.delete(tracked)
         this.maybeSettle()
       })
     }
@@ -1007,6 +1107,14 @@ export class CodexTurnNativeObserver {
       }
     }
     if (Object.hasOwn(event, 'id') && typeof eventMethod === 'string') {
+      if (root && (background.stopRequested || signal.aborted)) {
+        const requestId = Reflect.get(event, 'id')
+        if (typeof requestId === 'string' || typeof requestId === 'number')
+          void nativeConnection
+            .respondError(requestId, 'This root Turn was stopped. No approval response was sent.')
+            .catch(() => undefined)
+        return true
+      }
       if (root && !background.foregroundReleased && !detachedRoot && !this.replaying) return false
       if (background.interactions.size >= 8) {
         this.reportUnknown('Native interactions exceeded their bounded request owner.')

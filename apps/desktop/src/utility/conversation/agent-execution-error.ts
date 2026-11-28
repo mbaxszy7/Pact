@@ -1,5 +1,7 @@
 import type { RunFailureKind } from '@pact/contracts'
 
+import { readRunStopAbortReason } from '@pact/agent-runtime'
+
 export class AgentExecutionError extends Error {
   constructor(
     readonly kind: RunFailureKind,
@@ -104,4 +106,43 @@ export function classifyAgentError(error: unknown): AgentExecutionError {
     return new AgentExecutionError('transient_transport', message, true)
   }
   return new AgentExecutionError('agent_process_crash', message, true)
+}
+
+/** Shared predicate identifying cancellation errors caused by an explicit user Stop. */
+export function isUserStopCancellationError(
+  error: unknown,
+  signal: AbortSignal,
+  cancelledByUser?: boolean,
+): boolean {
+  if (!signal.aborted) return false
+  if (
+    cancelledByUser !== undefined
+      ? !cancelledByUser
+      : readRunStopAbortReason(signal)?.reason !== 'user_stop'
+  ) {
+    return false
+  }
+  if (
+    error instanceof PermissionModeRejectedError ||
+    error instanceof NativeCapacityError ||
+    error instanceof NativeThreadOccupiedError ||
+    error instanceof NativeThreadArchivedError ||
+    error instanceof NativeInputWithheldError
+  ) {
+    return false
+  }
+  if (error === signal.reason) return true
+  if (error instanceof AgentExecutionError) {
+    if (error.kind === 'user_stopped') return true
+    if (
+      error.kind === 'agent_process_crash' &&
+      (error.message === 'Codex was interrupted.' ||
+        error.message === 'Claude Code was interrupted.' ||
+        error.message === 'Antigravity was interrupted.')
+    ) {
+      return true
+    }
+    if (Reflect.get(error, 'cancelled') === true) return true
+  }
+  return error instanceof Error && error.name === 'AbortError'
 }

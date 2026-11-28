@@ -808,7 +808,7 @@ export const agentRunActivities = sqliteTable(
     title: text('title').notNull(),
     detail: text('detail'),
     detailRevision: integer('detail_revision').notNull().default(0),
-    status: text('status', { enum: ['running', 'completed', 'failed'] }).notNull(),
+    status: text('status', { enum: ['running', 'completed', 'failed', 'interrupted'] }).notNull(),
     sequence: integer('sequence').notNull(),
     createdAt: text('created_at').notNull(),
     updatedAt: text('updated_at').notNull(),

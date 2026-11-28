@@ -1029,4 +1029,66 @@ describe('Conversation resident window', () => {
     })
     expect(merged.loadedCommentMessageIds).toEqual({ [first.id]: true, [second.id]: true })
   })
+
+  it('projects running activities of a user_stopped run as neutral interrupted instead of failed', () => {
+    const user = message(0)
+    const runId = crypto.randomUUID()
+    const run: AgentRun = {
+      id: runId,
+      sessionId,
+      userMessageId: user.id,
+      agentId: 'codex',
+      status: 'running',
+      dispatchPhase: 'accepted',
+      attemptCount: 1,
+      settingsRevision: 1,
+      model: null,
+      effort: null,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    }
+    const activity: AgentActivity = {
+      id: crypto.randomUUID(),
+      sessionId,
+      runId,
+      agentId: 'codex',
+      nativeId: 'tool-running-on-stop',
+      kind: 'tool',
+      title: 'Running tests',
+      detailRevision: 0,
+      status: 'running',
+      sequence: 1,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    }
+    const active = mergeActivityPage(windowFromPage(withActivityRun(page([user]), runId)), {
+      scope: 'activities',
+      sessionId,
+      observation: { incarnation, sequence: 1 },
+      runId,
+      activities: [{ kind: 'complete', activity }],
+      truncated: false,
+    })!
+    const stoppedPage = withActivityRun(
+      page([user], { observationSequence: 2 }),
+      runId,
+      'interrupted',
+    )
+    const stoppedRun: AgentRun = {
+      ...run,
+      status: 'interrupted',
+      failureKind: 'user_stopped',
+      dispatchPhase: 'ended',
+      nativeOutcome: 'interrupted',
+    }
+    stoppedPage.runs = [stoppedRun]
+    stoppedPage.header.latestRun = stoppedRun
+    const stopped = mergeMessagePage(active, stoppedPage, 'around')
+    expect(stopped.view.activities[0]?.status).toBe('interrupted')
+    const patched = mergeConversationPatch(active, {
+      ...patch(2),
+      activityStates: [{ runId, status: 'interrupted' }],
+    }).window
+    expect(patched.view.activities[0]?.status).toBe('interrupted')
+  })
 })

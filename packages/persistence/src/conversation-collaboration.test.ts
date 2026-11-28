@@ -4618,4 +4618,101 @@ describe('Open-mode plan publish intent, recovery, failure matrix, legacy repair
         .get()?.applied,
     ).toBe(true)
   })
+
+  it('Astra #9: shows Failed when Stop races native failed and preserves Open Mode review Stop pause', async () => {
+    // Part A: Stop committed first, then native outcome is explicitly `failed` -> pauseReason is 'failure', NOT 'stopped'.
+    const fFail = await fixture()
+    const runFail = fFail.first.run
+    const sidFail = `fixture-${runFail.agentId}`
+    const turnFail = `turn-${runFail.id}`
+    fFail.repo.applyEvent(fFail.sessionId, runFail.id, {
+      type: 'session.started',
+      agentId: runFail.agentId,
+      nativeSessionId: sidFail,
+    })
+    const execFail = randomUUID()
+    fFail.repo.recordDispatch(runFail.id, 'accepted', sidFail, execFail)
+    fFail.repo.failRun(runFail.id, 'user_stopped', 'Stopped by user.', true)
+    fFail.repo.recordNativeEvidence({
+      kind: 'ended',
+      source: 'live_terminal',
+      outcome: 'failed',
+      identity: {
+        sessionId: fFail.sessionId,
+        agentId: runFail.agentId,
+        requestId: runFail.id,
+        runId: runFail.id,
+        nativeSessionId: sidFail,
+        nativeTurnId: turnFail,
+        bindingGeneration: runFail.bindingGeneration ?? 1,
+        executorId: execFail,
+      },
+    })
+    fFail.repo.recordNativeEffects(runFail.id, 'settled')
+    fFail.repo.settleKnownNativeEnding(runFail.id)
+    expect(fFail.repo.collaboration(fFail.sessionId)).toMatchObject({
+      status: 'failed',
+      automation: 'paused',
+      pauseReason: 'failure',
+    })
+    expect(fFail.repo.collaboration(fFail.sessionId)?.notice).toBeTruthy()
+
+    // Part B: Open Mode code_review commits native completed, user clicks Stop before verdict applies ->
+    // verdict `changes_requested` is preserved while automation stays `paused` with `pauseReason: 'stopped'`.
+    const fReview = await openDiskFixture({ primary: 'codex', split: true })
+    fReview.finish(fReview.first.run.id, { plan: '# Plan\nStep 1' })
+    fReview.finish(advance(fReview).id, { verdict: 'accepted' })
+    const impl = advance(fReview, 'execute')
+    recordCodeChange(fReview, impl.id, 'app.ts')
+    fReview.finish(impl.id, { answer: 'Implemented.' })
+    const reviewRun = advance(fReview, 'review_code')
+    const sidRev = `fixture-${reviewRun.agentId}`
+    const turnRev = `turn-${reviewRun.id}`
+    fReview.repo.applyEvent(fReview.sessionId, reviewRun.id, {
+      type: 'session.started',
+      agentId: reviewRun.agentId,
+      nativeSessionId: sidRev,
+    })
+    const execRev = randomUUID()
+    fReview.repo.recordDispatch(reviewRun.id, 'accepted', sidRev, execRev)
+    fReview.repo.recordWorkflowReview(reviewRun.id, { verdict: 'changes_requested' })
+    fReview.repo.applyEvent(fReview.sessionId, reviewRun.id, {
+      type: 'text.completed',
+      agentId: reviewRun.agentId,
+      turnId: turnRev,
+      outputId: 'answer',
+      text: 'Please fix the edge case.',
+    })
+    fReview.repo.recordNativeEvidence({
+      kind: 'ended',
+      source: 'live_terminal',
+      outcome: 'completed',
+      identity: {
+        sessionId: fReview.sessionId,
+        agentId: reviewRun.agentId,
+        requestId: reviewRun.id,
+        runId: reviewRun.id,
+        nativeSessionId: sidRev,
+        nativeTurnId: turnRev,
+        bindingGeneration: reviewRun.bindingGeneration ?? 1,
+        executorId: execRev,
+      },
+    })
+    fReview.repo.recordNativeEffects(reviewRun.id, 'settled')
+    fReview.repo.applyEvent(fReview.sessionId, reviewRun.id, {
+      type: 'turn.completed',
+      agentId: reviewRun.agentId,
+      turnId: turnRev,
+      outcome: 'completed',
+    })
+    // User clicks Stop after native completed committed, before finishCollaboration settles the review stage.
+    fReview.repo.pauseCollaboration(fReview.sessionId, 'stopped')
+    fReview.repo.settleKnownNativeEnding(reviewRun.id)
+    expect(fReview.repo.collaboration(fReview.sessionId)).toMatchObject({
+      status: 'waiting',
+      automation: 'paused',
+      pauseReason: 'stopped',
+      review: { runId: reviewRun.id, verdict: 'changes_requested' },
+    })
+  })
 })

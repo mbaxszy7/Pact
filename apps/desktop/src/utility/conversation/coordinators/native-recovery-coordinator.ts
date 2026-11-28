@@ -1,11 +1,6 @@
 import { randomUUID } from 'node:crypto'
 
 import type {
-  AgentAdapter,
-  AgentNativeCheckContext,
-  AgentNativeCheckOperation,
-} from '@pact/agent-runtime'
-import type {
   AgentRun,
   ConversationGetInput,
   ConversationPage,
@@ -18,6 +13,12 @@ import type {
 } from '@pact/contracts'
 import type { ConversationRepository } from '@pact/persistence'
 
+import {
+  createRunStopAbortReason,
+  type AgentAdapter,
+  type AgentNativeCheckContext,
+  type AgentNativeCheckOperation,
+} from '@pact/agent-runtime'
 import { NATIVE_PERMISSION_REQUESTS } from '@pact/contracts'
 import {
   HANDOFF_READ_DEADLINE_MS,
@@ -120,19 +121,70 @@ export class NativeRecoveryCoordinator {
         (entry) => entry.input.sessionId === input.sessionId,
       )
       if (execution) {
-        // The provider is stopped only after every Delta already accepted by Pact
-        // crosses the durable checkpoint. Closing here also clears both timers;
-        // late provider events are ignored by the cancellation fence below.
+        const beforeStop = this.core.conversations.findRun(execution.run.id)
+        const activeRunStatus = Boolean(
+          beforeStop && ['starting', 'running', 'recovering'].includes(beforeStop.status),
+        )
+        // Option 1 intent boundary: if a verified native `completed` terminal already committed
+        // BEFORE Stop arrived while this Run is still draining its own body, keep `completed`
+        // and let it finish while pausing queue, collaboration, and follow-up `@all` routing.
+        if (
+          activeRunStatus &&
+          beforeStop?.dispatchPhase === 'ended' &&
+          beforeStop.nativeOutcome === 'completed'
+        ) {
+          const patch = this.core.conversations.cancelPendingRoutedContinuation(input.sessionId)
+          this.core.publish(patch)
+          return { ok: true, value: patch }
+        }
+        // When `beforeStop` is already terminal (e.g., Primary completed and `@all` is preparing
+        // its Secondary continuation), cancel only `continuationAbortController` when active so an
+        // already-completed Primary with live background work is not disrupted.
+        if (!activeRunStatus) {
+          execution.cancelledByUser = true
+          if (execution.continuationAbortController) {
+            execution.continuationAbortController.abort(createRunStopAbortReason('user_stop'))
+          } else {
+            execution.abortController.abort(createRunStopAbortReason('user_stop'))
+          }
+          const patch = this.core.conversations.cancelPendingRoutedContinuation(input.sessionId)
+          this.core.publish(patch)
+          return { ok: true, value: patch }
+        }
+        // Freeze foreground output synchronously so every Delta already accepted by Pact
+        // crosses the durable checkpoint before the provider is interrupted; late post-Stop
+        // display deltas are suppressed while terminal receipts still converge cleanly.
         let streamSaved = true
         try {
-          streamSaved = execution.streamBuffer?.dispose() ?? true
+          streamSaved = execution.lastArchiver
+            ? execution.lastArchiver.freezeForeground()
+            : (execution.streamBuffer?.dispose() ?? true)
         } finally {
           execution.streamBuffer = undefined
           execution.adapter = undefined
           execution.cancelledByUser = true
-          execution.abortController.abort()
+          // Synchronously aborts every root-owned foreground interaction via its exact ioSignal
+          // while preserving independent Codex sub-turn interactions on their background signal.
+          execution.abortController.abort(createRunStopAbortReason('user_stop'))
         }
-        if (!streamSaved)
+        const current = this.core.conversations.findRun(execution.run.id)
+        if (!streamSaved) {
+          if (current && ['starting', 'running', 'recovering'].includes(current.status)) {
+            const outputFailure = execution.lastArchiver?.outputFailure
+            try {
+              const failedPatch = this.core.conversations.failRun(
+                current.id,
+                outputFailure?.kind ?? 'protocol_error',
+                outputFailure?.message ??
+                  'The response stopped, but its latest output could not be saved.',
+                true,
+                { userStopped: true },
+              )
+              this.core.publish(failedPatch)
+            } catch (error) {
+              if (!(error instanceof RunOperationConflictError)) throw error
+            }
+          }
           return {
             ok: false,
             error: {
@@ -140,16 +192,27 @@ export class NativeRecoveryCoordinator {
               message: 'The response stopped, but its latest output could not be saved.',
             },
           }
-        const current = this.core.conversations.findRun(execution.run.id)
-        const patch =
-          current && ['starting', 'running', 'recovering'].includes(current.status)
-            ? this.core.conversations.failRun(
-                current.id,
-                'user_stopped',
-                'Stopped by the user.',
-                true,
-              )
-            : this.core.conversations.cancelPendingRoutedContinuation(input.sessionId)
+        }
+        let patch: ConversationPatch
+        if (
+          current &&
+          ['starting', 'running', 'recovering'].includes(current.status) &&
+          !(current.dispatchPhase === 'ended' && current.nativeOutcome === 'completed')
+        ) {
+          try {
+            patch = this.core.conversations.failRun(
+              current.id,
+              'user_stopped',
+              'Stopped by the user.',
+              true,
+            )
+          } catch (error) {
+            if (!(error instanceof RunOperationConflictError)) throw error
+            patch = this.core.conversations.cancelPendingRoutedContinuation(input.sessionId)
+          }
+        } else {
+          patch = this.core.conversations.cancelPendingRoutedContinuation(input.sessionId)
+        }
         this.core.publish(patch)
         return { ok: true, value: patch }
       }

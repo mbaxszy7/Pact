@@ -1,4 +1,4 @@
-import { Check, ChevronDown, ChevronUp, LoaderCircle, X } from 'lucide-react'
+import { Check, ChevronDown, ChevronUp, LoaderCircle, Square, X } from 'lucide-react'
 import { useEffect, useId, useRef, useState } from 'react'
 
 import type { AgentActivity, ConversationPageActivity, RuntimeAgentId } from '@pact/contracts'
@@ -42,6 +42,7 @@ export function AgentActivityList({
   // so CSS grid-template-rows animates smoothly without snapping closed on unmount.
   const [contentMounted, setContentMounted] = useState(active || defaultExpanded)
   const failedCount = activities.filter((activity) => activity.status === 'failed').length
+  const stoppedCount = activities.filter((activity) => activity.status === 'interrupted').length
   const wasActiveRef = useRef(active)
   const wasDefaultExpandedRef = useRef(defaultExpanded)
   const headerRef = useRef<HTMLButtonElement>(null)
@@ -115,6 +116,8 @@ export function AgentActivityList({
             className="size-3.5 shrink-0 text-status-danger-foreground"
             strokeWidth={2}
           />
+        ) : stoppedCount > 0 ? (
+          <Square aria-hidden="true" className="size-3 shrink-0 text-tertiary" strokeWidth={2} />
         ) : (
           <Check
             aria-hidden="true"
@@ -230,6 +233,15 @@ function ActivityStatus({ activity }: { activity: AgentActivity }): React.JSX.El
         aria-label="Failed"
         className="mt-0.5 size-3 shrink-0 text-status-danger-foreground"
         strokeWidth={1.9}
+      />
+    )
+  }
+  if (activity.status === 'interrupted') {
+    return (
+      <Square
+        aria-label="Stopped"
+        className="mt-0.5 size-2.5 shrink-0 text-tertiary"
+        strokeWidth={2}
       />
     )
   }

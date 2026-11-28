@@ -63,6 +63,7 @@ import {
   preserveMessagesBeforeCutoffMutation,
 } from '../side-chat-persistence.js'
 import { backgroundReportId, validBodyText } from './helpers.js'
+import { confirmedNativeInitialization, recordOutputFailure } from './native-rebuild-queries.js'
 import {
   activeRunStatuses,
   BODY_PART_UNITS,
@@ -1139,9 +1140,7 @@ function applyEventWithinTransaction(
           .where(eq(conversationOutputSnapshots.sourceMessageId, previous.id))
           .get()
       : undefined
-    const identicalFrozenSnapshot = Boolean(
-      cut &&
-      !cut.sourceMessageId &&
+    const previousContentMatches = Boolean(
       previous &&
       event.type === 'text.completed' &&
       transaction
@@ -1149,6 +1148,16 @@ function applyEventWithinTransaction(
         .from(conversationMessages)
         .where(eq(conversationMessages.id, previous.id))
         .get()?.same,
+    )
+    const identicalFrozenSnapshot = Boolean(
+      mayProjectBody && cut && !cut.sourceMessageId && previousContentMatches,
+    )
+    const identicalHiddenSnapshot = Boolean(
+      !mayProjectBody &&
+      previous &&
+      !previous.isVisible &&
+      previousContentMatches &&
+      (bodyState === undefined || previous.state === bodyState),
     )
     const anchoredSource =
       archive &&
@@ -1189,6 +1198,9 @@ function applyEventWithinTransaction(
           .where(eq(conversationMessages.id, previous.id))
           .run()
       }
+      messageChange = { id: previous.id, mode: 'metadata' }
+    } else if (identicalHiddenSnapshot && previous) {
+      // Deduplicate repeated hidden-only recovery of identical text and state without mutating the visible row.
       messageChange = { id: previous.id, mode: 'metadata' }
     } else if (existing) {
       preserveMessagesBeforeCutoffMutation(transaction, [existing.id])
@@ -1239,7 +1251,10 @@ function applyEventWithinTransaction(
         .limit(1)
         .get()
       const replacesRecoveredSource =
-        bodyState === 'complete' && visible?.runId === runId && repo.ownsNativeControl(runId)
+        mayProjectBody &&
+        bodyState === 'complete' &&
+        visible?.runId === runId &&
+        repo.ownsNativeControl(runId)
       const replacesSnapshot = Boolean(cut && mayProjectBody && visible?.runId === runId)
       if (
         visible &&
@@ -1300,11 +1315,35 @@ function applyEventWithinTransaction(
       }
     }
   } else if (event.type === 'turn.completed') {
+    const existingRunOutcome = transaction
+      .select({
+        status: agentRuns.status,
+        dispatchPhase: agentRuns.dispatchPhase,
+        nativeOutcome: agentRuns.nativeOutcome,
+        failureKind: agentRuns.failureKind,
+        failureMessage: agentRuns.failureMessage,
+      })
+      .from(agentRuns)
+      .where(eq(agentRuns.id, runId))
+      .get()
+    // B-F6: Preserve an already-verified native `completed` outcome monotonically so a
+    // truncated-visible-body `turn.completed { outcome: 'failed' }` keeps the assistant
+    // message `incomplete` without downgrading verified `nativeOutcome` or falsely treating
+    // a racing native completion after Stop as a native crash (R2-F2).
+    const nextNativeOutcome =
+      existingRunOutcome?.dispatchPhase === 'ended' &&
+      existingRunOutcome.nativeOutcome === 'completed'
+        ? 'completed'
+        : event.outcome
+    const nativeFailed = nextNativeOutcome === 'failed'
+    const userStopped = hasCommittedUserStop(repo, runId)
+    const effectiveOutcome: 'completed' | 'failed' | 'interrupted' =
+      userStopped && !nativeFailed ? 'interrupted' : event.outcome
     if (!archive)
       transaction
         .update(nativeAgentContexts)
         .set({
-          state: event.outcome === 'completed' ? 'active' : 'interrupted',
+          state: effectiveOutcome === 'failed' ? 'interrupted' : 'active',
           continuationState: 'ready',
           recoveryReason: null,
           updatedAt: now,
@@ -1322,42 +1361,34 @@ function applyEventWithinTransaction(
       .from(sessions)
       .where(eq(sessions.id, sessionId))
       .get()?.status
-    const existingRunOutcome = transaction
-      .select({
-        dispatchPhase: agentRuns.dispatchPhase,
-        nativeOutcome: agentRuns.nativeOutcome,
-        failureKind: agentRuns.failureKind,
-        failureMessage: agentRuns.failureMessage,
-      })
-      .from(agentRuns)
-      .where(eq(agentRuns.id, runId))
-      .get()
-    // B-F6: Preserve an already-verified native `completed` outcome monotonically so a
-    // truncated-visible-body `turn.completed { outcome: 'failed' }` keeps the assistant
-    // message `incomplete` without downgrading verified `nativeOutcome` or breaking
-    // subsequent background report ownership.
-    const nextNativeOutcome =
-      existingRunOutcome?.dispatchPhase === 'ended' &&
-      existingRunOutcome.nativeOutcome === 'completed'
-        ? 'completed'
-        : event.outcome
     // A-2: Preserve recorded failure diagnostics when `turn.completed` settles non-completed.
-    const clearFailureDiagnostics = event.outcome === 'completed'
+    // Option 1 intent boundary: once user Stop committed, a racing native `completed` still
+    // records `nativeOutcome = 'completed'` for audit while keeping the Run neutrally
+    // `interrupted / user_stopped`. A real native `failed` outcome must never be masked.
+    const clearFailureDiagnostics = effectiveOutcome === 'completed'
+    const nextFailureKind = clearFailureDiagnostics
+      ? null
+      : userStopped && nativeFailed
+        ? 'agent_process_crash'
+        : (existingRunOutcome?.failureKind ?? null)
+    const nextFailureMessage = clearFailureDiagnostics
+      ? null
+      : userStopped && nativeFailed
+        ? 'The native Turn failed before Stop settled.'
+        : (existingRunOutcome?.failureMessage ?? null)
     transaction
       .update(agentRuns)
       .set({
-        status: event.outcome,
+        status: effectiveOutcome,
         nativeOutcome: nextNativeOutcome,
         dispatchPhase: 'ended',
-        failureKind: clearFailureDiagnostics ? null : (existingRunOutcome?.failureKind ?? null),
-        failureMessage: clearFailureDiagnostics
-          ? null
-          : (existingRunOutcome?.failureMessage ?? null),
+        failureKind: nextFailureKind,
+        failureMessage: nextFailureMessage,
         updatedAt: now,
       })
       .where(eq(agentRuns.id, runId))
       .run()
-    if (event.outcome !== 'completed' && !archive) {
+    if (effectiveOutcome !== 'completed' && !archive) {
       transaction
         .update(agentRuns)
         .set({ peerProposalState: 'superseded', updatedAt: now })
@@ -1375,10 +1406,16 @@ function applyEventWithinTransaction(
           .where(eq(conversationMessages.id, failedRun.userMessageId))
           .run()
     }
+    const nextActivityStatus: 'completed' | 'failed' | 'interrupted' =
+      effectiveOutcome === 'completed'
+        ? 'completed'
+        : userStopped || effectiveOutcome === 'interrupted'
+          ? 'interrupted'
+          : 'failed'
     transaction
       .update(agentRunActivities)
       .set({
-        status: event.outcome === 'completed' ? 'completed' : 'failed',
+        status: nextActivityStatus,
         updatedAt: now,
       })
       .where(and(eq(agentRunActivities.runId, runId), eq(agentRunActivities.status, 'running')))
@@ -1402,7 +1439,7 @@ function applyEventWithinTransaction(
       (!archive || !assistantMessage.visible || repo.ownsNativeControl(runId))
     ) {
       if (
-        event.outcome === 'completed' &&
+        effectiveOutcome === 'completed' &&
         assistantMessage.state !== 'incomplete' &&
         assistantMessage.replyTo &&
         assistantMessage.hasBody
@@ -1478,7 +1515,7 @@ function applyEventWithinTransaction(
         .update(conversationMessages)
         .set({
           state:
-            event.outcome === 'completed' && assistantMessage.state !== 'incomplete'
+            effectiveOutcome === 'completed' && assistantMessage.state !== 'incomplete'
               ? 'complete'
               : 'incomplete',
           updatedAt: now,
@@ -1490,8 +1527,8 @@ function applyEventWithinTransaction(
         mode: assistantMessage.visible ? 'metadata' : 'replace',
       }
     }
-    if (!archive) repo.finishCollaboration(runId, event.outcome === 'completed')
-    if (event.outcome === 'completed' && !assistantMessage?.hasBody)
+    if (!archive) repo.finishCollaboration(runId, effectiveOutcome === 'completed')
+    if (effectiveOutcome === 'completed' && !assistantMessage?.hasBody)
       transaction
         .update(agentRuns)
         .set({ peerProposalState: 'superseded', updatedAt: now })
@@ -1499,14 +1536,14 @@ function applyEventWithinTransaction(
         .run()
     activityStates.push({
       runId,
-      status: event.outcome === 'completed' ? 'completed' : 'failed',
+      status: nextActivityStatus,
     })
     if (!archive)
       transaction
         .update(sessions)
         .set({
           status:
-            event.outcome === 'completed'
+            effectiveOutcome === 'completed'
               ? currentSessionStatus === 'waiting_for_user'
                 ? 'waiting_for_user'
                 : 'idle'
@@ -1556,6 +1593,7 @@ export function failRun(
   failureKind: RunFailureKind,
   failureMessage: string,
   interrupted = false,
+  options?: { userStopped?: boolean },
 ): ConversationPatch {
   const run = repo.findRun(runId)
   if (!run) throw new Error('Agent Run does not exist.')
@@ -1566,9 +1604,26 @@ export function failRun(
     .orderBy(desc(agentRuns.createdAt), desc(sql`rowid`))
     .limit(1)
     .get()
-  if (latest?.id !== runId || run.status === 'completed')
+  const isUserStop =
+    interrupted && (failureKind === 'user_stopped' || options?.userStopped === true)
+  if (
+    latest?.id !== runId ||
+    run.status === 'completed' ||
+    (isUserStop && run.dispatchPhase === 'ended' && run.nativeOutcome === 'completed')
+  )
     throw new RunOperationConflictError('This Run no longer owns failure settlement.')
   const updatedAt = new Date().toISOString()
+  // Never let a later Stop mask an already-recorded real output/protocol failure on this Run.
+  const effectiveFailureKind =
+    isUserStop && run.failureKind && run.failureKind !== 'user_stopped'
+      ? run.failureKind
+      : failureKind
+  const effectiveFailureMessage =
+    isUserStop && run.failureKind && run.failureKind !== 'user_stopped'
+      ? (run.failureMessage ?? failureMessage)
+      : failureMessage
+  const cleanStop = interrupted && effectiveFailureKind === 'user_stopped'
+  const nextActivityStatus: 'failed' | 'interrupted' = cleanStop ? 'interrupted' : 'failed'
   repo.nativeMetadataTransaction(run.sessionId, (transaction) => {
     const partialMessage = transaction
       .select({ content: conversationMessages.content })
@@ -1582,7 +1637,8 @@ export function failRun(
       runId,
       eventType: interrupted ? 'run.interrupted' : 'run.failed',
       payload: JSON.stringify({
-        failureKind,
+        failureKind: effectiveFailureKind,
+        ...(isUserStop ? { userStopped: true } : {}),
         partialOutputPreserved: Boolean(partialMessage?.content),
         partialOutputLength: partialMessage?.content.length ?? 0,
       }),
@@ -1592,8 +1648,8 @@ export function failRun(
       .update(agentRuns)
       .set({
         status: interrupted ? 'interrupted' : 'failed',
-        failureKind,
-        failureMessage,
+        failureKind: effectiveFailureKind,
+        failureMessage: effectiveFailureMessage,
         updatedAt,
       })
       .where(eq(agentRuns.id, runId))
@@ -1624,20 +1680,21 @@ export function failRun(
       .run()
     transaction
       .update(agentRunActivities)
-      .set({ status: 'failed', updatedAt })
+      .set({ status: nextActivityStatus, updatedAt })
       .where(and(eq(agentRunActivities.runId, runId), eq(agentRunActivities.status, 'running')))
       .run()
-    transaction
-      .update(nativeAgentContexts)
-      .set({ state: 'interrupted', updatedAt })
-      .where(
-        and(
-          eq(nativeAgentContexts.sessionId, run.sessionId),
-          eq(nativeAgentContexts.agentId, run.agentId),
-          eq(nativeAgentContexts.lastRunId, runId),
-        ),
-      )
-      .run()
+    if (!cleanStop)
+      transaction
+        .update(nativeAgentContexts)
+        .set({ state: 'interrupted', updatedAt })
+        .where(
+          and(
+            eq(nativeAgentContexts.sessionId, run.sessionId),
+            eq(nativeAgentContexts.agentId, run.agentId),
+            eq(nativeAgentContexts.lastRunId, runId),
+          ),
+        )
+        .run()
     transaction
       .update(sessions)
       .set({ status: 'paused', updatedAt })
@@ -1659,8 +1716,254 @@ export function failRun(
   return repo.createPatch(run.sessionId, {
     runs: [updated],
     messages,
-    activityStates: [{ runId, status: 'failed' }],
+    activityStates: [{ runId, status: nextActivityStatus }],
   })
+}
+
+export function hasOutputUnavailable(repo: ConversationRepositoryHost, runId: string): boolean {
+  return Boolean(
+    repo.database
+      .select({ sequence: agentEventJournal.sequence })
+      .from(agentEventJournal)
+      .where(
+        and(
+          eq(agentEventJournal.runId, runId),
+          eq(agentEventJournal.eventType, 'pact.output_unavailable'),
+        ),
+      )
+      .limit(1)
+      .get(),
+  )
+}
+
+export function hasCommittedUserStop(repo: ConversationRepositoryHost, runId: string): boolean {
+  const recorded = repo.database
+    .select({ sequence: agentEventJournal.sequence })
+    .from(agentEventJournal)
+    .where(
+      and(
+        eq(agentEventJournal.runId, runId),
+        eq(agentEventJournal.eventType, 'run.interrupted'),
+        sql`(json_extract(${agentEventJournal.payload}, '$.userStopped') = 1 OR json_extract(${agentEventJournal.payload}, '$.failureKind') = 'user_stopped')`,
+      ),
+    )
+    .limit(1)
+    .get()
+  if (recorded) return true
+  const run = repo.findRun(runId)
+  return run?.status === 'interrupted' && run.failureKind === 'user_stopped'
+}
+
+export function settleKnownNativeEnding(
+  repo: ConversationRepositoryHost,
+  runId: string,
+  failure?: { kind: RunFailureKind; message: string },
+): ConversationPatch {
+  const run = repo.findRun(runId)
+  if (!run || run.dispatchPhase !== 'ended')
+    throw new RunOperationConflictError('The native ending has no evidence.')
+  const userStopped = hasCommittedUserStop(repo, runId)
+  const outputFailure = failure && failure.kind !== 'user_stopped' ? failure : undefined
+  if (outputFailure) recordOutputFailure(repo, runId, outputFailure)
+  const hasFail = Boolean(outputFailure) || hasOutputUnavailable(repo, runId)
+  const currentContext = repo.nativeContext(run.sessionId, run.agentId)
+  const bindingHealthy =
+    !currentContext ||
+    (currentContext.bindingGeneration === (run.bindingGeneration ?? 1) &&
+      currentContext.state !== 'missing' &&
+      currentContext.recoveryFailureKind !== 'native_session_occupied' &&
+      currentContext.recoveryAction !== 'rebuild')
+  const nativeFailedAfterStop = userStopped && run.nativeOutcome === 'failed'
+  const cleanUserStopped =
+    userStopped &&
+    run.failureKind === 'user_stopped' &&
+    !hasFail &&
+    bindingHealthy &&
+    (run.nativeOutcome === 'interrupted' || run.nativeOutcome === 'completed') &&
+    (!run.nativeEffectsState ||
+      run.nativeEffectsState === 'settled' ||
+      run.nativeEffectsState === 'not_dispatched')
+  const complete = repo.hasCompleteResponse(runId)
+  const status: AgentRun['status'] =
+    userStopped && !nativeFailedAfterStop
+      ? 'interrupted'
+      : run.status === 'failed' && !complete
+        ? 'failed'
+        : (run.nativeOutcome ?? 'interrupted')
+  const ok = !userStopped && status === 'completed' && complete
+  repo.nativeMetadataTransaction(run.sessionId, () => {
+    repo.database
+      .update(agentRuns)
+      .set({
+        status,
+        failureKind: ok
+          ? null
+          : nativeFailedAfterStop
+            ? (outputFailure?.kind ?? 'agent_process_crash')
+            : (outputFailure?.kind ?? run.failureKind ?? null),
+        failureMessage: !run.nativeOutcome
+          ? 'The Turn ended, but its outcome was not recorded.'
+          : ok
+            ? null
+            : nativeFailedAfterStop
+              ? (outputFailure?.message ?? 'The native Turn failed before Stop settled.')
+              : (outputFailure?.message ?? run.failureMessage ?? null),
+      })
+      .where(eq(agentRuns.id, runId))
+      .run()
+    if (cleanUserStopped)
+      repo.database
+        .update(agentRunActivities)
+        .set({ status: 'interrupted', updatedAt: new Date().toISOString() })
+        .where(and(eq(agentRunActivities.runId, runId), eq(agentRunActivities.status, 'running')))
+        .run()
+    if (repo.ownsNativeControl(runId) && (!userStopped || cleanUserStopped))
+      repo.database
+        .update(nativeAgentContexts)
+        .set({
+          ...(cleanUserStopped ? { state: 'active' as const } : {}),
+          continuationState: 'ready',
+          recoveryReason: null,
+        })
+        .where(
+          and(
+            eq(nativeAgentContexts.sessionId, run.sessionId),
+            eq(nativeAgentContexts.agentId, run.agentId),
+            eq(nativeAgentContexts.bindingGeneration, run.bindingGeneration ?? 1),
+          ),
+        )
+        .run()
+    repo.recordSchedulingBusinessActivity(runId, complete)
+  })
+  repo.finishCollaboration(
+    runId,
+    status === 'completed' && (complete || !hasFail),
+    outputFailure?.message ?? run.failureMessage,
+  )
+  return cleanUserStopped
+    ? repo.createPatch(run.sessionId, {
+        runs: [repo.findRun(runId)!],
+        activityStates: [{ runId, status: 'interrupted' }],
+      })
+    : repo.runPatch(runId)
+}
+
+/**
+ * Atomically settles a pre-dispatch (`not_sent`/`rejected`) context after clean Stop or withheld input:
+ * discards an unmaterialized 0-turn fresh binding so the next Send starts cleanly without hitting
+ * `context_resume_failed`, or restores a genuinely established binding back to `ready`.
+ */
+export function restorePreDispatchContext(
+  repo: ConversationRepositoryHost,
+  runId: string,
+): ConversationPatch | undefined {
+  const run = repo.findRun(runId)
+  if (
+    !run ||
+    run.nativeTurnId ||
+    run.nativeOutcome ||
+    !['not_sent', 'rejected'].includes(run.dispatchPhase ?? '')
+  ) {
+    return undefined
+  }
+  const generation = run.bindingGeneration ?? 1
+  let mutated = false
+  repo.nativeMetadataTransaction(run.sessionId, (transaction) => {
+    const current = transaction
+      .select()
+      .from(nativeAgentContexts)
+      .where(
+        and(
+          eq(nativeAgentContexts.sessionId, run.sessionId),
+          eq(nativeAgentContexts.agentId, run.agentId),
+        ),
+      )
+      .get()
+    if (!current || current.bindingGeneration !== generation) {
+      return
+    }
+    const recoverableWithheldContext =
+      current.lastRunId === run.id &&
+      run.failureKind === 'user_stopped' &&
+      (current.state === 'active' || current.state === 'interrupted') &&
+      (!current.recoveryFailureKind || current.recoveryFailureKind === 'user_stopped') &&
+      (!current.recoveryAction ||
+        current.recoveryAction === 'none' ||
+        current.recoveryAction === 'retry')
+    if (
+      !recoverableWithheldContext &&
+      (current.state !== 'active' ||
+        current.recoveryFailureKind ||
+        (current.recoveryAction && current.recoveryAction !== 'none'))
+    ) {
+      return
+    }
+    const dispatchedInGeneration = transaction
+      .select({ id: agentRuns.id })
+      .from(agentRuns)
+      .where(
+        and(
+          eq(agentRuns.sessionId, run.sessionId),
+          eq(agentRuns.agentId, run.agentId),
+          eq(agentRuns.bindingGeneration, generation),
+          or(
+            sql`${agentRuns.dispatchPhase} NOT IN ('not_sent', 'rejected')`,
+            isNotNull(agentRuns.nativeTurnId),
+          ),
+        ),
+      )
+      .limit(1)
+      .get()
+    const unmaterializedFreshContext =
+      current.lastRunId === run.id &&
+      current.rebuiltThroughSequence === null &&
+      current.forkThroughSequence === null &&
+      !confirmedNativeInitialization(repo, run.sessionId, run.agentId) &&
+      !dispatchedInGeneration
+    if (unmaterializedFreshContext) {
+      transaction
+        .delete(nativeAgentContexts)
+        .where(
+          and(
+            eq(nativeAgentContexts.sessionId, run.sessionId),
+            eq(nativeAgentContexts.agentId, run.agentId),
+            eq(nativeAgentContexts.bindingGeneration, generation),
+          ),
+        )
+        .run()
+      mutated = true
+    } else if (
+      current.continuationState === 'responding' ||
+      current.continuationState === 'waiting_user' ||
+      (recoverableWithheldContext &&
+        (current.continuationState !== 'ready' ||
+          current.state !== 'active' ||
+          current.recoveryFailureKind !== null ||
+          current.recoveryAction !== null))
+    ) {
+      transaction
+        .update(nativeAgentContexts)
+        .set({
+          state: 'active',
+          continuationState: 'ready',
+          recoveryReason: null,
+          recoveryFailureKind: null,
+          recoveryFailureMessage: null,
+          recoveryAction: null,
+          updatedAt: new Date().toISOString(),
+        })
+        .where(
+          and(
+            eq(nativeAgentContexts.sessionId, run.sessionId),
+            eq(nativeAgentContexts.agentId, run.agentId),
+            eq(nativeAgentContexts.bindingGeneration, generation),
+          ),
+        )
+        .run()
+      mutated = true
+    }
+  })
+  return mutated ? repo.createPatch(run.sessionId, { runs: [repo.findRun(runId)!] }) : undefined
 }
 
 export function recoverInterruptedRuns(repo: ConversationRepositoryHost): string[] {

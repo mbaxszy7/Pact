@@ -1311,17 +1311,28 @@ export class CollaborationAndHandoffCoordinator {
       return
     }
     execution.protectedAgentId = pending.agentId
-    const prepared = await this.beginPendingRoutedContinuation(
-      pending,
-      {
-        cwd,
-        settings,
-        settingsRevision: execution.run.settingsRevision,
-        executablePaths,
-      },
-      execution.abortController.signal,
-    )
-    if (!prepared) return
+    const continuationAbort = new AbortController()
+    execution.continuationAbortController = continuationAbort
+    let prepared: Awaited<
+      ReturnType<CollaborationAndHandoffCoordinator['beginPendingRoutedContinuation']>
+    >
+    try {
+      prepared = await this.beginPendingRoutedContinuation(
+        pending,
+        {
+          cwd,
+          settings,
+          settingsRevision: execution.run.settingsRevision,
+          executablePaths,
+        },
+        continuationAbort.signal,
+      )
+    } finally {
+      if (execution.continuationAbortController === continuationAbort) {
+        execution.continuationAbortController = undefined
+      }
+    }
+    if (!prepared || execution.cancelledByUser || continuationAbort.signal.aborted) return
     const { started, prompt } = prepared
     execution.run = started.run
     execution.protectedAgentId = started.run.agentId

@@ -395,7 +395,7 @@ export const agentActivitySchema = z.strictObject({
   title: z.string().min(1),
   detail: z.string().optional(),
   detailRevision: z.number().int().nonnegative(),
-  status: z.enum(['running', 'completed', 'failed']),
+  status: z.enum(['running', 'completed', 'failed', 'interrupted']),
   sequence: z.number().int().nonnegative(),
   createdAt: z.string().datetime(),
   updatedAt: z.string().datetime(),
@@ -691,6 +691,7 @@ export const sessionIssuesSchema = z.strictObject({
   sessionId: z.string().uuid(),
   inputGate: z.enum(['open', 'send_blocked', 'read_only']),
   agents: z.array(sessionIssueSchema).max(3),
+  stoppingAgentId: runtimeAgentIdSchema.optional(),
 })
 export type SessionIssues = z.infer<typeof sessionIssuesSchema>
 
@@ -1414,7 +1415,7 @@ export const conversationPatchSchema = z
       .array(
         z.strictObject({
           runId: z.string().uuid(),
-          status: z.enum(['completed', 'failed']),
+          status: z.enum(['completed', 'failed', 'interrupted']),
         }),
       )
       .max(4),

@@ -412,10 +412,11 @@ export class ConversationRepository {
       isCurrentNativeCursor: (...args) => nativeRebuildQueries.isCurrentNativeCursor(host, ...args),
       latestAgentRun: (...args) => nativeRebuildQueries.latestAgentRun(host, ...args),
       hasCompleteResponse: (...args) => nativeRebuildQueries.hasCompleteResponse(host, ...args),
+      hasCommittedUserStop: (...args) => eventStreamQueries.hasCommittedUserStop(host, ...args),
       bindingHasUnsettledWork: (...args) =>
         nativeRebuildQueries.bindingHasUnsettledWork(host, ...args),
       settleKnownNativeEnding: (...args) =>
-        nativeRebuildQueries.settleKnownNativeEnding(host, ...args),
+        eventStreamQueries.settleKnownNativeEnding(host, ...args),
       nativeRebuildOperation: (...args) =>
         nativeRebuildQueries.nativeRebuildOperation(host, ...args),
       pendingNativeRebuild: (...args) => nativeRebuildQueries.pendingNativeRebuild(host, ...args),
@@ -2009,6 +2010,10 @@ export class ConversationRepository {
     return messageWindowQueries.runPatch(this.host, runId)
   }
 
+  hasOutputUnavailable(runId: string): boolean {
+    return eventStreamQueries.hasOutputUnavailable(this.host, runId)
+  }
+
   recordNativeEffects(
     runId: string,
     state: 'not_dispatched' | 'pending' | 'settled' | 'unknown',
@@ -2122,7 +2127,7 @@ export class ConversationRepository {
     runId: string,
     failure?: { kind: RunFailureKind; message: string },
   ): ConversationPatch {
-    return nativeRebuildQueries.settleKnownNativeEnding(this.host, runId, failure)
+    return eventStreamQueries.settleKnownNativeEnding(this.host, runId, failure)
   }
 
   projectHasNativeWork(projectId: string): boolean {
@@ -2406,28 +2411,31 @@ export class ConversationRepository {
   }
 
   applyArchivedBatch(
-    sessionId: string,
-    runId: string,
-    events: readonly StreamDeltaEvent[],
+    ...args: [sessionId: string, runId: string, events: readonly StreamDeltaEvent[]]
   ): ConversationPatch {
-    return eventStreamQueries.applyArchivedBatch(this.host, sessionId, runId, events)
+    return eventStreamQueries.applyArchivedBatch(this.host, ...args)
   }
 
   applyStreamBatch(
-    sessionId: string,
-    runId: string,
-    events: readonly StreamDeltaEvent[],
+    ...args: [sessionId: string, runId: string, events: readonly StreamDeltaEvent[]]
   ): ConversationPatch {
-    return eventStreamQueries.applyStreamBatch(this.host, sessionId, runId, events)
+    return eventStreamQueries.applyStreamBatch(this.host, ...args)
   }
 
   failRun(
-    runId: string,
-    failureKind: RunFailureKind,
-    failureMessage: string,
-    interrupted = false,
+    ...args: [
+      runId: string,
+      failureKind: RunFailureKind,
+      failureMessage: string,
+      interrupted?: boolean,
+      options?: { userStopped?: boolean },
+    ]
   ): ConversationPatch {
-    return eventStreamQueries.failRun(this.host, runId, failureKind, failureMessage, interrupted)
+    return eventStreamQueries.failRun(this.host, ...args)
+  }
+
+  restorePreDispatchContext(runId: string): ConversationPatch | undefined {
+    return eventStreamQueries.restorePreDispatchContext(this.host, runId)
   }
 
   recoverInterruptedRuns(): string[] {
@@ -2459,18 +2467,14 @@ export class ConversationRepository {
   }
 
   nativeContextRebuildSource(
-    sessionId: string,
-    signal: AbortSignal,
-    operationId?: string,
-    sourceRevisions?: Map<string, number>,
+    ...args: [
+      sessionId: string,
+      signal: AbortSignal,
+      operationId?: string,
+      sourceRevisions?: Map<string, number>,
+    ]
   ): AsyncIterable<NativeContextRebuildChunk> {
-    return nativeRebuildQueries.nativeContextRebuildSource(
-      this.host,
-      sessionId,
-      signal,
-      operationId,
-      sourceRevisions,
-    )
+    return nativeRebuildQueries.nativeContextRebuildSource(this.host, ...args)
   }
 
   nativeContext(sessionId: string, agentId: RuntimeAgentId): NativeAgentContext | undefined {

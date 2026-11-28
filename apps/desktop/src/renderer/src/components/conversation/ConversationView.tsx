@@ -653,12 +653,14 @@ export function ConversationView({
     (message) => message.role === 'user' && message.pendingAgentId,
   )
   const pendingRoutedAgentId = pendingRoutedMessage?.pendingAgentId
+  const foregroundStopping = Boolean(sessionIssues?.stoppingAgentId)
   const respondingAgentId =
     (snapshot?.nativeContexts ?? []).find(
       (context) =>
         context.continuationState === 'responding' || context.continuationState === 'waiting_user',
     )?.agentId ??
     activeRun?.agentId ??
+    sessionIssues?.stoppingAgentId ??
     (!recoveryLocked ? pendingRoutedAgentId : undefined)
   const backgroundIssues = visibleSessionIssues?.agents ?? []
   const backgroundWorking = backgroundIssues.some((issue) => issue.phase === 'background_working')
@@ -668,7 +670,7 @@ export function ConversationView({
   )
   const backgroundStopIssue = backgroundIssues.find((issue) => issue.backgroundStop)
   const backgroundStop = backgroundStopIssue?.backgroundStop
-  const stopping = stopRequested || backgroundStopping
+  const stopping = stopRequested || backgroundStopping || foregroundStopping
   const responseInProgress = Boolean(respondingAgentId) || stopping
   const showStop = stopping || (!recoveryLocked && Boolean(respondingAgentId || backgroundStop))
   const stopLabel = stopping

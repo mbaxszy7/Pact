@@ -67,16 +67,18 @@ vi.mock('../owned-process-group', () => ({
 }))
 
 import type {
-  AgentNativeContextRebuildInput,
-  AgentNativeInputProbeInput,
-  AgentRunInput,
-  AgentSteerInput,
-} from '@pact/agent-runtime'
-import type {
   NormalizedAgentEvent,
   NativeProbeResult,
   CollaborationRetainedPlan,
 } from '@pact/contracts'
+
+import {
+  createRunStopAbortReason,
+  type AgentNativeContextRebuildInput,
+  type AgentNativeInputProbeInput,
+  type AgentRunInput,
+  type AgentSteerInput,
+} from '@pact/agent-runtime'
 
 import { planRevisionFixture } from '../../../../../packages/persistence/src/plan-revision-guidance.test-support.js'
 import {
@@ -6773,6 +6775,410 @@ describe('Wave 6A Codex TurnSession adversarial regressions', () => {
         type: 'session.title.updated',
         title: 'Run B Title',
       })
+    } finally {
+      await adapter.dispose()
+    }
+  })
+
+  it('Clean User Stop: C2 settles confirmed-stopped root commandExecution after 250ms grace without clearing fileChange, and rejects late stopped-root approval while keeping sub-turn approval alive', async () => {
+    let pushNotify!: (message: object) => void
+    const turnStarted = Promise.withResolvers<void>()
+    const rootRejected = Promise.withResolvers<Record<string, unknown>>()
+    const childResponded = Promise.withResolvers<Record<string, unknown>>()
+    let foregroundApprovals = 0
+    let subturnApprovals = 0
+    const effects: string[] = []
+
+    const adapter = new CodexAgentAdapter('/fake/codex', () => {
+      const child = fakeCodexProcess(
+        (request, respond, notify) => {
+          pushNotify = notify
+          const id = Reflect.get(request, 'id')
+          const method = String(Reflect.get(request, 'method'))
+          if (method === 'initialize') {
+            respond({ id, result: { userAgent: 'codex_cli_rs/0.163.0' } })
+          } else if (method === 'thread/start') {
+            respond({
+              id,
+              result: {
+                model: 'gpt-5.4',
+                reasoningEffort: 'high',
+                approvalPolicy: 'on-request',
+                approvalsReviewer: 'user',
+                sandbox: { type: 'workspaceWrite', writableRoots: [] },
+                thread: { id: 'th-clean-stop-c2' },
+              },
+            })
+          } else if (method === 'turn/start') {
+            respond({ id, result: { turn: { id: 'turn-root-c2' } } })
+            // Emit a commandExecution, a fileChange, and a spawned child thread before Stop.
+            notify({
+              method: 'item/started',
+              params: {
+                threadId: 'th-clean-stop-c2',
+                turnId: 'turn-root-c2',
+                item: {
+                  id: 'cmd-c2',
+                  processId: 'proc-c2',
+                  source: 'agent',
+                  type: 'commandExecution',
+                  command: 'sleep 10',
+                  cwd: '/project',
+                  status: 'inProgress',
+                },
+              },
+            })
+            notify({
+              method: 'item/started',
+              params: {
+                threadId: 'th-clean-stop-c2',
+                turnId: 'turn-root-c2',
+                item: {
+                  id: 'file-c2',
+                  type: 'fileChange',
+                  changes: [{ path: 'src/a.ts', kind: { type: 'update' } }],
+                },
+              },
+            })
+            notify({
+              method: 'item/completed',
+              params: {
+                threadId: 'th-clean-stop-c2',
+                turnId: 'turn-root-c2',
+                item: {
+                  id: 'spawn-c2',
+                  type: 'collabAgentToolCall',
+                  tool: 'spawnAgent',
+                  senderThreadId: 'th-clean-stop-c2',
+                  receiverThreadIds: ['child-c2'],
+                  agentsStates: { 'child-c2': { status: 'running' } },
+                },
+              },
+            })
+            notify({
+              method: 'turn/started',
+              params: { threadId: 'child-c2', turn: { id: 'turn-sub-c2' } },
+            })
+          } else if (method === 'thread/backgroundTerminals/list') {
+            respond({
+              id,
+              result: {
+                data: [
+                  {
+                    itemId: 'cmd-c2',
+                    processId: 'proc-c2',
+                    command: 'sleep 10',
+                    cwd: '/project',
+                  },
+                ],
+                nextCursor: null,
+              },
+            })
+          } else if (method === 'thread/backgroundTerminals/terminate') {
+            respond({ id, result: { terminated: true } })
+          } else if (method === 'turn/interrupt') {
+            respond({ id, result: {} })
+            // Send late stopped-root approval (must be rejected without touching host)
+            // and a distinct owned child sub-turn approval (must still invoke host).
+            notify({
+              id: 'req-root-after-stop',
+              method: 'item/commandExecution/requestApproval',
+              params: {
+                threadId: 'th-clean-stop-c2',
+                turnId: 'turn-root-c2',
+                itemId: 'cmd-c2-late',
+                command: ['echo', 'late'],
+                cwd: '/project',
+                availableDecisions: ['accept', 'cancel'],
+              },
+            })
+            notify({
+              id: 'req-child-subturn',
+              method: 'item/commandExecution/requestApproval',
+              params: {
+                threadId: 'child-c2',
+                turnId: 'turn-sub-c2',
+                itemId: 'cmd-sub',
+                command: ['echo', 'child'],
+                cwd: '/project',
+                availableDecisions: ['accept', 'cancel'],
+              },
+            })
+            // Omit item/completed for cmd-c2 (C2 bug in codex-rs!), emit turn/completed interrupted.
+            notify({
+              method: 'turn/completed',
+              params: {
+                threadId: 'th-clean-stop-c2',
+                turn: { id: 'turn-root-c2', status: 'interrupted' },
+              },
+            })
+          }
+        },
+        (request) => {
+          const id = Reflect.get(request, 'id')
+          if (id === 'req-root-after-stop') {
+            rootRejected.resolve(request as Record<string, unknown>)
+            return true
+          }
+          if (id === 'req-child-subturn') {
+            childResponded.resolve(request as Record<string, unknown>)
+            return true
+          }
+          return false
+        },
+      )
+      return {
+        child,
+        close: async () => {
+          child.emit('exit', 0, null)
+          child.emit('close', 0, null)
+        },
+      }
+    })
+
+    try {
+      const abort = new AbortController()
+      const runId = randomUUID()
+      const runPromise = (async () => {
+        for await (const ev of adapter.run(
+          {
+            runId,
+            sessionId: randomUUID(),
+            cwd: '/project',
+            model: 'gpt-5.4',
+            effort: 'high',
+            promptEnvelope: {
+              version: 'pact-agent-prompt-v1',
+              sessionId: randomUUID(),
+              message: { id: randomUUID(), content: 'Run C2 stop test' },
+              comments: [],
+            },
+            host: {
+              interactions: {
+                requestPermission: async (req) => {
+                  if (req.title.includes('late') || (req.detail ?? '').includes('late'))
+                    foregroundApprovals += 1
+                  else subturnApprovals += 1
+                  const allow = req.actions?.find((candidate) => candidate.kind === 'allow')
+                  if (!allow) throw new Error('Missing allow action')
+                  return allow.id
+                },
+              },
+              effects: {
+                reportNativeEffects: (report) => {
+                  effects.push(report.state)
+                },
+              },
+            },
+          },
+          abort.signal,
+        )) {
+          if (ev.type === 'tool.started' && ev.toolCallId === 'file-c2') {
+            turnStarted.resolve()
+          }
+        }
+      })()
+      await turnStarted.promise
+      abort.abort(createRunStopAbortReason('user_stop'))
+      // Wait for both server-request responses: stopped root rejected, sub-turn accepted!
+      const rootReply = await rootRejected.promise
+      expect(Reflect.get(rootReply, 'error')).toBeDefined()
+      const childReply = await childResponded.promise
+      expect(Reflect.get(childReply, 'result')).toMatchObject({ decision: 'accept' })
+      expect(foregroundApprovals).toBe(0)
+      expect(subturnApprovals).toBe(1)
+
+      // After 250ms C2 grace, cmd-c2 is cleared, but file-c2 is STILL open -> background work remains active!
+      await new Promise((r) => setTimeout(r, 350))
+      expect(adapter.hasActiveBackgroundWork(runId)).toBe(true)
+
+      // Complete file-c2 and child-c2 -> now root settles cleanly without waiting on omitted cmd-c2!
+      pushNotify({
+        method: 'item/completed',
+        params: {
+          threadId: 'th-clean-stop-c2',
+          turnId: 'turn-root-c2',
+          item: {
+            id: 'file-c2',
+            type: 'fileChange',
+            status: 'completed',
+            changes: [{ path: 'src/a.ts', kind: { type: 'update' } }],
+          },
+        },
+      })
+      pushNotify({
+        method: 'turn/completed',
+        params: {
+          threadId: 'child-c2',
+          turn: { id: 'turn-sub-c2', status: 'completed' },
+        },
+      })
+      await runPromise
+      await vi.waitFor(() => expect(adapter.hasActiveBackgroundWork(runId)).toBe(false))
+      expect(effects.at(-1)).toBe('settled')
+    } finally {
+      await adapter.dispose()
+    }
+  })
+
+  it('B3 (Astra #5): honors full Stop deadline (>2s) on terminate RPC and preserves confirmed proofs across sibling failures', async () => {
+    const turnStarted = Promise.withResolvers<void>()
+    let pushNotify!: (message: object) => void
+    const effects: string[] = []
+    const adapter = new CodexAgentAdapter('/fake/codex', () => {
+      const child = fakeCodexProcess((request, respond, notify) => {
+        pushNotify = notify
+        const method = String(Reflect.get(request, 'method'))
+        const id = Reflect.get(request, 'id')
+        const params = Reflect.get(request, 'params') as Record<string, unknown> | undefined
+        if (method === 'initialize') {
+          respond({ id, result: { userAgent: 'codex_cli_rs/0.163.0' } })
+        } else if (method === 'thread/start') {
+          respond({
+            id,
+            result: {
+              model: 'gpt-5.4',
+              reasoningEffort: 'high',
+              approvalPolicy: 'on-request',
+              approvalsReviewer: 'user',
+              sandbox: { type: 'workspaceWrite', writableRoots: [] },
+              thread: { id: 'th-b3' },
+            },
+          })
+        } else if (method === 'turn/start') {
+          respond({ id, result: { turn: { id: 'turn-b3', status: 'inProgress', items: [] } } })
+          notify({
+            method: 'turn/started',
+            params: { threadId: 'th-b3', turn: { id: 'turn-b3', status: 'inProgress' } },
+          })
+          notify({
+            method: 'item/started',
+            params: {
+              threadId: 'th-b3',
+              turnId: 'turn-b3',
+              item: {
+                id: 'cmd-slow',
+                processId: 'proc-slow',
+                source: 'agent',
+                type: 'commandExecution',
+                command: 'sleep 20',
+                cwd: '/project',
+                status: 'inProgress',
+              },
+            },
+          })
+          notify({
+            method: 'item/started',
+            params: {
+              threadId: 'th-b3',
+              turnId: 'turn-b3',
+              item: {
+                id: 'cmd-fail',
+                processId: 'proc-fail',
+                source: 'agent',
+                type: 'commandExecution',
+                command: 'sleep 20',
+                cwd: '/project',
+                status: 'inProgress',
+              },
+            },
+          })
+        } else if (method === 'turn/interrupt') {
+          respond({ id, result: {} })
+        } else if (method === 'thread/backgroundTerminals/list') {
+          const cursor = params?.cursor
+          if (!cursor) {
+            respond({
+              id,
+              result: {
+                data: [{ itemId: 'cmd-slow', processId: 'proc-slow' }],
+                nextCursor: 'c2',
+              },
+            })
+          } else {
+            respond({
+              id,
+              result: {
+                data: [{ itemId: 'cmd-fail', processId: 'proc-fail' }],
+                nextCursor: null,
+              },
+            })
+          }
+        } else if (method === 'thread/backgroundTerminals/terminate') {
+          if (params?.processId === 'proc-slow') {
+            // Delay 2.2s (> old 2s per-RPC cap, well within the 10s Stop deadline!)
+            setTimeout(() => {
+              respond({ id, result: { terminated: true } })
+            }, 2_200)
+          } else {
+            // Second command RPC returns a JSON-RPC error -> must NOT erase cmd-slow proof!
+            respond({ id, error: { code: -32000, message: 'terminate failed' } })
+            notify({
+              method: 'turn/completed',
+              params: { threadId: 'th-b3', turn: { id: 'turn-b3', status: 'interrupted' } },
+            })
+          }
+        }
+      })
+      return {
+        child,
+        close: async () => {
+          child.emit('exit', 0, null)
+          child.emit('close', 0, null)
+        },
+      }
+    })
+
+    try {
+      const abort = new AbortController()
+      const runId = randomUUID()
+      const runPromise = (async () => {
+        for await (const ev of adapter.run(
+          {
+            runId,
+            sessionId: randomUUID(),
+            cwd: '/project',
+            model: 'gpt-5.4',
+            effort: 'high',
+            promptEnvelope: {
+              version: 'pact-agent-prompt-v1',
+              sessionId: randomUUID(),
+              message: { id: randomUUID(), content: 'Run B3 stop test' },
+              comments: [],
+            },
+            host: {
+              effects: {
+                reportNativeEffects: (report) => {
+                  effects.push(report.state)
+                },
+              },
+            },
+          },
+          abort.signal,
+        )) {
+          if (ev.type === 'tool.started' && ev.toolCallId === 'cmd-fail') {
+            turnStarted.resolve()
+          }
+        }
+      })()
+      await turnStarted.promise
+      abort.abort(createRunStopAbortReason('user_stop', performance.now() + 4_500))
+      // Wait past the 2.2s slow terminate reply + 250ms C2 grace; cmd-slow is cleared while cmd-fail stays open.
+      await new Promise((r) => setTimeout(r, 2_700))
+      expect(adapter.hasActiveBackgroundWork(runId)).toBe(true)
+      // Completing ONLY cmd-fail (never emitting item/completed for cmd-slow!) settles the turn cleanly,
+      // proving cmd-slow's 2.2s `{ terminated: true }` proof survived both the >2s RPC delay and cmd-fail's error!
+      pushNotify({
+        method: 'item/completed',
+        params: {
+          threadId: 'th-b3',
+          turnId: 'turn-b3',
+          item: { id: 'cmd-fail', type: 'commandExecution', status: 'interrupted' },
+        },
+      })
+      await runPromise
+      await vi.waitFor(() => expect(adapter.hasActiveBackgroundWork(runId)).toBe(false))
+      expect(effects).toContain('settled')
     } finally {
       await adapter.dispose()
     }

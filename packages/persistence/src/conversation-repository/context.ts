@@ -615,7 +615,7 @@ export interface ConversationRepositoryHost {
         toolName?: string | undefined
         title: string
         detailRevision: number
-        status: 'completed' | 'failed' | 'running'
+        status: 'completed' | 'failed' | 'interrupted' | 'running'
         sequence: number
         createdAt: string
         updatedAt: string
@@ -627,7 +627,7 @@ export interface ConversationRepositoryHost {
     }[]
     activityStates: {
       runId: string
-      status: 'completed' | 'failed'
+      status: 'completed' | 'failed' | 'interrupted'
     }[]
     nativeContexts?:
       | {
@@ -1878,6 +1878,7 @@ export interface ConversationRepositoryHost {
     generation?: number,
   ): AgentRun | undefined
   hasCompleteResponse(runId: string): boolean
+  hasCommittedUserStop(runId: string): boolean
   bindingHasUnsettledWork(sessionId: string, agentId: RuntimeAgentId, generation: number): boolean
   settleKnownNativeEnding(
     runId: string,

@@ -58,7 +58,6 @@ import {
   refreshNativeSessionMetadata,
 } from '../native-presence-metadata.js'
 import {
-  agentEventJournal,
   agentRuns,
   anchoredComments,
   collaborationActionReceipts,
@@ -238,6 +237,7 @@ export function ownsBackgroundControl(repo: ConversationRepositoryHost, runId: s
 }
 
 export function mayProjectNativeBody(repo: ConversationRepositoryHost, run: AgentRun): boolean {
+  if (repo.hasCommittedUserStop(run.id)) return false
   const context = nativeContext(repo, run.sessionId, run.agentId)
   return (
     ownsNativeControl(repo, run.id) ||
@@ -918,69 +918,6 @@ export function verifyRebuildReceipt(
     throw new RunOperationConflictError('The rebuild receipt belongs to another binding.')
   if (expectedRunId !== undefined && row.oldRunId !== expectedRunId)
     throw new RunOperationConflictError('The rebuild receipt belongs to another recovery target.')
-}
-
-export function settleKnownNativeEnding(
-  repo: ConversationRepositoryHost,
-  runId: string,
-  failure?: { kind: RunFailureKind; message: string },
-): ConversationPatch {
-  const run = repo.findRun(runId)
-  if (!run || run.dispatchPhase !== 'ended')
-    throw new RunOperationConflictError('The native ending has no evidence.')
-  if (failure) recordOutputFailure(repo, runId, failure)
-  const complete = hasCompleteResponse(repo, runId)
-  const status: AgentRun['status'] =
-    run.status === 'failed' && !complete ? 'failed' : (run.nativeOutcome ?? 'interrupted')
-  const ok = status === 'completed' && complete
-  nativeMetadataTransaction(repo, run.sessionId, () => {
-    repo.database
-      .update(agentRuns)
-      .set({
-        status,
-        failureKind: ok ? null : (failure?.kind ?? run.failureKind ?? null),
-        failureMessage: !run.nativeOutcome
-          ? 'The Turn ended, but its outcome was not recorded.'
-          : ok
-            ? null
-            : (failure?.message ?? run.failureMessage ?? null),
-      })
-      .where(eq(agentRuns.id, runId))
-      .run()
-    if (ownsNativeControl(repo, runId))
-      repo.database
-        .update(nativeAgentContexts)
-        .set({ continuationState: 'ready', recoveryReason: null })
-        .where(
-          and(
-            eq(nativeAgentContexts.sessionId, run.sessionId),
-            eq(nativeAgentContexts.agentId, run.agentId),
-            eq(nativeAgentContexts.bindingGeneration, run.bindingGeneration ?? 1),
-          ),
-        )
-        .run()
-    repo.recordSchedulingBusinessActivity(runId, complete)
-  })
-  const hasFail = Boolean(
-    failure ??
-    repo.database
-      .select({ sequence: agentEventJournal.sequence })
-      .from(agentEventJournal)
-      .where(
-        and(
-          eq(agentEventJournal.runId, runId),
-          eq(agentEventJournal.eventType, 'pact.output_unavailable'),
-        ),
-      )
-      .limit(1)
-      .get(),
-  )
-  repo.finishCollaboration(
-    runId,
-    status === 'completed' && (complete || !hasFail),
-    failure?.message ?? run.failureMessage,
-  )
-  return repo.runPatch(runId)
 }
 
 /** Indexed Project-wide facts, including old bindings whose native work is not settled. */

@@ -31,6 +31,7 @@ import { recordDiagnostic } from '../../../diagnostics/utility-log'
 import {
   AgentExecutionError,
   classifyAgentError,
+  isUserStopCancellationError,
   NativeCapacityError,
   NativeInputWithheldError,
   NativeThreadArchivedError,
@@ -79,6 +80,7 @@ export class RunExecutor {
         if (
           !this.core.disposed &&
           !execution.abortController.signal.aborted &&
+          !execution.continuationAbortController?.signal.aborted &&
           !execution.cancelledByUser
         ) {
           const activePair = resolveActiveAgentPair(settings)
@@ -152,7 +154,11 @@ export class RunExecutor {
               !owner.adapter.hasActiveBackgroundWork?.(execution.run.id) &&
               !(owner.backgroundReportTasks?.size ?? 0)
             ) {
-              if (execution.streamBuffer && !execution.streamBuffer.flush()) {
+              if (
+                execution.streamBuffer &&
+                !archiverForRun?.foregroundFrozen &&
+                !execution.streamBuffer.flush()
+              ) {
                 drainError ??= new Error('The last foreground output could not be committed.')
               }
               if (
@@ -562,8 +568,12 @@ export class RunExecutor {
     } catch (error) {
       if (this.core.disposed) return
       const saved = this.core.conversations.findRun(run.id)
-      if (execution.cancelledByUser || saved?.status === 'interrupted') {
-        if (saved?.nativeEffectsState === 'pending') {
+      if (
+        isUserStopCancellationError(error, signal, execution.cancelledByUser) &&
+        saved?.status === 'interrupted' &&
+        saved.failureKind === 'user_stopped'
+      ) {
+        if (saved.nativeEffectsState === 'pending') {
           this.core.publish(
             this.core.conversations.recordNativeEffects(
               run.id,
@@ -576,10 +586,14 @@ export class RunExecutor {
       }
       const failure = classifyAgentError(error)
       this.core.conversations.finishCollaboration(run.id, false, failure.message)
-      if (saved && ['starting', 'running', 'recovering'].includes(saved.status)) {
-        this.core.publish(
-          this.core.conversations.failRun(run.id, failure.kind, failure.message, false),
-        )
+      if (saved && ['starting', 'running', 'recovering', 'interrupted'].includes(saved.status)) {
+        try {
+          this.core.publish(
+            this.core.conversations.failRun(run.id, failure.kind, failure.message, false),
+          )
+        } catch (conflict) {
+          if (!(conflict instanceof RunOperationConflictError)) throw conflict
+        }
         if (error instanceof NativeCapacityError) {
           this.core.publish(
             this.core.conversations.recordNativeEffects(
@@ -742,6 +756,44 @@ export class RunExecutor {
 
     let enteredNativeAdapter = false
     let runDeliveryPossible = false
+
+    const restorePreDispatchBinding = (
+      savedRun: AgentRun,
+      allowWithheldWithoutUserStop = false,
+    ): void => {
+      if (
+        !allowWithheldWithoutUserStop &&
+        (savedRun.status !== 'interrupted' || savedRun.failureKind !== 'user_stopped')
+      ) {
+        return
+      }
+      if (
+        adapter.hasActiveBackgroundWork?.(run.id) ||
+        (!allowWithheldWithoutUserStop &&
+          this.core.interactions.pendingNativeInteractions(run.sessionId).length > 0)
+      ) {
+        return
+      }
+      const patch = this.core.conversations.restorePreDispatchContext(run.id)
+      if (patch) this.core.publish(patch)
+    }
+
+    const settlePreDispatchUserStop = (savedRun: AgentRun): void => {
+      const provenUnsent =
+        savedRun.dispatchPhase === 'rejected' ||
+        (!runDeliveryPossible && savedRun.dispatchPhase === 'not_sent')
+      if (!provenUnsent || savedRun.nativeEffectsState === 'unknown') return
+      if (savedRun.nativeEffectsState === 'pending' && !adapter.hasActiveBackgroundWork?.(run.id)) {
+        this.core.publish(
+          this.core.conversations.recordNativeEffects(
+            run.id,
+            'not_dispatched',
+            'stopped_before_native_dispatch',
+          ),
+        )
+      }
+      restorePreDispatchBinding(savedRun)
+    }
 
     const release = (): void => {
       if (
@@ -1346,22 +1398,15 @@ export class RunExecutor {
               const saved = this.core.conversations.findRun(run.id)
               if (
                 effectiveState === 'settled' &&
-                effectiveReason === 'workflow_input_withheld' &&
+                (effectiveReason === 'workflow_input_withheld' ||
+                  effectiveReason === 'native_turn_not_started') &&
                 saved &&
                 !saved.nativeTurnId &&
                 !saved.nativeOutcome &&
                 ['not_sent', 'rejected'].includes(saved.dispatchPhase ?? '') &&
                 this.core.conversations.ownsNativeControl(run.id)
               ) {
-                this.core.publish(
-                  this.core.conversations.setContinuation(
-                    run.sessionId,
-                    run.agentId,
-                    'ready',
-                    undefined,
-                    run.bindingGeneration,
-                  ),
-                )
+                restorePreDispatchBinding(saved, effectiveReason === 'workflow_input_withheld')
               }
               const settled = this.core.conversations.reconcileCompletedCollaboration(run.id)
               if (settled) this.core.publish(settled)
@@ -1440,7 +1485,7 @@ export class RunExecutor {
         await archiver.admitEvent(event, 'foreground', signal)
       }
 
-      archiver.foregroundBuffer.flush()
+      archiver.flushForeground()
       const saved = this.core.conversations.findRun(run.id)
       recordDiagnostic({
         operation: 'send',
@@ -1456,7 +1501,13 @@ export class RunExecutor {
         agentId: run.agentId,
         durationMs: Date.now() - diagnosticStartedAt,
       })
-      if (saved?.dispatchPhase !== 'ended') {
+      if (
+        execution.cancelledByUser &&
+        saved &&
+        (saved.dispatchPhase === 'not_sent' || saved.dispatchPhase === 'rejected')
+      ) {
+        settlePreDispatchUserStop(saved)
+      } else if (saved?.dispatchPhase !== 'ended') {
         this.core.publish(
           this.core.conversations.observationUnavailable(
             run.id,
@@ -1464,7 +1515,14 @@ export class RunExecutor {
           ),
         )
       } else {
-        this.core.publish(this.core.conversations.settleKnownNativeEnding(run.id))
+        try {
+          await archiver.drain()
+        } catch {
+          // Output archive failure is already latched on `archiver`.
+        }
+        this.core.publish(
+          this.core.conversations.settleKnownNativeEnding(run.id, archiver.outputFailure),
+        )
         const settledRun = this.core.conversations.findRun(run.id)
         const titleBinding = this.core.conversations.nativeContext(run.sessionId, run.agentId)
         if (
@@ -1484,13 +1542,19 @@ export class RunExecutor {
         }
       }
     } catch (error) {
-      archiver.foregroundBuffer.flush()
+      archiver.flushForeground()
       if (this.core.disposed) return
       const failure = classifyAgentError(error)
+      const userStopCancelError = isUserStopCancellationError(
+        error,
+        signal,
+        execution.cancelledByUser,
+      )
       if (
-        failure.kind === 'authentication_required' ||
-        failure.kind === 'runtime_incompatible' ||
-        failure.kind === 'agent_process_crash'
+        !userStopCancelError &&
+        (failure.kind === 'authentication_required' ||
+          failure.kind === 'runtime_incompatible' ||
+          failure.kind === 'agent_process_crash')
       ) {
         this.core.runtimePreparation.invalidateAgentReadiness(run.agentId)
       }
@@ -1500,7 +1564,11 @@ export class RunExecutor {
       // until after `archiver.drain()` so an archived completed snapshot is not prematurely
       // locked to `interrupted` or stamped with `pact.output_unavailable`.
       if (saved?.dispatchPhase !== 'ended') {
-        this.core.conversations.finishCollaboration(run.id, false, failure.message)
+        this.core.conversations.finishCollaboration(
+          run.id,
+          false,
+          execution.cancelledByUser ? 'Stopped by the user.' : failure.message,
+        )
       }
       recordDiagnostic({
         operation: 'send',
@@ -1519,8 +1587,13 @@ export class RunExecutor {
           ).data ?? 'other',
         durationMs: Date.now() - diagnosticStartedAt,
       })
-      if (!enteredNativeAdapter && (execution.cancelledByUser || saved?.status === 'interrupted')) {
-        if (saved?.nativeEffectsState === 'pending') {
+      if (
+        !enteredNativeAdapter &&
+        userStopCancelError &&
+        saved?.status === 'interrupted' &&
+        saved.failureKind === 'user_stopped'
+      ) {
+        if (saved.nativeEffectsState === 'pending') {
           this.core.publish(
             this.core.conversations.recordNativeEffects(
               run.id,
@@ -1539,25 +1612,52 @@ export class RunExecutor {
         }
         const drainedSaved = this.core.conversations.findRun(run.id)
         const completedWithAnswer =
+          !execution.cancelledByUser &&
           drainedSaved?.nativeOutcome === 'completed' &&
           !archiver.outputFailure &&
           this.core.conversations.hasCompleteResponse(run.id)
         this.core.publish(
-          completedWithAnswer
-            ? this.core.conversations.settleKnownNativeEnding(run.id)
-            : this.core.conversations.settleKnownNativeEnding(
-                run.id,
-                archiver.outputFailure ?? failure,
-              ),
+          execution.cancelledByUser
+            ? this.core.conversations.settleKnownNativeEnding(run.id, archiver.outputFailure)
+            : completedWithAnswer
+              ? this.core.conversations.settleKnownNativeEnding(run.id)
+              : this.core.conversations.settleKnownNativeEnding(
+                  run.id,
+                  archiver.outputFailure ?? failure,
+                ),
         )
         const completedReceipt = archiver.completedNativeReceipt
-        if (completedReceipt) {
+        if (completedReceipt && !execution.cancelledByUser) {
           this.reconcileOwnedCompletedCollaboration(run.id, completedReceipt)
         }
       } else if (saved?.dispatchPhase === 'rejected' || saved?.dispatchPhase === 'not_sent') {
+        if (
+          execution.cancelledByUser &&
+          userStopCancelError &&
+          !archiver.outputFailure &&
+          saved.status === 'interrupted' &&
+          saved.failureKind === 'user_stopped'
+        ) {
+          settlePreDispatchUserStop(saved)
+          return
+        }
         this.core.publish(
           this.core.conversations.failRun(run.id, failure.kind, failure.message, false),
         )
+        const provenUnsentWithheld =
+          error instanceof NativeInputWithheldError &&
+          (!runDeliveryPossible || saved.dispatchPhase === 'rejected') &&
+          !saved.nativeTurnId &&
+          !saved.nativeOutcome &&
+          !this.core.interactions.pendingNativeInteractions(run.sessionId).length
+        const withheldSettled =
+          provenUnsentWithheld &&
+          !adapter.hasActiveBackgroundWork?.(run.id) &&
+          (saved.nativeEffectsState === undefined ||
+            ['not_dispatched', 'settled'].includes(saved.nativeEffectsState))
+        if (withheldSettled) {
+          restorePreDispatchBinding(this.core.conversations.findRun(run.id)!, true)
+        }
         const currentContext = this.core.conversations.nativeContext(run.sessionId, run.agentId)
         const unsentProof = this.core.conversations.executionInput(run.id)?.proof
         const unsentReadyQuotaOrAuthRejection = Boolean(
@@ -1624,6 +1724,7 @@ export class RunExecutor {
         }
         const unchangedReadyBinding =
           confirmedUnsentBinding ||
+          withheldSettled ||
           (context?.continuationState === 'ready' &&
             currentContext?.continuationState === 'ready' &&
             currentContext.nativeSessionId === context.nativeSessionId &&
@@ -1688,7 +1789,7 @@ export class RunExecutor {
         )
       }
     } finally {
-      archiver.foregroundBuffer.flush()
+      archiver.flushForeground()
       owner.foregroundExited = true
       release()
     }

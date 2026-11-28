@@ -39,6 +39,75 @@ const ALLOWED_TRANSITIONS: Readonly<Record<RunLifecyclePhase, readonly RunLifecy
 export type RunDispatchPhase = 'none' | 'possibly_sent' | 'accepted' | 'rejected'
 export type RunTerminalOutcome = 'completed' | 'failed' | 'interrupted'
 export type NativeEffectsState = 'pending' | 'settled' | 'unknown'
+export type RunStopReason = 'user_stop' | 'archive' | 'timeout' | 'quit'
+
+export const USER_STOP_SETTLEMENT_TIMEOUT_MS = 10_000
+
+export interface RunStopAbortReason {
+  readonly kind: 'pact_run_stop'
+  readonly reason: RunStopReason
+  readonly deadlineAt: number
+}
+
+export function createRunStopAbortReason(
+  reason: RunStopReason,
+  deadlineAt = performance.now() + USER_STOP_SETTLEMENT_TIMEOUT_MS,
+): RunStopAbortReason {
+  return { kind: 'pact_run_stop', reason, deadlineAt }
+}
+
+export function remainingStopBudgetMs(stopAbort: RunStopAbortReason): number {
+  return Math.max(0, Math.ceil(stopAbort.deadlineAt - performance.now()))
+}
+
+export async function awaitWithinStopBudget<T>(
+  promise: Promise<T>,
+  stopAbort: RunStopAbortReason,
+): Promise<boolean> {
+  const remainingMs = remainingStopBudgetMs(stopAbort)
+  if (remainingMs <= 0) return false
+  let settled = false
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    await Promise.race([
+      promise.then(
+        () => {
+          settled = true
+          return undefined
+        },
+        () => {
+          settled = true
+          return undefined
+        },
+      ),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, remainingMs)
+      }),
+    ])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+  return settled
+}
+
+export function readRunStopAbortReason(
+  signal: AbortSignal | undefined,
+): RunStopAbortReason | undefined {
+  if (!signal?.aborted) return undefined
+  const candidate: unknown = signal.reason
+  if (!candidate || typeof candidate !== 'object') return undefined
+  const kind = Reflect.get(candidate, 'kind')
+  const reason = Reflect.get(candidate, 'reason')
+  const deadlineAt = Reflect.get(candidate, 'deadlineAt')
+  if (
+    kind === 'pact_run_stop' &&
+    (reason === 'user_stop' || reason === 'archive' || reason === 'timeout' || reason === 'quit') &&
+    typeof deadlineAt === 'number'
+  ) {
+    return { kind, reason, deadlineAt }
+  }
+  return undefined
+}
 
 /**
  * Exhaustive classification of runtime side effects.
@@ -549,11 +618,28 @@ export class RunLifecycleKernel<TMeta = undefined> {
     return true
   }
 
-  requestAbort(): boolean {
+  private stopReasonValue: RunStopReason | undefined
+  private stopDeadlineAtValue: number | undefined
+
+  get stopReason(): RunStopReason | undefined {
+    return this.stopReasonValue
+  }
+
+  get stopDeadlineAt(): number | undefined {
+    return this.stopDeadlineAtValue
+  }
+
+  requestAbort(reason?: RunStopReason, deadlineAt?: number): boolean {
     if (this.phaseValue === 'Settled' || this.phaseValue === 'DrainingEffects') {
       return false
     }
     this.abortRequestedFlag = true
+    if (reason !== undefined && this.stopReasonValue === undefined) {
+      this.stopReasonValue = reason
+    }
+    if (deadlineAt !== undefined && this.stopDeadlineAtValue === undefined) {
+      this.stopDeadlineAtValue = deadlineAt
+    }
     this.foregroundOutputFrozenFlag = true
     if (this.phaseValue !== 'TerminalObserved' && this.phaseValue !== 'AbortRequested') {
       this.transition('AbortRequested')

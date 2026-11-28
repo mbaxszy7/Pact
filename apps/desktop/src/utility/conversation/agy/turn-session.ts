@@ -3,7 +3,13 @@ import { isDeepStrictEqual } from 'node:util'
 import type { AgentRunInput } from '@pact/agent-runtime'
 import type { NormalizedAgentEvent, SessionPermissionMode } from '@pact/contracts'
 
-import { RunLifecycleKernel, validateSourceGrant } from '@pact/agent-runtime'
+import {
+  awaitWithinStopBudget,
+  readRunStopAbortReason,
+  remainingStopBudgetMs,
+  RunLifecycleKernel,
+  validateSourceGrant,
+} from '@pact/agent-runtime'
 import { collaborationAskMode, collaborationPlanMode } from '@pact/contracts'
 
 import type {
@@ -31,7 +37,6 @@ import { collaborationReadOnly } from '../collaboration-prompt'
 import {
   AgyRoundEffectsTracker,
   nativeEffectsUncertain,
-  nativeFileChangesSettled,
   recordNativeChanges,
 } from '../native-file-changes'
 import { NativePermissionWait } from '../native-permission-wait'
@@ -161,6 +166,9 @@ export class AgyTurnSession {
     let createdFreshSession = false
     let activeExecutorId = this.runtime.pool.executorId
     let rootFirstByteWritten = false
+    let rootWithheldByGuard = false
+    let inputWithheldError: NativeInputWithheldError | undefined
+    let retainTimedOutRecordings = false
     let promptEnteredTransport = false
     let rootConfirmedNotSent = false
     const isConfirmedZeroBytesSent = (): boolean =>
@@ -402,7 +410,7 @@ export class AgyTurnSession {
     }
 
     let zeroInputClosePromise: Promise<void> | undefined
-    const closeZeroInputSessionOnce = (deadlineAt?: number): Promise<void> => {
+    const closeZeroInputSessionOnce = (maxTimeoutMs?: number): Promise<void> => {
       if (zeroInputClosePromise) return zeroInputClosePromise
       if (
         !createdFreshSession ||
@@ -412,7 +420,7 @@ export class AgyTurnSession {
       ) {
         return Promise.resolve()
       }
-      const timeoutMs = deadlineAt !== undefined ? Math.min(1_500, deadlineAt - Date.now()) : 1_500
+      const timeoutMs = maxTimeoutMs !== undefined ? Math.min(1_500, maxTimeoutMs) : 1_500
       if (timeoutMs <= 0) {
         return Promise.resolve()
       }
@@ -521,9 +529,12 @@ export class AgyTurnSession {
             !this.runtime.disposed &&
             Boolean(
               activeRun &&
-              activeRun.activeBackgroundTasks.size > 0 &&
+              (activeRun.activeBackgroundTasks.size > 0 ||
+                (retainTimedOutRecordings && recordings.size > 0)) &&
               rootTerminal &&
-              (compactTerminalCommitted || finalTerminalEvidenceCommitted),
+              (compactTerminalCommitted ||
+                finalTerminalEvidenceCommitted ||
+                retainTimedOutRecordings),
             )
           runIsolated(() =>
             cleanupForegroundResources?.({ keepForeignExecReservation: retainBackground }),
@@ -539,7 +550,10 @@ export class AgyTurnSession {
           tools.clear()
           collaboration.clearApprovedCalls()
           if (!isEmergency) {
-            await closeZeroInputSessionOnce().catch(() => undefined)
+            const stopAbort = readRunStopAbortReason(signal)
+            await closeZeroInputSessionOnce(
+              stopAbort?.reason === 'user_stop' ? remainingStopBudgetMs(stopAbort) : undefined,
+            ).catch(() => undefined)
           }
           runIsolated(() => {
             serverRequestOwner?.dispose()
@@ -1127,10 +1141,17 @@ export class AgyTurnSession {
             exp.nativeSessionId !== resolvedSessionId ||
             !isDeepStrictEqual(exp.settings, appliedSettings)
           ) {
+            rootWithheldByGuard = true
             recordHostBeforeRootStart()
-            throw new NativeInputWithheldError(
+            try {
+              this.kernel.recordDispatch('rejected', resolvedSessionId, activeExecutorId)
+            } catch {
+              // Preserve confirmed-unsent proof and withheld classification if host callback throws.
+            }
+            inputWithheldError = new NativeInputWithheldError(
               'Antigravity replacement settings or executor differed from the expected recovery binding.',
             )
+            throw inputWithheldError
           }
         }
       }
@@ -1395,7 +1416,8 @@ export class AgyTurnSession {
       // Abort handler: distinguishes pre-write abort (`not_sent`) from post-write `session/cancel`
       // with a bounded settlement window for a real native `{ stopReason: 'cancelled' }` reply.
       const onCallerAbort = (): void => {
-        this.kernel.requestAbort()
+        const stopAbort = readRunStopAbortReason(signal)
+        this.kernel.requestAbort(stopAbort?.reason, stopAbort?.deadlineAt)
         if (rootTerminal) return
         userCancelRequested = true
         if (activeRun) activeRun.cancellationPending = true
@@ -1407,7 +1429,7 @@ export class AgyTurnSession {
         if (promptSettled || promptRpcCompleted) return
         void requestTurnCancel({
           onError: () => {
-            if (!rootTerminal) {
+            if (!rootTerminal && stopAbort?.reason !== 'user_stop') {
               reportUnknown(
                 'Native Antigravity cancellation could not be confirmed; observation remains active.',
               )
@@ -1415,13 +1437,18 @@ export class AgyTurnSession {
           },
         })
         if (!clearCancelGraceTimer) {
+          // A3: Explicit user Stop shares one monotonic 10s deadline; plain abort() preserves 1.5s grace.
+          const cancelGraceMs =
+            stopAbort?.reason === 'user_stop'
+              ? Math.max(1, remainingStopBudgetMs(stopAbort))
+              : AGY_PHYSICAL_SETTLEMENT_GRACE_MS
           clearCancelGraceTimer = foregroundScope.setTimeout(
             'cancel_grace_timer',
             () => {
               clearCancelGraceTimer = undefined
               promptRpcAbort.abort()
             },
-            AGY_PHYSICAL_SETTLEMENT_GRACE_MS,
+            cancelGraceMs,
             true,
           )
         }
@@ -1435,7 +1462,6 @@ export class AgyTurnSession {
       }
 
       // Dispatch `session/prompt` with ordered reply delivery (`replyTo: sessionStream`).
-      let rootWithheldByGuard = false
       const promptParams: Record<string, unknown> = {
         sessionId: resolvedSessionId,
         prompt: promptBlocks,
@@ -1460,7 +1486,15 @@ export class AgyTurnSession {
           return true
         },
         onDispatch: () => {
-          this.kernel.recordDispatch('possibly_sent', resolvedSessionId, activeExecutorId)
+          try {
+            this.kernel.recordDispatch('possibly_sent', resolvedSessionId, activeExecutorId)
+          } catch (error) {
+            if (error instanceof NativeInputWithheldError) {
+              rootWithheldByGuard = true
+              inputWithheldError = error
+            }
+            throw error
+          }
           rootFirstByteWritten = true
           promptMemoryReservation?.release()
           promptMemoryReservation = undefined
@@ -1696,6 +1730,7 @@ export class AgyTurnSession {
             acceptRootTurn()
           },
           canAdmitForegroundDelta: () => this.kernel.canAdmitEffect('stream_delta'),
+          retainHiddenAnswerAfterFreeze: readRunStopAbortReason(signal)?.reason === 'user_stop',
           canAdmitWorkflowEffect: () => this.kernel.canAdmitEffect('open_plan_publish'),
           onForegroundDeltaDropped: () => {
             foregroundDeltaDropped = true
@@ -1964,7 +1999,15 @@ export class AgyTurnSession {
         }
         if (promptError) {
           promptRpcAbort.abort()
-          const physical = await awaitPhysicalCompletionBounded(promptOp.physicalOutcome)
+          const stopAbort = readRunStopAbortReason(signal)
+          const physicalBudgetMs =
+            stopAbort?.reason === 'user_stop'
+              ? remainingStopBudgetMs(stopAbort)
+              : AGY_PHYSICAL_SETTLEMENT_GRACE_MS
+          const physical =
+            physicalBudgetMs <= 0
+              ? 'timeout'
+              : await awaitPhysicalCompletionBounded(promptOp.physicalOutcome, physicalBudgetMs)
           if (physical === 'not_sent') {
             rootConfirmedNotSent = true
             rootFirstByteWritten = false
@@ -1994,8 +2037,11 @@ export class AgyTurnSession {
               // even if the host dispatch callback itself threw.
             }
             if (rootWithheldByGuard) {
-              throw new NativeInputWithheldError(
-                'Antigravity root prompt was withheld by the recovery dispatch guard before any byte was written.',
+              throw (
+                inputWithheldError ??
+                new NativeInputWithheldError(
+                  'Antigravity root prompt was withheld by the recovery dispatch guard before any byte was written.',
+                )
               )
             }
           } else if (physical === 'invalid_reply') {
@@ -2082,15 +2128,17 @@ export class AgyTurnSession {
           postReplyCheckSignal,
         )
 
-        // Complete any open reasoning items.
-        for (const [idxKey, text] of reasoningItems) {
-          if (text) {
-            yield {
-              agentId: 'agy',
-              type: 'reasoning.summary.completed',
-              turnId: input.runId,
-              activityId: `${input.runId}:thought:${idxKey}`,
-              text,
+        // A4: Suppress late `reasoning.summary.completed` emission after user Stop.
+        if (!userCancelRequested && !signal.aborted) {
+          for (const [idxKey, text] of reasoningItems) {
+            if (text) {
+              yield {
+                agentId: 'agy',
+                type: 'reasoning.summary.completed',
+                turnId: input.runId,
+                activityId: `${input.runId}:thought:${idxKey}`,
+                text,
+              }
             }
           }
         }
@@ -2104,7 +2152,19 @@ export class AgyTurnSession {
           signal: postReplyCheckSignal,
         })
 
-        await recordingTail
+        const activeStopAbort = readRunStopAbortReason(signal)
+        if (activeStopAbort?.reason === 'user_stop' && recordings.size > 0) {
+          const drainedInBudget = await awaitWithinStopBudget(recordingTail, activeStopAbort)
+          if (!drainedInBudget) {
+            retainTimedOutRecordings = true
+            activeRun.backgroundUnconfirmed = true
+            reportUnknown(
+              'Antigravity workspace file recording did not finish before the Stop deadline.',
+            )
+          }
+        } else {
+          await recordingTail
+        }
         await input.host?.lifecycle?.waitForRootOutput?.()
         drainBufferedPostCutoff?.()
         await observer.awaitTail()
@@ -2183,7 +2243,8 @@ export class AgyTurnSession {
         yield* collaboration.promoteArtifactsIfEligible({
           outcome,
           unknownReported: effectsReporter.isUnknownReported,
-          incompleteVisiblePrefix,
+          incompleteVisiblePrefix:
+            incompleteVisiblePrefix || activeStopAbort?.reason === 'user_stop',
           resolvedSessionId,
           mcpServer,
         })
@@ -2233,9 +2294,12 @@ export class AgyTurnSession {
             keepForeignExecReservation:
               !emergencyCleanedUp &&
               !this.runtime.disposed &&
-              activeRun.activeBackgroundTasks.size > 0 &&
+              (activeRun.activeBackgroundTasks.size > 0 ||
+                (retainTimedOutRecordings && recordings.size > 0)) &&
               rootTerminal &&
-              (compactTerminalCommitted || finalTerminalEvidenceCommitted),
+              (compactTerminalCommitted ||
+                finalTerminalEvidenceCommitted ||
+                retainTimedOutRecordings),
           })
         }
       }
@@ -2250,12 +2314,29 @@ export class AgyTurnSession {
       await stopPrePromptDrain?.(false).catch(() => undefined)
       stopStreamPump?.()
       this.runtime.invalidateNonTerminalEvidence(input.runId, resolvedSessionId)
-      await recordingTail.catch(() => undefined)
+      const catchStopAbort = readRunStopAbortReason(signal)
+      if (catchStopAbort?.reason === 'user_stop' && recordings.size > 0) {
+        const drainedInBudget = await awaitWithinStopBudget(
+          recordingTail.catch(() => undefined),
+          catchStopAbort,
+        )
+        if (!drainedInBudget) {
+          retainTimedOutRecordings = true
+          if (activeRun) activeRun.backgroundUnconfirmed = true
+          reportUnknown(
+            'Antigravity workspace file recording did not finish before the Stop deadline.',
+          )
+        }
+      } else {
+        await recordingTail.catch(() => undefined)
+      }
       const confirmedZeroBytesSent = isConfirmedZeroBytesSent()
       if (!effectsReporter.isUnknownReported) {
         if (confirmedZeroBytesSent) {
-          if (activeRun) {
-            nativeFileChangesSettled(input, 'settled', 'native_work_drained')
+          if (activeRun || rootWithheldByGuard) {
+            effectsReporter.reportSettled(
+              rootWithheldByGuard ? 'workflow_input_withheld' : 'native_turn_not_started',
+            )
           }
         } else {
           reportUnknown(

@@ -188,14 +188,21 @@ export function nativeSessionIssueMetadata(database: PactDrizzleDatabase, sessio
         ]
       : []
   })
-  const incomplete = runs.flatMap((run) =>
-    run?.dispatchPhase === 'ended' &&
-    !database.get(sql`
-    SELECT id FROM conversation_messages WHERE run_id=${run.id} AND role='assistant' AND is_visible=1 AND state='complete' AND length(content)>0 LIMIT 1
-  `)
+  const incomplete = runs.flatMap((run) => {
+    if (run?.dispatchPhase !== 'ended') return []
+    if (run.status === 'interrupted' && run.failureKind === 'user_stopped') {
+      return database.get(sql`
+        SELECT sequence FROM agent_event_journal WHERE run_id=${run.id} AND event_type='pact.output_unavailable' LIMIT 1
+      `)
+        ? [run.id]
+        : []
+    }
+    return !database.get(sql`
+      SELECT id FROM conversation_messages WHERE run_id=${run.id} AND role='assistant' AND is_visible=1 AND state='complete' AND length(content)>0 LIMIT 1
+    `)
       ? [run.id]
-      : [],
-  )
+      : []
+  })
   return {
     issues: projectSessionIssues(sessionId, contexts, runs, cursors, incomplete, operations, {
       activeAgents,

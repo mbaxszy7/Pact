@@ -71,7 +71,27 @@ export class ConversationAdmissionGate {
 
   /** All new execution admissions share this gate; confirmed work permits explicit Send. */
   hasBlockingBackgroundWork(sessionId: string): boolean {
-    return this.core.conversations.nativeContexts(sessionId).some((binding) => {
+    const activeExecution = this.core.activeExecutions.get(sessionId)
+    if (activeExecution?.cancelledByUser) return true
+    const contexts = this.core.conversations.nativeContexts(sessionId)
+    const hasBlockedContext = contexts.some((binding) => {
+      const latest = this.core.conversations.latestAgentRun(
+        sessionId,
+        binding.agentId,
+        binding.bindingGeneration,
+      )
+      if (
+        latest &&
+        ['not_sent', 'rejected'].includes(latest.dispatchPhase ?? '') &&
+        (['pending', 'unknown'].includes(latest.nativeEffectsState ?? '') ||
+          Boolean(
+            this.core.nativeObservations
+              .get(latest.id)
+              ?.adapter.hasActiveBackgroundWork?.(latest.id),
+          ))
+      ) {
+        return true
+      }
       const run = binding.lastRunId && this.core.conversations.findRun(binding.lastRunId)
       if (!run || !this.isCurrentBackground(run)) return false
       const owner = this.ownedBackground(run)
@@ -81,6 +101,23 @@ export class ConversationAdmissionGate {
         owner.backgroundStopUnconfirmed ||
         run.nativeEffectsState === 'unknown' ||
         !owner.adapter.backgroundWork?.(run.id, run.executorId!),
+      )
+    })
+    if (hasBlockedContext) return true
+    return AGENTS.some((agentId) => {
+      if (contexts.some((binding) => binding.agentId === agentId)) return false
+      const latest =
+        this.core.conversations.unacknowledgedNativeRun(sessionId, agentId) ??
+        this.core.conversations.latestAgentRun(sessionId, agentId)
+      if (!latest || latest.id === activeExecution?.run.id) return false
+      return (
+        ['pending', 'unknown'].includes(latest.nativeEffectsState ?? '') ||
+        (['not_sent', 'rejected'].includes(latest.dispatchPhase ?? '') &&
+          Boolean(
+            this.core.nativeObservations
+              .get(latest.id)
+              ?.adapter.hasActiveBackgroundWork?.(latest.id),
+          ))
       )
     })
   }
@@ -208,21 +245,34 @@ export class ConversationAdmissionGate {
     const cursors = contexts.map((context) =>
       context.lastRunId ? this.core.conversations.findRun(context.lastRunId) : undefined,
     )
-    const incomplete = [...runs, ...cursors].flatMap((run) =>
-      run?.dispatchPhase === 'ended' && !this.core.conversations.hasCompleteResponse(run.id)
-        ? [run.id]
-        : [],
-    )
+    const incomplete = [...runs, ...cursors].flatMap((run) => {
+      if (run?.dispatchPhase !== 'ended') return []
+      if (run.status === 'interrupted' && run.failureKind === 'user_stopped') {
+        return this.core.conversations.hasOutputUnavailable(run.id) ? [run.id] : []
+      }
+      return !this.core.conversations.hasCompleteResponse(run.id) ? [run.id] : []
+    })
     const session = this.core.sessions.find(sessionId)
     const activeAgents = session ? resolveActiveAgentPair(session.settings) : undefined
     const rebuildOperations = this.core.conversations.rebuildOperations(sessionId)
+    const activeExecution = this.core.activeExecutions.get(sessionId)
+    const stoppingRunId = activeExecution?.cancelledByUser ? activeExecution.run.id : undefined
     const projection = activeAgents
       ? projectSessionIssues(sessionId, contexts, runs, cursors, incomplete, rebuildOperations, {
           isArchivedRejection: isCodexArchivedSessionRejection,
           sanitize: safeNativePermissionText,
           activeAgents,
+          ...(stoppingRunId ? { stoppingRunId } : {}),
         })
-      : presentSessionIssues(sessionId, contexts, runs, cursors, incomplete, rebuildOperations)
+      : presentSessionIssues(
+          sessionId,
+          contexts,
+          runs,
+          cursors,
+          incomplete,
+          rebuildOperations,
+          stoppingRunId,
+        )
     for (const issue of projection.agents) {
       const run = [...runs, ...cursors].find((candidate) => candidate?.id === issue.runId)
       const currentBackground = run && this.isCurrentBackground(run)
@@ -272,7 +322,10 @@ export class ConversationAdmissionGate {
         issue.generation,
       )
     }
-    if (projection.inputGate === 'open' && this.hasBlockingBackgroundWork(sessionId)) {
+    if (activeExecution?.cancelledByUser) {
+      if (projection.inputGate === 'open') projection.inputGate = 'send_blocked'
+      projection.stoppingAgentId = activeExecution.run.agentId
+    } else if (projection.inputGate === 'open' && this.hasBlockingBackgroundWork(sessionId)) {
       projection.inputGate = 'send_blocked'
     }
     return projection

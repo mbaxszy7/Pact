@@ -589,10 +589,15 @@ export class AgyTurnEffectsReporter {
     this.host.runtime.activeRuns.delete(this.host.input.runId)
   }
 
-  reportSettled(): void {
+  reportSettled(
+    reason:
+      | 'native_work_drained'
+      | 'native_turn_not_started'
+      | 'workflow_input_withheld' = 'native_work_drained',
+  ): void {
     if (this.outcomeReported || this.unknownReported) return
     this.outcomeReported = true
-    nativeFileChangesSettled(this.host.input, 'settled', 'native_work_drained')
+    nativeFileChangesSettled(this.host.input, 'settled', reason)
   }
 
   reportUnknown(reason: string): void {

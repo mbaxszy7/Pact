@@ -76,6 +76,7 @@ export function projectSessionIssues(
     isArchivedRejection?: (error: unknown, nativeSessionId: string) => boolean
     sanitize?: (value: string, maximum: number) => string
     activeAgents?: readonly [RuntimeAgentId, RuntimeAgentId] | undefined
+    stoppingRunId?: string | undefined
   },
 ): SessionIssues {
   const isCodexArchivedSessionRejection = presentation?.isArchivedRejection ?? (() => false)
@@ -83,6 +84,7 @@ export function projectSessionIssues(
   const activeAgents = presentation?.activeAgents
   const agents: SessionIssue[] = []
   let inputGate: SessionIssues['inputGate'] = 'open'
+  let stoppingAgentId: RuntimeAgentId | undefined
   for (const agentId of ['codex', 'claude', 'agy'] as const) {
     const isActiveMember =
       !activeAgents || activeAgents[0] === agentId || activeAgents[1] === agentId
@@ -133,7 +135,11 @@ export function projectSessionIssues(
       state === 'rebuilding' ||
       state === 'checking' ||
       Boolean(pending)
+    const isForegroundStopping = Boolean(
+      presentation?.stoppingRunId && run?.id === presentation.stoppingRunId,
+    )
     const lostForeground =
+      !isForegroundStopping &&
       (state === 'responding' || state === 'waiting_user') &&
       run &&
       ['failed', 'interrupted'].includes(run.status)
@@ -147,6 +153,11 @@ export function projectSessionIssues(
       !processing && run && ['pending', 'unknown'].includes(run.nativeEffectsState ?? '')
     const hasPendingPermission =
       Boolean(context?.hasPendingPermission) || Boolean(context?.permissionRequests?.length)
+    if (isForegroundStopping && !blocked && !pending && operation?.stage !== 'failed') {
+      if (inputGate === 'open') inputGate = 'send_blocked'
+      stoppingAgentId = agentId
+      continue
+    }
     if (
       !isActiveMember &&
       isRetiredAgentRecoverySettled({
@@ -162,6 +173,43 @@ export function projectSessionIssues(
       continue
     if (!isActiveMember && !blocked && !lostForeground && !uncertainWork && !unsettledEffects)
       continue
+    const contextHealthy =
+      !context ||
+      (context.state === 'active' &&
+        state === 'ready' &&
+        !context.recoveryReason &&
+        !context.recoveryFailureKind &&
+        !context.recoveryFailureMessage &&
+        (!context.recoveryAction || context.recoveryAction === 'none'))
+    const cleanWithheldGuard =
+      run?.status === 'failed' &&
+      run.failureKind === 'user_stopped' &&
+      (run.dispatchPhase === 'not_sent' || run.dispatchPhase === 'rejected') &&
+      (run.nativeEffectsState === 'not_dispatched' ||
+        (run.nativeEffectsState === 'settled' &&
+          (run.nativeEffectsReason === 'workflow_input_withheld' ||
+            run.nativeEffectsReason === 'native_turn_not_started')))
+    const cleanUserStop =
+      !blocked &&
+      !lostForeground &&
+      !uncertainWork &&
+      !unsettledEffects &&
+      !incomplete &&
+      !hasPendingPermission &&
+      operation?.stage !== 'failed' &&
+      contextHealthy &&
+      (cleanWithheldGuard ||
+        (run?.status === 'interrupted' &&
+          run.failureKind === 'user_stopped' &&
+          ((run.dispatchPhase === 'ended' &&
+            (run.nativeOutcome === 'interrupted' || run.nativeOutcome === 'completed') &&
+            (run.nativeEffectsState === 'settled' ||
+              run.nativeEffectsState === 'not_dispatched')) ||
+            ((run.dispatchPhase === 'not_sent' || run.dispatchPhase === 'rejected') &&
+              (!run.nativeEffectsState ||
+                run.nativeEffectsState === 'not_dispatched' ||
+                run.nativeEffectsState === 'settled')))))
+    if (cleanUserStop) continue
     if (!blocked && !lostForeground && !failed && !incomplete && !unsettledEffects) continue
     const name = agentDisplayName(agentId)
     const inputDisposition: SessionIssue['inputDisposition'] =
@@ -388,5 +436,5 @@ export function projectSessionIssues(
       previousCreationUnconfirmed: operation?.stage === 'unconfirmed',
     })
   }
-  return { sessionId, inputGate, agents }
+  return { sessionId, inputGate, ...(stoppingAgentId ? { stoppingAgentId } : {}), agents }
 }

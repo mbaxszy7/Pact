@@ -10,6 +10,9 @@ import type {
 } from '@pact/contracts'
 
 import {
+  awaitWithinStopBudget,
+  readRunStopAbortReason,
+  remainingStopBudgetMs,
   RunLifecycleKernel,
   sanitizeNativeTerminalFailure,
   validateSourceGrant,
@@ -28,6 +31,7 @@ import { AgentAnswerAssembler } from '../agent-answer-assembler'
 import {
   AgentExecutionError,
   classifyAgentError,
+  isUserStopCancellationError,
   NativeCapacityError,
   NativeInputWithheldError,
 } from '../agent-execution-error'
@@ -164,8 +168,11 @@ export class CodexTurnSession {
       )
     }
     if (signal.aborted) {
+      const stopAbort = readRunStopAbortReason(signal)
       await rejectBeforeStart(
-        new AgentExecutionError('agent_process_crash', 'Codex was interrupted.', false),
+        stopAbort?.reason === 'user_stop'
+          ? new AgentExecutionError('user_stopped', 'Stopped by the user.', false)
+          : new AgentExecutionError('agent_process_crash', 'Codex was interrupted.', false),
       )
     }
 
@@ -222,8 +229,10 @@ export class CodexTurnSession {
     // and detached requests keep their separate observation owner.
     const foregroundInteractionSignal = AbortSignal.any([signal, background.observation.signal])
     let stoppedCommands: Map<string, string | undefined> | undefined
+    let observerRef: CodexTurnNativeObserver | undefined
     const freezeForegroundCommands = (): void => {
-      this.kernel.requestAbort()
+      const stopAbort = readRunStopAbortReason(signal)
+      this.kernel.requestAbort(stopAbort?.reason, stopAbort?.deadlineAt)
       background.stopRequested = true
       if (background.closed || stoppedCommands) return
       if (sourceGrant) this.runtime.peerToolServer.retireSourceReader(sourceGrant)
@@ -231,6 +240,13 @@ export class CodexTurnSession {
       background.foregroundCommands = new Map()
       background.foregroundCommandBytes = 0
       background.cancellationPending = true
+      if (
+        stopAbort?.reason === 'user_stop' &&
+        background.primaryTurnId &&
+        !background.rootTerminal
+      ) {
+        void observerRef?.maybeInterruptRoot(stoppedCommands, false, true, stopAbort.deadlineAt)
+      }
     }
     const foregroundScope = new TurnResourceScope()
     const releaseScope = new TurnResourceScope()
@@ -241,6 +257,7 @@ export class CodexTurnSession {
     let provisionalThreadId: string | undefined
     let threadStartupDispatched = false
     let threadStartupCompleted = false
+    let lateStartupRejection: Error | undefined
     let rootTurnRequested = false
     let foregroundTurnCompletedYielded = false
     const answer = new AgentAnswerAssembler(input.runId)
@@ -416,6 +433,12 @@ export class CodexTurnSession {
       }
       void this.kernel.settle()
     }
+    let wakeStopWaiter: (() => void) | undefined
+    const notifyStopWaiter = (): void => {
+      const wake = wakeStopWaiter
+      wakeStopWaiter = undefined
+      wake?.()
+    }
     const reasoningSummaries = new CodexReasoningSummaryTracker()
     const observer = new CodexTurnNativeObserver({
       runtime: this.runtime,
@@ -451,7 +474,9 @@ export class CodexTurnSession {
       captureReview,
       captureInputResult,
       getWorkflowArtifacts: () => ({ submittedPlan, reviewResult, inputResult }),
+      onStateChanged: notifyStopWaiter,
     })
+    observerRef = observer
 
     try {
       const resolvedPeerCandidate = this.runtime.resolvePeerTarget?.(input.sessionId)
@@ -557,7 +582,23 @@ export class CodexTurnSession {
           // turn/start or fabricating confirmed-unsent), and let maybeSettle release cleanly.
           onLateReply: (lateMessage) => {
             if (background.closed || background.rootNotStarted) return
-            if (Reflect.get(lateMessage, 'error')) {
+            const lateError = Reflect.get(lateMessage, 'error')
+            if (lateError) {
+              lateStartupRejection = classifyCodexStartupRejection(lateError, input.nativeSessionId)
+              if (background.foregroundReleased) {
+                if (
+                  input.nativeSessionId &&
+                  lateStartupRejection instanceof AgentExecutionError &&
+                  lateStartupRejection.kind === 'context_resume_failed'
+                ) {
+                  input.host?.lifecycle?.recordNativeEvidence?.({
+                    kind: 'missing',
+                    source: 'native_error',
+                    identity: this.runtime.runIdentity(input, input.nativeSessionId),
+                  })
+                }
+                observer.reportUnknown(lateStartupRejection.message)
+              }
               observer.markRootNotStartedIfUnsent(input.nativeSessionId)
               observer.maybeSettle()
               return
@@ -798,8 +839,14 @@ export class CodexTurnSession {
         // arrival-order fact replay, and one-shot Stop interruption share one transition.
         onLateReply: (lateMessage) => {
           if (background.closed || background.rootNotStarted) return
-          if (Reflect.get(lateMessage, 'error')) {
+          const lateTurnError = Reflect.get(lateMessage, 'error')
+          if (lateTurnError) {
             if (!background.primaryTurnId) {
+              const classified = classifyCodexRpcError(lateTurnError, 'Codex rejected turn/start.')
+              lateStartupRejection = classified
+              if (background.foregroundReleased) {
+                observer.reportUnknown(classified.message)
+              }
               observer.markRootNotStartedIfUnsent(threadId)
               observer.maybeSettle()
             }
@@ -1183,8 +1230,34 @@ export class CodexTurnSession {
             if (Reflect.get(item, 'type') === 'fileChange') {
               const pendingRecording = observer.getFileChangeRecording(item)
               if (pendingRecording) {
-                // oxlint-disable-next-line no-await-in-loop -- Preserve applied native operation order.
-                await pendingRecording
+                // oxlint-disable-next-line no-await-in-loop -- Preserve applied native operation order without blocking Stop on slow file I/O.
+                await new Promise<void>((resolveRec, rejectRec) => {
+                  const recAbortError = (): AgentExecutionError =>
+                    readRunStopAbortReason(signal)?.reason === 'user_stop'
+                      ? new AgentExecutionError('user_stopped', 'Stopped by the user.', false)
+                      : new AgentExecutionError(
+                          'agent_process_crash',
+                          'Codex was interrupted.',
+                          false,
+                        )
+                  if (signal.aborted) {
+                    rejectRec(recAbortError())
+                    return
+                  }
+                  const onRecAbort = (): void => rejectRec(recAbortError())
+                  signal.addEventListener('abort', onRecAbort, { once: true })
+                  void pendingRecording.then(
+                    () => {
+                      signal.removeEventListener('abort', onRecAbort)
+                      resolveRec()
+                      return undefined
+                    },
+                    (recError: unknown) => {
+                      signal.removeEventListener('abort', onRecAbort)
+                      rejectRec(recError)
+                    },
+                  )
+                })
               }
             } else if (
               [
@@ -1215,7 +1288,11 @@ export class CodexTurnSession {
                 toolName: activity.toolName,
                 title: activity.title,
                 ...(activity.detail ? { detail: activity.detail } : {}),
-                outcome: toolFailed(item) ? 'failed' : 'completed',
+                outcome: toolFailed(item)
+                  ? background.stopRequested || signal.aborted
+                    ? 'interrupted'
+                    : 'failed'
+                  : 'completed',
               }
             }
           }
@@ -1362,6 +1439,116 @@ export class CodexTurnSession {
       })
       if (!threadStartupDispatched || (threadStartupCompleted && !rootTurnRequested)) {
         observer.markRootNotStartedIfUnsent()
+      }
+      const stopAbort = readRunStopAbortReason(signal)
+      const isUserStopCancelError = isUserStopCancellationError(error, signal)
+      if (
+        stopAbort?.reason === 'user_stop' &&
+        isUserStopCancelError &&
+        !inputWithheldError &&
+        !projectionFailure
+      ) {
+        if (lateStartupRejection) {
+          throw lateStartupRejection
+        }
+        if (background.rootNotStarted) {
+          return
+        }
+        if (connection?.isOpen && !background.closed && !this.runtime.disposed) {
+          // Hand off queued notifications to the observer BEFORE awaiting physical root Stop drain.
+          background.foregroundReleased = true
+          connection.replayBackgroundNotifications()
+          observer.drainPendingOwnedFacts(false)
+          void observer.maybeInterruptRoot(stoppedCommands, false, true, stopAbort?.deadlineAt)
+          const waitUntil = async (
+            predicate: () => boolean,
+            remainingMsFn: () => number,
+          ): Promise<void> => {
+            while (!predicate()) {
+              const remainingMs = remainingMsFn()
+              if (remainingMs <= 0) return
+              // oxlint-disable-next-line no-await-in-loop -- Event-driven wait bounded by monotonic user Stop deadline.
+              await new Promise<void>((resolve) => {
+                const done = (): void => {
+                  clearTimeout(timer)
+                  background.observation.signal.removeEventListener('abort', done)
+                  if (wakeStopWaiter === done) wakeStopWaiter = undefined
+                  resolve()
+                }
+                const timer = setTimeout(done, remainingMs)
+                wakeStopWaiter = done
+                background.observation.signal.addEventListener('abort', done, { once: true })
+                if (predicate()) done()
+              })
+            }
+          }
+          const stopTerminalReady = (): boolean =>
+            !connection?.isOpen ||
+            this.runtime.disposed ||
+            background.closed ||
+            background.rootNotStarted ||
+            (background.rootTerminal &&
+              !observer.hasRootOperations() &&
+              background.recordings.size === 0 &&
+              !background.early.length)
+          // Wait up to the 10s monotonic deadline for rootTerminal + root operations/recordings drain.
+          // If rootTerminal arrives while only confirmed-stopped root commands remain open (C2),
+          // allow a short 250ms grace window for late item/completed before closing only those commands.
+          await waitUntil(
+            () =>
+              stopTerminalReady() ||
+              (background.rootTerminal &&
+                background.recordings.size === 0 &&
+                !background.early.length &&
+                observer.hasStillOpenStoppedCommands()),
+            () => remainingStopBudgetMs(stopAbort),
+          )
+          const activeInterrupt = observer.getRootInterruptState().promise
+          if (activeInterrupt) {
+            await awaitWithinStopBudget(activeInterrupt, stopAbort)
+          }
+          if (
+            background.rootTerminal &&
+            observer.hasStillOpenStoppedCommands() &&
+            connection.isOpen &&
+            !background.closed
+          ) {
+            const c2GraceEnd = performance.now() + Math.min(remainingStopBudgetMs(stopAbort), 250)
+            await waitUntil(stopTerminalReady, () =>
+              Math.max(0, Math.ceil(c2GraceEnd - performance.now())),
+            )
+            observer.clearConfirmedStoppedRootCommands()
+          }
+          // Re-check ALL root operations (including unconfirmed commands, fileChange, MCP)
+          // and recordings within the same single monotonic deadline before settling.
+          if (!stopTerminalReady() && remainingStopBudgetMs(stopAbort) > 0) {
+            await waitUntil(stopTerminalReady, () => remainingStopBudgetMs(stopAbort))
+          }
+          if (lateStartupRejection) {
+            throw lateStartupRejection
+          }
+          if (background.rootNotStarted) {
+            return
+          }
+          const interruptState = observer.getRootInterruptState()
+          if (
+            interruptState.promise !== undefined &&
+            !interruptState.confirmed &&
+            (!background.rootTerminal || observer.hasRootOperations())
+          ) {
+            observer.reportUnknown(
+              'Codex interruption could not be confirmed before the Stop deadline.',
+            )
+          }
+          if (
+            stopTerminalReady() &&
+            connection.isOpen &&
+            !background.closed &&
+            !this.runtime.disposed
+          ) {
+            return
+          }
+        }
       }
       if (!background.rootTerminal && !background.rootNotStarted && threadId)
         input.host?.lifecycle?.recordNativeEvidence?.({

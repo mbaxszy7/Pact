@@ -84,6 +84,7 @@ export class RunOutputArchiver {
   private completedReceiptValue: CompletedNativeReceipt | undefined
   private reportedTitleValue = false
   private drainingPendingPublished = false
+  private foregroundFrozenValue = false
 
   constructor(private readonly host: RunOutputArchiverHost) {
     this.foregroundBuffer = new AgentStreamBuffer(
@@ -129,6 +130,60 @@ export class RunOutputArchiver {
 
   get reportedTitle(): boolean {
     return this.reportedTitleValue
+  }
+
+  get foregroundFrozen(): boolean {
+    return this.foregroundFrozenValue
+  }
+
+  /**
+   * Synchronously commits any already-buffered foreground deltas and freezes
+   * foreground transcript/reasoning mutations at the user Stop boundary.
+   */
+  freezeForeground(): boolean {
+    if (this.foregroundFrozenValue) return true
+    this.foregroundFrozenValue = true
+    return this.foregroundBuffer.dispose()
+  }
+
+  flushForeground(): void {
+    if (this.foregroundFrozenValue) return
+    this.foregroundBuffer.flush()
+  }
+
+  private isFrozenPostStopSuppressed(type: NormalizedAgentEvent['type']): boolean {
+    return (
+      type === 'text.delta' ||
+      type === 'reasoning.summary.delta' ||
+      type === 'reasoning.summary.completed' ||
+      type === 'tool.started' ||
+      type === 'tool.completed' ||
+      type === 'collaboration.plan' ||
+      type === 'collaboration.review' ||
+      type === 'peer.assistance.requested' ||
+      type === 'session.title.updated' ||
+      type === 'interaction.requested'
+    )
+  }
+
+  private isExactForegroundStopAbort(
+    error: unknown,
+    foregroundSignal: AbortSignal | undefined,
+  ): boolean {
+    if (
+      !this.foregroundFrozenValue ||
+      !foregroundSignal?.aborted ||
+      this.archiveController.signal.aborted ||
+      this.outputFailureValue !== undefined
+    ) {
+      return false
+    }
+    if (error === foregroundSignal.reason) return true
+    if (error instanceof Error && error.name === 'AbortError') {
+      const cause: unknown = Reflect.get(error, 'cause')
+      return cause === undefined || cause === foregroundSignal.reason
+    }
+    return false
   }
 
   static async *answerParts(text: string, signal: AbortSignal): AsyncIterable<string> {
@@ -184,6 +239,7 @@ export class RunOutputArchiver {
       this.markAborted(error)
       return
     }
+    if (this.foregroundFrozenValue && this.isFrozenPostStopSuppressed(fact.type)) return
     this.host.observeNormalizedDelta(fact, true)
     const large =
       fact.type === 'text.completed' &&
@@ -421,7 +477,7 @@ export class RunOutputArchiver {
    */
   flush(): boolean {
     if (this.outputFailureValue) return false
-    const fgOk = this.foregroundBuffer.flush()
+    const fgOk = this.foregroundFrozenValue ? true : this.foregroundBuffer.flush()
     const archOk = this.archiveBufferValue ? this.archiveBufferValue.flush() : true
     if (!fgOk || !archOk) {
       this.markAborted(
@@ -455,7 +511,7 @@ export class RunOutputArchiver {
    */
   dispose(): boolean {
     let ok = true
-    if (!this.foregroundBuffer.dispose()) ok = false
+    if (!this.foregroundFrozenValue && !this.foregroundBuffer.dispose()) ok = false
     if (this.archiveBufferValue && !this.archiveBufferValue.dispose()) ok = false
     return ok && !this.outputFailureValue && this.failureRecordingErrorValue === undefined
   }
@@ -465,6 +521,7 @@ export class RunOutputArchiver {
     foregroundSignal?: AbortSignal,
   ): Promise<void> {
     if (this.host.isDisposed()) return
+    if (this.foregroundFrozenValue && this.isFrozenPostStopSuppressed(event.type)) return
     let fact: NormalizedAgentEvent
     try {
       fact = normalizedAgentEventSchema.parse(event)
@@ -478,6 +535,10 @@ export class RunOutputArchiver {
         throw this.markAborted(error)
       }
       throw error
+    }
+    if (this.foregroundFrozenValue) {
+      this.admitArchiveEventSync(fact)
+      return
     }
     if (!this.host.ownsCurrentControl()) {
       this.admitArchiveEventSync(fact)
@@ -528,6 +589,12 @@ export class RunOutputArchiver {
         )
         this.emitPublished(patch, false)
       } catch (error: unknown) {
+        if (this.isExactForegroundStopAbort(error, foregroundSignal)) {
+          // Hand off the already-admitted authoritative text.completed to independent archiveTail
+          // so hidden archival persists it once without modifying the frozen visible prefix.
+          this.admitArchiveEventSync(fact)
+          return
+        }
         throw this.markAborted(error)
       }
     } else {

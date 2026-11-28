@@ -3193,4 +3193,101 @@ describe('Side-chat UI, /btw, and @Main routing', () => {
     fireEvent.keyDown(screen.getByRole('combobox', { name: 'Message' }), { key: 'Enter' })
     await waitFor(() => expect(onSend).toHaveBeenCalledTimes(2))
   })
+
+  it('renders neutral Stopped Work Log and keeps Stopping button visible without warning cards during clean user stop', () => {
+    const base = fixture()
+    const userId = crypto.randomUUID()
+    const assistantId = crypto.randomUUID()
+    const runId = crypto.randomUUID()
+    const createdAt = base.session.createdAt
+
+    // 1. Draining stop state: inputGate = send_blocked + stoppingAgentId = 'codex', zero issues -> disabled Stopping button, no warning card.
+    base.snapshot!.messages = [
+      {
+        id: userId,
+        sessionId: base.session.id,
+        role: 'user',
+        content: 'Stop cleanly',
+        contentRevision: 0,
+        state: 'complete',
+        sequence: 1,
+        createdAt,
+        updatedAt: createdAt,
+      },
+      {
+        id: assistantId,
+        sessionId: base.session.id,
+        role: 'assistant',
+        agentId: 'codex',
+        runId,
+        content: 'Partial answer before stop.',
+        contentRevision: 0,
+        state: 'incomplete',
+        sequence: 2,
+        createdAt,
+        updatedAt: createdAt,
+      },
+    ]
+    base.snapshot!.runs = [
+      {
+        id: runId,
+        sessionId: base.session.id,
+        userMessageId: userId,
+        responseMessageId: assistantId,
+        agentId: 'codex',
+        status: 'interrupted',
+        failureKind: 'user_stopped',
+        attemptCount: 1,
+        settingsRevision: 1,
+        model: null,
+        effort: null,
+        dispatchPhase: 'accepted',
+        createdAt,
+        updatedAt: createdAt,
+      },
+    ]
+    base.snapshot!.activities = [
+      {
+        id: crypto.randomUUID(),
+        sessionId: base.session.id,
+        runId,
+        agentId: 'codex',
+        nativeId: 'act-stopped-1',
+        kind: 'tool',
+        status: 'interrupted',
+        title: 'Inspecting repository',
+        detailRevision: 0,
+        sequence: 1,
+        createdAt,
+        updatedAt: createdAt,
+      },
+    ]
+    base.snapshot!.sessionIssues = {
+      sessionId: base.session.id,
+      inputGate: 'send_blocked',
+      stoppingAgentId: 'codex',
+      agents: [],
+    }
+    const view = render(<ConversationView {...base} />)
+    expect(screen.queryByRole('region', { name: 'Session recovery' })).toBeNull()
+    const stoppingButton = screen.getByRole<HTMLButtonElement>('button', {
+      name: 'Stopping…',
+    })
+    expect(stoppingButton.disabled).toBe(true)
+
+    // 2. Settled clean user stop: inputGate = open, zero warning card, Work Log item shows neutral Stopped icon (not Failed).
+    const settledSnapshot = {
+      ...base.snapshot!,
+      sessionIssues: {
+        sessionId: base.session.id,
+        inputGate: 'open' as const,
+        agents: [],
+      },
+    }
+    view.rerender(<ConversationView {...base} snapshot={settledSnapshot} />)
+    expect(screen.queryByRole('region', { name: 'Session recovery' })).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: /Work log · 1 step/iu }))
+    expect(screen.getByLabelText('Stopped')).toBeTruthy()
+    expect(screen.queryByLabelText('Failed')).toBeNull()
+  })
 })

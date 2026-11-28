@@ -849,7 +849,13 @@ export function recoverAppliedWorkflowResult(
   repo.database.transaction(() => {
     const run = repo.findRun(runId),
       turn = repo.database.select().from(workflowTurns).where(eq(workflowTurns.runId, runId)).get()
-    if (!run || run.forkSourceRunId || run.controlDisposition === 'abandoned' || !turn?.applied)
+    if (
+      !run ||
+      run.forkSourceRunId ||
+      run.controlDisposition === 'abandoned' ||
+      repo.hasCommittedUserStop(run.id) ||
+      !turn?.applied
+    )
       return
     const task = repo.collaboration(run.sessionId),
       auth = collaborationTurnAuthorizationSchema.parse(JSON.parse(turn.authorizationJson)),

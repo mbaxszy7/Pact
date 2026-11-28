@@ -31,7 +31,12 @@ import { ProjectFileReader } from '../project-file/project-file-reader.js'
 import { RuntimePreparation } from '../runtime-preparation/runtime-preparation.js'
 import { runDirectoryWorker } from '../workspace-changes/directory-worker.test-support.js'
 import { WorkspaceChanges } from '../workspace-changes/workspace-changes.js'
-import { NativeCapacityError } from './agent-execution-error.js'
+import {
+  AgentExecutionError,
+  NativeCapacityError,
+  NativeInputWithheldError,
+  PermissionModeRejectedError,
+} from './agent-execution-error.js'
 import { Conversation } from './conversation.js'
 
 const native = vi.hoisted(() => ({
@@ -1821,5 +1826,774 @@ it('Carbon R2-A1 & R2-A3: lone-surrogate background report degrades with patch, 
     finishSpy.mockRestore()
   } finally {
     await f3.dispose()
+  }
+})
+
+it('Clean User Stop Option 1: enforces stop-vs-completed ordering, freezes UI prefix and Work Log, and never masks real pre-dispatch failures', async () => {
+  // 1. Stop BEFORE racing ended/completed: freezes visible text & Work Log, archives full body hidden, zero warning card.
+  const f1 = await fixture('codex')
+  try {
+    const started = Promise.withResolvers<void>()
+    const allowFinish = Promise.withResolvers<void>()
+    native.customRun = async function* (agentId, executorId, input, signal) {
+      const nativeSid = `native-stop-order:${input.sessionId}`
+      input.host?.lifecycle?.recordExecutor?.(executorId)
+      input.host?.lifecycle?.recordDispatch?.('possibly_sent', nativeSid, executorId)
+      yield { type: 'session.started', agentId, nativeSessionId: nativeSid }
+      input.host?.lifecycle?.recordDispatch?.('accepted', nativeSid, executorId)
+      yield { type: 'turn.started', agentId, turnId: `turn:${input.runId}` }
+      yield {
+        type: 'text.delta',
+        agentId,
+        turnId: `turn:${input.runId}`,
+        outputId: 'answer',
+        text: 'Visible prefix before Stop.',
+      }
+      yield {
+        type: 'tool.started',
+        agentId,
+        turnId: `turn:${input.runId}`,
+        toolCallId: 'tool-before-stop',
+        toolName: 'exec_command',
+        title: 'Running before stop',
+      }
+      started.resolve()
+      await new Promise<void>((done) => {
+        if (signal.aborted) done()
+        else signal.addEventListener('abort', () => done(), { once: true })
+      })
+      // Simulate racing post-Stop late delta, late tool, hidden full answer, and racing native completed!
+      yield {
+        type: 'text.delta',
+        agentId,
+        turnId: `turn:${input.runId}`,
+        outputId: 'answer',
+        text: ' LATE_DELTA_MUST_NOT_APPEAR',
+      }
+      yield {
+        type: 'tool.started',
+        agentId,
+        turnId: `turn:${input.runId}`,
+        toolCallId: 'tool-after-stop',
+        toolName: 'exec_command',
+        title: 'Late tool must be suppressed',
+      }
+      input.host?.effects?.recordArchivedEvent?.({
+        type: 'text.completed',
+        agentId,
+        turnId: `turn:${input.runId}`,
+        outputId: 'answer',
+        text: 'Visible prefix before Stop. Full archived native answer.',
+      })
+      input.host?.lifecycle?.recordNativeEvidence?.({
+        kind: 'ended',
+        source: 'live_terminal',
+        outcome: 'completed',
+        identity: {
+          sessionId: input.sessionId,
+          agentId,
+          runId: input.runId,
+          requestId: input.runId,
+          nativeSessionId: nativeSid,
+          nativeTurnId: `turn:${input.runId}`,
+          bindingGeneration: input.bindingGeneration!,
+          executorId,
+        },
+      })
+      input.host?.effects?.reportNativeEffects?.({
+        runId: input.runId,
+        generation: input.nativeGeneration!,
+        state: 'settled',
+      })
+      allowFinish.resolve()
+    }
+    const drafts1 = f1.db.conversationRepository.readPage({
+      scope: 'drafts',
+      sessionId: f1.sessionId,
+    })
+    if (drafts1.scope !== 'drafts') throw new Error('Missing drafts')
+    const sent1 = await f1.flow.send({
+      sessionId: f1.sessionId,
+      clientMessageId: randomUUID(),
+      content: 'Stop before native completion',
+      expectedCommentsRevision: drafts1.commentsRevision,
+      commentIds: [],
+      route: { type: 'agent', agentId: 'codex' },
+    })
+    if (!sent1.ok) throw new Error('Expected send to succeed')
+    const runId1 = sent1.value.runs[0]!.id
+    await started.promise
+    await vi.waitFor(() => {
+      const p = f1.db.conversationRepository.readPage({
+        scope: 'messages',
+        sessionId: f1.sessionId,
+      })
+      expect(
+        p.scope === 'messages' &&
+          p.messages.some(
+            (m) => m.kind === 'complete' && m.message.content.includes('Visible prefix'),
+          ),
+      ).toBe(true)
+    })
+    const stopped = f1.flow.stop({ sessionId: f1.sessionId })
+    expect(stopped.ok).toBe(true)
+    await allowFinish.promise
+    await vi.waitFor(() => expect(f1.flow.diagnostics().activeExecutions).toBe(0))
+
+    const run1 = f1.db.conversationRepository.findRun(runId1)!
+    expect(run1).toMatchObject({
+      status: 'interrupted',
+      failureKind: 'user_stopped',
+      dispatchPhase: 'ended',
+      nativeOutcome: 'completed',
+    })
+    const loaded1 = await f1.flow.load({ scope: 'messages', sessionId: f1.sessionId })
+    if (!loaded1.ok || loaded1.value.scope !== 'messages') throw new Error('Missing messages page')
+    const visible1 = loaded1.value.messages.find((m) => m.message.role === 'assistant')!
+    if (visible1.kind !== 'complete') throw new Error('Expected complete visible message')
+    expect(visible1.message.content).toBe('Visible prefix before Stop.')
+    expect(visible1.message.state).toBe('incomplete')
+    const hiddenRows = f1.db.drizzle
+      .select()
+      .from(conversationMessages)
+      .where(eq(conversationMessages.sessionId, f1.sessionId))
+      .all()
+      .filter((m) => m.role === 'assistant' && !m.isVisible)
+    expect(hiddenRows.some((m) => m.content.includes('Full archived native answer.'))).toBe(true)
+    const acts1 = f1.db.conversationRepository.readPage({
+      scope: 'activities',
+      sessionId: f1.sessionId,
+      runId: runId1,
+    })
+    if (acts1.scope !== 'activities') throw new Error('Missing activities')
+    expect(acts1.activities.map((a) => a.activity.title)).toEqual(['Running before stop'])
+    expect(acts1.activities[0]?.activity.status).toBe('interrupted')
+    expect(loaded1.value.header.sessionIssues?.agents ?? []).toEqual([])
+    expect(loaded1.value.header.sessionIssues?.inputGate ?? 'open').toBe('open')
+  } finally {
+    await f1.dispose()
+  }
+
+  // 2. Verified ended/completed ALREADY committed BEFORE stop() -> preserves completed and full body.
+  const f2 = await fixture('codex')
+  try {
+    const evidenceCommitted = Promise.withResolvers<void>()
+    const releaseTail = Promise.withResolvers<void>()
+    native.customRun = async function* (agentId, executorId, input) {
+      const nativeSid = `native-done-first:${input.sessionId}`
+      input.host?.lifecycle?.recordExecutor?.(executorId)
+      input.host?.lifecycle?.recordDispatch?.('possibly_sent', nativeSid, executorId)
+      yield { type: 'session.started', agentId, nativeSessionId: nativeSid }
+      input.host?.lifecycle?.recordDispatch?.('accepted', nativeSid, executorId)
+      yield { type: 'turn.started', agentId, turnId: `turn:${input.runId}` }
+      input.host?.lifecycle?.recordNativeEvidence?.({
+        kind: 'ended',
+        source: 'live_terminal',
+        outcome: 'completed',
+        identity: {
+          sessionId: input.sessionId,
+          agentId,
+          runId: input.runId,
+          requestId: input.runId,
+          nativeSessionId: nativeSid,
+          nativeTurnId: `turn:${input.runId}`,
+          bindingGeneration: input.bindingGeneration!,
+          executorId,
+        },
+      })
+      evidenceCommitted.resolve()
+      await releaseTail.promise
+      yield {
+        type: 'text.completed',
+        agentId,
+        turnId: `turn:${input.runId}`,
+        outputId: 'answer',
+        text: 'Already completed before Stop.',
+      }
+      yield { type: 'turn.completed', agentId, turnId: `turn:${input.runId}`, outcome: 'completed' }
+      input.host?.effects?.reportNativeEffects?.({
+        runId: input.runId,
+        generation: input.nativeGeneration!,
+        state: 'settled',
+      })
+    }
+    const drafts2 = f2.db.conversationRepository.readPage({
+      scope: 'drafts',
+      sessionId: f2.sessionId,
+    })
+    if (drafts2.scope !== 'drafts') throw new Error('Missing drafts')
+    const sent2 = await f2.flow.send({
+      sessionId: f2.sessionId,
+      clientMessageId: randomUUID(),
+      content: 'Completed before Stop arrives',
+      expectedCommentsRevision: drafts2.commentsRevision,
+      commentIds: [],
+      route: { type: 'agent', agentId: 'codex' },
+    })
+    if (!sent2.ok) throw new Error('Expected send to succeed')
+    const runId2 = sent2.value.runs[0]!.id
+    await evidenceCommitted.promise
+    const stopResult2 = f2.flow.stop({ sessionId: f2.sessionId })
+    expect(stopResult2.ok).toBe(true)
+    releaseTail.resolve()
+    await vi.waitFor(() => expect(f2.flow.diagnostics().activeExecutions).toBe(0))
+    expect(f2.db.conversationRepository.findRun(runId2)).toMatchObject({
+      status: 'completed',
+      dispatchPhase: 'ended',
+    })
+    const page2 = f2.db.conversationRepository.readPage({
+      scope: 'messages',
+      sessionId: f2.sessionId,
+    })
+    if (page2.scope !== 'messages') throw new Error('Missing messages page')
+    const visible2 = page2.messages.find((m) => m.message.role === 'assistant')
+    if (visible2?.kind !== 'complete') throw new Error('Expected complete visible message')
+    expect(visible2.message).toMatchObject({
+      content: 'Already completed before Stop.',
+      state: 'complete',
+    })
+  } finally {
+    await f2.dispose()
+  }
+
+  // 3. Real pre-dispatch PermissionModeRejectedError racing with stop() -> stays failed (never masked as user_stopped).
+  const f3 = await fixture('claude')
+  try {
+    const insideBootstrap = Promise.withResolvers<void>()
+    native.customRun = (_agentId, _executorId, _input, signal) => ({
+      [Symbol.asyncIterator]: () => ({
+        next: async () => {
+          insideBootstrap.resolve()
+          await new Promise<void>((done) => {
+            if (signal.aborted) done()
+            else signal.addEventListener('abort', () => done(), { once: true })
+          })
+          throw new PermissionModeRejectedError('Auto mode was rejected by policy.')
+        },
+      }),
+    })
+    const drafts3 = f3.db.conversationRepository.readPage({
+      scope: 'drafts',
+      sessionId: f3.sessionId,
+    })
+    if (drafts3.scope !== 'drafts') throw new Error('Missing drafts')
+    const sent3 = await f3.flow.send({
+      sessionId: f3.sessionId,
+      clientMessageId: randomUUID(),
+      content: 'Pre-dispatch rejection racing Stop',
+      expectedCommentsRevision: drafts3.commentsRevision,
+      commentIds: [],
+      route: { type: 'agent', agentId: 'claude' },
+    })
+    if (!sent3.ok) throw new Error('Expected send to succeed')
+    const runId3 = sent3.value.runs[0]!.id
+    await insideBootstrap.promise
+    f3.flow.stop({ sessionId: f3.sessionId })
+    await vi.waitFor(() => expect(f3.flow.diagnostics().activeExecutions).toBe(0))
+    expect(f3.db.conversationRepository.findRun(runId3)).toMatchObject({
+      status: 'failed',
+      failureKind: 'runtime_incompatible',
+    })
+  } finally {
+    await f3.dispose()
+  }
+
+  // 4. R2-F1: Pre-dispatch Stop sentinel ('Claude Code was interrupted.') settles cleanly without red Failed or warning card.
+  const f4 = await fixture('claude')
+  try {
+    const insideBootstrap4 = Promise.withResolvers<void>()
+    native.customRun = (_agentId, _executorId, _input, signal) => ({
+      [Symbol.asyncIterator]: () => ({
+        next: async () => {
+          insideBootstrap4.resolve()
+          await new Promise<void>((done) => {
+            if (signal.aborted) done()
+            else signal.addEventListener('abort', () => done(), { once: true })
+          })
+          throw new AgentExecutionError(
+            'agent_process_crash',
+            'Claude Code was interrupted.',
+            false,
+          )
+        },
+      }),
+    })
+    const drafts4 = f4.db.conversationRepository.readPage({
+      scope: 'drafts',
+      sessionId: f4.sessionId,
+    })
+    if (drafts4.scope !== 'drafts') throw new Error('Missing drafts')
+    const sent4 = await f4.flow.send({
+      sessionId: f4.sessionId,
+      clientMessageId: randomUUID(),
+      content: 'Pre-dispatch Stop during Claude bootstrap',
+      expectedCommentsRevision: drafts4.commentsRevision,
+      commentIds: [],
+      route: { type: 'agent', agentId: 'claude' },
+    })
+    if (!sent4.ok) throw new Error('Expected send to succeed')
+    const runId4 = sent4.value.runs[0]!.id
+    await insideBootstrap4.promise
+    f4.flow.stop({ sessionId: f4.sessionId })
+    await vi.waitFor(() => expect(f4.flow.diagnostics().activeExecutions).toBe(0))
+    expect(f4.db.conversationRepository.findRun(runId4)).toMatchObject({
+      status: 'interrupted',
+      failureKind: 'user_stopped',
+    })
+    const loaded4 = await f4.flow.load({ scope: 'messages', sessionId: f4.sessionId })
+    if (!loaded4.ok || loaded4.value.scope !== 'messages') throw new Error('Missing messages page')
+    expect(loaded4.value.header.sessionIssues?.agents ?? []).toEqual([])
+    expect(loaded4.value.header.sessionIssues?.inputGate ?? 'open').toBe('open')
+  } finally {
+    await f4.dispose()
+  }
+
+  // 5. Carbon F1 + Astra #6: Pre-dispatch Stop after `session.started` discards fresh 0-turn binding
+  // so Run 2 starts fresh without `context_resume_failed`, and concurrent `send()` during Stop drain is rejected.
+  const f5 = await fixture('claude')
+  try {
+    const started5 = Promise.withResolvers<void>()
+    const releaseDrain5 = Promise.withResolvers<void>()
+    let runCount5 = 0
+    let secondRunNativeSid: string | undefined = 'sentinel'
+    native.customRun = async function* (agentId, executorId, input, signal) {
+      runCount5 += 1
+      if (runCount5 === 1) {
+        yield { type: 'session.started', agentId, nativeSessionId: 'fresh-0turn-sid' }
+        input.host?.lifecycle?.recordDispatch?.('rejected', 'fresh-0turn-sid', executorId)
+        started5.resolve()
+        await new Promise<void>((done) => {
+          if (signal.aborted) done()
+          else signal.addEventListener('abort', () => done(), { once: true })
+        })
+        await releaseDrain5.promise
+        input.host?.effects?.reportNativeEffects?.({
+          runId: input.runId,
+          generation: input.nativeGeneration!,
+          state: 'settled',
+          reason: 'native_turn_not_started',
+        })
+        return
+      }
+      secondRunNativeSid = input.nativeSessionId
+      yield { type: 'session.started', agentId, nativeSessionId: 'fresh-run2-sid' }
+      input.host?.lifecycle?.recordDispatch?.('accepted', 'fresh-run2-sid', executorId)
+      yield {
+        type: 'text.completed',
+        agentId,
+        turnId: `turn:${input.runId}`,
+        outputId: 'answer',
+        text: 'Run 2 started cleanly without stale 0-turn binding.',
+      }
+      input.host?.lifecycle?.recordNativeEvidence?.({
+        kind: 'ended',
+        source: 'live_terminal',
+        outcome: 'completed',
+        identity: {
+          sessionId: input.sessionId,
+          agentId,
+          runId: input.runId,
+          requestId: input.runId,
+          nativeSessionId: 'fresh-run2-sid',
+          nativeTurnId: `turn:${input.runId}`,
+          bindingGeneration: input.bindingGeneration!,
+          executorId,
+        },
+      })
+      yield { type: 'turn.completed', agentId, turnId: `turn:${input.runId}`, outcome: 'completed' }
+      input.host?.effects?.reportNativeEffects?.({
+        runId: input.runId,
+        generation: input.nativeGeneration!,
+        state: 'settled',
+      })
+    }
+    const drafts5 = f5.db.conversationRepository.readPage({
+      scope: 'drafts',
+      sessionId: f5.sessionId,
+    })
+    if (drafts5.scope !== 'drafts') throw new Error('Missing drafts')
+    const sent5a = await f5.flow.send({
+      sessionId: f5.sessionId,
+      clientMessageId: randomUUID(),
+      content: 'Run 1 stopped pre-dispatch',
+      expectedCommentsRevision: drafts5.commentsRevision,
+      commentIds: [],
+      route: { type: 'agent', agentId: 'claude' },
+    })
+    if (!sent5a.ok) throw new Error('Expected run 1 send to succeed')
+    await started5.promise
+    f5.flow.stop({ sessionId: f5.sessionId })
+
+    // Astra #6: While Stop is draining, concurrent second-window send MUST return CONFLICT!
+    const concurrentSend = await f5.flow.send({
+      sessionId: f5.sessionId,
+      clientMessageId: randomUUID(),
+      content: 'Concurrent send while stopping',
+      expectedCommentsRevision: drafts5.commentsRevision,
+      commentIds: [],
+      route: { type: 'agent', agentId: 'claude' },
+    })
+    expect(concurrentSend).toMatchObject({ ok: false, error: { code: 'CONFLICT' } })
+
+    releaseDrain5.resolve()
+    await vi.waitFor(() => expect(f5.flow.diagnostics().activeExecutions).toBe(0))
+    expect(f5.db.conversationRepository.nativeContext(f5.sessionId, 'claude')).toBeUndefined()
+
+    // Run 2 starts fresh with no stale nativeSessionId and succeeds cleanly!
+    const drafts5b = f5.db.conversationRepository.readPage({
+      scope: 'drafts',
+      sessionId: f5.sessionId,
+    })
+    if (drafts5b.scope !== 'drafts') throw new Error('Missing drafts')
+    const sent5b = await f5.flow.send({
+      sessionId: f5.sessionId,
+      clientMessageId: randomUUID(),
+      content: 'Run 2 after clean pre-dispatch stop',
+      expectedCommentsRevision: drafts5b.commentsRevision,
+      commentIds: [],
+      route: { type: 'agent', agentId: 'claude' },
+    })
+    expect(sent5b).toEqual({ ok: true, value: expect.anything() })
+    await vi.waitFor(() => expect(f5.flow.diagnostics().activeExecutions).toBe(0))
+    expect(secondRunNativeSid).toBeUndefined()
+  } finally {
+    await f5.dispose()
+  }
+
+  // 6. B4 (Astra #7): `@all` Stop during Secondary preparation cancels only continuationAbortController
+  // without aborting an already-completed Primary signal.
+  const f6 = await fixture('claude')
+  try {
+    let primarySignalAborted = false
+    let secondaryStarted = false
+    const secondaryPreparing = Promise.withResolvers<void>()
+    native.customRun = async function* (agentId, executorId, input, signal) {
+      if (agentId === 'claude') {
+        signal.addEventListener('abort', () => {
+          primarySignalAborted = true
+        })
+        yield { type: 'session.started', agentId, nativeSessionId: 'claude-all-primary' }
+        input.host?.lifecycle?.recordDispatch?.('accepted', 'claude-all-primary', executorId)
+        yield {
+          type: 'text.completed',
+          agentId,
+          turnId: `turn:${input.runId}`,
+          outputId: 'answer',
+          text: 'Primary completed before @all Secondary prepared.',
+        }
+        input.host?.lifecycle?.recordNativeEvidence?.({
+          kind: 'ended',
+          source: 'live_terminal',
+          outcome: 'completed',
+          identity: {
+            sessionId: input.sessionId,
+            agentId,
+            runId: input.runId,
+            requestId: input.runId,
+            nativeSessionId: 'claude-all-primary',
+            nativeTurnId: `turn:${input.runId}`,
+            bindingGeneration: input.bindingGeneration!,
+            executorId,
+          },
+        })
+        yield {
+          type: 'turn.completed',
+          agentId,
+          turnId: `turn:${input.runId}`,
+          outcome: 'completed',
+        }
+        input.host?.effects?.reportNativeEffects?.({
+          runId: input.runId,
+          generation: input.nativeGeneration!,
+          state: 'settled',
+        })
+        return
+      }
+      secondaryStarted = true
+    }
+    Reflect.set(
+      f6.flow['core'].collaboration,
+      'beginPendingRoutedContinuation',
+      async (_pending: unknown, _ctx: unknown, signal: AbortSignal) => {
+        secondaryPreparing.resolve()
+        await new Promise<void>((done) => {
+          if (signal.aborted) done()
+          else signal.addEventListener('abort', () => done(), { once: true })
+        })
+        return undefined
+      },
+    )
+    const drafts6 = f6.db.conversationRepository.readPage({
+      scope: 'drafts',
+      sessionId: f6.sessionId,
+    })
+    if (drafts6.scope !== 'drafts') throw new Error('Missing drafts')
+    const sent6 = await f6.flow.send({
+      sessionId: f6.sessionId,
+      clientMessageId: randomUUID(),
+      content: 'Run both agents',
+      expectedCommentsRevision: drafts6.commentsRevision,
+      commentIds: [],
+      route: { type: 'all' },
+    })
+    expect(sent6.ok).toBe(true)
+    await secondaryPreparing.promise
+    f6.flow.stop({ sessionId: f6.sessionId })
+    await vi.waitFor(() => expect(f6.flow.diagnostics().activeExecutions).toBe(0))
+    expect(primarySignalAborted).toBe(false)
+    expect(secondaryStarted).toBe(false)
+  } finally {
+    await f6.dispose()
+  }
+})
+
+it('Carbon Final Finding 2: restores 0-turn and ready bindings across sync and async NativeInputWithheldError settlement', async () => {
+  // 1. Fresh 0-turn session (schedulingSettings.enabled = false):
+  //    generator throws NativeInputWithheldError BEFORE delayed reportNativeEffects('settled', 'workflow_input_withheld')
+  //    arrives (simulating Claude child close after throw). The 0-turn binding MUST be discarded cleanly,
+  //    sessionIssues must stay empty, and the next send() must start fresh.
+  const f1 = await fixture('claude')
+  try {
+    let run1Input: AgentRunInput | undefined
+    let run2NativeSessionId: string | undefined = 'sentinel'
+    let callNum = 0
+    native.customRun = async function* (agentId, executorId, input) {
+      callNum += 1
+      native.actors += 1
+      native.inputs.set(input.runId, input)
+      input.host?.lifecycle?.recordExecutor?.(executorId)
+      if (callNum === 1) {
+        run1Input = input
+        native.background.add(input.runId)
+        yield { type: 'session.started', agentId, nativeSessionId: 'claude-0turn-withheld' }
+        input.host?.lifecycle?.recordDispatch?.('rejected', 'claude-0turn-withheld', executorId)
+        throw new NativeInputWithheldError('Workflow paused before first byte.')
+      }
+      run2NativeSessionId = input.nativeSessionId
+      yield { type: 'session.started', agentId, nativeSessionId: 'claude-fresh-run2' }
+      input.host?.lifecycle?.recordDispatch?.('accepted', 'claude-fresh-run2', executorId)
+      yield {
+        type: 'text.completed',
+        agentId,
+        turnId: `turn:${input.runId}`,
+        outputId: 'answer',
+        text: 'Fresh Claude turn succeeded.',
+      }
+      input.host?.lifecycle?.recordNativeEvidence?.({
+        kind: 'ended',
+        source: 'live_terminal',
+        outcome: 'completed',
+        identity: {
+          sessionId: input.sessionId,
+          agentId,
+          runId: input.runId,
+          requestId: input.runId,
+          nativeSessionId: 'claude-fresh-run2',
+          nativeTurnId: `turn:${input.runId}`,
+          bindingGeneration: input.bindingGeneration!,
+          executorId,
+        },
+      })
+      yield { type: 'turn.completed', agentId, turnId: `turn:${input.runId}`, outcome: 'completed' }
+      input.host?.effects?.reportNativeEffects?.({
+        runId: input.runId,
+        generation: input.nativeGeneration!,
+        state: 'settled',
+      })
+    }
+
+    const drafts1 = f1.db.conversationRepository.readPage({
+      scope: 'drafts',
+      sessionId: f1.sessionId,
+    })
+    if (drafts1.scope !== 'drafts') throw new Error('Missing drafts')
+    const sent1 = await f1.flow.send({
+      sessionId: f1.sessionId,
+      clientMessageId: randomUUID(),
+      content: 'Fresh run withheld before first byte',
+      expectedCommentsRevision: drafts1.commentsRevision,
+      commentIds: [],
+      route: { type: 'agent', agentId: 'claude' },
+    })
+    expect(sent1.ok).toBe(true)
+    await vi.waitFor(() => expect(f1.flow.diagnostics().activeExecutions).toBe(0))
+    expect(run1Input).toBeDefined()
+
+    // Delayed child close now settles native effects AFTER RunExecutor catch completed.
+    native.background.delete(run1Input!.runId)
+    run1Input!.host?.effects?.reportNativeEffects?.({
+      runId: run1Input!.runId,
+      generation: run1Input!.nativeGeneration!,
+      state: 'settled',
+      reason: 'workflow_input_withheld',
+    })
+
+    expect(f1.db.conversationRepository.nativeContext(f1.sessionId, 'claude')).toBeUndefined()
+    const loaded1 = await f1.flow.load({ scope: 'messages', sessionId: f1.sessionId })
+    if (!loaded1.ok || loaded1.value.scope !== 'messages') throw new Error('Expected messages page')
+    expect(loaded1.value.header.sessionIssues?.agents ?? []).toEqual([])
+    expect(loaded1.value.header.sessionIssues?.inputGate ?? 'open').toBe('open')
+
+    const drafts1b = f1.db.conversationRepository.readPage({
+      scope: 'drafts',
+      sessionId: f1.sessionId,
+    })
+    if (drafts1b.scope !== 'drafts') throw new Error('Missing drafts')
+    const sent1b = await f1.flow.send({
+      sessionId: f1.sessionId,
+      clientMessageId: randomUUID(),
+      content: 'Next turn starts fresh',
+      expectedCommentsRevision: drafts1b.commentsRevision,
+      commentIds: [],
+      route: { type: 'agent', agentId: 'claude' },
+    })
+    expect(sent1b.ok).toBe(true)
+    await vi.waitFor(() => expect(f1.flow.diagnostics().activeExecutions).toBe(0))
+    expect(run2NativeSessionId).toBeUndefined()
+  } finally {
+    await f1.dispose()
+  }
+
+  // 2. Established 'ready' binding (Turn 1 completed; schedulingSettings.enabled = false):
+  //    Turn 2 yields session.started, synchronously reports settled('workflow_input_withheld') BEFORE
+  //    throwing NativeInputWithheldError. Binding MUST remain { state: 'active', continuationState: 'ready' },
+  //    inputGate MUST remain 'open' with zero SessionWarningCard, and Turn 3 reuses the binding.
+  const f2 = await fixture('codex')
+  try {
+    let callNum = 0
+    let turn3NativeSessionId: string | undefined
+    native.customRun = async function* (agentId, executorId, input) {
+      callNum += 1
+      native.actors += 1
+      native.inputs.set(input.runId, input)
+      input.host?.lifecycle?.recordExecutor?.(executorId)
+      const nativeSessionId = 'codex-established-sid'
+      if (callNum === 1) {
+        yield { type: 'session.started', agentId, nativeSessionId }
+        input.host?.lifecycle?.recordDispatch?.('accepted', nativeSessionId, executorId)
+        yield {
+          type: 'text.completed',
+          agentId,
+          turnId: `turn:${input.runId}`,
+          outputId: 'answer',
+          text: 'Turn 1 complete.',
+        }
+        input.host?.lifecycle?.recordNativeEvidence?.({
+          kind: 'ended',
+          source: 'live_terminal',
+          outcome: 'completed',
+          identity: {
+            sessionId: input.sessionId,
+            agentId,
+            runId: input.runId,
+            requestId: input.runId,
+            nativeSessionId,
+            nativeTurnId: `turn:${input.runId}`,
+            bindingGeneration: input.bindingGeneration!,
+            executorId,
+          },
+        })
+        yield {
+          type: 'turn.completed',
+          agentId,
+          turnId: `turn:${input.runId}`,
+          outcome: 'completed',
+        }
+        input.host?.effects?.reportNativeEffects?.({
+          runId: input.runId,
+          generation: input.nativeGeneration!,
+          state: 'settled',
+        })
+        return
+      }
+      if (callNum === 2) {
+        yield { type: 'session.started', agentId, nativeSessionId }
+        input.host?.lifecycle?.recordDispatch?.('rejected', nativeSessionId, executorId)
+        input.host?.effects?.reportNativeEffects?.({
+          runId: input.runId,
+          generation: input.nativeGeneration!,
+          state: 'settled',
+          reason: 'workflow_input_withheld',
+        })
+        throw new NativeInputWithheldError('Workflow paused before Turn 2 first byte.')
+      }
+      turn3NativeSessionId = input.nativeSessionId
+      yield { type: 'session.started', agentId, nativeSessionId }
+      input.host?.lifecycle?.recordDispatch?.('accepted', nativeSessionId, executorId)
+      yield {
+        type: 'text.completed',
+        agentId,
+        turnId: `turn:${input.runId}`,
+        outputId: 'answer',
+        text: 'Turn 3 reused healthy binding.',
+      }
+      input.host?.lifecycle?.recordNativeEvidence?.({
+        kind: 'ended',
+        source: 'live_terminal',
+        outcome: 'completed',
+        identity: {
+          sessionId: input.sessionId,
+          agentId,
+          runId: input.runId,
+          requestId: input.runId,
+          nativeSessionId,
+          nativeTurnId: `turn:${input.runId}`,
+          bindingGeneration: input.bindingGeneration!,
+          executorId,
+        },
+      })
+      yield { type: 'turn.completed', agentId, turnId: `turn:${input.runId}`, outcome: 'completed' }
+      input.host?.effects?.reportNativeEffects?.({
+        runId: input.runId,
+        generation: input.nativeGeneration!,
+        state: 'settled',
+      })
+    }
+
+    const sendTurn = async (content: string) => {
+      const drafts = f2.db.conversationRepository.readPage({
+        scope: 'drafts',
+        sessionId: f2.sessionId,
+      })
+      if (drafts.scope !== 'drafts') throw new Error('Missing drafts')
+      return f2.flow.send({
+        sessionId: f2.sessionId,
+        clientMessageId: randomUUID(),
+        content,
+        expectedCommentsRevision: drafts.commentsRevision,
+        commentIds: [],
+        route: { type: 'agent', agentId: 'codex' },
+      })
+    }
+
+    expect((await sendTurn('Turn 1')).ok).toBe(true)
+    await vi.waitFor(() => expect(f2.flow.diagnostics().activeExecutions).toBe(0))
+    expect(f2.db.conversationRepository.nativeContext(f2.sessionId, 'codex')).toMatchObject({
+      nativeSessionId: 'codex-established-sid',
+      state: 'active',
+      continuationState: 'ready',
+    })
+
+    expect((await sendTurn('Turn 2 withheld')).ok).toBe(true)
+    await vi.waitFor(() => expect(f2.flow.diagnostics().activeExecutions).toBe(0))
+
+    expect(f2.db.conversationRepository.nativeContext(f2.sessionId, 'codex')).toMatchObject({
+      nativeSessionId: 'codex-established-sid',
+      state: 'active',
+      continuationState: 'ready',
+    })
+    expect(
+      f2.db.conversationRepository.nativeContext(f2.sessionId, 'codex')?.recoveryFailureKind,
+    ).toBeUndefined()
+    const loaded2 = await f2.flow.load({ scope: 'messages', sessionId: f2.sessionId })
+    if (!loaded2.ok || loaded2.value.scope !== 'messages') throw new Error('Expected messages page')
+    expect(loaded2.value.header.sessionIssues?.agents ?? []).toEqual([])
+    expect(loaded2.value.header.sessionIssues?.inputGate ?? 'open').toBe('open')
+
+    expect((await sendTurn('Turn 3')).ok).toBe(true)
+    await vi.waitFor(() => expect(f2.flow.diagnostics().activeExecutions).toBe(0))
+    expect(turn3NativeSessionId).toBe('codex-established-sid')
+  } finally {
+    await f2.dispose()
   }
 })

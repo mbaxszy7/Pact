@@ -718,6 +718,7 @@ export class AgyNotificationProjector {
     onObservedBackgroundTask: () => void
     onAcceptTurn: () => void
     canAdmitForegroundDelta: () => boolean
+    retainHiddenAnswerAfterFreeze?: boolean
     canAdmitWorkflowEffect?: (() => boolean) | undefined
     onForegroundDeltaDropped?: () => void
     reportUnknown: (reason: string) => void
@@ -921,13 +922,14 @@ export class AgyNotificationProjector {
         const content = isPlainObject(update.content) ? update.content : undefined
         const text = content && content.type === 'text' ? asString(content.text) : undefined
         if (!text) return
-        if (!context.canAdmitForegroundDelta()) {
+        const canEmitForeground = context.canAdmitForegroundDelta()
+        if (!canEmitForeground && !context.retainHiddenAnswerAfterFreeze) {
           context.onForegroundDeltaDropped?.()
           return
         }
         const itemId = `msg:${context.getMessageIndex()}`
         const delta = context.answer.append(itemId, text)
-        if (delta) {
+        if (delta && canEmitForeground) {
           emitted.push({
             agentId: 'agy',
             type: 'text.delta',
@@ -1550,7 +1552,12 @@ export class AgyNotificationProjector {
             toolName: state.name,
             title: state.title,
             ...(state.detail ? { detail: state.detail } : {}),
-            outcome: state.status === 'completed' ? 'completed' : 'failed',
+            outcome:
+              state.status === 'completed'
+                ? 'completed'
+                : context.activeRun.cancellationPending || context.signal.aborted
+                  ? 'interrupted'
+                  : 'failed',
           })
         }
         return

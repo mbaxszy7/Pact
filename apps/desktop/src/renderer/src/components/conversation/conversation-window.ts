@@ -733,6 +733,8 @@ export function mergeMessagePage(
           const run = runs.get(activity.runId)
           if (run?.status === 'completed')
             return Object.assign({}, activity, { status: 'completed' as const })
+          if (run?.status === 'interrupted' && run.failureKind === 'user_stopped')
+            return Object.assign({}, activity, { status: 'interrupted' as const })
           if (run?.status === 'failed' || run?.status === 'interrupted')
             return Object.assign({}, activity, { status: 'failed' as const })
           return activity

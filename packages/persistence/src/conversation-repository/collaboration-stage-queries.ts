@@ -604,10 +604,11 @@ export function reconcileCompletedCollaboration(
     return undefined
   const task = collaboration(repo, run.sessionId)
   const before = task?.revision
+  const userStopped = repo.hasCommittedUserStop(run.id)
   finishCollaboration(
     repo,
     runId,
-    run.dispatchPhase === 'ended' && run.nativeOutcome === 'completed',
+    !userStopped && run.dispatchPhase === 'ended' && run.nativeOutcome === 'completed',
   )
   return collaboration(repo, run.sessionId)?.revision !== before
     ? repo.metadataPatch(run.sessionId)
@@ -640,8 +641,9 @@ export function finishCollaboration(
     task.inputProcessing = collaborationInputProcessing(task)
     const auth = collaborationTurnAuthorizationSchema.parse(JSON.parse(turn.authorizationJson))
     const frozen = decodedCollaboration(repo, turn.stateJson)
+    const userStopped = repo.hasCommittedUserStop(run.id)
     const nativeCompleted =
-      complete && run.dispatchPhase === 'ended' && run.nativeOutcome === 'completed'
+      complete && !userStopped && run.dispatchPhase === 'ended' && run.nativeOutcome === 'completed'
     if (auth.replyIntentBasis?.kind === 'ask_only') {
       repo.finishAskOnly(task, run, auth, nativeCompleted, notice)
       return
@@ -671,7 +673,8 @@ export function finishCollaboration(
         settleCollaborationStage(task, {
           kind: 'interrupted',
           authorization: auth,
-          stopped: run.nativeOutcome === 'interrupted' || run.failureKind === 'user_stopped',
+          stopped:
+            run.nativeOutcome !== 'failed' && (run.nativeOutcome === 'interrupted' || userStopped),
           unstarted,
           failed: run.nativeOutcome === 'failed',
           ended,

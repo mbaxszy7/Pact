@@ -205,7 +205,11 @@ export interface CodexConnectionManagerPort {
     commands: Map<string, string | undefined>,
     signal?: AbortSignal,
     backgroundOnly?: boolean,
-  ): Promise<void>
+    options?: {
+      deadlineAt?: number
+      onCommandTerminated?: (id: string) => void
+    },
+  ): Promise<ReadonlySet<string>>
   pactToolConfig(
     connection: CodexAppServerConnection,
     peerToolUrl: string,

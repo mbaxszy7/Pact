@@ -54,6 +54,7 @@ export interface ActiveExecution {
   enteredNativeAdapter?: boolean | undefined
   cancelledByUser?: boolean | undefined
   abortController: AbortController
+  continuationAbortController?: AbortController | undefined
   streamBuffer?: AgentStreamBuffer | undefined
   lastArchiver?: RunOutputArchiver | undefined
   completion?: Promise<void> | undefined

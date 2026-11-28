@@ -2102,8 +2102,14 @@ export function settleCollaborationStage(
         if (auth.stage === 'code_review') next.unreviewedCodeActor = undefined
       }
       if (open && settlement.verdict !== 'incomplete') {
-        next.automation = 'active'
-        next.pauseReason = undefined
+        const incomingExplicitPauseReason = preservedExplicitPauseReason(task)
+        if (incomingExplicitPauseReason) {
+          next.automation = 'paused'
+          next.pauseReason = incomingExplicitPauseReason
+        } else {
+          next.automation = 'active'
+          next.pauseReason = undefined
+        }
       }
       if (settlement.verdict === 'accepted' && currentBasis) {
         if (auth.stage === 'plan_review') {
